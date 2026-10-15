@@ -133,11 +133,66 @@ run_pades_case() {
 [ -f "$INPUTS/simple.pdf" ] || python3 tools/gen-testpdf.py "$INPUTS/simple.pdf"
 run_pades_case simple "$INPUTS/simple.pdf" signer-rsa
 
+# XAdES: enveloped XAdES-B-B over an XML document. The normalizer is Python
+# on top of expat, lxml and xmlsec1 (tools/golden/xml-normalize.py), never
+# our own XML code, and it recomputes every ds:Reference digest over the
+# canonicalized bytes and has xmlsec1 verify the SignatureValue on both
+# sides before the dumps are diffed, so a MATCH also means both files pass
+# their own integrity claims. The measured reference is docs/xades.md.
+run_xades_case() {
+  local name="$1" input="$2" base="$3"
+  local af="$OUT/$name.autofirma.xades.xml" ours="$OUT/$name.openfirma.xades.xml"
+
+  command -v xmlsec1 >/dev/null \
+    || { echo "SKIP   $name (no xmlsec1 to verify the SignatureValue with)"; return 0; }
+  python3 -c 'import lxml.etree' 2>/dev/null \
+    || { echo "SKIP   $name (no lxml for the canonicalization recomputation)"; return 0; }
+
+  java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
+    "$CERTS/$base.p12" "$PASS" "$input" "$af" SHA256withRSA \
+    format=XAdES\ Enveloped profile=baseline >/dev/null 2>&1 \
+    || { echo "SKIP   $name (AutoFirma refused to sign it)"; return 0; }
+
+  ./target/debug/openfirma sign -i "$input" -o "$ours" --format xades-b-b \
+    --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
+    --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" >/dev/null
+
+  python3 tools/golden/xml-normalize.py "$af" --trusted "$CERTS/ca.crt" \
+    | grep -v '^source:' >"$OUT/$name.autofirma.xades.dump"
+  python3 tools/golden/xml-normalize.py "$ours" --trusted "$CERTS/ca.crt" \
+    | grep -v '^source:' >"$OUT/$name.openfirma.xades.dump"
+
+  # both sides must pass their own integrity check, or a MATCH is meaningless
+  for side in autofirma openfirma; do
+    local dump="$OUT/$name.$side.xades.dump"
+    if grep -q '^  FAIL' "$dump"; then
+      echo "FAIL   $name ($side: an integrity check failed)"
+      grep '^  FAIL' "$dump" | head -4
+      return 0
+    fi
+    if ! grep -q 'ok: xmlsec1 verified' "$dump"; then
+      echo "FAIL   $name ($side: xmlsec1 did not verify the signature)"
+      return 0
+    fi
+  done
+
+  if diff -u "$OUT/$name.autofirma.xades.dump" "$OUT/$name.openfirma.xades.dump" \
+       >"$OUT/$name.xades.diff"; then
+    rm -f "$OUT/$name.xades.diff"
+    echo "MATCH  $name (XAdES-B-B)"
+  else
+    echo "DIFF   $name  ($(grep -c '^[-+][^-+]' "$OUT/$name.xades.diff") lines, see $OUT/$name.xades.diff)"
+  fi
+}
+
+run_xades_case simple "$INPUTS/simple.xml" signer-rsa
+
 # A legal person is not a natural person with a different name: the subject
 # carries a CIF in serialNumber and an organizationIdentifier, and there is no
 # human in it at all. Both implementations must treat it as unremarkable.
 run_case juridical "$INPUTS/simple.txt" signer-juridical
 run_pades_case juridical "$INPUTS/simple.pdf" signer-juridical
+run_xades_case juridical "$INPUTS/simple.xml" signer-juridical
 
 echo
 echo "dumps and signatures in $OUT"

@@ -29,6 +29,10 @@ must match:
 - for PAdES: `/SubFilter`, `/Filter`, the shape of `/ByteRange`, the AcroForm
   field and its flags, which optional dictionary entries are absent, and the CMS
   inside `/Contents`. See `docs/pades.md` for the measured reference.
+- for XAdES: the `SignedInfo` transforms and every algorithm URI, the
+  `QualifyingProperties` layout down to the empty `IssuerSerialV2` and the
+  namespace declarations each element carries, and which references baseline
+  signs. See `docs/xades.md` for the measured reference.
 
 For CAdES the normalizer is `openfirma inspect`, our own DER dumper, which is
 safe to use as the oracle because it only walks TLV and understands no
@@ -43,14 +47,26 @@ collapses revisions. The same script recomputes the digest over `/ByteRange`
 and checks it against the CMS `messageDigest`, which is the property that
 actually makes the file a signature.
 
+For XAdES it is `tools/golden/xml-normalize.py`, again deliberately not our
+code: openfirma has its own XML reader and its own canonicalizer, so the dump
+is built with Python's `xml.etree` (expat), the reference digests are
+recomputed with `lxml`'s C14N, and the `SignatureValue` is verified by
+`xmlsec1` — three implementations that share nothing with ours. The volatile
+values it neutralizes are exactly the four classes measured in `docs/xades.md`
+(the uuids, `SigningTime`, and the two values that cover them); the data
+reference digest, the certificate digest and the certificate bytes are kept
+because they must match. Before the dumps are diffed, both files must pass
+their own integrity check, so a MATCH means both sides are also internally
+sound signatures.
+
 This is the layer that catches most of the problems. It caught four real bugs
 in the CAdES encoder that OpenSSL tolerated: a missing `SigningCertificateV2`
 wrapper level, an unsorted `certificates` set, `sha256WithRSAEncryption` where
 RFC 3370 requires `rsaEncryption`, and encapsulating content by default.
 
-## 2. OpenSSL, as an independent ASN.1 reader
+## 2. Independent verifiers in cargo test
 
-Three independent implementations are wired into `cargo test`, each checking a
+Five independent implementations are wired into `cargo test`, each checking a
 different property, and each skipped with a message when it is not installed:
 
 - **OpenSSL** (`crates/openfirma-cades/tests/openssl_crosscheck.rs` and
@@ -68,6 +84,27 @@ different property, and each skipped with a message when it is not installed:
 - **qpdf** checks the container: cross-reference offsets, object structure,
   stream lengths. A signature can be cryptographically perfect in a PDF that
   no reader can open, so this is checked separately.
+- **xmlsec1** (`crates/openfirma-xades/tests/xmlsec_crosscheck.rs`) verifies
+  the XAdES signatures with its own C14N 1.0 and the openssl backend: every
+  `ds:Reference` digest and the `SignatureValue` over the canonicalized
+  `SignedInfo`. It is the only independent verdict the ECDSA path gets,
+  because AutoFirma headless cannot sign EC XAdES on this JVM
+  (`docs/xades.md`, deviation 5), and a tampered document test proves the
+  check bites.
+- **AutoFirma's own validator**
+  (`crates/openfirma-xades/tests/autofirma_verify.rs`) runs the official
+  jar's `ValidateXMLSignature` — the validator behind the GUI's "validate
+  signature" — against files openfirma signed, RSA and ECDSA, and against a
+  tampered copy that must be refused. The jar comes from
+  `tools/fetch-autofirma.sh` and is not a CI dependency, so this test skips
+  with a message when java or the jar is absent, the same treatment qpdf
+  gets; when the jar is present and the driver misbehaves, it fails.
+
+The XAdES canonicalizer additionally runs against known-answer vectors hand
+written from the examples of the C14N 1.0 specification
+(`crates/openfirma-xades/tests/c14n_kat.rs`), every expected value
+cross-checked against Apache Santuario and libxml2 while the crate was
+written.
 
 Gotcha found while setting this up: **`openssl cms -verify -content` is broken
 for detached signatures in 3.6.5**. It rejects detached CMS produced by openssl
@@ -83,12 +120,16 @@ verifies that token against the signature value it imprints, and the test
 refuses a token that imprints anything else.
 
 What these prove today: RSA SHA-256 and SHA-512 plus ECDSA P-256, encapsulated
-and detached, verify under OpenSSL with byte identical recovered content; and
+and detached, verify under OpenSSL with byte identical recovered content;
 PAdES-B-B verifies under OpenSSL over the `/ByteRange` bytes, under poppler as
-"Signature is Valid" and "Total document signed", and opens cleanly in qpdf.
-That covers the CMS structure, the `SET OF` DER ordering, the `[0] IMPLICIT`
-retag rule for the signed attributes, the `signingCertificateV2` encoding, the
-certificate embedding and the PDF incremental update.
+"Signature is Valid" and "Total document signed", and opens cleanly in qpdf;
+and XAdES-B-B verifies under xmlsec1 (all references plus the signature value,
+RSA and ECDSA) and under AutoFirma's own validator. That covers the CMS
+structure, the `SET OF` DER ordering, the `[0] IMPLICIT` retag rule for the
+signed attributes, the `signingCertificateV2` encoding, the certificate
+embedding, the PDF incremental update, and for XML the whole canonicalization
+and reference machinery down to the namespace suppression rule inside
+`SignedInfo`.
 
 `openfirma verify` is the in-repo verifier, and now that it exists the OpenSSL
 crosscheck also runs *against it*: `crates/openfirma-cades/tests/verify.rs`

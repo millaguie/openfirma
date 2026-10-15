@@ -46,6 +46,9 @@ pub enum Error {
     #[error("pdf: {0}")]
     Pdf(String),
 
+    #[error("xml: {0}")]
+    Xml(String),
+
     #[error("keystore: {0}")]
     Keystore(String),
 

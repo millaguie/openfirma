@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<documento Id="doc-prueba" version="1.0">
+  <titulo>Documento de prueba para el golden diff</titulo>
+  <descripcion>Contiene acentos: cañón, administración.</descripcion>
+  <importe moneda="EUR">1234.56</importe>
+</documento>

@@ -46,8 +46,14 @@ registration) and the installers.
   placeholder patching, AcroForm signature field, invisible and visible
   appearances. Planned: document timestamp, DSS dictionary and LTV. See
   `docs/pades.md` and `docs/adr/0003`.
-- **openfirma-xades**: C14N/EC14N, XML-DSig transforms, XAdES 1.9 (the profile
-  the Spanish administration uses, not only ETSI Baseline), FacturaE 3.2.
+- **openfirma-xades**: strict hand rolled XML reader that keeps the byte spans
+  of the input (the signed output preserves the original document bytes and
+  only splices the signature in), Canonical XML 1.0 inclusive with subtree
+  namespace inheritance, enveloped XML-DSig and the XAdES-B-B qualifying
+  properties of ETSI EN 319 132-1 as AutoFirma's baseline profile writes
+  them. Planned: the other signature shapes (enveloping, detached), the
+  advanced profile, XAdES 1.9 policy handling and FacturaE 3.2. See
+  `docs/xades.md`.
 - **openfirma-keystore**: enumeration and selection of certificates across
   stores, key operations through the platform or a token.
 - **openfirma-protocol**: the local service that browsers invoke. Wire

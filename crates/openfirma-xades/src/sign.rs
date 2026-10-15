@@ -1,0 +1,547 @@
+//! XAdES-B-B: an enveloped XML-DSig signature with the ETSI EN 319 132-1
+//! baseline qualifying properties, built to match the measured AutoFirma 1.9
+//! output byte for byte in structure. Everything about the layout here is
+//! measured, not guessed; docs/xades.md is the record and the arbiter.
+
+use std::time::SystemTime;
+
+use base64::Engine;
+use der::asn1::UintRef;
+use der::{Decode, Sequence};
+use openfirma_core::alg::{DigestAlg, EcCurve, KeyAlgorithm};
+use openfirma_core::signer::Signer;
+use openfirma_core::{Error, Result};
+
+use crate::c14n;
+use crate::xml::{self, Child};
+
+pub const DS_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+pub const XADES_NS: &str = "http://uri.etsi.org/01903/v1.3.2#";
+/// The Type of the SignedProperties reference uses the XAdES namespace
+/// without a version, exactly like AutoFirma.
+pub const SIGNED_PROPERTIES_TYPE: &str = "http://uri.etsi.org/01903#SignedProperties";
+pub const C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+pub const ENVELOPED_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+pub const XPATH_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+pub const XPATH_FILTER: &str = "not(ancestor-or-self::ds:Signature)";
+
+/// The OID that AutoFirma's mime table assigns to `text/xml`, measured in its
+/// `DataObjectFormat`.
+pub const OID_TEXT_XML: &str = "1.2.840.10003.5.109.10";
+
+pub struct XadesOptions {
+    /// Digest of the signature algorithm (`ds:SignatureMethod`). AutoFirma's
+    /// GUI signs with SHA256withRSA, so SHA-256 is the default.
+    pub digest: DigestAlg,
+    /// Digest of every `ds:Reference` and of the signing certificate in
+    /// `CertDigest`. AutoFirma's `referencesDigestMethod` default is SHA-512,
+    /// independent of the signature algorithm, and so is ours.
+    pub reference_digest: DigestAlg,
+    /// `xades:SigningTime`. Defaults to now, written as UTC: std Rust has no
+    /// timezone database and AutoFirma writes local time with its offset, a
+    /// deviation recorded in docs/xades.md.
+    pub signing_time: Option<SystemTime>,
+    /// `xades:MimeType` in `DataObjectFormat`. XML input is `text/xml` in
+    /// AutoFirma unless overridden.
+    pub mime_type: Option<String>,
+    /// OID for the `DataObjectFormat`'s `ObjectIdentifier`, as a dotted
+    /// string. Defaults to the table lookup for the mime type; when there is
+    /// no known OID the whole `ObjectIdentifier` element is omitted, which is
+    /// what AutoFirma does for an unrecognized mime type.
+    pub content_type_oid: Option<String>,
+}
+
+impl Default for XadesOptions {
+    fn default() -> Self {
+        XadesOptions {
+            digest: DigestAlg::Sha256,
+            reference_digest: DigestAlg::Sha512,
+            signing_time: None,
+            mime_type: None,
+            content_type_oid: None,
+        }
+    }
+}
+
+/// Signs an XML document with an enveloped XAdES-B-B signature.
+///
+/// The output is the input document with the `ds:Signature` spliced in as
+/// the last child of the root element, the declaration normalized to
+/// `<?xml version="1.0" encoding="UTF-8"?>` and everything outside the root
+/// dropped: the measured AutoFirma serialization, see docs/xades.md.
+pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Result<Vec<u8>> {
+    let doc = xml::parse(input).map_err(|e| {
+        if !looks_like_xml(input) {
+            Error::Xml(format!(
+                "the input is not an XML document ({e}). Enveloped XAdES signs XML; \
+                 for any other content sign it as CAdES with --format cades-b-b, which \
+                 is also what AutoFirma's GUI offers for a file that is not XML"
+            ))
+        } else {
+            e
+        }
+    })?;
+
+    let key_alg = signer.key_algorithm()?;
+    let sig_method_uri = signature_method_uri(key_alg, opts.digest)?;
+    let digest_uri = digest_method_uri(opts.reference_digest);
+
+    let sig_uuid = uuid_v4()?;
+    let ref_uuid = uuid_v4()?;
+    let sig_id = format!("Signature-{sig_uuid}");
+    let ref_id = format!("Reference-{ref_uuid}");
+
+    // AutoFirma references the root by its Id attribute when it has one and
+    // signs the whole document (URI="") when it does not; the signature is
+    // appended to the root either way
+    let root_id = doc.root.attr("Id");
+    let data_uri = match root_id {
+        Some(id) => format!("#{id}"),
+        None => String::new(),
+    };
+
+    // The data digest: C14N of the root subtree with every ds:Signature
+    // subtree removed, which is the net effect of the enveloped transform
+    // plus the XPath filter AutoFirma declares (docs/xades.md). Computed on
+    // the input as it will appear in the output, signature excluded.
+    let data_opts = c14n::Options {
+        omit: Some((DS_NS.to_string(), "Signature".to_string())),
+        ..Default::default()
+    };
+    let target = match root_id {
+        Some(id) => find_by_id(&doc.root, id).ok_or_else(|| {
+            Error::Xml(format!(
+                "the root element declares Id=\"{id}\" but no element in the \
+                 document carries it"
+            ))
+        })?,
+        None => &doc.root,
+    };
+    let data_c14n = c14n::subtree(target, &c14n::Axis::new(), &[], &data_opts);
+    let data_digest = opts.reference_digest.digest(&data_c14n);
+
+    let cert = signer.certificate();
+    let cert_digest = opts.reference_digest.digest(cert.der());
+
+    let signing_time = opts.signing_time.unwrap_or_else(SystemTime::now);
+    let mime_type = opts
+        .mime_type
+        .clone()
+        .unwrap_or_else(|| "text/xml".to_string());
+    let oid = match &opts.content_type_oid {
+        Some(oid) => Some(oid.clone()),
+        None => oid_for_mime(&mime_type).map(str::to_string),
+    };
+
+    // ---- the ds:Object content: QualifyingProperties/SignedProperties ----
+
+    let mut qp = String::new();
+    qp.push_str(&format!(
+        "<xades:QualifyingProperties xmlns:xades=\"{XADES_NS}\" \
+         Id=\"{sig_id}-QualifyingProperties\" Target=\"#{sig_id}-Signature\" \
+         xmlns:ds=\"{DS_NS}\">"
+    ));
+    qp.push_str(&format!(
+        "<xades:SignedProperties Id=\"{sig_id}-SignedProperties\">\
+         <xades:SignedSignatureProperties>\
+         <xades:SigningTime>{}</xades:SigningTime>\
+         <xades:SigningCertificateV2><xades:Cert><xades:CertDigest>\
+         <ds:DigestMethod Algorithm=\"{digest_uri}\"/>\
+         <ds:DigestValue>{}</ds:DigestValue>\
+         </xades:CertDigest><xades:IssuerSerialV2/></xades:Cert></xades:SigningCertificateV2>\
+         </xades:SignedSignatureProperties>",
+        format_signing_time(signing_time)?,
+        b64(&cert_digest),
+    ));
+    qp.push_str("<xades:SignedDataObjectProperties>");
+    qp.push_str(&format!(
+        "<xades:DataObjectFormat ObjectReference=\"#{ref_id}\">\
+         <xades:Description/>"
+    ));
+    if let Some(oid) = &oid {
+        // the leading urn:oid: and the OIDAsURN qualifier are what AutoFirma
+        // writes; the value is escaped because a mime table is data
+        qp.push_str(&format!(
+            "<xades:ObjectIdentifier>\
+             <xades:Identifier Qualifier=\"OIDAsURN\">urn:oid:{}</xades:Identifier>\
+             <xades:Description/>\
+             </xades:ObjectIdentifier>",
+            escape_text(oid)
+        ));
+    }
+    qp.push_str(&format!(
+        "<xades:MimeType>{}</xades:MimeType><xades:Encoding/>\
+         </xades:DataObjectFormat>",
+        escape_text(&mime_type)
+    ));
+    qp.push_str("</xades:SignedDataObjectProperties></xades:SignedProperties>");
+    qp.push_str("</xades:QualifyingProperties>");
+
+    // The SignedProperties digest is taken over the canonical form of the
+    // SignedProperties element *including the namespaces it inherits from
+    // QualifyingProperties*. Parsing the fragment and canonicalizing through
+    // the same code a verifier uses is how the inherited xmlns:ds and
+    // xmlns:xades end up in the digest (docs/xades.md).
+    let qp_doc = xml::parse(qp.as_bytes()).map_err(|e| {
+        Error::other(format!(
+            "internal error: the QualifyingProperties template does not parse: {e}"
+        ))
+    })?;
+    let sp_opts = c14n::Options::default();
+    let sp_c14n = c14n::subtree_from(
+        &qp_doc.root,
+        |el| el.namespace.as_deref() == Some(XADES_NS) && el.name.local == "SignedProperties",
+        &sp_opts,
+    )
+    .ok_or_else(|| Error::other("internal error: no SignedProperties in the template"))?;
+    let sp_digest = opts.reference_digest.digest(&sp_c14n);
+
+    // ---- SignedInfo ----
+
+    let signed_info = format!(
+        "<ds:SignedInfo>\
+         <ds:CanonicalizationMethod Algorithm=\"{C14N_URI}\"/>\
+         <ds:SignatureMethod Algorithm=\"{sig_method_uri}\"/>\
+         <ds:Reference Id=\"{ref_id}\" URI=\"{}\">\
+         <ds:Transforms>\
+         <ds:Transform Algorithm=\"{ENVELOPED_URI}\"/>\
+         <ds:Transform Algorithm=\"{C14N_URI}\"/>\
+         <ds:Transform Algorithm=\"{XPATH_URI}\">\
+         <ds:XPath xmlns:ds=\"{DS_NS}\">{XPATH_FILTER}</ds:XPath>\
+         </ds:Transform>\
+         </ds:Transforms>\
+         <ds:DigestMethod Algorithm=\"{digest_uri}\"/>\
+         <ds:DigestValue>{}</ds:DigestValue>\
+         </ds:Reference>\
+         <ds:Reference Type=\"{SIGNED_PROPERTIES_TYPE}\" URI=\"#{sig_id}-SignedProperties\">\
+         <ds:DigestMethod Algorithm=\"{digest_uri}\"/>\
+         <ds:DigestValue>{}</ds:DigestValue>\
+         </ds:Reference>\
+         </ds:SignedInfo>",
+        escape_attr(&data_uri),
+        b64(&data_digest),
+        b64(&sp_digest),
+    );
+
+    // The signature is over the canonical form of SignedInfo with the
+    // xmlns:ds it inherits from ds:Signature. The ds:XPath element carries
+    // its own redundant xmlns:ds in the file, and C14N 1.0 suppresses it in
+    // the canonical form; parsing the wrapper and canonicalizing through the
+    // same rules reproduces exactly what Apache Santuario signed (the
+    // "Gotcha" of docs/xades.md).
+    let wrapper = format!("<ds:Signature xmlns:ds=\"{DS_NS}\">{signed_info}</ds:Signature>");
+    let wrapper_doc = xml::parse(wrapper.as_bytes()).map_err(|e| {
+        Error::other(format!(
+            "internal error: the SignedInfo wrapper does not parse: {e}"
+        ))
+    })?;
+    let si_c14n = c14n::subtree_from(
+        &wrapper_doc.root,
+        |el| el.namespace.as_deref() == Some(DS_NS) && el.name.local == "SignedInfo",
+        &sp_opts,
+    )
+    .ok_or_else(|| Error::other("internal error: no SignedInfo in the wrapper"))?;
+
+    let prehash = opts.digest.digest(&si_c14n);
+    let raw_sig = signer.sign_prehash(opts.digest, &prehash)?;
+    // AutoFirma checks the PKCS#1 it just produced against the certificate
+    // public key (ETSI TS 119 102-1); so do we, before any conversion
+    openfirma_core::signer::verify_prehash(cert, opts.digest, &prehash, &raw_sig)?;
+    let sig_value = match key_alg {
+        KeyAlgorithm::Rsa => raw_sig,
+        KeyAlgorithm::EcPrimeField(curve) => ecdsa_der_to_p1363(&raw_sig, coord_len(curve))?,
+    };
+
+    // ---- KeyInfo ----
+
+    let mut certs_b64 = String::new();
+    certs_b64.push_str(&format!(
+        "<ds:X509Certificate>{}</ds:X509Certificate>",
+        b64(cert.der())
+    ));
+    for chain_cert in signer.chain() {
+        certs_b64.push_str(&format!(
+            "<ds:X509Certificate>{}</ds:X509Certificate>",
+            b64(chain_cert.der())
+        ));
+    }
+    // KeyValue for RSA only: AutoFirma omits it for EC keys because its own
+    // validator does not accept Santuario's ECKeyValue (a FIXME in their
+    // source), and we match the measured output (docs/xades.md)
+    let key_value = match key_alg {
+        KeyAlgorithm::Rsa => {
+            let (modulus, exponent) = rsa_public_key_bytes(cert)?;
+            format!(
+                "<ds:KeyValue><ds:RSAKeyValue>\
+                 <ds:Modulus>{}</ds:Modulus>\
+                 <ds:Exponent>{}</ds:Exponent>\
+                 </ds:RSAKeyValue></ds:KeyValue>",
+                b64(&modulus),
+                b64(&exponent)
+            )
+        }
+        KeyAlgorithm::EcPrimeField(_) => String::new(),
+    };
+    let key_info = format!(
+        "<ds:KeyInfo Id=\"{sig_id}-KeyInfo\">\
+         <ds:X509Data>{certs_b64}</ds:X509Data>{key_value}\
+         </ds:KeyInfo>"
+    );
+
+    // In baseline the KeyInfo exists but is not referenced from SignedInfo,
+    // measured; the signature covers the data and the SignedProperties only.
+
+    let signature = format!(
+        "<ds:Signature xmlns:ds=\"{DS_NS}\" Id=\"{sig_id}-Signature\">\
+         {signed_info}\
+         <ds:SignatureValue Id=\"{sig_id}-SignatureValue\">{}</ds:SignatureValue>\
+         {key_info}\
+         <ds:Object>{qp}</ds:Object>\
+         </ds:Signature>",
+        b64(&sig_value),
+    );
+
+    splice_into_document(input, &doc, signature.as_bytes())
+}
+
+/// The output file: the normalized declaration, then the input bytes of the
+/// root element with the signature inserted before its end tag. Nothing
+/// outside the root survives, which is what AutoFirma's serializer does.
+fn splice_into_document(input: &[u8], doc: &xml::Document, signature: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() + signature.len() + 64);
+    out.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+
+    let root = &doc.root;
+    if root.self_closing {
+        // <root attrs/> becomes <root attrs><ds:Signature .../></root>: the
+        // DOM appendChild that AutoFirma performs cannot keep the short form
+        let open = &input[root.open_tag.0..root.open_tag.1];
+        let trimmed = &open[..open.len() - 2]; // drop the "/>"
+        let trimmed = trim_ascii_end(trimmed);
+        out.extend_from_slice(trimmed);
+        out.push(b'>');
+        out.extend_from_slice(signature);
+        out.extend_from_slice(b"</");
+        out.extend_from_slice(root.name.to_string_with_prefix().as_bytes());
+        out.push(b'>');
+        return Ok(out);
+    }
+    let (close_start, close_end) = root.close_tag;
+    out.extend_from_slice(&input[root.open_tag.0..close_start]);
+    out.extend_from_slice(signature);
+    out.extend_from_slice(&input[close_start..close_end]);
+    Ok(out)
+}
+
+fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+fn looks_like_xml(input: &[u8]) -> bool {
+    let mut bytes = input;
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]) {
+        bytes = rest;
+    }
+    let first = bytes.iter().find(|b| !b.is_ascii_whitespace());
+    first == Some(&b'<')
+}
+
+fn find_by_id<'e>(root: &'e xml::Element, id: &str) -> Option<&'e xml::Element> {
+    if root.attr("Id") == Some(id) {
+        return Some(root);
+    }
+    for child in &root.children {
+        if let Child::Element(el) = child {
+            if let Some(found) = find_by_id(el, id) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The `ds:SignatureMethod` URI for a key and a digest, AutoFirma's table.
+fn signature_method_uri(key: KeyAlgorithm, digest: DigestAlg) -> Result<&'static str> {
+    Ok(match key {
+        KeyAlgorithm::Rsa => match digest {
+            DigestAlg::Sha1 => "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+            DigestAlg::Sha256 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            DigestAlg::Sha384 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
+            DigestAlg::Sha512 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512",
+            DigestAlg::Sha224 => {
+                return Err(Error::UnsupportedCombination {
+                    key: "RSA",
+                    digest: "SHA-224",
+                });
+            }
+        },
+        KeyAlgorithm::EcPrimeField(_) => match digest {
+            DigestAlg::Sha1 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1",
+            DigestAlg::Sha224 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha224",
+            DigestAlg::Sha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+            DigestAlg::Sha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+            DigestAlg::Sha512 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512",
+        },
+    })
+}
+
+/// The `ds:DigestMethod` URI. The javax.xml.crypto.dsig constants AutoFirma
+/// uses are not uniform: SHA-256 and SHA-512 come from xmlenc, SHA-224 and
+/// SHA-384 from xmldsig-more. Matched value for value.
+fn digest_method_uri(digest: DigestAlg) -> &'static str {
+    match digest {
+        DigestAlg::Sha1 => "http://www.w3.org/2000/09/xmldsig#sha1",
+        DigestAlg::Sha224 => "http://www.w3.org/2001/04/xmldsig-more#sha224",
+        DigestAlg::Sha256 => "http://www.w3.org/2001/04/xmlenc#sha256",
+        DigestAlg::Sha384 => "http://www.w3.org/2001/04/xmldsig-more#sha384",
+        DigestAlg::Sha512 => "http://www.w3.org/2001/04/xmlenc#sha512",
+    }
+}
+
+/// The OID AutoFirma's jmimemagic table assigns to a mime type. Only `text/xml`
+/// is measured (docs/xades.md); anything else gets no ObjectIdentifier unless
+/// the caller names one.
+pub fn oid_for_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "text/xml" => Some(OID_TEXT_XML),
+        _ => None,
+    }
+}
+
+/// `xs:dateTime`, second precision, UTC. AutoFirma writes local time with its
+/// offset; we cannot without a timezone database, and the instant is the
+/// same, so we write Z (docs/xades.md, deviation 1).
+fn format_signing_time(t: SystemTime) -> Result<String> {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| Error::other("the signing time is before 1970 and cannot be written"))?
+        .as_secs() as i64;
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
+    Ok(format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    ))
+}
+
+/// Days since the epoch to a proleptic Gregorian date, Howard Hinnant's
+/// `civil_from_days`, the same conversion the CLI and openfirma-pades use.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (y + i64::from(m <= 2), m, d)
+}
+
+/// UUID version 4, formatted like `java.util.UUID.toString`, which is what
+/// every AutoFirma Id is built from.
+fn uuid_v4() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| Error::other(format!("the operating system refused random bytes: {e}")))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
+/// XML-DSig carries ECDSA signatures as the raw `r || s` (IEEE P1363), while
+/// the `Signer` trait returns the DER form CMS uses. This converts between
+/// the two, left padding each half to the curve's coordinate length.
+fn ecdsa_der_to_p1363(der_sig: &[u8], coord_len: usize) -> Result<Vec<u8>> {
+    #[derive(Sequence)]
+    struct EcdsaSigDer<'a> {
+        r: UintRef<'a>,
+        s: UintRef<'a>,
+    }
+    let parsed = EcdsaSigDer::from_der(der_sig)
+        .map_err(|e| Error::Signing(format!("the ECDSA signature is not DER: {e}")))?;
+    let (r, s) = (parsed.r.as_bytes(), parsed.s.as_bytes());
+    if r.len() > coord_len || s.len() > coord_len {
+        return Err(Error::Signing(
+            "the ECDSA signature coordinates are larger than the curve".into(),
+        ));
+    }
+    let mut out = vec![0u8; 2 * coord_len];
+    out[coord_len - r.len()..coord_len].copy_from_slice(r);
+    out[2 * coord_len - s.len()..].copy_from_slice(s);
+    Ok(out)
+}
+
+/// Modulus and public exponent of the certificate's RSA key, minimal
+/// big-endian, which is what Santuario writes into `ds:RSAKeyValue`.
+fn rsa_public_key_bytes(cert: &openfirma_core::CertificateHandle) -> Result<(Vec<u8>, Vec<u8>)> {
+    #[derive(Sequence)]
+    struct RsaPublicKeyDer<'a> {
+        modulus: UintRef<'a>,
+        public_exponent: UintRef<'a>,
+    }
+    let spki_der = cert.spki_der()?;
+    let spki = spki::SubjectPublicKeyInfoRef::from_der(&spki_der)
+        .map_err(|e| Error::Certificate(format!("unreadable public key info: {e}")))?;
+    let key = RsaPublicKeyDer::from_der(spki.subject_public_key.raw_bytes()).map_err(|e| {
+        Error::Certificate(format!("the certificate carries no readable RSA key: {e}"))
+    })?;
+    Ok((
+        key.modulus.as_bytes().to_vec(),
+        key.public_exponent.as_bytes().to_vec(),
+    ))
+}
+
+fn b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn escape_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn escape_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Length of one ECDSA signature coordinate in the P1363 form.
+fn coord_len(curve: EcCurve) -> usize {
+    match curve {
+        EcCurve::P256 => 32,
+        EcCurve::P384 => 48,
+        EcCurve::P521 => 66,
+    }
+}

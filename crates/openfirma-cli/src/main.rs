@@ -181,16 +181,19 @@ struct SignArgs {
 #[derive(Clone, Copy, ValueEnum)]
 enum Format {
     #[value(name = "cades-b-b")]
-    CadesBb,
+    Cades,
     #[value(name = "pades-b-b")]
-    PadesBb,
+    Pades,
+    #[value(name = "xades-b-b")]
+    Xades,
 }
 
 impl Format {
     fn label(self) -> &'static str {
         match self {
-            Format::CadesBb => "CAdES-B-B",
-            Format::PadesBb => "PAdES-B-B",
+            Format::Cades => "CAdES-B-B",
+            Format::Pades => "PAdES-B-B",
+            Format::Xades => "XAdES-B-B",
         }
     }
 }
@@ -385,7 +388,7 @@ fn main() -> Result<()> {
             let mut opts = CadesOptions {
                 digest: digest_alg,
                 encapsulate_content: encapsulate,
-                mime_type,
+                mime_type: mime_type.clone(),
                 content_hint,
                 include_issuer_serial: !no_issuer_serial,
                 timestamp: stamp.clone(),
@@ -396,11 +399,11 @@ fn main() -> Result<()> {
             }
 
             let signature = match format {
-                Format::CadesBb => sign(&content, &signer, &opts)?,
+                Format::Cades => sign(&content, &signer, &opts)?,
                 // PAdES fixes the CAdES shape itself: detached, no signingTime
                 // because the time is in /M, and no contentHint. The knobs
                 // above only apply to CAdES, see docs/pades.md.
-                Format::PadesBb => openfirma_pades::pades_sign(
+                Format::Pades => openfirma_pades::pades_sign(
                     &content,
                     &signer,
                     &PadesOptions {
@@ -416,6 +419,21 @@ fn main() -> Result<()> {
                         }),
                         timestamp: stamp,
                         ..PadesOptions::default()
+                    },
+                )?,
+                // XAdES-B-B is enveloped and signs XML, see docs/xades.md.
+                // --digest picks the signature algorithm; the reference
+                // digests stay SHA-512, AutoFirma's default. signingTime is
+                // not optional here: the baseline profile requires it, so
+                // --no-signing-time and the CAdES attribute knobs do not
+                // apply, and --mime-type feeds DataObjectFormat instead.
+                Format::Xades => openfirma_xades::xades_sign(
+                    &content,
+                    &signer,
+                    &openfirma_xades::XadesOptions {
+                        digest: digest_alg,
+                        mime_type,
+                        ..Default::default()
                     },
                 )?,
             };

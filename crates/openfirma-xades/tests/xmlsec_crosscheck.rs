@@ -1,0 +1,170 @@
+//! xmlsec1 as an independent verifier: its own XML parser, its own C14N 1.0
+//! and its own XML-DSig reference machinery, with openssl as the crypto
+//! backend. When it says OK, our canonicalized SignedInfo, our digests and
+//! our signature value agree with an implementation that shares no code with
+//! ours. This is the layer that would catch a canonicalizer that is
+//! self-consistent but wrong, which the structure tests cannot see.
+//!
+//! The EC case matters twice: AutoFirma headless cannot even *sign* EC XAdES
+//! on this JVM (docs/xades.md, deviation 5), so xmlsec1 is the only
+//! independent verdict our ECDSA path gets.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use openfirma_core::cert::CertificateHandle;
+use openfirma_core::signer::SoftwareSigner;
+use openfirma_xades::{XadesOptions, xades_sign};
+
+const INPUT: &[u8] = include_bytes!("../../../testdata/inputs/simple.xml");
+
+fn certs_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
+}
+
+fn require_or_skip(reason: &str) {
+    let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
+    let allowed = std::env::var("OPENFIRMA_ALLOW_SKIP").is_ok();
+    if required && !allowed {
+        panic!("cannot run the crosscheck: {reason}");
+    }
+    eprintln!("skipped, {reason}");
+}
+
+fn xmlsec_available() -> bool {
+    Command::new("xmlsec1")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> {
+    let dir = certs_dir();
+    let (Ok(cert_pem), Ok(key_pem)) = (
+        std::fs::read_to_string(dir.join(cert)),
+        std::fs::read_to_string(dir.join(key)),
+    ) else {
+        return None;
+    };
+    let signer = SoftwareSigner::from_pkcs8_pem(&cert_pem, &key_pem).unwrap_or_else(|e| {
+        panic!("{cert} / {key} are present but unusable: {e}, rerun tools/gen-testcert.sh")
+    });
+    let handles = chain
+        .iter()
+        .map(|c| {
+            let pem = std::fs::read_to_string(dir.join(c))
+                .unwrap_or_else(|e| panic!("{c} cannot be read: {e}"));
+            CertificateHandle::from_pem(&pem).unwrap_or_else(|e| panic!("{c}: {e}"))
+        })
+        .collect();
+    Some(signer.with_chain(handles))
+}
+
+/// xmlsec1 needs the trust anchor for the chain and the Id hack because the
+/// fixture declares no DTD that would type Id as an XML ID.
+fn xmlsec_verify(file: &Path) -> (bool, String) {
+    let out = Command::new("xmlsec1")
+        .args([
+            "--verify",
+            "--verbose",
+            "--enabled-key-data",
+            "x509",
+            "--add-id-attr",
+            "Id",
+            "--trusted-pem",
+            certs_dir().join("ca.crt").to_str().unwrap(),
+        ])
+        .arg(file)
+        .output()
+        .expect("xmlsec1 disappeared mid test");
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    (text.contains("Verification status: OK"), text)
+}
+
+fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("openfirma-xades-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn xmlsec_verifies_the_rsa_signature() {
+    if !xmlsec_available() {
+        // not a CI dependency, the golden diff needs it and that runs locally
+        eprintln!("skipped, xmlsec1 not found");
+        return;
+    }
+    let Some(signer) = load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let signed = xades_sign(INPUT, &signer, &XadesOptions::default()).expect("signing");
+    let path = write_tmp("rsa.xml", &signed);
+
+    let (ok, text) = xmlsec_verify(&path);
+    assert!(ok, "xmlsec1 rejected our XAdES-B-B signature:\n{text}");
+    assert!(
+        text.contains("SignedInfo References (ok/all): 2/2"),
+        "not both references verified:\n{text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn xmlsec_verifies_the_ecdsa_signature() {
+    if !xmlsec_available() {
+        eprintln!("skipped, xmlsec1 not found");
+        return;
+    }
+    let Some(signer) = load_signer(
+        "signer-ec.crt",
+        "signer-ec.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let signed = xades_sign(INPUT, &signer, &XadesOptions::default()).expect("signing");
+    let path = write_tmp("ec.xml", &signed);
+
+    let (ok, text) = xmlsec_verify(&path);
+    assert!(
+        ok,
+        "xmlsec1 rejected our ECDSA XAdES-B-B signature:\n{text}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A crosscheck that cannot fail is not a crosscheck: one changed character
+/// of signed content has to be noticed.
+#[test]
+fn xmlsec_notices_a_tampered_document() {
+    if !xmlsec_available() {
+        eprintln!("skipped, xmlsec1 not found");
+        return;
+    }
+    let Some(signer) = load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let signed = xades_sign(INPUT, &signer, &XadesOptions::default()).expect("signing");
+    let text = std::str::from_utf8(&signed).unwrap().to_string();
+    let tampered = text.replacen("1234.56", "9999.99", 1);
+    assert_ne!(tampered, text, "the tamper point must exist in the output");
+    let path = write_tmp("tampered.xml", tampered.as_bytes());
+
+    let (ok, _) = xmlsec_verify(&path);
+    assert!(!ok, "xmlsec1 accepted a document whose content was changed");
+    std::fs::remove_file(&path).ok();
+}

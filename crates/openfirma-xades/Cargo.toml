@@ -1,0 +1,15 @@
+[package]
+name = "openfirma-xades"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "XAdES-B-B: XML-DSig with the ETSI EN 319 132-1 baseline qualifying properties, matching AutoFirma's output"
+
+[dependencies]
+openfirma-core.workspace = true
+base64.workspace = true
+der.workspace = true
+spki.workspace = true
+getrandom.workspace = true

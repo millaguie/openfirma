@@ -4,6 +4,7 @@ members = [
     "crates/openfirma-core",
     "crates/openfirma-cades",
     "crates/openfirma-pades",
+    "crates/openfirma-xades",
     "crates/openfirma-keystore",
     "crates/openfirma-cli",
 ]
@@ -47,6 +48,10 @@ rand_core = "0.10"
 thiserror = "2"
 hex = "0.4"
 base64 = "0.23"
+# The XAdES Id attributes are UUIDv4 like AutoFirma's (java.util.UUID). Pure
+# Rust, and not a new library in the binary: getrandom 0.4 is already in the
+# dependency tree through rsa -> crypto-bigint, this only calls it by name.
+getrandom = "0.4"
 # FlateDecode, which is how a cross-reference stream and an object stream are
 # stored. rust_backend is miniz_oxide, pure Rust; the default is pinned off so
 # a future release cannot quietly swap in a C zlib.
@@ -63,6 +68,7 @@ anyhow = "1"
 openfirma-core = { path = "crates/openfirma-core", version = "0.1.0" }
 openfirma-cades = { path = "crates/openfirma-cades", version = "0.1.0" }
 openfirma-pades = { path = "crates/openfirma-pades", version = "0.1.0" }
+openfirma-xades = { path = "crates/openfirma-xades", version = "0.1.0" }
 openfirma-keystore = { path = "crates/openfirma-keystore", version = "0.1.0" }
 
 [profile.release]

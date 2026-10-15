@@ -518,6 +518,7 @@ dependencies = [
  "openfirma-core",
  "openfirma-keystore",
  "openfirma-pades",
+ "openfirma-xades",
  "tracing",
 ]
 
@@ -579,6 +580,17 @@ dependencies = [
  "sha2",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "openfirma-xades"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "der",
+ "getrandom",
+ "openfirma-core",
+ "spki",
 ]
 
 [[package]]

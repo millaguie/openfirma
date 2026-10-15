@@ -28,6 +28,13 @@ Very early, phase 1. What works today:
   AutoFirma signed, which means reading cross-reference streams and object
   streams. OpenSSL verifies the signature over exactly the ranges `/ByteRange`
   names, and the structure matches AutoFirma's, see `docs/pades.md`.
+- **XAdES-B-B** signing (`--format xades-b-b`): an enveloped XML-DSig
+  signature with the ETSI EN 319 132-1 baseline properties
+  (`SigningCertificateV2`, `SigningTime`, `DataObjectFormat`), on top of a
+  hand-rolled strict XML reader and Canonical XML 1.0 implementation. RSA and
+  ECDSA P-256. The structure matches AutoFirma's `profile=baseline` output,
+  `xmlsec1` verifies every reference and the signature value, and AutoFirma's
+  own validator accepts our files, see `docs/xades.md`.
 - **Verification**: `openfirma verify` cryptographically checks CAdES and
   PAdES signatures, every signature of a co-signed PDF included: the
   `messageDigest` against the content, the signature value over the signed
@@ -39,8 +46,8 @@ Very early, phase 1. What works today:
 - CLI: `openfirma sign`, `openfirma verify` and `openfirma inspect`, the last
   dumping any DER signature as a normalized tree for diffing.
 
-Not started yet: XAdES, the system keystores (PKCS#11, DNIe, Windows, macOS,
-NSS), the browser protocol, the GUI, and B-LT/B-LTA.
+Not started yet: the system keystores (PKCS#11, DNIe, Windows, macOS,
+NSS), the browser protocol, the GUI, FacturaE, and B-LT/B-LTA.
 
 | Component | Status |
 |---|---|
@@ -52,7 +59,8 @@ NSS), the browser protocol, the GUI, and B-LT/B-LTA.
 | B-LT / B-LTA (validation data, archive timestamps) | not started |
 | Keystores: PKCS#12 | works, pure Rust, MAC checked before decrypting |
 | Keystores: PKCS#11, DNIe, Windows, macOS, NSS | not started |
-| XAdES / FacturaE | not started |
+| XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
+| XAdES B-T and above, FacturaE, enveloping/detached shapes | not started |
 | Browser integration (`afirma://`, wss:// localhost, AutoScript) | not started |
 | GUI | not started |
 
@@ -63,6 +71,9 @@ NSS), the browser protocol, the GUI, and B-LT/B-LTA.
 cargo run -- sign -i doc.txt -o doc.csig \
     --cert testdata/certs/signer-rsa.crt --key testdata/certs/signer-rsa.key
 cargo run -- sign -i doc.pdf -o doc.signed.pdf --format pades-b-b \
+    --cert testdata/certs/signer-rsa.crt --key testdata/certs/signer-rsa.key \
+    --chain testdata/certs/intermediate.crt --chain testdata/certs/ca.crt
+cargo run -- sign -i doc.xml -o doc.signed.xml --format xades-b-b \
     --cert testdata/certs/signer-rsa.crt --key testdata/certs/signer-rsa.key \
     --chain testdata/certs/intermediate.crt --chain testdata/certs/ca.crt
 cargo run -- verify -i doc.csig --content doc.txt --trust testdata/certs/ca.crt
@@ -80,10 +91,12 @@ crates/
   openfirma-core     shared types: algorithms, certificates, Signer trait
   openfirma-cades    CMS / CAdES
   openfirma-pades    PDF reading, incremental updates, PAdES
+  openfirma-xades    XML reader, Canonical XML, XAdES-B-B
   openfirma-cli      the `openfirma` binary
 docs/
   architecture.md    crate layering and data flow
   pades.md           what AutoFirma's PAdES output actually contains
+  xades.md           what AutoFirma's XAdES output actually contains
   platforms.md       the multiplatform matrix
   validation.md      how we prove output validates
   adr/               decisions that are expensive to reverse
