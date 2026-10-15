@@ -90,6 +90,26 @@ That covers the CMS structure, the `SET OF` DER ordering, the `[0] IMPLICIT`
 retag rule for the signed attributes, the `signingCertificateV2` encoding, the
 certificate embedding and the PDF incremental update.
 
+`openfirma verify` is the in-repo verifier, and now that it exists the OpenSSL
+crosscheck also runs *against it*: `crates/openfirma-cades/tests/verify.rs`
+asserts that openssl and our verifier reach the same verdict on a good and on
+a tampered file. `verify` checks the `messageDigest` against the content, the
+`signatureValue` over the signed attributes re-tagged as `SET OF`, the
+`signingCertificateV2` reference against the embedded signer certificate, and
+it builds the chain from the signer up to the trust anchors given on the
+command line, verifying each link's signature with the issuer's public key and
+every certificate's validity dates against a validation time (`--at`, default
+now). It verifies *every* signature in a document, so a co-signed PDF passes
+only when all of its signatures do. What it does not do is everything that
+makes layers 3 and 4 necessary: no revocation, no certificate policy (key
+usage, basic constraints, qualification), no signature policy, no time-stamp
+token validation. A file that passes `openfirma verify` is cryptographically
+sound and chains to an anchor *you* chose; whether a regulator agrees is still
+a question for DSS and VALIDe. And it shares the codebase with the encoder,
+which is one more reason the independent readers above stay in the suite: a
+bug in how openfirma reads ASN.1 could otherwise hide on both sides of the
+verification.
+
 ## 3. ETSI reference validator, local
 
 The reference implementation for ETSI EN 319 102-2 and 142 is the European

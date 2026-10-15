@@ -14,4 +14,4 @@ pub use alg::{DigestAlg, KeyAlgorithm, SignatureAlg};
 pub use cert::CertificateHandle;
 pub use dump::der_dump;
 pub use error::{Error, Result};
-pub use signer::{Signer, SoftwareSigner};
+pub use signer::{Signer, SoftwareSigner, verify_prehash};

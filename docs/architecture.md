@@ -36,7 +36,9 @@ registration) and the installers.
   backends, signature parameters and profiles shared by all formats.
 - **openfirma-cades**: hand rolled CMS `SignedData` encoder/decoder on the `der`
   crate, CAdES-B-B/B-T/B-LT/B-LTA attribute sets, TSA client, countersignature
-  and cofirm trees.
+  and cofirm trees, and the cryptographic verifier (`openfirma_cades::verify`):
+  `messageDigest`, the signature value over the re-tagged signed attributes,
+  `signingCertificateV2`, and chain building against supplied trust anchors.
 - **openfirma-pades**: minimal PDF reader (last trailer, classic cross-reference
   tables *and* cross-reference streams, object streams, FlateDecode with the PNG
   and TIFF predictors, dictionary surgery at the byte level so untouched objects
@@ -50,8 +52,11 @@ registration) and the installers.
   stores, key operations through the platform or a token.
 - **openfirma-protocol**: the local service that browsers invoke. Wire
   compatible with AutoScript so existing sedes electrónicas work unchanged.
-- **openfirma-validate**: verification of CAdES/PAdES/XAdES, revocation, chain
-  building, and the report format VALIDe shows.
+- **openfirma-validate**: revocation, certificate policy, validation data and
+  the report format VALIDe shows. The cryptographic verification of CAdES and
+  PAdES already lives in the format crates, behind `openfirma verify`; PAdES
+  verification extracts each signature's covered bytes and delegates to the
+  CAdES verifier, so every signature of a co-signed document is checked.
 - **openfirma-cli**: `openfirma sign|verify|list-certs|serve`.
 
 ## Why hand rolled CMS

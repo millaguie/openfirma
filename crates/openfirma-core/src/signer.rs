@@ -188,3 +188,192 @@ fn rsa_sign_prehash(
         DigestAlg::Sha512 => sign_with!(sha2::Sha512),
     }
 }
+
+/// Verifies an already computed digest signature under a certificate's public
+/// key: the verification counterpart of [`Signer::sign_prehash`], and the only
+/// place where public key crypto lives outside the `Signer` backends. The
+/// `Signer` trait stays the only home of key material for *signing*; a
+/// verifier never holds a private key, it holds certificates.
+///
+/// Supported: RSA PKCS#1 v1.5 and ECDSA P-256, each over SHA-1/256/384/512
+/// (RSA also SHA-224). The digest is named explicitly, exactly like on the
+/// signing side, because that is what CMS carries: `digestAlgorithm` in the
+/// `SignerInfo` and, for RSA PKCS#1 v1.5, inside the DigestInfo the signature
+/// recovers.
+pub fn verify_prehash(
+    cert: &CertificateHandle,
+    digest: DigestAlg,
+    prehash: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    use crate::alg::{EcCurve, KeyAlgorithm};
+    use signature::hazmat::PrehashVerifier;
+    use spki::DecodePublicKey;
+
+    let expected = digest.output_len();
+    if prehash.len() != expected {
+        return Err(Error::PrehashLength {
+            alg: digest.name(),
+            expected,
+            got: prehash.len(),
+        });
+    }
+    let spki_der = cert.spki_der()?;
+    match cert.key_algorithm()? {
+        KeyAlgorithm::Rsa => {
+            let key = rsa::RsaPublicKey::from_public_key_der(&spki_der).map_err(|e| {
+                Error::Certificate(format!("the certificate carries no readable RSA key: {e}"))
+            })?;
+            let sig = rsa::pkcs1v15::Signature::try_from(signature)
+                .map_err(|e| Error::Verification(format!("unreadable RSA signature: {e}")))?;
+            macro_rules! verify_with {
+                ($ty:ty) => {{
+                    rsa::pkcs1v15::VerifyingKey::<$ty>::new(key)
+                        .verify_prehash(prehash, &sig)
+                        .map_err(|e| {
+                            Error::Verification(format!("the signature does not verify: {e}"))
+                        })
+                }};
+            }
+            match digest {
+                DigestAlg::Sha1 => verify_with!(sha1::Sha1),
+                DigestAlg::Sha224 => verify_with!(sha2::Sha224),
+                DigestAlg::Sha256 => verify_with!(sha2::Sha256),
+                DigestAlg::Sha384 => verify_with!(sha2::Sha384),
+                DigestAlg::Sha512 => verify_with!(sha2::Sha512),
+            }
+        }
+        KeyAlgorithm::EcPrimeField(EcCurve::P256) => {
+            let key = p256::PublicKey::from_public_key_der(&spki_der).map_err(|e| {
+                Error::Certificate(format!(
+                    "the certificate carries no readable P-256 key: {e}"
+                ))
+            })?;
+            let sig = p256::ecdsa::Signature::from_der(signature)
+                .map_err(|e| Error::Verification(format!("the ECDSA signature is not DER: {e}")))?;
+            p256::ecdsa::VerifyingKey::from(key)
+                .verify_prehash(prehash, &sig)
+                .map_err(|e| Error::Verification(format!("the signature does not verify: {e}")))
+        }
+        KeyAlgorithm::EcPrimeField(curve) => Err(Error::UnsupportedKeyAlgorithm(format!(
+            "{}: signature verification is implemented for RSA and ECDSA P-256 only",
+            curve.name()
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pkcs8::DecodePrivateKey;
+    use signature::hazmat::PrehashSigner;
+
+    /// Same rule as the integration tests: skip when the throwaway PKI has not
+    /// been generated, but fail the build when CI asked for the tests to run.
+    fn require_or_skip(reason: &str) {
+        let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
+        let allowed = std::env::var("OPENFIRMA_ALLOW_SKIP").is_ok();
+        if required && !allowed {
+            panic!("cannot run the test: {reason}");
+        }
+        eprintln!("skipped, {reason}");
+    }
+
+    fn certs_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
+    }
+
+    /// The requirement is RSA PKCS#1 v1.5 and ECDSA P-256, each over
+    /// SHA-1/256/384/512 (RSA also SHA-224, which the signing side supports).
+    /// The signing half of this test goes directly to the crypto crates rather
+    /// than through `SoftwareSigner`, whose P-256 backend deliberately pairs
+    /// with SHA-256 only: verification must accept what other implementations
+    /// produce, not only what we would sign ourselves.
+    #[test]
+    fn verify_prehash_covers_the_required_key_and_digest_combinations() {
+        let dir = certs_dir();
+        let (Ok(rsa_cert), Ok(rsa_key), Ok(ec_cert), Ok(ec_key)) = (
+            std::fs::read(dir.join("signer-rsa.crt.der")),
+            std::fs::read_to_string(dir.join("signer-rsa.key")),
+            std::fs::read(dir.join("signer-ec.crt.der")),
+            std::fs::read_to_string(dir.join("signer-ec.key")),
+        ) else {
+            require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let rsa_cert = CertificateHandle::from_der(&rsa_cert).expect("signer-rsa.crt.der");
+        let rsa_key =
+            rsa::RsaPrivateKey::from_pkcs8_pem(&rsa_key).expect("signer-rsa.key must be PKCS#8");
+        let ec_cert = CertificateHandle::from_der(&ec_cert).expect("signer-ec.crt.der");
+        let ec_key =
+            p256::ecdsa::SigningKey::from_pkcs8_pem(&ec_key).expect("signer-ec.key must be PKCS#8");
+
+        macro_rules! rsa_round_trip {
+            ($digest:expr, $ty:ty) => {{
+                let d = $digest;
+                let prehash = d.digest(b"the message");
+                let sig: rsa::pkcs1v15::Signature =
+                    rsa::pkcs1v15::SigningKey::<$ty>::new(rsa_key.clone())
+                        .sign_prehash(&prehash)
+                        .expect("rsa sign_prehash");
+                verify_prehash(&rsa_cert, d, &prehash, &sig.to_vec())
+                    .unwrap_or_else(|e| panic!("RSA {}: {e}", d.name()));
+                // a digest of a different message must not verify
+                let other = d.digest(b"another message");
+                assert!(
+                    verify_prehash(&rsa_cert, d, &other, &sig.to_vec()).is_err(),
+                    "RSA {} verified the wrong digest",
+                    d.name()
+                );
+            }};
+        }
+        rsa_round_trip!(DigestAlg::Sha1, sha1::Sha1);
+        rsa_round_trip!(DigestAlg::Sha224, sha2::Sha224);
+        rsa_round_trip!(DigestAlg::Sha256, sha2::Sha256);
+        rsa_round_trip!(DigestAlg::Sha384, sha2::Sha384);
+        rsa_round_trip!(DigestAlg::Sha512, sha2::Sha512);
+
+        for digest in [
+            DigestAlg::Sha1,
+            DigestAlg::Sha256,
+            DigestAlg::Sha384,
+            DigestAlg::Sha512,
+        ] {
+            let prehash = digest.digest(b"the message");
+            let sig: p256::ecdsa::Signature = ec_key
+                .sign_prehash(&prehash)
+                .expect("p256 sign_prehash accepts any prehash length");
+            let der = sig.to_der();
+            verify_prehash(&ec_cert, digest, &prehash, der.as_bytes())
+                .unwrap_or_else(|e| panic!("ECDSA P-256 {}: {e}", digest.name()));
+            let other = digest.digest(b"another message");
+            assert!(
+                verify_prehash(&ec_cert, digest, &other, der.as_bytes()).is_err(),
+                "ECDSA P-256 {} verified the wrong digest",
+                digest.name()
+            );
+        }
+    }
+
+    #[test]
+    fn verify_prehash_rejects_a_wrong_length_prehash() {
+        let dir = certs_dir();
+        let Ok(der) = std::fs::read(dir.join("signer-rsa.crt.der")) else {
+            require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let cert = CertificateHandle::from_der(&der).expect("signer-rsa.crt.der");
+        let err = verify_prehash(&cert, DigestAlg::Sha256, &[0u8; 31], &[0u8; 256]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PrehashLength {
+                    expected: 32,
+                    got: 31,
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+}

@@ -88,8 +88,16 @@ pub const ID_SHA384_WITH_RSA: ObjectIdentifier =
 pub const ID_SHA512_WITH_RSA: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
 
+// X.509 extensions
+pub const ID_SUBJECT_KEY_IDENTIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.35");
+
 // Elliptic curve
 pub const ID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+/// Only needed on the verification side: we never sign ECDSA with SHA-1 or
+/// SHA-224, but a certificate in a chain may be signed with them.
+pub const ID_ECDSA_WITH_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.1");
+pub const ID_ECDSA_WITH_SHA224: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.1");
 pub const ID_ECDSA_WITH_SHA256: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 pub const ID_ECDSA_WITH_SHA384: ObjectIdentifier =

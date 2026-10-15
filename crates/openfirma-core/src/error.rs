@@ -40,6 +40,9 @@ pub enum Error {
     #[error("invalid x.509 certificate: {0}")]
     Certificate(String),
 
+    #[error("verification: {0}")]
+    Verification(String),
+
     #[error("pdf: {0}")]
     Pdf(String),
 

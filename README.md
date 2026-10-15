@@ -28,8 +28,16 @@ Very early, phase 1. What works today:
   AutoFirma signed, which means reading cross-reference streams and object
   streams. OpenSSL verifies the signature over exactly the ranges `/ByteRange`
   names, and the structure matches AutoFirma's, see `docs/pades.md`.
-- CLI: `openfirma sign` and `openfirma inspect`, the latter dumping any DER
-  signature as a normalized tree for diffing.
+- **Verification**: `openfirma verify` cryptographically checks CAdES and
+  PAdES signatures, every signature of a co-signed PDF included: the
+  `messageDigest` against the content, the signature value over the signed
+  attributes re-tagged as `SET OF`, the `signingCertificateV2` reference, and
+  the certificate chain from the signer up to the trust anchors you supply,
+  each link's signature and every validity date checked at a validation time
+  of your choice. RSA and ECDSA P-256. It is the in-repo verifier, not a
+  substitute for VALIDe or the ETSI validators, see `docs/validation.md`.
+- CLI: `openfirma sign`, `openfirma verify` and `openfirma inspect`, the last
+  dumping any DER signature as a normalized tree for diffing.
 
 Not started yet: XAdES, the system keystores (PKCS#11, DNIe, Windows, macOS,
 NSS), the browser protocol, the GUI, and B-LT/B-LTA.
@@ -39,6 +47,7 @@ NSS), the browser protocol, the GUI, and B-LT/B-LTA.
 | CAdES-B-B (RFC 5652 CMS + ETSI EN 319 122-1) | works, crosschecked with OpenSSL |
 | CAdES B-T / B-LT / B-LTA (TSA, DSS, archive timestamps) | not started |
 | PAdES-B-B (PDF, ISO 32000 + ETSI EN 319 142-1) | works, crosschecked with OpenSSL and qpdf |
+| Verification of CAdES and PAdES (crypto, chain, trust anchors) | works, crosschecked with OpenSSL |
 | CAdES/PAdES B-T (RFC 3161 time-stamp) | works, crosschecked with openssl ts |
 | B-LT / B-LTA (validation data, archive timestamps) | not started |
 | Keystores: PKCS#12 | works, pure Rust, MAC checked before decrypting |
@@ -56,6 +65,8 @@ cargo run -- sign -i doc.txt -o doc.csig \
 cargo run -- sign -i doc.pdf -o doc.signed.pdf --format pades-b-b \
     --cert testdata/certs/signer-rsa.crt --key testdata/certs/signer-rsa.key \
     --chain testdata/certs/intermediate.crt --chain testdata/certs/ca.crt
+cargo run -- verify -i doc.csig --content doc.txt --trust testdata/certs/ca.crt
+cargo run -- verify -i doc.signed.pdf --trust testdata/certs/ca.crt
 cargo test                       # includes the OpenSSL crosschecks
 ```
 

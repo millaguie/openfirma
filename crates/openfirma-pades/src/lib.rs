@@ -25,6 +25,7 @@ pub mod pdf;
 pub mod sign;
 pub mod stream;
 pub mod update;
+pub mod verify;
 
 pub use appearance::Appearance;
 pub use sign::{DEFAULT_CONTENTS_RESERVED, PadesOptions};
@@ -34,3 +35,9 @@ pub use sign::{DEFAULT_CONTENTS_RESERVED, PadesOptions};
 /// Named `pades_sign` on re-export because `sign` is also the module, and a
 /// `use openfirma_pades::sign` that can mean either is a trap.
 pub use sign::sign as pades_sign;
+
+pub use verify::SignatureReport;
+/// Verifies every signature in a signed PDF, each over the bytes its own
+/// `/ByteRange` covers. Renamed on re-export for the same reason as
+/// [`pades_sign`].
+pub use verify::verify as pades_verify;

@@ -23,11 +23,41 @@ struct Cli {
 enum Command {
     /// Sign a document
     Sign(Box<SignArgs>),
+    /// Verify a CAdES or PAdES signature against trust anchors
+    Verify(VerifyArgs),
     /// Dump the DER structure of a signature in normalized, diffable form
     Inspect {
         #[arg(long, short = 'i')]
         input: PathBuf,
     },
+}
+
+/// Every flag of `verify`. The format of the input is detected, not declared:
+/// a file that starts with `%PDF-` is PAdES, anything else is a CAdES
+/// `ContentInfo`.
+#[derive(Args)]
+struct VerifyArgs {
+    /// Signature to verify: a signed PDF, or a CAdES signature
+    #[arg(long, short = 'i')]
+    input: PathBuf,
+
+    /// The signed content, for a detached CAdES signature. Not needed for an
+    /// encapsulated one, where the content travels inside the signature and
+    /// this flag is ignored, and ignored for a PDF, where each signature
+    /// covers the bytes its own /ByteRange names.
+    #[arg(long)]
+    content: Option<PathBuf>,
+
+    /// Trust anchor certificate, PEM or DER, repeatable. The signer's chain
+    /// has to reach one of them, and at least one is required.
+    #[arg(long, required = true)]
+    trust: Vec<PathBuf>,
+
+    /// Validation time for the certificate validity dates, as an RFC 3339
+    /// time (2026-10-15T13:36:00Z, offsets and fractions allowed, a bare
+    /// date means midnight UTC). Defaults to now.
+    #[arg(long)]
+    at: Option<String>,
 }
 
 /// Every flag of `sign`, in its own struct because the variant is far larger
@@ -406,6 +436,80 @@ fn main() -> Result<()> {
                 cn,
             );
         }
+        Command::Verify(args) => {
+            let VerifyArgs {
+                input,
+                content,
+                trust,
+                at,
+            } = args;
+            let bytes =
+                std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+
+            let mut anchors = Vec::with_capacity(trust.len());
+            for t in &trust {
+                let anchor =
+                    std::fs::read(t).with_context(|| format!("reading {}", t.display()))?;
+                anchors.push(parse_certificate(&anchor).with_context(|| {
+                    format!("{} is not a valid X.509 certificate", t.display())
+                })?);
+            }
+            let validation_time = match &at {
+                Some(text) => parse_rfc3339(text)
+                    .map_err(|e| anyhow::anyhow!("--at {text:?} is not an RFC 3339 time: {e}"))?,
+                None => std::time::SystemTime::now(),
+            };
+            let opts = openfirma_cades::VerifyOptions {
+                trust_anchors: anchors,
+                validation_time,
+            };
+            println!("validation time: {}", fmt_system_time(validation_time));
+
+            if bytes.starts_with(b"%PDF-") {
+                if content.is_some() {
+                    eprintln!(
+                        "note: --content is ignored for a PDF, every signature covers the \
+                         bytes its own /ByteRange names"
+                    );
+                }
+                let signatures = openfirma_pades::pades_verify(&bytes, &opts)?;
+                for (i, sig) in signatures.iter().enumerate() {
+                    let [a, b, c, d] = sig.byte_range;
+                    println!(
+                        "signature {} (object {} {}), /ByteRange [{a} {b} {c} {d}]:",
+                        i + 1,
+                        sig.object.num,
+                        sig.object.generation
+                    );
+                    for report in &sig.reports {
+                        print_report(report);
+                    }
+                }
+                println!(
+                    "OK: all {} signature(s) verify against the supplied trust anchors",
+                    signatures.len()
+                );
+            } else {
+                let external = match &content {
+                    Some(path) => Some(
+                        std::fs::read(path)
+                            .with_context(|| format!("reading {}", path.display()))?,
+                    ),
+                    None => None,
+                };
+                let reports = openfirma_cades::verify(&bytes, external.as_deref(), &opts)?;
+                for (i, report) in reports.iter().enumerate() {
+                    if reports.len() > 1 {
+                        println!("signature {}:", i + 1);
+                    }
+                    print_report(report);
+                }
+                println!(
+                    "OK: all {} signature(s) verify against the supplied trust anchors",
+                    reports.len()
+                );
+            }
+        }
         Command::Inspect { input } => {
             let bytes =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
@@ -503,4 +607,288 @@ fn cert_to_pem(cert: &CertificateHandle) -> openfirma_core::Result<String> {
     }
     pem.push_str("-----END CERTIFICATE-----\n");
     Ok(pem)
+}
+
+/// One `VerifyReport` as the lines a person reads. Failures never reach this:
+/// they come back as an error naming the check, and anyhow prints it.
+fn print_report(r: &openfirma_cades::VerifyReport) {
+    println!("  signer:         {}", r.signer_subject);
+    println!("  digest:         {}", r.digest.name());
+    println!("  signature:      {}", r.signature_alg);
+    println!("  chain:");
+    for (i, s) in r.chain_subjects.iter().enumerate() {
+        println!("    {}. {s}", i + 1);
+    }
+    println!("  trust anchor:   {}", r.trust_anchor);
+    let (signed, unsigned) = attribute_names(&r.attributes);
+    println!("  signed attrs:   {}", signed.join(", "));
+    if !unsigned.is_empty() {
+        println!("  unsigned attrs: {}", unsigned.join(", "));
+    }
+    println!("  checks passed:  {}", r.passed.join(", "));
+}
+
+/// Human names for the attribute OIDs the report carries.
+fn attribute_names(a: &openfirma_cades::Attributes) -> (Vec<String>, Vec<String>) {
+    use openfirma_core::oid;
+    let mut signed = Vec::new();
+    if a.content_type.is_some() {
+        signed.push("contentType".to_string());
+    }
+    if a.signing_time.is_some() {
+        signed.push("signingTime".to_string());
+    }
+    if a.message_digest {
+        signed.push("messageDigest".to_string());
+    }
+    if a.signing_certificate_v2 {
+        signed.push("signingCertificateV2".to_string());
+    }
+    if a.mime_type.is_some() {
+        signed.push("mimeType".to_string());
+    }
+    if a.content_hint.is_some() {
+        signed.push("contentHint".to_string());
+    }
+    for o in &a.other_signed {
+        signed.push(o.to_string());
+    }
+    let unsigned = a
+        .unsigned_attributes
+        .iter()
+        .map(|o| {
+            if *o == oid::ID_SIGNATURE_TIME_STAMP_TOKEN {
+                "signatureTimeStampToken".to_string()
+            } else {
+                o.to_string()
+            }
+        })
+        .collect();
+    (signed, unsigned)
+}
+
+/// An RFC 3339 time to a `SystemTime`. Handwritten like the rest of the time
+/// handling in this workspace: a date parser is not worth a dependency, and
+/// the only crate that would do it properly drags in a C backend or a
+/// timezone database.
+///
+/// Accepts `YYYY-MM-DDTHH:MM:SS` with `Z` or a `±HH:MM` offset, an optional
+/// fraction of a second (which is dropped, the validity dates are second
+/// granularity anyway), `T`/`t`/space as the separator, and a bare
+/// `YYYY-MM-DD`, meaning midnight UTC.
+fn parse_rfc3339(text: &str) -> std::result::Result<std::time::SystemTime, String> {
+    let t = text.trim();
+    if t.len() == 10 {
+        // a full date on its own, RFC 3339's full-date
+        let (y, m, d) = parse_date(t)?;
+        return civil_to_system_time(y, m, d, 0, 0, 0, 0);
+    }
+    let (datetime, offset_secs) = if let Some(head) = t.strip_suffix(['Z', 'z']) {
+        (head, 0i64)
+    } else if t.len() > 6 {
+        let (head, tail) = t.split_at(t.len() - 6);
+        let sign = match tail.as_bytes()[0] {
+            b'+' => 1i64,
+            b'-' => -1i64,
+            _ => return Err("the time ends with neither Z nor a ±HH:MM offset".into()),
+        };
+        if tail.as_bytes()[3] != b':' {
+            return Err("the UTC offset is not shaped ±HH:MM".into());
+        }
+        let oh: i64 = tail[1..3]
+            .parse()
+            .map_err(|_| "the offset hours are not a number".to_string())?;
+        let om: i64 = tail[4..6]
+            .parse()
+            .map_err(|_| "the offset minutes are not a number".to_string())?;
+        if oh > 23 || om > 59 {
+            return Err("the UTC offset is out of range".into());
+        }
+        (head, sign * (oh * 3600 + om * 60))
+    } else {
+        return Err("too short to be an RFC 3339 date-time".into());
+    };
+
+    let (date, time) = datetime
+        .split_once(['T', 't', ' '])
+        .ok_or_else(|| "the date and the time are not separated by a T".to_string())?;
+    let (y, m, d) = parse_date(date)?;
+    let (hh, mm, ss) = parse_time(time)?;
+    // local time = UTC + offset, so UTC = local - offset
+    civil_to_system_time(y, m, d, hh, mm, ss, -offset_secs)
+}
+
+fn parse_date(s: &str) -> std::result::Result<(i64, u32, u32), String> {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return Err(format!("{s:?} is not shaped YYYY-MM-DD"));
+    }
+    let y: i64 = s[0..4]
+        .parse()
+        .map_err(|_| "the year is not a number".to_string())?;
+    let m: u32 = s[5..7]
+        .parse()
+        .map_err(|_| "the month is not a number".to_string())?;
+    let d: u32 = s[8..10]
+        .parse()
+        .map_err(|_| "the day is not a number".to_string())?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(format!("month {m} or day {d} is out of range"));
+    }
+    Ok((y, m, d))
+}
+
+fn parse_time(s: &str) -> std::result::Result<(u32, u32, u32), String> {
+    let b = s.as_bytes();
+    if b.len() < 8 || b[2] != b':' || b[5] != b':' {
+        return Err(format!("{s:?} is not shaped HH:MM:SS"));
+    }
+    if b.len() > 8 {
+        // an optional fraction, digits only, dropped
+        if b[8] != b'.' || b[9..].is_empty() || !b[9..].iter().all(u8::is_ascii_digit) {
+            return Err(format!(
+                "{s:?} has trailing characters that are not .fraction"
+            ));
+        }
+    }
+    let hh: u32 = s[0..2]
+        .parse()
+        .map_err(|_| "the hour is not a number".to_string())?;
+    let mm: u32 = s[3..5]
+        .parse()
+        .map_err(|_| "the minute is not a number".to_string())?;
+    let ss: u32 = s[6..8]
+        .parse()
+        .map_err(|_| "the second is not a number".to_string())?;
+    if hh > 23 || mm > 59 || ss > 60 {
+        return Err("the time of day is out of range".into());
+    }
+    Ok((hh, mm, ss))
+}
+
+fn civil_to_system_time(
+    y: i64,
+    m: u32,
+    d: u32,
+    hh: u32,
+    mm: u32,
+    ss: u32,
+    extra_secs: i64,
+) -> std::result::Result<std::time::SystemTime, String> {
+    let secs = days_from_civil(y, m, d) * 86_400
+        + i64::from(hh) * 3600
+        + i64::from(mm) * 60
+        + i64::from(ss)
+        + extra_secs;
+    if secs < 0 {
+        return Err("times before 1970 cannot be represented".into());
+    }
+    Ok(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+}
+
+/// Days since 1970-01-01 from a proleptic Gregorian date. Howard Hinnant's
+/// `days_from_civil`, the inverse of the `civil_from_days` the PAdES writer
+/// uses, and exact over the whole range.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (i64::from(m) + if m > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(d) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Days since the epoch to a proleptic Gregorian date, Howard Hinnant's
+/// `civil_from_days`, the same one openfirma-pades uses for PDF dates.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (y + i64::from(m <= 2), m, d)
+}
+
+/// `2026-10-15T13:36:00Z`, for echoing the validation time.
+fn fmt_system_time(t: std::time::SystemTime) -> String {
+    let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) else {
+        return format!("{t:?}");
+    };
+    let secs = d.as_secs() as i64;
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn epoch(t: SystemTime) -> u64 {
+        t.duration_since(SystemTime::UNIX_EPOCH)
+            .expect("before 1970")
+            .as_secs()
+    }
+
+    #[test]
+    fn rfc3339_utc() {
+        // cross-checked against `date -u -d 2026-10-15T13:36:00Z +%s`
+        assert_eq!(
+            epoch(parse_rfc3339("2026-10-15T13:36:00Z").unwrap()),
+            1_792_071_360
+        );
+        assert_eq!(epoch(parse_rfc3339("1970-01-01T00:00:00Z").unwrap()), 0);
+    }
+
+    #[test]
+    fn rfc3339_shapes_that_mean_the_same_instant() {
+        let base = parse_rfc3339("2026-10-15T13:36:00Z").unwrap();
+        assert_eq!(parse_rfc3339("2026-10-15T15:36:00+02:00").unwrap(), base);
+        assert_eq!(parse_rfc3339("2026-10-15T08:06:00-05:30").unwrap(), base);
+        assert_eq!(parse_rfc3339("2026-10-15T13:36:00.500Z").unwrap(), base);
+        assert_eq!(parse_rfc3339("2026-10-15t13:36:00z").unwrap(), base);
+        assert_eq!(
+            parse_rfc3339("2026-10-15").unwrap(),
+            parse_rfc3339("2026-10-15T00:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn rfc3339_rejects_rubbish() {
+        for bad in [
+            "",
+            "now",
+            "15/10/2026",
+            "2026-10-15T13:36:00",      // no zone
+            "2026-10-15T25:00:00Z",     // hour out of range
+            "2026-13-15T00:00:00Z",     // month out of range
+            "2026-10-15T13:36:00+2:00", // malformed offset
+            "2026-10-15T13:36:00ZZ",
+            "1960-01-01T00:00:00Z", // before 1970
+        ] {
+            assert!(parse_rfc3339(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn the_two_civil_conversions_are_inverses() {
+        for days in [-100_000i64, -1, 0, 1, 20_741, 100_000] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "{days} did not round trip");
+        }
+        assert_eq!(
+            fmt_system_time(SystemTime::UNIX_EPOCH),
+            "1970-01-01T00:00:00Z"
+        );
+    }
 }
