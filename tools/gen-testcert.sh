@@ -176,22 +176,27 @@ echo "== CRLs, for the PAdES B-LT validation data tests =="
 make_crl() {
   # make_crl <name> <ca.crt> <ca.key>
   local name="$1" cacert="$2" cakey="$3"
-  local db="$TMP/crl-$name"
-  mkdir -p "$db"
-  : > "$db/index.txt"
-  echo 01 > "$db/crlnumber"
+  # The database paths go into the config CONTENT as paths relative to this
+  # directory, deliberately not as $TMP paths: on Windows the -config
+  # argument goes through Git Bash's path translation but the text inside
+  # the file does not, and the native Windows openssl cannot resolve a
+  # /tmp/... path. Relative paths work on OpenSSL, LibreSSL and Windows.
+  local index="crl-$name.index" number="crl-$name.number" conf="crl-$name.conf"
+  : > "$index"
+  echo 01 > "$number"
   {
     echo "[ca]"
     echo "default_ca = settings"
     echo "[settings]"
-    echo "database = $db/index.txt"
-    echo "crlnumber = $db/crlnumber"
+    echo "database = $index"
+    echo "crlnumber = $number"
     echo "default_md = sha256"
     echo "default_crl_days = 3650"
-  } > "$db/ca.conf"
-  openssl ca -gencrl -config "$db/ca.conf" -cert "$cacert" -keyfile "$cakey" \
+  } > "$conf"
+  openssl ca -gencrl -config "$conf" -cert "$cacert" -keyfile "$cakey" \
     -out "$name.crl.pem"
   openssl crl -in "$name.crl.pem" -outform DER -out "$name.crl.der"
+  rm -f "$index" "$number" "$conf" "$index.attr"
 }
 # ca.crl covers the intermediate, intermediate.crl covers the signing certs:
 # one revocation datum per CA of the chain, which is what ETSI EN 319 142-1

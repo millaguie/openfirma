@@ -163,7 +163,8 @@ The details that are decisions rather than accidents:
   recomputes in `PAdESSignature.getVRIKey()`, so a validator looking for a
   signature's validation data finds it under this key and no other. The key is
   written as a **name** (`/1A2B...`), because PDF dictionary keys are names
-  and qpdf rejects anything else; both spellings are read back.
+  and qpdf flags the literal hex-string reading as a damaged object; both
+  spellings are read back.
 - **Nothing is fetched.** The certificates and the revocation data come from
   `PadesOptions::validation_certs` and `PadesOptions::revocation`, or from
   the signer's own chain. Where a CRL or an OCSP response came from is the
