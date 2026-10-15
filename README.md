@@ -31,17 +31,19 @@ Very early, phase 1. What works today:
 - CLI: `openfirma sign` and `openfirma inspect`, the latter dumping any DER
   signature as a normalized tree for diffing.
 
-Not started yet: XAdES, the keystores, the browser protocol and the visible
-signature appearance.
+Not started yet: XAdES, the system keystores (PKCS#11, DNIe, Windows, macOS,
+NSS), the browser protocol, the GUI, and B-LT/B-LTA.
 
 | Component | Status |
 |---|---|
 | CAdES-B-B (RFC 5652 CMS + ETSI EN 319 122-1) | works, crosschecked with OpenSSL |
 | CAdES B-T / B-LT / B-LTA (TSA, DSS, archive timestamps) | not started |
 | PAdES-B-B (PDF, ISO 32000 + ETSI EN 319 142-1) | works, crosschecked with OpenSSL and qpdf |
-| PAdES B-T / B-LT (TSA, validation data, LTV) | not started |
+| CAdES/PAdES B-T (RFC 3161 time-stamp) | works, crosschecked with openssl ts |
+| B-LT / B-LTA (validation data, archive timestamps) | not started |
+| Keystores: PKCS#12 | works, pure Rust, MAC checked before decrypting |
+| Keystores: PKCS#11, DNIe, Windows, macOS, NSS | not started |
 | XAdES / FacturaE | not started |
-| Keystores: PKCS#12, PKCS#11, Windows, macOS, NSS, DNIe | not started |
 | Browser integration (`afirma://`, wss:// localhost, AutoScript) | not started |
 | GUI | not started |
 

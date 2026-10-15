@@ -10,5 +10,6 @@
 
 pub mod attributes;
 pub mod signed_data;
+pub mod tsp;
 
-pub use signed_data::{CadesOptions, sign};
+pub use signed_data::{CadesOptions, TimestampFn, sign};

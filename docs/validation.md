@@ -76,6 +76,12 @@ the `messageDigest` attribute matches the file exactly. `openssl smime -verify
 -content` does the same job and works, so the detached tests go through
 `smime`. Encapsulated signatures verify fine with `cms -verify`.
 
+For B-T, `crates/openfirma-cades/tests/tsp_crosscheck.rs` answers the RFC 3161
+query with `openssl ts -reply` and a synthetic TSA certificate, so the token
+embedded in our signature is one a real responder produced; openssl then
+verifies that token against the signature value it imprints, and the test
+refuses a token that imprints anything else.
+
 What these prove today: RSA SHA-256 and SHA-512 plus ECDSA P-256, encapsulated
 and detached, verify under OpenSSL with byte identical recovered content; and
 PAdES-B-B verifies under OpenSSL over the `/ByteRange` bytes, under poppler as

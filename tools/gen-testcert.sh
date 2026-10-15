@@ -154,6 +154,17 @@ openssl req -newkey rsa:2048 -nodes -keyout "$TMP/rep-raw.key" -out "$TMP/rep.cs
 to_pkcs8 "$TMP/rep-raw.key" signer-representative.key
 issue "$TMP/rep.csr" signer-representative.crt intermediate.crt intermediate.key "$SUB_EXT"
 
+echo "== TSA certificate, for offline B-T tests with openssl ts =="
+# extendedKeyUsage timeStamping, critical, is what makes openssl and every
+# validator accept this certificate as a time-stamp authority.
+dn_conf "$TMP/tsa.cnf" "C = ES" "O = openfirma test" "OU = Test TSA" \
+  "CN = openfirma Test TSA"
+openssl req -newkey rsa:2048 -nodes -keyout "$TMP/tsa-raw.key" -out "$TMP/tsa.csr" \
+  -config "$TMP/tsa.cnf"
+printf 'basicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSignature, nonRepudiation\nextendedKeyUsage = critical, timeStamping\n' > "$TMP/tsa.ext"
+issue "$TMP/tsa.csr" tsa.crt intermediate.crt intermediate.key "$TMP/tsa.ext"
+to_pkcs8 "$TMP/tsa-raw.key" tsa.key
+
 echo "== PKCS#12 for the official AutoFirma, chain included =="
 # AutoFirma loads .p12, so the golden files are produced with exactly the
 # certificate openfirma uses. Password is not a secret.
@@ -169,10 +180,11 @@ openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-rsa.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-ec.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-juridical.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-representative.crt
+openssl verify -CAfile ca.crt -untrusted intermediate.crt tsa.crt
 
 echo "== every key must be PKCS#8, our loader accepts nothing else =="
 for k in ca.key intermediate.key signer-rsa.key signer-ec.key \
-         signer-juridical.key signer-representative.key; do
+         signer-juridical.key signer-representative.key tsa.key; do
   # The pattern avoids spelling out the PEM header, tools/check-no-real-certs.sh
   # would flag this script for containing one
   head -1 "$k" | grep -qE '^-----BEGIN.*KEY-----$' || { echo "$k is not PKCS#8" >&2; exit 1; }

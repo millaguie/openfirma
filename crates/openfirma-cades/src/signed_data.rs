@@ -52,9 +52,24 @@ pub struct CadesOptions {
     /// Extra certificates to embed on top of the signer cert and its chain.
     pub extra_certificates: Vec<CertificateHandle>,
 
-    /// Unsigned attributes, already DER encoded. Used for the B-T timestamp.
+    /// Unsigned attributes, already DER encoded.
     pub unsigned_attributes: Vec<Vec<u8>>,
+
+    /// Asked for the B-T level: called with the signature value once it exists,
+    /// returning extra unsigned attributes to attach. A time-stamp token
+    /// imprints the signature value, so it can only be requested after the
+    /// value is computed, and being unsigned it cannot change it. The closure
+    /// is where transport lives, which keeps this crate free of any network
+    /// dependency.
+    pub timestamp: Option<TimestampFn>,
 }
+
+/// Produces unsigned attributes for a signature value, typically by asking a
+/// TSA for a token that imprints it.
+// Arc rather than Box so options can be shared by reference: PAdES builds
+// its CAdES options from a borrowed PadesOptions.
+pub type TimestampFn =
+    std::sync::Arc<dyn Fn(&[u8], DigestAlg) -> openfirma_core::Result<Vec<Vec<u8>>> + Send + Sync>;
 
 /// The defaults reproduce AutoFirma's `advanced` profile, which is what it
 /// uses unless told otherwise: content encapsulated, `signingTime` present,
@@ -77,6 +92,7 @@ impl Default for CadesOptions {
             include_issuer_serial: true,
             extra_certificates: Vec::new(),
             unsigned_attributes: Vec::new(),
+            timestamp: None,
         }
     }
 }
@@ -121,13 +137,18 @@ pub fn sign(content: &[u8], signer: &dyn Signer, opts: &CadesOptions) -> Result<
     let signature_value = signer.sign_prehash(digest_alg, &prehash)?;
     let signature_alg = signer.signature_alg(digest_alg)?;
 
+    let mut unsigned = opts.unsigned_attributes.clone();
+    if let Some(stamp) = &opts.timestamp {
+        unsigned.extend(stamp(&signature_value, digest_alg)?);
+    }
+
     let signer_info = build_signer_info(
         signer,
         digest_alg,
         signature_alg,
         &attrs_content,
         &signature_value,
-        &opts.unsigned_attributes,
+        &unsigned,
     )?;
 
     let signed_data = tlv::sequence(&[

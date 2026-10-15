@@ -68,6 +68,10 @@ pub struct PadesOptions {
     pub reason: Option<String>,
     pub location: Option<String>,
     pub contact_info: Option<String>,
+
+    /// B-T: asked for a time-stamp token over the signature value. See
+    /// [`openfirma_cades::TimestampFn`]; the transport is the caller's.
+    pub timestamp: Option<openfirma_cades::TimestampFn>,
 }
 
 impl Default for PadesOptions {
@@ -81,6 +85,7 @@ impl Default for PadesOptions {
             reason: None,
             location: None,
             contact_info: None,
+            timestamp: None,
         }
     }
 }
@@ -374,6 +379,7 @@ fn cades_options(opts: &PadesOptions) -> CadesOptions {
         include_issuer_serial: true,
         extra_certificates: Vec::new(),
         unsigned_attributes: Vec::new(),
+        timestamp: opts.timestamp.clone(),
     }
 }
 

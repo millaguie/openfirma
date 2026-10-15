@@ -130,6 +130,22 @@ struct SignArgs {
     /// Line drawn above the signer's name in a visible signature. PAdES only.
     #[arg(long)]
     label: Option<String>,
+
+    /// URL of a TSA to raise the signature to B-T with a time-stamp token.
+    /// Plain http only: HTTPS needs a TLS client, which is a dependency
+    /// decision of its own, not something to slip in here. For an https TSA,
+    /// fetch the token by hand and pass --timestamp-token.
+    #[arg(long)]
+    tsa: Option<String>,
+
+    /// A TimeStampResp file, as `openssl ts -reply` writes one, to embed as
+    /// the B-T token instead of asking a TSA live. The token imprints the
+    /// signature value, which for RSA PKCS#1 v1.5 is deterministic, so the flow
+    /// is: sign once, stamp the signature value, sign again with this flag.
+    /// ECDSA signatures are randomised, so for those use --tsa. The imprint is
+    /// checked against the signature value and a mismatch is an error.
+    #[arg(long)]
+    timestamp_token: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -166,6 +182,105 @@ impl From<Digest> for DigestAlg {
             Digest::Sha512 => DigestAlg::Sha512,
         }
     }
+}
+
+/// Builds the B-T timestamp provider, or None when neither flag is given.
+fn timestamp_provider(
+    tsa: Option<String>,
+    token_file: Option<PathBuf>,
+) -> Result<Option<openfirma_cades::TimestampFn>> {
+    use openfirma_cades::tsp;
+    use std::sync::Arc;
+    match (tsa, token_file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--tsa and --timestamp-token are alternatives, not companions")
+        }
+        (Some(url), None) => {
+            if !url.starts_with("http://") {
+                anyhow::bail!(
+                    "--tsa only speaks plain http today. An https TSA needs a TLS client, \
+                     which is a dependency decision recorded separately; until then fetch \
+                     the token by hand and pass --timestamp-token."
+                );
+            }
+            Ok(Some(Arc::new(move |sig: &[u8], digest| {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let query = tsp::request(digest, sig, nonce)?;
+                let response = http_post(&url, &query)
+                    .map_err(|e| openfirma_core::Error::Other(e.to_string()))?;
+                let token = tsp::token_from_response(&response, digest, sig)?;
+                Ok(vec![tsp::unsigned_attribute(&token)?])
+            })))
+        }
+        (None, Some(path)) => {
+            let response =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            Ok(Some(Arc::new(move |sig: &[u8], digest| {
+                let token = tsp::token_from_response(&response, digest, sig)?;
+                Ok(vec![tsp::unsigned_attribute(&token)?])
+            })))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// A minimal HTTP/1.1 POST, enough for a timestamp query and nothing more.
+/// std::net only: no dependency for a request that is two headers and a body.
+fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    let rest = url
+        .strip_prefix("http://")
+        .context("only http:// TSA urls are supported")?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:80")
+    };
+    let mut stream = std::net::TcpStream::connect(&host)
+        .with_context(|| format!("cannot reach the TSA at {host}"))?;
+    stream
+        .write_all(
+            format!(
+                "POST /{path} HTTP/1.1\r\nHost: {authority}\r\n\
+                 Content-Type: application/timestamp-query\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .context("cannot send the timestamp query")?;
+    stream
+        .write_all(body)
+        .context("cannot send the timestamp query")?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .context("the TSA closed the connection without answering")?;
+
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .context("the TSA answer has no header/body separator")?;
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let status = head.lines().next().unwrap_or_default();
+    if !status.contains(" 200") {
+        anyhow::bail!("the TSA answered {status:?}");
+    }
+    let mut body_out = raw[split + 4..].to_vec();
+    // honour Content-Length when present; otherwise the connection close was
+    // the terminator and everything after the headers is the body
+    if let Some(line) = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+    {
+        let n: usize = line[15..].trim().parse().unwrap_or(body_out.len());
+        body_out.truncate(n);
+    }
+    Ok(body_out)
 }
 
 /// Parses `llx,lly,urx,ury`, accepting commas or spaces as separators.
@@ -217,6 +332,8 @@ fn main() -> Result<()> {
                 p12,
                 password,
                 alias,
+                tsa,
+                timestamp_token,
             } = *args;
             let content =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
@@ -234,12 +351,14 @@ fn main() -> Result<()> {
             };
             let digest_alg: DigestAlg = digest.into();
 
+            let stamp = timestamp_provider(tsa, timestamp_token)?;
             let mut opts = CadesOptions {
                 digest: digest_alg,
                 encapsulate_content: encapsulate,
                 mime_type,
                 content_hint,
                 include_issuer_serial: !no_issuer_serial,
+                timestamp: stamp.clone(),
                 ..CadesOptions::default()
             };
             if no_signing_time {
@@ -265,6 +384,7 @@ fn main() -> Result<()> {
                             rect: r,
                             label: label.clone(),
                         }),
+                        timestamp: stamp,
                         ..PadesOptions::default()
                     },
                 )?,
