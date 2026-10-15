@@ -128,6 +128,32 @@ openssl req -new -key signer-ec.key -out "$TMP/ec.csr" \
 issue "$TMP/ec.csr" signer-ec.crt intermediate.crt intermediate.key "$SUB_EXT"
 openssl pkcs8 -topk8 -nocrypt -in signer-ec.key -outform DER -out signer-ec.pk8.der
 
+echo "== RSA 2048 signer, legal person, sello de entidad style DN =="
+# A certificate whose subject is the entity itself, no natural person in it:
+# the CN is the company name and serialNumber carries the CIF. openfirma must
+# sign with it exactly as with a personal certificate, copying the subject
+# verbatim. organizationIdentifier (2.5.4.97) is what ETSI EN 319 412-1 puts
+# in legal person certificates, VATES- prefix for a Spanish CIF.
+dn_conf "$TMP/jur.cnf" "C = ES" "O = OPENFIRMA TEST SL" "OU = sello de entidad" \
+  "serialNumber = A12345678" "organizationIdentifier = VATES-A12345678" \
+  "CN = OPENFIRMA TEST SL"
+openssl req -newkey rsa:2048 -nodes -keyout "$TMP/jur-raw.key" -out "$TMP/jur.csr" \
+  -config "$TMP/jur.cnf"
+to_pkcs8 "$TMP/jur-raw.key" signer-juridical.key
+issue "$TMP/jur.csr" signer-juridical.crt intermediate.crt intermediate.key "$SUB_EXT"
+
+echo "== RSA 2048 signer, representative of a legal person =="
+# The common real world case for company signing: a natural person's DNI in
+# serialNumber, the entity in O and organizationIdentifier, and the role in
+# title. The subject mixes both, so nothing may assume which one it gets.
+dn_conf "$TMP/rep.cnf" "C = ES" "O = OPENFIRMA TEST SL" "OU = representante" \
+  "serialNumber = IDCES-12345678Z" "organizationIdentifier = VATES-A12345678" \
+  "title = Representante Legal" "CN = PEREZ GARCIA, ANA"
+openssl req -newkey rsa:2048 -nodes -keyout "$TMP/rep-raw.key" -out "$TMP/rep.csr" \
+  -config "$TMP/rep.cnf"
+to_pkcs8 "$TMP/rep-raw.key" signer-representative.key
+issue "$TMP/rep.csr" signer-representative.crt intermediate.crt intermediate.key "$SUB_EXT"
+
 echo "== PKCS#12 for the official AutoFirma, chain included =="
 # AutoFirma loads .p12, so the golden files are produced with exactly the
 # certificate openfirma uses. Password is not a secret.
@@ -135,13 +161,18 @@ openssl pkcs12 -export -in signer-rsa.crt -inkey signer-rsa.key -certfile chain.
   -out signer-rsa.p12 -passout pass:openfirma -name "PEREZ GARCIA, ANA"
 openssl pkcs12 -export -in signer-ec.crt -inkey signer-ec.key -certfile chain.crt \
   -out signer-ec.p12 -passout pass:openfirma -name "LOPEZ MARTIN, JUAN"
+openssl pkcs12 -export -in signer-juridical.crt -inkey signer-juridical.key -certfile chain.crt \
+  -out signer-juridical.p12 -passout pass:openfirma -name "OPENFIRMA TEST SL"
 
 echo "== chain verification =="
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-rsa.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-ec.crt
+openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-juridical.crt
+openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-representative.crt
 
 echo "== every key must be PKCS#8, our loader accepts nothing else =="
-for k in ca.key intermediate.key signer-rsa.key signer-ec.key; do
+for k in ca.key intermediate.key signer-rsa.key signer-ec.key \
+         signer-juridical.key signer-representative.key; do
   # The pattern avoids spelling out the PEM header, tools/check-no-real-certs.sh
   # would flag this script for containing one
   head -1 "$k" | grep -qE '^-----BEGIN.*KEY-----$' || { echo "$k is not PKCS#8" >&2; exit 1; }

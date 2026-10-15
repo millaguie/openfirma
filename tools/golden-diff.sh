@@ -14,7 +14,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 JAR="${AUTOFIRMA_JAR:-${AUTOFIRMA_DIR:-/tmp/autofirma-ref}/autofirma.jar}"
-P12="testdata/certs/signer-rsa.p12"
+CERTS="testdata/certs"
+P12="$CERTS/signer-rsa.p12"
 PASS="openfirma"
 OUT="${GOLDEN_DIR:-testdata/golden}"
 DRIVER="target/golden-driver"
@@ -38,12 +39,13 @@ normalize() {
 # The openfirma flags below are the equivalent of AutoFirma's advanced profile
 # defaults. contentHint carries the Spanish description AutoFirma gets from its
 # jmimemagic database, which we do not ship, so it is passed explicitly.
+# run_case <name> <input> <cert base name> [autofirma key=value...]
 run_case() {
-  local name="$1" input="$2"; shift 2
+  local name="$1" input="$2" base="$3"; shift 3
   local af="$OUT/$name.autofirma.csig" ours="$OUT/$name.openfirma.csig"
 
   java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
-    "$P12" "$PASS" "$input" "$af" SHA256withRSA "$@" >/dev/null 2>&1
+    "$CERTS/$base.p12" "$PASS" "$input" "$af" SHA256withRSA "$@" >/dev/null 2>&1
 
   ./target/debug/openfirma inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
 
@@ -58,8 +60,8 @@ run_case() {
   ' "$OUT/$name.autofirma.dump")"
 
   ./target/debug/openfirma sign -i "$input" -o "$ours" \
-    --cert testdata/certs/signer-rsa.crt --key testdata/certs/signer-rsa.key \
-    --chain testdata/certs/intermediate.crt --chain testdata/certs/ca.crt \
+    --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
+    --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
     ${hint:+--content-hint "$hint"} >/dev/null
 
   ./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
@@ -72,7 +74,7 @@ run_case() {
   fi
 }
 
-run_case simple "$INPUTS/simple.txt"
+run_case simple "$INPUTS/simple.txt" signer-rsa
 
 # PAdES: same idea, but the comparison goes through qpdf and a normalizer that
 # is deliberately not our own PDF parser, so a bug in it cannot appear on both
@@ -92,18 +94,18 @@ normalize_pades() {
 }
 
 run_pades_case() {
-  local name="$1" input="$2"
+  local name="$1" input="$2" base="$3"
   local af="$OUT/$name.autofirma.pdf" ours="$OUT/$name.openfirma.pdf"
 
   command -v qpdf >/dev/null || { echo "SKIP   $name (no qpdf to normalize with)"; return 0; }
 
   java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
-    "$P12" "$PASS" "$input" "$af" SHA256withRSA >/dev/null 2>&1 \
+    "$CERTS/$base.p12" "$PASS" "$input" "$af" SHA256withRSA >/dev/null 2>&1 \
     || { echo "SKIP   $name (AutoFirma refused to sign it)"; return 0; }
 
   ./target/debug/openfirma sign -i "$input" -o "$ours" --format pades-b-b \
-    --cert testdata/certs/signer-rsa.crt --key testdata/certs/signer-rsa.key \
-    --chain testdata/certs/intermediate.crt --chain testdata/certs/ca.crt >/dev/null
+    --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
+    --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" >/dev/null
 
   python3 tools/golden/pdf-normalize.py "$af" --inspect ./target/debug/openfirma \
     | normalize_pades >"$OUT/$name.autofirma.pades.dump"
@@ -129,7 +131,13 @@ run_pades_case() {
 }
 
 [ -f "$INPUTS/simple.pdf" ] || python3 tools/gen-testpdf.py "$INPUTS/simple.pdf"
-run_pades_case simple "$INPUTS/simple.pdf"
+run_pades_case simple "$INPUTS/simple.pdf" signer-rsa
+
+# A legal person is not a natural person with a different name: the subject
+# carries a CIF in serialNumber and an organizationIdentifier, and there is no
+# human in it at all. Both implementations must treat it as unremarkable.
+run_case juridical "$INPUTS/simple.txt" signer-juridical
+run_pades_case juridical "$INPUTS/simple.pdf" signer-juridical
 
 echo
 echo "dumps and signatures in $OUT"

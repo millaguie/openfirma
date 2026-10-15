@@ -91,8 +91,13 @@ cargo test
 
 No certificate, private key, keystore, or signature produced with a real
 certificate may ever enter this repository. A CAdES or PAdES signature embeds
-the signer certificate and its full chain, so a single golden file signed with
-a real FNMT or DNIe certificate would publish the holder's name and DNI number.
+the signer certificate and its full chain, so a single committed signature
+publishes whoever the certificate identifies. That is a wider set than people
+usually picture: the Spanish @firma ecosystem issues certificates against a
+NIF, a NIE, a passport number, a legal person's CIF (persona jurídica and
+sello de entidad) and a representative of a legal person, and each of them
+carries a name and an identifier in the subject. Any of them in this
+repository is someone's identity, made public.
 
 Everything is generated locally and stays out of git:
 

@@ -4,7 +4,9 @@
 # The dangerous case is not someone copying a .p12 in by hand. It is committing
 # a signature: CAdES and PAdES embed the signer certificate and its chain
 # inside the file, so a golden file or a PDF signed with a real FNMT or DNIe
-# certificate carries the holder's full name and DNI number, and the private
+# certificate carries the full name and identifier of whoever it identifies,
+# a natural person (NIF, NIE, passport) or a legal person (CIF, sello de
+# entidad, representative), and the private
 # key operation that produced it proves nothing about whether the key leaked.
 #
 # Usage:

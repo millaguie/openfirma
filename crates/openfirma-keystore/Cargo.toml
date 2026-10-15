@@ -1,0 +1,29 @@
+[package]
+name = "openfirma-keystore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Certificate and key containers for openfirma: PKCS#12 today, system stores next"
+
+[dependencies]
+openfirma-core.workspace = true
+const-oid.workspace = true
+der.workspace = true
+spki.workspace = true
+pkcs8.workspace = true
+digest.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+aes.workspace = true
+cbc.workspace = true
+des.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+hex.workspace = true

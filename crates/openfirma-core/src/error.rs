@@ -43,6 +43,9 @@ pub enum Error {
     #[error("pdf: {0}")]
     Pdf(String),
 
+    #[error("keystore: {0}")]
+    Keystore(String),
+
     #[error("the signer carries no certificate")]
     NoCertificate,
 

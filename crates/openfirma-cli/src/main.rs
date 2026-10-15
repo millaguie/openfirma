@@ -48,17 +48,30 @@ struct SignArgs {
     #[arg(long, value_enum, default_value = "sha256")]
     digest: Digest,
 
-    /// Signer certificate, PEM or DER
+    /// Signer certificate, PEM or DER. Required unless --p12 is given.
     #[arg(long)]
-    cert: PathBuf,
+    cert: Option<PathBuf>,
 
-    /// PKCS#8 private key, PEM or DER
+    /// PKCS#8 private key, PEM or DER. Required unless --p12 is given.
     #[arg(long)]
-    key: PathBuf,
+    key: Option<PathBuf>,
 
     /// Issuing certificates to embed, PEM or DER, repeatable
     #[arg(long)]
     chain: Vec<PathBuf>,
+
+    /// PKCS#12 container holding the key and its whole chain, the shape a real
+    /// certificate arrives in. Replaces --cert and --key.
+    #[arg(long)]
+    p12: Option<PathBuf>,
+
+    /// Password of the --p12 container
+    #[arg(long)]
+    password: Option<String>,
+
+    /// friendlyName of the entry to use when the --p12 holds more than one key
+    #[arg(long)]
+    alias: Option<String>,
 
     /// Include the content inside the signature. AutoFirma leaves it out by
     /// default: its mode is "explicit", and in @firma vocabulary explicit
@@ -201,10 +214,24 @@ fn main() -> Result<()> {
                 rect,
                 page,
                 label,
+                p12,
+                password,
+                alias,
             } = *args;
             let content =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
-            let signer = load_signer(&cert, &key, &chain)?;
+            let signer = match (&p12, &password) {
+                (Some(container), Some(pw)) => load_p12(container, pw, alias.as_deref())?,
+                (Some(_), None) => {
+                    anyhow::bail!("--p12 needs --password with the container's password")
+                }
+                (None, Some(_)) => anyhow::bail!("--password only makes sense together with --p12"),
+                (None, None) => {
+                    let cert = cert.context("--cert is required unless --p12 is given")?;
+                    let key = key.context("--key is required unless --p12 is given")?;
+                    load_signer(&cert, &key, &chain)?
+                }
+            };
             let digest_alg: DigestAlg = digest.into();
 
             let mut opts = CadesOptions {
@@ -276,6 +303,24 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Reads a PKCS#12 and takes one entry from it: the key, the leaf certificate
+/// and whatever chain the container carried.
+fn load_p12(path: &PathBuf, password: &str, alias: Option<&str>) -> Result<SoftwareSigner> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let container = openfirma_keystore::Pkcs12::load(&bytes, password)
+        .with_context(|| format!("{} is not a readable PKCS#12", path.display()))?;
+    let entry = container.entry(alias)?;
+    let leaf = parse_certificate(&entry.chain[0])
+        .context("the PKCS#12 leaf is not a valid X.509 certificate")?;
+    let mut chain = Vec::with_capacity(entry.chain.len().saturating_sub(1));
+    for der in &entry.chain[1..] {
+        chain.push(parse_certificate(der)?);
+    }
+    let signer = SoftwareSigner::from_pkcs8_der(leaf.der(), &entry.key_pkcs8)
+        .context("the PKCS#12 key does not match its certificate")?;
+    Ok(signer.with_chain(chain))
 }
 
 /// Reads a certificate and a PKCS#8 key, accepting PEM or DER for both.

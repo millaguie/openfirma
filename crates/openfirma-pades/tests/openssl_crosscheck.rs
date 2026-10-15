@@ -382,6 +382,65 @@ fn poppler_pdfsig_verifies_the_signature() {
     std::fs::remove_file(path).ok();
 }
 
+/// A certificate whose subject is a legal person, and one that mixes a natural
+/// person with an entity, must sign exactly like a personal certificate does.
+/// The Spanish ecosystem issues against a NIF, a NIE, a passport, a CIF and a
+/// representative role, and none of that may be interpreted: the subject is
+/// copied verbatim and /Name is whatever the CN happens to be.
+#[test]
+fn legal_person_and_representative_certificates_sign_verbatim() {
+    for (cert, key, cn) in [
+        (
+            "signer-juridical.crt",
+            "signer-juridical.key",
+            "OPENFIRMA TEST SL",
+        ),
+        (
+            "signer-representative.crt",
+            "signer-representative.key",
+            "PEREZ GARCIA, ANA",
+        ),
+    ] {
+        let Some(signer) = load_signer(cert, key, &["intermediate.crt", "ca.crt"]) else {
+            require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let signed = pades_sign(INPUT, &signer, &PadesOptions::default())
+            .unwrap_or_else(|e| panic!("signing with {cert} failed: {e}"));
+
+        // /Name is the CN, an entity name for the sello and a person name for
+        // the representative; neither is special cased
+        let needle = format!("/Name ({cn})").into_bytes();
+        assert!(
+            signed.windows(needle.len()).any(|w| w == needle.as_slice()),
+            "{cert}: the signature dictionary does not carry the subject CN {cn:?}"
+        );
+
+        // the certificate travels byte for byte, organizationIdentifier and
+        // all: interpreting any of it would change these bytes. It lives
+        // inside the CMS, which in PAdES is hex encoded, so look there rather
+        // than in the file bytes
+        let pem = std::fs::read_to_string(certs_dir().join(cert)).expect("no such test cert");
+        let der = CertificateHandle::from_pem(&pem)
+            .expect("not a certificate")
+            .der()
+            .to_vec();
+        let cms = contents_der(&signed, byte_range(&signed));
+        assert!(
+            cms.windows(der.len()).any(|w| w == der.as_slice()),
+            "{cert}: its DER is not embedded verbatim in the CMS"
+        );
+
+        // and it still verifies, whatever the subject says
+        let r = byte_range(&signed);
+        assert_eq!(
+            message_digest(&contents_der(&signed, r)),
+            DigestAlg::Sha256.digest(&covered(&signed, r)).to_vec(),
+            "{cert}: messageDigest does not match the ranges"
+        );
+    }
+}
+
 #[test]
 fn a_second_signature_leaves_the_first_alone() {
     let Some(signer) = load_signer(
