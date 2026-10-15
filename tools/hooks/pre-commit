@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Enable with:  git config core.hooksPath tools/hooks
+#
+# Refuses any commit that would put certificate material, private keys or a
+# signature made with a real certificate into the repository.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+exec "$ROOT/tools/check-no-real-certs.sh"

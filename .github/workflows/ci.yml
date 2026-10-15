@@ -1,0 +1,108 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The OpenSSL crosscheck tests skip themselves when the test PKI is missing.
+  # In CI the material is generated on purpose, so a skip there means the
+  # generation step silently broke and the suite would go green without
+  # verifying anything. This turns a skip into a failure.
+  OPENFIRMA_REQUIRE_TESTS: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            openssl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            openssl: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            openssl: true
+          # Not macos-13, GitHub is retiring those runners and the job sits
+          # queued forever. The SDK is universal, so the Intel target builds
+          # fine from an arm64 runner.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            openssl: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            openssl: false
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            openssl: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      # The crosscheck tests are the ones that prove our CMS output is
+      # accepted by an independent implementation, so openssl has to be on
+      # PATH and the test PKI has to exist before cargo test runs.
+      #
+      # On Windows this step runs in Git Bash, which can see the openssl that
+      # Git for Windows bundles, but the test step runs in pwsh and cannot. So
+      # the directory always goes to GITHUB_PATH, converted with cygpath,
+      # whether or not bash already found it.
+      - name: generate test PKI
+        shell: bash
+        run: |
+          openssl_bin="$(command -v openssl || true)"
+          if [ -z "$openssl_bin" ]; then
+            for candidate in "$(dirname "$(command -v git)")/../usr/bin" "/c/Program Files/Git/usr/bin"; do
+              if [ -x "$candidate/openssl.exe" ]; then openssl_bin="$candidate/openssl.exe"; break; fi
+            done
+          fi
+          if [ -z "$openssl_bin" ]; then
+            echo "no openssl on this runner, crosscheck tests will skip"
+            echo "OPENFIRMA_ALLOW_SKIP=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          dir="$(dirname "$openssl_bin")"
+          export PATH="$dir:$PATH"
+          if command -v cygpath >/dev/null 2>&1; then dir="$(cygpath -w "$dir")"; fi
+          echo "$dir" >> "$GITHUB_PATH"
+          openssl version
+          ./tools/gen-testcert.sh
+
+      - name: build
+        run: cargo build --all-targets --target ${{ matrix.target }}
+
+      - name: test
+        run: cargo test --target ${{ matrix.target }}
+
+  no-real-certs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: tracked files
+        run: ./tools/check-no-real-certs.sh --tracked
+      - name: full history
+        run: ./tools/check-no-real-certs.sh --history

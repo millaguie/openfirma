@@ -1,0 +1,116 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux, glibc, the two architectures AutoFirma ships plus arm64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # Static Linux binary, no glibc version constraint, works as a
+          # portable drop in for AppImage and containers
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            setup: sudo apt-get update && sudo apt-get install -y musl-tools
+          # Windows 64 and 32 bit. AutoFirma still ships a 32 bit installer
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+          # macOS Intel and Apple Silicon, separate artifacts like AutoFirma.
+          # Not notarized, so Gatekeeper will warn until we have a Developer ID
+          # macos-13 runners are being retired and queue forever, and the SDK
+          # is universal, so Intel builds from the arm64 runner
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: platform packages
+        if: matrix.setup
+        run: ${{ matrix.setup }}
+
+      - name: build
+        run: cargo build --release --target ${{ matrix.target }} --bin openfirma
+
+      # Every artifact carries the license texts and the attribution notice,
+      # because that is a condition of the GPL/EUPL distribution, not a nicety
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="openfirma-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$name/LICENSES"
+          cp "target/${{ matrix.target }}/release/openfirma" "$name/"
+          cp README.md NOTICE.md "$name/"
+          cp LICENSES/* "$name/LICENSES/"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "openfirma-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "$name/LICENSES" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/openfirma.exe" "$name/"
+          Copy-Item README.md,NOTICE.md "$name/"
+          Copy-Item LICENSES/* "$name/LICENSES/"
+          Compress-Archive -Path "$name" -DestinationPath "$name.zip"
+          $h = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$name.zip.sha256" -Value "$h  $name.zip" -NoNewline
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openfirma-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+            *.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: list what we are publishing
+        run: ls -lh dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

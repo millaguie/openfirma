@@ -1,0 +1,22 @@
+[package]
+name = "openfirma-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "openfirma command line client"
+
+[[bin]]
+name = "openfirma"
+path = "src/main.rs"
+
+[dependencies]
+openfirma-core.workspace = true
+openfirma-cades.workspace = true
+openfirma-pades.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+tracing.workspace = true

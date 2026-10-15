@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/openfirma-core",
+    "crates/openfirma-cades",
+    "crates/openfirma-pades",
+    "crates/openfirma-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-2.0-or-later OR EUPL-1.1"
+repository = "https://github.com/millaguie/openfirma"
+description = "Pure Rust reimplementation of the Spanish government's AutoFirma electronic signature client"
+
+[workspace.dependencies]
+# --- ASN.1 / X.509 stack, one coherent generation (see docs/adr/0002) ---
+const-oid = { version = "0.10", features = ["db"] }
+der = { version = "0.8", features = ["derive", "oid", "alloc", "std"] }
+spki = { version = "0.8", features = ["alloc", "std"] }
+x509-cert = { version = "0.3", features = ["std", "pem"] }
+pkcs8 = { version = "0.11", features = ["std", "pem"] }
+
+# --- digests ---
+digest = "0.11"
+sha1 = "0.11"
+sha2 = { version = "0.11", features = ["oid"] }
+
+# --- asymmetric ---
+# pinned: rsa 0.9 stable sits on digest 0.10 / signature 2 and carries
+# RUSTSEC-2023-0071 (Marvin). 0.10 rc is the only pure Rust RSA that joins
+# the current generation and fixes it. Re-evaluate on 0.10 stable.
+rsa = { version = "=0.10.0-rc.19", features = ["std", "sha2"] }
+p256 = { version = "0.14", default-features = false, features = ["std", "pem", "pkcs8", "ecdsa", "arithmetic"] }
+signature = "3"
+rand_core = "0.10"
+
+# --- utilities ---
+thiserror = "2"
+hex = "0.4"
+base64 = "0.23"
+# FlateDecode, which is how a cross-reference stream and an object stream are
+# stored. rust_backend is miniz_oxide, pure Rust; the default is pinned off so
+# a future release cannot quietly swap in a C zlib.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+# NOTE: no rcgen. It pulls ring or aws-lc-rs, which are C/asm, and that would
+# break the pure Rust rule even as a dev dependency. Test certificates come
+# from tools/gen-testcert.sh, which drives the openssl CLI.
+
+# --- workspace crates ---
+openfirma-core = { path = "crates/openfirma-core", version = "0.1.0" }
+openfirma-cades = { path = "crates/openfirma-cades", version = "0.1.0" }
+openfirma-pades = { path = "crates/openfirma-pades", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# rsa/num-bigint key ops are unusable without optimization in debug builds
+[profile.dev.package."*"]
+opt-level = 2

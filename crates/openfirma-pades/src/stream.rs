@@ -1,0 +1,481 @@
+//! Decoding PDF streams.
+//!
+//! This exists because a document that iText wrote cannot be read without it:
+//! the cross-reference table is a compressed stream and most of the objects
+//! live inside compressed object streams. Until this was written, signing one
+//! meant re-saving the file with an external tool first.
+//!
+//! Only the filters that carry document *structure* are implemented. The image
+//! filters (`DCTDecode`, `JPXDecode`, `CCITTFaxDecode`) are deliberately left
+//! out: we never render a page, we only look for the catalog, the page tree and
+//! the signature dictionaries, and none of those live in an image. Pretending
+//! otherwise would mean shipping a JPEG decoder to sign a PDF.
+
+use std::io::Read;
+
+use openfirma_core::{Error, Result};
+
+use crate::pdf;
+
+/// Decodes the raw bytes of a stream according to its dictionary.
+///
+/// Filters compose, and `/DecodeParms` is a parallel list, so the nth
+/// parameter set belongs to the nth filter.
+pub fn decode(dict: &[u8], raw: &[u8]) -> Result<Vec<u8>> {
+    let filters = filter_names(dict)?;
+    let parms = parameter_sets(dict);
+    let mut data = raw.to_vec();
+    for (i, name) in filters.iter().enumerate() {
+        data = apply(name, &data, parms.get(i).copied().flatten())?;
+    }
+    Ok(data)
+}
+
+fn apply(name: &str, data: &[u8], parms: Option<&[u8]>) -> Result<Vec<u8>> {
+    match name {
+        "/FlateDecode" => {
+            let inflated = inflate(data)?;
+            apply_predictor(&inflated, parms)
+        }
+        "/LZWDecode" => Err(Error::Pdf(
+            "LZWDecode is not implemented; it is a legacy filter and a modern writer \
+             will not use it. Re-save the file with qpdf if you need to sign it."
+                .into(),
+        )),
+        "/ASCIIHexDecode" => ascii_hex(data),
+        "/ASCII85Decode" => ascii85(data),
+        "/RunLengthDecode" => run_length(data),
+        other => Err(Error::Pdf(format!(
+            "stream filter {other} is not supported. The image filters are left out on \
+             purpose, nothing that carries document structure uses them."
+        ))),
+    }
+}
+
+/// PDF's `FlateDecode` is zlib format, RFC 1950, not raw deflate.
+fn inflate(data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .read_to_end(&mut out)
+        .map_err(|e| Error::Pdf(format!("FlateDecode failed: {e}")))?;
+    Ok(out)
+}
+
+/// The names in `/Filter`, which is either a single name or an array.
+fn filter_names(dict: &[u8]) -> Result<Vec<String>> {
+    let Some(value) = pdf::get(dict, "/Filter") else {
+        return Ok(Vec::new());
+    };
+    let value = pdf::trim_ws(value);
+    if value.starts_with(b"/") {
+        return Ok(vec![String::from_utf8_lossy(value).into_owned()]);
+    }
+    if value.starts_with(b"[") {
+        let mut out = Vec::new();
+        let mut i = 1;
+        while i < value.len() {
+            i = pdf::skip_ws(value, i);
+            if i >= value.len() || value[i] == b']' {
+                break;
+            }
+            let end = pdf::token_end_pub(value, i);
+            out.push(String::from_utf8_lossy(&value[i..end]).into_owned());
+            i = end;
+        }
+        return Ok(out);
+    }
+    Err(Error::Pdf("/Filter is neither a name nor an array".into()))
+}
+
+/// `/DecodeParms`, or its abbreviation `/DP`, as a list of optional dictionaries.
+fn parameter_sets(dict: &[u8]) -> Vec<Option<&[u8]>> {
+    let value = pdf::get(dict, "/DecodeParms")
+        .or_else(|| pdf::get(dict, "/DP"))
+        .map(pdf::trim_ws);
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    if value.starts_with(b"<<") {
+        return vec![Some(value)];
+    }
+    if value.starts_with(b"[") {
+        // elements may be "null", meaning no parameters for that filter
+        let mut out = Vec::new();
+        let mut i = 1;
+        while i < value.len() {
+            i = pdf::skip_ws(value, i);
+            if i >= value.len() || value[i] == b']' {
+                break;
+            }
+            let end = pdf::token_end_pub(value, i);
+            let tok = &value[i..end];
+            out.push(if tok == b"null" { None } else { Some(tok) });
+            i = end;
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+fn int_parm(parms: Option<&[u8]>, key: &str) -> Option<i64> {
+    let dict = parms?;
+    let value = pdf::get(dict, key)?;
+    std::str::from_utf8(pdf::trim_ws(value))
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+}
+
+/// Undo the predictor, if one was applied.
+///
+/// Predictor 1 means none. Predictor 2 is the TIFF horizontal differencing.
+/// Predictors 10 to 15 are the PNG filters, where every row carries a tag byte
+/// saying which filter that row uses, so a single stream can mix them.
+fn apply_predictor(data: &[u8], parms: Option<&[u8]>) -> Result<Vec<u8>> {
+    let predictor = int_parm(parms, "/Predictor").unwrap_or(1);
+    match predictor {
+        1 => Ok(data.to_vec()),
+        2 => {
+            let colors = int_parm(parms, "/Colors").unwrap_or(1) as usize;
+            let bpc = int_parm(parms, "/BitsPerComponent").unwrap_or(8) as usize;
+            let columns = int_parm(parms, "/Columns").unwrap_or(1) as usize;
+            tiff_predictor(data, colors, bpc, columns)
+        }
+        10..=15 => {
+            let colors = int_parm(parms, "/Colors").unwrap_or(1) as usize;
+            let bpc = int_parm(parms, "/BitsPerComponent").unwrap_or(8) as usize;
+            let columns = int_parm(parms, "/Columns").unwrap_or(1) as usize;
+            png_predictor(data, colors, bpc, columns)
+        }
+        other => Err(Error::Pdf(format!("unknown predictor {other}"))),
+    }
+}
+
+fn tiff_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Result<Vec<u8>> {
+    if bpc != 8 {
+        return Err(Error::Pdf(format!(
+            "the TIFF predictor is only implemented for 8 bits per component, got {bpc}"
+        )));
+    }
+    if colors == 0 || columns == 0 {
+        return Err(Error::Pdf(
+            "the TIFF predictor needs non-zero /Colors and /Columns".into(),
+        ));
+    }
+    let row_bytes = colors * columns;
+    let mut out = data.to_vec();
+    for row in out.chunks_mut(row_bytes) {
+        for i in colors..row.len() {
+            row[i] = row[i].wrapping_add(row[i - colors]);
+        }
+    }
+    Ok(out)
+}
+
+fn png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Result<Vec<u8>> {
+    if colors == 0 || bpc == 0 || columns == 0 {
+        return Err(Error::Pdf(
+            "a PNG predictor needs non-zero /Colors, /BitsPerComponent and /Columns".into(),
+        ));
+    }
+    let row_bytes = (colors * bpc * columns).div_ceil(8);
+    // a "pixel" for the Sub and Paeth filters is one sample position, and it
+    // cannot be narrower than a byte
+    let bpp = ((colors * bpc).div_ceil(8)).max(1);
+    let stride = row_bytes + 1;
+    let rows = data.len() / stride;
+    if rows == 0 {
+        return Err(Error::Pdf(format!(
+            "a PNG predicted stream holds {stride} byte rows but is only {} bytes long",
+            data.len()
+        )));
+    }
+
+    let mut out = vec![0u8; rows * row_bytes];
+    let mut prev = vec![0u8; row_bytes];
+    for r in 0..rows {
+        let row = &data[r * stride..(r + 1) * stride];
+        let tag = row[0];
+        let dst = &mut out[r * row_bytes..(r + 1) * row_bytes];
+        dst.copy_from_slice(&row[1..]);
+        match tag {
+            0 => {} // None
+            1 => {
+                for i in bpp..row_bytes {
+                    dst[i] = dst[i].wrapping_add(dst[i - bpp]);
+                }
+            }
+            2 => {
+                for i in 0..row_bytes {
+                    dst[i] = dst[i].wrapping_add(prev[i]);
+                }
+            }
+            3 => {
+                for i in 0..row_bytes {
+                    let left = if i >= bpp { dst[i - bpp] as u16 } else { 0 };
+                    let up = prev[i] as u16;
+                    dst[i] = dst[i].wrapping_add(((left + up) / 2) as u8);
+                }
+            }
+            4 => {
+                for i in 0..row_bytes {
+                    let a = if i >= bpp { dst[i - bpp] } else { 0 };
+                    let b = prev[i];
+                    let c = if i >= bpp { prev[i - bpp] } else { 0 };
+                    dst[i] = dst[i].wrapping_add(paeth(a, b, c));
+                }
+            }
+            other => {
+                return Err(Error::Pdf(format!(
+                    "row {r} of a PNG predicted stream has filter tag {other}, only 0 to 4 exist"
+                )));
+            }
+        }
+        prev.copy_from_slice(dst);
+    }
+    Ok(out)
+}
+
+/// The PNG Paeth predictor function, byte for byte as the specification gives it.
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let (a, b, c) = (i32::from(a), i32::from(b), i32::from(c));
+    let p = a + b - c;
+    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+    if pa <= pb && pa <= pc {
+        a as u8
+    } else if pb <= pc {
+        b as u8
+    } else {
+        c as u8
+    }
+}
+
+fn ascii_hex(data: &[u8]) -> Result<Vec<u8>> {
+    let end = data.iter().position(|b| *b == b'>').unwrap_or(data.len());
+    let mut hex: Vec<u8> = data[..end]
+        .iter()
+        .copied()
+        .filter(|b| b.is_ascii_hexdigit())
+        .collect();
+    // an odd number of digits means a trailing zero, per the specification
+    if hex.len() % 2 == 1 {
+        hex.push(b'0');
+    }
+    hex::decode(&hex).map_err(|e| Error::Pdf(format!("ASCIIHexDecode failed: {e}")))
+}
+
+fn ascii85(data: &[u8]) -> Result<Vec<u8>> {
+    let start = data
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(0);
+    let end = data.iter().position(|b| *b == b'~').unwrap_or(data.len());
+    let mut out = Vec::new();
+    let mut group: u32 = 0;
+    let mut count = 0;
+    for b in &data[start..end] {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if *b == b'z' && count == 0 {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        if !(33..=117).contains(b) {
+            return Err(Error::Pdf(format!(
+                "ASCII85Decode found byte {b} outside the 33..117 range"
+            )));
+        }
+        group = group * 85 + u32::from(b - 33);
+        count += 1;
+        if count == 5 {
+            out.extend_from_slice(&group.to_be_bytes());
+            group = 0;
+            count = 0;
+        }
+    }
+    if count > 0 {
+        // a partial group is padded with 'u' (84) and the extra bytes dropped
+        for _ in count..5 {
+            group = group * 85 + 84;
+        }
+        out.extend_from_slice(&group.to_be_bytes()[..count - 1]);
+    }
+    Ok(out)
+}
+
+fn run_length(data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let len = data[i] as i16;
+        i += 1;
+        match len {
+            128 => break, // end of data
+            0..=127 => {
+                let n = len as usize + 1;
+                if i + n > data.len() {
+                    return Err(Error::Pdf(
+                        "RunLengthDecode runs past the end of the stream".into(),
+                    ));
+                }
+                out.extend_from_slice(&data[i..i + n]);
+                i += n;
+            }
+            _ => {
+                let n = (256 - len) as usize + 1;
+                if i >= data.len() {
+                    return Err(Error::Pdf(
+                        "RunLengthDecode has a repeat with no byte to repeat".into(),
+                    ));
+                }
+                out.extend(std::iter::repeat_n(data[i], n));
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn deflate(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn flate_round_trips() {
+        let raw = b"the quick brown fox jumps over the lazy dog, twice, twice";
+        let dict = b"<< /Filter /FlateDecode /Length 20 >>";
+        assert_eq!(decode(dict, &deflate(raw)).unwrap(), raw);
+    }
+
+    #[test]
+    fn no_filter_is_the_identity() {
+        assert_eq!(decode(b"<< /Length 3 >>", b"abc").unwrap(), b"abc");
+    }
+
+    #[test]
+    fn the_png_predictor_undoes_every_filter_tag() {
+        // one row per filter type, 4 bytes per row, bpp 1
+        let rows: Vec<(u8, Vec<u8>)> = vec![
+            (0, vec![1, 2, 3, 4]),
+            (1, vec![10, 1, 1, 1]), // Sub: each byte adds the one to its left
+            (2, vec![1, 1, 1, 1]),  // Up: each byte adds the one above
+            (3, vec![2, 0, 0, 0]),  // Average
+            (4, vec![0, 0, 0, 0]),  // Paeth
+        ];
+        let row_bytes = 4;
+        let mut filtered = Vec::new();
+        let mut prev = vec![0u8; row_bytes];
+        let mut expected = Vec::new();
+        for (tag, mut row) in rows {
+            let raw = row.clone();
+            match tag {
+                0 => {}
+                1 => {
+                    let orig = row.clone();
+                    for i in (1..row_bytes).rev() {
+                        row[i] = orig[i].wrapping_sub(orig[i - 1]);
+                    }
+                }
+                2 => {
+                    for i in 0..row_bytes {
+                        row[i] = raw[i].wrapping_sub(prev[i]);
+                    }
+                }
+                3 => {
+                    let orig = row.clone();
+                    for i in 0..row_bytes {
+                        let left = if i >= 1 { orig[i - 1] as u16 } else { 0 };
+                        row[i] = orig[i].wrapping_sub(((left + prev[i] as u16) / 2) as u8);
+                    }
+                }
+                4 => {
+                    let orig = row.clone();
+                    for i in 0..row_bytes {
+                        let a = if i >= 1 { orig[i - 1] } else { 0 };
+                        let c = if i >= 1 { prev[i - 1] } else { 0 };
+                        row[i] = orig[i].wrapping_sub(paeth(a, prev[i], c));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            filtered.push(tag);
+            filtered.extend_from_slice(&row);
+            expected.extend_from_slice(&raw);
+            prev = raw;
+        }
+
+        let dict = b"<< /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 4 >> >>";
+        let got = decode(dict, &deflate(&filtered)).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn the_tiff_predictor_accumulates_across_colors() {
+        // predictor parameters belong to a filter, so without /Filter nothing
+        // is decoded and they must be ignored
+        let dict =
+            b"<< /Filter /FlateDecode /DecodeParms << /Predictor 2 /Colors 3 /Columns 2 >> >>";
+        // two pixels of three colours, stored as differences from the previous
+        // sample of the same colour
+        let stored = vec![10, 20, 30, 1, 2, 3];
+        assert_eq!(
+            decode(dict, &deflate(&stored)).unwrap(),
+            vec![10, 20, 30, 11, 22, 33]
+        );
+    }
+
+    #[test]
+    fn decode_parms_without_a_filter_are_ignored() {
+        let dict = b"<< /DecodeParms << /Predictor 2 /Colors 3 /Columns 2 >> >>";
+        assert_eq!(decode(dict, b"abcdef").unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn ascii_hex_stops_at_the_angle_bracket_and_pads_an_odd_length() {
+        assert_eq!(
+            decode(b"<< /Filter /ASCIIHexDecode >>", b"4869>").unwrap(),
+            b"Hi"
+        );
+        // an odd number of digits gets a zero nibble appended, so "486" is 0x48 0x60
+        assert_eq!(
+            decode(b"<< /Filter /ASCIIHexDecode >>", b"486>").unwrap(),
+            vec![0x48, 0x60]
+        );
+    }
+
+    #[test]
+    fn run_length_expands_and_copies() {
+        // 2 bytes literal "AB", then repeat the next byte 4 times, then EOD
+        let stored = vec![1, b'A', b'B', 253, b'x', 128];
+        assert_eq!(
+            decode(b"<< /Filter /RunLengthDecode >>", &stored).unwrap(),
+            b"ABxxxx"
+        );
+    }
+
+    #[test]
+    fn ascii85_decodes_the_canonical_example() {
+        // "Man " is the example from the specification
+        assert_eq!(
+            decode(b"<< /Filter /ASCII85Decode >>", b"9jqo^~>").unwrap(),
+            b"Man "
+        );
+    }
+
+    #[test]
+    fn an_unsupported_filter_says_which() {
+        let err = decode(b"<< /Filter /DCTDecode >>", b"x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DCTDecode"), "{err}");
+    }
+}

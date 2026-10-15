@@ -1,0 +1,45 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Generated test material. Nothing in here is committed, not even the public
+# halves: it is throwaway and reproducible with tools/gen-testcert.sh. In
+# particular *.pk8.der and *.p12 are private keys.
+/testdata/certs/*
+!/testdata/certs/README.md
+/testdata/golden/*
+!/testdata/golden/README.md
+
+# Certificate, key and signature material, anywhere in the tree. A signature
+# embeds the signer certificate and its whole chain, so a file signed with a
+# real FNMT or DNIe certificate carries the holder's name and DNI number.
+# tools/check-no-real-certs.sh is the authority and runs on pre-commit and in
+# CI, this list only keeps git status quiet.
+*.p12
+*.pfx
+*.p8
+*.p7b
+*.p7s
+*.p10
+*.p1m
+*.csr
+*.key
+*.pem
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
+*.csig
+*.xsig
+*.sig
+cert9.db
+key4.db
+cert8.db
+secmod.db
+cacerts
+autofirma.pfx
+
+# output signed by hand while testing
+*.signed.pdf
+/tmp/

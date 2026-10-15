@@ -1,0 +1,25 @@
+[package]
+name = "openfirma-cades"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CMS and CAdES signature formats for openfirma"
+
+[dependencies]
+openfirma-core.workspace = true
+const-oid.workspace = true
+der.workspace = true
+spki.workspace = true
+x509-cert.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+digest.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

@@ -1,0 +1,3 @@
+Documento de prueba para el golden diff.
+Contiene acentos: cañón, administración.
+Y una tercera línea para dar volumen.

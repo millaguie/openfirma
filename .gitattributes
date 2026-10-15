@@ -1,0 +1,11 @@
+# The PDF fixture is binary and git's heuristic cannot tell. This one contains
+# no NUL byte, because a minimal uncompressed PDF has nothing that would
+# produce one, so git classified it as text and core.autocrlf rewrote every LF
+# into CRLF on the Windows runners. That moves the byte offsets its
+# cross-reference table records, so the document is not merely different, it is
+# corrupt, and the failure surfaces as a parse error far from the cause.
+*.pdf binary
+
+# Shell scripts run under bash on every platform including the Windows runners,
+# where a CRLF ending is a carriage return inside the command being run.
+*.sh text eol=lf
