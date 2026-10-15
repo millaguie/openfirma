@@ -28,6 +28,20 @@ Very early, phase 1. What works today:
   AutoFirma signed, which means reading cross-reference streams and object
   streams. OpenSSL verifies the signature over exactly the ranges `/ByteRange`
   names, and the structure matches AutoFirma's, see `docs/pades.md`.
+- **PAdES B-LT and B-LTA** (`--format pades-b-lt`, `--format pades-b-lta`):
+  the ETSI EN 319 142-1 long-term levels, appended as further revisions in
+  the order the specification names. B-LT writes the `/DSS` validation data —
+  the full chain and one CRL or OCSP response per CA, supplied by the caller
+  and never fetched, indexed per signature under `/VRI` by the SHA-1 key the
+  spec and the EU's DSS validator define. B-LTA adds a document time-stamp
+  (`/Type /DocTimeStamp`, RFC 3161 through the same TSA closure as B-T) over
+  everything before it, the archive included. `openfirma verify` judges the
+  whole archive: CRL signatures under the issuing CA's key, chains rebuilt
+  from the `/DSS` alone, nothing revoked, and every document time-stamp
+  imprinting exactly its `/ByteRange`. AutoFirma has no golden here — its
+  enhancer ships disabled — so the crosschecks are openssl, qpdf and poppler,
+  including that every earlier signature stays valid after the archive is
+  appended. See `docs/pades.md`.
 - **XAdES-B-B** signing (`--format xades-b-b`): an enveloped XML-DSig
   signature with the ETSI EN 319 132-1 baseline properties
   (`SigningCertificateV2`, `SigningTime`, `DataObjectFormat`), on top of a
@@ -47,16 +61,17 @@ Very early, phase 1. What works today:
   dumping any DER signature as a normalized tree for diffing.
 
 Not started yet: the system keystores (PKCS#11, DNIe, Windows, macOS,
-NSS), the browser protocol, the GUI, FacturaE, and B-LT/B-LTA.
+NSS), the browser protocol, the GUI, and FacturaE.
 
 | Component | Status |
 |---|---|
 | CAdES-B-B (RFC 5652 CMS + ETSI EN 319 122-1) | works, crosschecked with OpenSSL |
-| CAdES B-T / B-LT / B-LTA (TSA, DSS, archive timestamps) | not started |
 | PAdES-B-B (PDF, ISO 32000 + ETSI EN 319 142-1) | works, crosschecked with OpenSSL and qpdf |
 | Verification of CAdES and PAdES (crypto, chain, trust anchors) | works, crosschecked with OpenSSL |
 | CAdES/PAdES B-T (RFC 3161 time-stamp) | works, crosschecked with openssl ts |
-| B-LT / B-LTA (validation data, archive timestamps) | not started |
+| PAdES B-LT (`/DSS` validation data, CRL and OCSP) | works, crosschecked with openssl crl and the DSS-shape checks in verify |
+| PAdES B-LTA (document time-stamp over the archive) | works, crosschecked with openssl ts, qpdf and pdfsig |
+| CAdES ES-LT / ES-LTA (validation data inside the CMS) | out of scope: the long-term path is PAdES B-LT/B-LTA, see docs/pades.md |
 | Keystores: PKCS#12 | works, pure Rust, MAC checked before decrypting |
 | Keystores: PKCS#11, DNIe, Windows, macOS, NSS | not started |
 | XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
@@ -76,6 +91,10 @@ cargo run -- sign -i doc.pdf -o doc.signed.pdf --format pades-b-b \
 cargo run -- sign -i doc.xml -o doc.signed.xml --format xades-b-b \
     --cert testdata/certs/signer-rsa.crt --key testdata/certs/signer-rsa.key \
     --chain testdata/certs/intermediate.crt --chain testdata/certs/ca.crt
+cargo run -- sign -i doc.pdf -o doc.lt.pdf --format pades-b-lt \
+    --cert testdata/certs/signer-rsa.crt --key testdata/certs/signer-rsa.key \
+    --chain testdata/certs/intermediate.crt --chain testdata/certs/ca.crt \
+    --crl testdata/certs/intermediate.crl.der --crl testdata/certs/ca.crl.der
 cargo run -- verify -i doc.csig --content doc.txt --trust testdata/certs/ca.crt
 cargo run -- verify -i doc.signed.pdf --trust testdata/certs/ca.crt
 cargo test                       # includes the OpenSSL crosschecks

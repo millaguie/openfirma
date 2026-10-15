@@ -89,11 +89,15 @@ fn a_single_pades_signature_verifies() {
     };
     let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
 
-    let reports = pades_verify(&signed, &VerifyOptions::new(anchors(&["ca.crt"])))
+    let report = pades_verify(&signed, &VerifyOptions::new(anchors(&["ca.crt"])))
         .expect("an untouched PAdES signature must verify");
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].reports.len(), 1, "one SignerInfo in /Contents");
-    let r = &reports[0].reports[0];
+    assert_eq!(report.signatures.len(), 1);
+    assert_eq!(
+        report.signatures[0].reports.len(),
+        1,
+        "one SignerInfo in /Contents"
+    );
+    let r = &report.signatures[0].reports[0];
     assert!(
         r.signer_subject.contains("PEREZ GARCIA"),
         "{}",
@@ -105,7 +109,7 @@ fn a_single_pades_signature_verifies() {
     assert!(r.attributes.signing_time.is_none());
     assert!(r.attributes.message_digest && r.attributes.signing_certificate_v2);
     // the ranges the report carries are the ones the CMS was verified over
-    let [a, _b, c, d] = reports[0].byte_range;
+    let [a, _b, c, d] = report.signatures[0].byte_range;
     assert_eq!(a, 0);
     assert_eq!(
         c + d,
@@ -127,11 +131,11 @@ fn a_cosigned_document_verifies_every_signature() {
     let twice = pades_sign(&once, &ec, &PadesOptions::default()).expect("second signing failed");
 
     let opts = VerifyOptions::new(anchors(&["ca.crt"]));
-    let reports = pades_verify(&twice, &opts).expect("both signatures must verify");
-    assert_eq!(reports.len(), 2);
+    let report = pades_verify(&twice, &opts).expect("both signatures must verify");
+    assert_eq!(report.signatures.len(), 2);
 
-    let first = &reports[0].reports[0];
-    let second = &reports[1].reports[0];
+    let first = &report.signatures[0].reports[0];
+    let second = &report.signatures[1].reports[0];
     assert!(
         first.signer_subject.contains("PEREZ GARCIA"),
         "{}",
@@ -147,8 +151,8 @@ fn a_cosigned_document_verifies_every_signature() {
 
     // the first signature stops at its revision boundary, only the second
     // reaches the end of the file
-    let [_, _, c1, d1] = reports[0].byte_range;
-    let [_, _, c2, d2] = reports[1].byte_range;
+    let [_, _, c1, d1] = report.signatures[0].byte_range;
+    let [_, _, c2, d2] = report.signatures[1].byte_range;
     assert!(
         c1 + d1 < twice.len(),
         "the older signature covers its own revision only"
@@ -167,9 +171,9 @@ fn sha512_pades_verifies() {
         ..PadesOptions::default()
     };
     let signed = pades_sign(INPUT, &signer, &opts).expect("signing failed");
-    let reports = pades_verify(&signed, &VerifyOptions::new(anchors(&["ca.crt"])))
+    let report = pades_verify(&signed, &VerifyOptions::new(anchors(&["ca.crt"])))
         .expect("a SHA-512 PAdES signature must verify");
-    assert_eq!(reports[0].reports[0].digest, DigestAlg::Sha512);
+    assert_eq!(report.signatures[0].reports[0].digest, DigestAlg::Sha512);
 }
 
 /// One flipped byte in the first revision, length preserved so every offset

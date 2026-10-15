@@ -2,8 +2,9 @@
 //!
 //! `openfirma inspect` on a DER file prints a normalized tree, which is what
 //! the golden diff runs on. On a PDF there is more to say than the CMS: where
-//! the signature claims to cover, whether that claim holds, and which of the
-//! optional dictionary entries are present. This module produces that report.
+//! the signature claims to cover, whether that claim holds, which of the
+//! optional dictionary entries are present, and — since B-LTA — whether each
+//! document time-stamp token imprints the bytes its own `/ByteRange` names.
 //!
 //! It walks the cross-reference rather than scanning for keywords, so it works
 //! on a classic table, on a cross-reference stream and on a document whose
@@ -57,9 +58,8 @@ pub fn signatures(pdf: &[u8]) -> Result<Vec<Signature>> {
     Ok(out)
 }
 
-fn read_signature(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<Signature> {
-    let mut problems = Vec::new();
-
+/// The `/ByteRange` of a signature or document time-stamp dictionary.
+fn byte_range_of(dict: &[u8], object: ObjRef) -> Result<[usize; 4]> {
     let Some(range_bytes) = pdf::get(dict, "/ByteRange") else {
         return Err(Error::Pdf(format!("signature {object} has no /ByteRange")));
     };
@@ -74,16 +74,23 @@ fn read_signature(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<Signature> 
             nums.len()
         )));
     }
-    let byte_range = [nums[0], nums[1], nums[2], nums[3]];
-    let [a, b, c, d] = byte_range;
+    Ok([nums[0], nums[1], nums[2], nums[3]])
+}
 
+/// The structural claims of a `/ByteRange`, shared by signatures and document
+/// time-stamps: the ranges start at 0, end at a revision boundary, do not
+/// overlap, and the hole between them is exactly the `/Contents` string.
+///
+/// The ranges have to end at a revision boundary, not necessarily at the end
+/// of the file: a signature added by an incremental update covers the
+/// document as it was when it was made, and later revisions are appended
+/// after it. Only the newest one reaches the end of the file.
+fn range_problems(pdf: &[u8], byte_range: [usize; 4]) -> Vec<String> {
+    let [a, b, c, d] = byte_range;
+    let mut problems = Vec::new();
     if a != 0 {
         problems.push(format!("the first range starts at {a}, not at 0"));
     }
-    // The ranges have to end at a revision boundary, not necessarily at the
-    // end of the file: a signature added by an incremental update covers the
-    // document as it was when it was made, and later revisions are appended
-    // after it. Only the newest signature reaches the end of the file.
     let ends = revision_ends(pdf);
     if !ends.contains(&(c + d)) {
         problems.push(format!(
@@ -99,18 +106,40 @@ fn read_signature(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<Signature> 
     if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
         problems.push("the gap between the ranges is not exactly the /Contents string".into());
     }
+    problems
+}
 
-    let cms = contents_der(gap, &mut problems);
+/// The bytes a `/ByteRange` covers, tolerating ranges that run past the end
+/// of the file so a damaged document stays reportable.
+fn covered_bytes(pdf: &[u8], byte_range: [usize; 4]) -> Vec<u8> {
+    let [a, b, c, d] = byte_range;
+    let mut covered = Vec::with_capacity(b.min(pdf.len()) + d);
+    if a + b.min(pdf.len()) <= pdf.len() {
+        covered.extend_from_slice(&pdf[a..a + b.min(pdf.len())]);
+    }
+    if c + d <= pdf.len() {
+        covered.extend_from_slice(&pdf[c..c + d]);
+    }
+    covered
+}
+
+fn read_signature(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<Signature> {
+    let byte_range = byte_range_of(dict, object)?;
+    let [b, c] = [byte_range[1], byte_range[2]];
+    let mut problems = range_problems(pdf, byte_range);
+
+    let gap = &pdf[b..c.min(pdf.len())];
+    let cms = if gap.first() == Some(&b'<') && gap.last() == Some(&b'>') {
+        contents_der(gap, &mut problems)
+    } else {
+        Vec::new()
+    };
 
     // the digest claim: messageDigest must equal the digest of the two ranges
     if cms.is_empty() {
         problems.push("no CMS could be read from /Contents".into());
     } else {
-        let mut covered = Vec::with_capacity(b + d);
-        covered.extend_from_slice(&pdf[a..a + b.min(pdf.len())]);
-        if c + d <= pdf.len() {
-            covered.extend_from_slice(&pdf[c..c + d]);
-        }
+        let covered = covered_bytes(pdf, byte_range);
         let want = openfirma_core::DigestAlg::Sha256.digest(&covered);
         match message_digest(&cms) {
             Some(got) if got == want.as_slice() => {}
@@ -129,6 +158,98 @@ fn read_signature(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<Signature> 
         byte_range,
         dictionary,
         cms,
+        problems,
+    })
+}
+
+/// A document time-stamp dictionary (`/Type /DocTimeStamp`), the B-LTA
+/// layer: an RFC 3161 token over the whole document before it, validation
+/// data included.
+pub struct DocTimeStamp {
+    /// The object holding the dictionary.
+    pub object: ObjRef,
+    /// The two ranges the token claims to cover.
+    pub byte_range: [usize; 4],
+    /// The RFC 3161 token in `/Contents`, without the zero padding.
+    pub token: Vec<u8>,
+    /// The digest the token imprints under, when it parses.
+    pub digest: Option<openfirma_core::alg::DigestAlg>,
+    /// What is wrong, if anything. Empty means the claims hold.
+    pub problems: Vec<String>,
+}
+
+impl DocTimeStamp {
+    /// True when the token covers the bytes it claims to and imprints them.
+    pub fn is_consistent(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+/// Every document time-stamp in the PDF, in object number order.
+pub fn document_timestamps(pdf: &[u8]) -> Result<Vec<DocTimeStamp>> {
+    if !pdf.starts_with(b"%PDF-") {
+        return Err(Error::Pdf("the input does not start with %PDF-".into()));
+    }
+    let xref_at = pdf::last_startxref(pdf)?;
+    let locations = pdf::object_locations(pdf, xref_at)?;
+
+    let mut out = Vec::new();
+    for object in locations.keys() {
+        let Ok(body) = pdf::resolve(pdf, &locations, *object) else {
+            continue;
+        };
+        if pdf::get(&body, "/Type").map(|t| pdf::trim_ws(t) == b"/DocTimeStamp") != Some(true) {
+            continue;
+        }
+        out.push(read_document_timestamp(pdf, *object, &body)?);
+    }
+    out.sort_by_key(|t| (t.object.num, t.object.generation));
+    Ok(out)
+}
+
+fn read_document_timestamp(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<DocTimeStamp> {
+    let byte_range = byte_range_of(dict, object)?;
+    let [b, c] = [byte_range[1], byte_range[2]];
+    let mut problems = range_problems(pdf, byte_range);
+    let mut digest = None;
+
+    let gap = &pdf[b..c.min(pdf.len())];
+    let token = if gap.first() == Some(&b'<') && gap.last() == Some(&b'>') {
+        contents_der(gap, &mut problems)
+    } else {
+        Vec::new()
+    };
+    if token.is_empty() {
+        if !problems.iter().any(|p| p.contains("/Contents")) {
+            problems.push("no token could be read from /Contents".into());
+        }
+    } else {
+        // the imprint claim: the token must hash the bytes its /ByteRange covers
+        match openfirma_cades::tsp::token_imprint(&token) {
+            Ok((alg, hashed)) => {
+                digest = Some(alg);
+                let want = alg.digest(&covered_bytes(pdf, byte_range));
+                if want.as_slice() != hashed.as_slice() {
+                    problems.push(format!(
+                        "the token imprints {}... but the {} of the bytes its /ByteRange \
+                         covers is {}...",
+                        hex::encode(&hashed[..8.min(hashed.len())]),
+                        alg.name(),
+                        hex::encode(&want[..8]),
+                    ));
+                }
+            }
+            Err(e) => problems.push(format!(
+                "/Contents does not hold a readable RFC 3161 token: {e}"
+            )),
+        }
+    }
+
+    Ok(DocTimeStamp {
+        object,
+        byte_range,
+        token,
+        digest,
         problems,
     })
 }
@@ -271,6 +392,46 @@ pub fn render(pdf: &[u8]) -> Result<String> {
             }
             Err(e) => out.push_str(&format!("    <not valid DER: {e}>\n")),
         }
+        out.push('\n');
+    }
+
+    let timestamps = document_timestamps(pdf)?;
+    for (i, t) in timestamps.iter().enumerate() {
+        out.push_str(&format!(
+            "document time-stamp {} (object {} {}):\n",
+            i + 1,
+            t.object.num,
+            t.object.generation
+        ));
+        let [a, b, c, d] = t.byte_range;
+        out.push_str(&format!("  /ByteRange [{a} {b} {c} {d}]\n"));
+        out.push_str(&format!(
+            "  /Contents <RFC 3161 token {} bytes>\n",
+            t.token.len()
+        ));
+        if t.is_consistent() {
+            out.push_str(&format!(
+                "  integrity: the token imprints {} of the bytes its /ByteRange covers\n",
+                t.digest.map(|alg| alg.name()).unwrap_or("the digest")
+            ));
+        } else {
+            for p in &t.problems {
+                out.push_str(&format!("  integrity FAIL: {p}\n"));
+            }
+        }
+        out.push('\n');
+    }
+
+    if let Some(dss) = crate::ltv::read_dss(pdf)? {
+        let keys = dss.vri_keys().unwrap_or_default();
+        out.push_str(&format!(
+            "validation data (/DSS): {} certificate(s), {} CRL(s), {} OCSP response(s), \
+             {} /VRI key(s)\n",
+            dss.certs.len(),
+            dss.crls.len(),
+            dss.ocsps.len(),
+            keys.len(),
+        ));
         out.push('\n');
     }
     Ok(out)

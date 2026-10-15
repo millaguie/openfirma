@@ -75,7 +75,7 @@ fn line_end(data: &[u8], i: usize) -> usize {
 /// End of a `/Name`, which runs to the next whitespace or delimiter. Names may
 /// contain `#xx` escapes, which need no special handling here because `#` is
 /// neither whitespace nor a delimiter.
-fn name_end(data: &[u8], i: usize) -> usize {
+pub(crate) fn name_end(data: &[u8], i: usize) -> usize {
     let mut j = i + 1;
     while j < data.len() && !is_ws(data[j]) && !is_delim(data[j]) {
         j += 1;
@@ -119,7 +119,7 @@ fn string_end(data: &[u8], i: usize) -> Result<usize> {
 
 /// End of a `<<dictionary>>`, tracking nested dictionaries. Strings and names
 /// are skipped so that a `>>` inside one of them does not end the scan.
-fn dict_end(data: &[u8], start: usize) -> Result<usize> {
+pub(crate) fn dict_end(data: &[u8], start: usize) -> Result<usize> {
     let mut i = start + 2;
     let mut depth = 1usize;
     while i < data.len() {
@@ -191,7 +191,7 @@ fn token_end(data: &[u8], i: usize) -> usize {
 /// End of one complete value, whatever its type. An indirect reference is three
 /// tokens that together form one value, and telling it apart from a plain
 /// integer is what the lookahead here is for.
-fn value_end(data: &[u8], start: usize) -> Result<usize> {
+pub(crate) fn value_end(data: &[u8], start: usize) -> Result<usize> {
     let i = skip_ws(data, start);
     match at(data, i) {
         b'<' if at(data, i + 1) == b'<' => dict_end(data, i),

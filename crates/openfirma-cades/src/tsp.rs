@@ -65,8 +65,16 @@ pub fn token_from_response(response: &[u8], digest: DigestAlg, message: &[u8]) -
     // outer.i is relative to the TimeStampResp content, so the slice has to be
     // taken from outer.b, not from the whole response
     let token_start = outer.i;
-    let mut ci = outer.sequence()?;
+    outer.sequence()?; // step over the token to find where it ends
     let token = &outer.b[token_start..outer.i];
+    check_token(token, digest, message)?;
+    Ok(token.to_vec())
+}
+
+/// Checks that `token`, a `ContentInfo` holding the TSA's `SignedData`,
+/// imprints the digest of `message`.
+pub fn check_token(token: &[u8], digest: DigestAlg, message: &[u8]) -> Result<()> {
+    let mut ci = Cur::new(token).sequence()?;
     let content_type = ci.oid_string()?;
     if content_type != oid::ID_SIGNED_DATA.to_string() {
         return Err(Error::Other(format!(
@@ -75,8 +83,86 @@ pub fn token_from_response(response: &[u8], digest: DigestAlg, message: &[u8]) -
     }
     // explicit(0) yields the SignedData TLV itself, so step into it
     let mut sd = Cur::new(ci.explicit(0)?).sequence()?;
-    check_imprint(&mut sd, digest, message)?;
+    check_imprint(&mut sd, digest, message)
+}
+
+/// The token inside a `signature-time-stamp-token` unsigned attribute, with
+/// its imprint checked against `message`.
+///
+/// This is how the token gets back out of what a [`crate::TimestampFn`]
+/// returns: the closure hands over unsigned *attributes*, and a PDF document
+/// time-stamp (B-LTA) embeds the bare token, so the attribute is unwrapped
+/// here — under the same imprint check, because a token that imprints
+/// something else must never be embedded no matter who produced it.
+pub fn token_from_attribute(attr: &[u8], digest: DigestAlg, message: &[u8]) -> Result<Vec<u8>> {
+    let mut outer = Cur::new(attr).sequence()?;
+    let attr_type = outer.oid_string()?;
+    if attr_type != oid::ID_SIGNATURE_TIME_STAMP_TOKEN.to_string() {
+        return Err(Error::Other(format!(
+            "the attribute is {attr_type}, not a signature-time-stamp-token \
+             ({})",
+            oid::ID_SIGNATURE_TIME_STAMP_TOKEN
+        )));
+    }
+    let values = outer.expect(tlv::TAG_SET)?;
+    // the token is the first value of the SET; slice its whole TLV out
+    if values.first() != Some(&tlv::TAG_SEQUENCE) {
+        return Err(Error::Other(
+            "the time-stamp attribute value is not a ContentInfo SEQUENCE".into(),
+        ));
+    }
+    let (len, n) = read_len(&values[1..])?;
+    let end = 1 + n + len;
+    if end > values.len() {
+        return Err(Error::Other(
+            "the time-stamp token runs past its attribute value".into(),
+        ));
+    }
+    let token = &values[..end];
+    check_token(token, digest, message)?;
     Ok(token.to_vec())
+}
+
+/// The digest algorithm and hashed message that a token's
+/// `TSTInfo.messageImprint` carries, checked against nothing. This is what a
+/// reader recomputes the covered bytes with; the writer side compares through
+/// [`check_token`] instead.
+pub fn token_imprint(token: &[u8]) -> Result<(DigestAlg, Vec<u8>)> {
+    let mut ci = Cur::new(token).sequence()?;
+    let content_type = ci.oid_string()?;
+    if content_type != oid::ID_SIGNED_DATA.to_string() {
+        return Err(Error::Other(format!(
+            "a time-stamp token must be a SignedData, this ContentInfo is {content_type}"
+        )));
+    }
+    let mut sd = Cur::new(ci.explicit(0)?).sequence()?;
+    let _version = sd.tlv()?; // version
+    let _digest_algs = sd.tlv()?; // digestAlgorithms
+    let mut eci = sd.sequence()?; // encapContentInfo
+    let _content_type = eci.oid_string()?;
+    let econtent = eci.explicit(0)?;
+    let octets = Cur::new(econtent).octets()?;
+    let mut tst = Cur::new(octets).sequence()?;
+    let _version = tst.number()?;
+    let _policy = tst.oid_string()?;
+    let mut imprint = tst.sequence()?;
+    let mut alg = imprint.sequence()?;
+    let alg_oid = alg.oid_string()?;
+    let hashed = imprint.octets()?.to_vec();
+    let digest_oid = parse_dotted_oid(&alg_oid)?;
+    let digest = DigestAlg::from_oid(&digest_oid).map_err(|_| {
+        Error::Other(format!(
+            "the time-stamp token imprints a digest this code does not know: {alg_oid}"
+        ))
+    })?;
+    Ok((digest, hashed))
+}
+
+/// Parses a dotted decimal OID string back into an `ObjectIdentifier`.
+fn parse_dotted_oid(text: &str) -> Result<const_oid::ObjectIdentifier> {
+    use std::str::FromStr;
+    const_oid::ObjectIdentifier::from_str(text)
+        .map_err(|e| Error::Other(format!("unreadable OID {text:?}: {e}")))
 }
 
 /// Finds `encapContentInfo`, unwraps the `TSTInfo` and compares its

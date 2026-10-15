@@ -9,11 +9,15 @@
 //! the `signingCertificateV2` reference and the certificate chain up to the
 //! supplied trust anchors, and reports what the signature carries.
 //!
-//! Current level: B-B. Unsigned attributes can be injected through
-//! [`CadesOptions::unsigned_attributes`], which is how B-T will carry the TSA
-//! token.
+//! Current levels: B-B and B-T (the time-stamp token of
+//! [`CadesOptions::timestamp`], crosschecked against `openssl ts`). The CAdES
+//! long-term levels ES-LT/ES-LTA are deliberately not implemented: openfirma's
+//! long-term path is PAdES B-LT/B-LTA, where the validation data lives in the
+//! document's `/DSS` instead of in CMS attributes. [`revocation`] carries the
+//! shared reading of that data, CRLs and OCSP responses.
 
 pub mod attributes;
+pub mod revocation;
 pub mod signed_data;
 pub mod tsp;
 pub mod verify;

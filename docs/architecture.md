@@ -35,16 +35,23 @@ registration) and the installers.
   certificate wrapper (DER plus parsed), the `Signer` trait, software signer
   backends, signature parameters and profiles shared by all formats.
 - **openfirma-cades**: hand rolled CMS `SignedData` encoder/decoder on the `der`
-  crate, CAdES-B-B/B-T/B-LT/B-LTA attribute sets, TSA client, countersignature
-  and cofirm trees, and the cryptographic verifier (`openfirma_cades::verify`):
-  `messageDigest`, the signature value over the re-tagged signed attributes,
-  `signingCertificateV2`, and chain building against supplied trust anchors.
+  crate, the CAdES-B-B attribute set, RFC 3161 requests and tokens for B-T
+  (transport stays with the caller), the reading and checking of revocation
+  data shared with PAdES (`openfirma_cades::revocation`: CRL signature
+  verification, OCSP response parsing), and the cryptographic verifier
+  (`openfirma_cades::verify`): `messageDigest`, the signature value over the
+  re-tagged signed attributes, `signingCertificateV2`, and chain building
+  against supplied trust anchors. The CAdES long-term levels ES-LT/ES-LTA are
+  deliberately out of scope: the long-term path is PAdES B-LT/B-LTA
+  (`docs/pades.md`). Planned: countersignature and cofirm trees.
 - **openfirma-pades**: minimal PDF reader (last trailer, classic cross-reference
   tables *and* cross-reference streams, object streams, FlateDecode with the PNG
   and TIFF predictors, dictionary surgery at the byte level so untouched objects
   are reproduced exactly), incremental update writer, `/ByteRange` and
   placeholder patching, AcroForm signature field, invisible and visible
-  appearances. Planned: document timestamp, DSS dictionary and LTV. See
+  appearances, and the long-term levels as further appended revisions: the
+  `/DSS` validation data with its per-signature `/VRI` index (B-LT) and the
+  `/DocTimeStamp` field (B-LTA), plus the verifier that judges both. See
   `docs/pades.md` and `docs/adr/0003`.
 - **openfirma-xades**: strict hand rolled XML reader that keeps the byte spans
   of the input (the signed output preserves the original document bytes and

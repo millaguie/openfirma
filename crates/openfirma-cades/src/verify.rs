@@ -485,12 +485,17 @@ fn check_signing_certificate_v2(value: &Tlv<'_>, cert: &CertificateHandle) -> Re
 /// embedded in the signature, and every candidate has to verify the current
 /// certificate's signature with its public key. Dates are checked on every
 /// certificate that joins the chain, anchors included.
-fn build_chain<'c>(
+///
+/// Returns the chain signer first, *excluding* the anchor, and the anchor it
+/// stands on. The one case where the two overlap is a chain that already
+/// contains the anchor as an embedded root, and the caller tells that apart
+/// by comparing the last element with the anchor.
+fn build_chain_refs<'c, 'a>(
     signer: &'c CertificateHandle,
     embedded: &'c [CertificateHandle],
-    anchors: &[CertificateHandle],
+    anchors: &'a [CertificateHandle],
     at: SystemTime,
-) -> Result<(Vec<String>, String)> {
+) -> Result<(Vec<&'c CertificateHandle>, &'a CertificateHandle)> {
     if anchors.is_empty() {
         return Err(fail(
             CHECK_CERTIFICATE_CHAIN,
@@ -498,14 +503,14 @@ fn build_chain<'c>(
         ));
     }
     check_validity(signer, at)?;
-    let mut chain = vec![subject(signer)];
+    let mut chain: Vec<&'c CertificateHandle> = vec![signer];
     let mut visited: Vec<&[u8]> = vec![signer.der()];
     let mut current: &'c CertificateHandle = signer;
 
     for _ in 0..MAX_CHAIN_DEPTH {
         // the chain already stands on the anchor itself: an embedded root
-        if anchors.iter().any(|a| a.der() == current.der()) {
-            return Ok((chain, subject(current)));
+        if let Some(anchor) = anchors.iter().find(|a| a.der() == current.der()) {
+            return Ok((chain, anchor));
         }
         let issuer_der = current.issuer().to_der()?;
         let mut name_matches = 0usize;
@@ -519,7 +524,7 @@ fn build_chain<'c>(
             match check_cert_signature(current, anchor) {
                 Ok(()) => {
                     check_validity(anchor, at)?;
-                    return Ok((chain, subject(anchor)));
+                    return Ok((chain, anchor));
                 }
                 Err(_) => signature_failures += 1,
             }
@@ -571,7 +576,7 @@ fn build_chain<'c>(
                 )
             });
         };
-        chain.push(subject(next));
+        chain.push(next);
         visited.push(next.der());
         current = next;
     }
@@ -579,6 +584,53 @@ fn build_chain<'c>(
         CHECK_CERTIFICATE_CHAIN,
         format!("the chain is deeper than {MAX_CHAIN_DEPTH} levels, which no real PKI is"),
     ))
+}
+
+fn build_chain<'c>(
+    signer: &'c CertificateHandle,
+    embedded: &'c [CertificateHandle],
+    anchors: &[CertificateHandle],
+    at: SystemTime,
+) -> Result<(Vec<String>, String)> {
+    let (chain, anchor) = build_chain_refs(signer, embedded, anchors, at)?;
+    // The report's chain_subjects excludes the anchor, except in the one
+    // case where the chain already stands on the anchor itself (an embedded
+    // root), and build_chain_refs returns exactly the elements for either
+    // case; the anchor's subject travels separately as trust_anchor.
+    Ok((chain.iter().map(|c| subject(c)).collect(), subject(anchor)))
+}
+
+/// Builds the certificate chain from `signer` up to one of the `anchors`
+/// using **only** the certificates in `embedded`, verifying every link's
+/// signature with the issuer's public key and every validity date against
+/// `at`.
+///
+/// This is the entry point the PAdES `/DSS` check uses to prove that a chain
+/// can be rebuilt from the archived validation data alone, without the
+/// certificates a CMS happens to carry. The returned vector holds the signer
+/// first and the trust anchor last.
+pub fn chain_certificates(
+    signer: &CertificateHandle,
+    embedded: &[CertificateHandle],
+    anchors: &[CertificateHandle],
+    at: SystemTime,
+) -> Result<Vec<CertificateHandle>> {
+    let (chain, anchor) = build_chain_refs(signer, embedded, anchors, at)?;
+    let mut out: Vec<CertificateHandle> = chain.iter().map(|c| (*c).clone()).collect();
+    if out.last().map(|c| c.der() != anchor.der()).unwrap_or(true) {
+        out.push(anchor.clone());
+    }
+    Ok(out)
+}
+
+/// The certificate each `SignerInfo` names through its `sid`, as embedded in
+/// `SignedData.certificates`. One entry per `SignerInfo`, in order.
+pub fn signer_certificates(der: &[u8]) -> Result<Vec<CertificateHandle>> {
+    let sd = parse_signed_data(der)?;
+    sd.signer_infos
+        .iter()
+        .map(|si| find_signer_cert(&sd, &si.sid).cloned())
+        .collect()
 }
 
 fn check_validity(cert: &CertificateHandle, at: SystemTime) -> Result<()> {
@@ -624,7 +676,7 @@ fn tbs_der(cert: &CertificateHandle) -> Result<Vec<u8>> {
     Ok(tbs.whole.to_vec())
 }
 
-fn digest_from_signature_oid(o: &ObjectIdentifier) -> Result<DigestAlg> {
+pub(crate) fn digest_from_signature_oid(o: &ObjectIdentifier) -> Result<DigestAlg> {
     if let Some(d) = rsa_pkcs1_digest(o).or_else(|| ecdsa_digest(o)) {
         return Ok(d);
     }
@@ -675,7 +727,7 @@ fn subject_key_identifier(cert: &CertificateHandle) -> Option<Vec<u8>> {
     Some(inner.as_bytes().to_vec())
 }
 
-fn subject(cert: &CertificateHandle) -> String {
+pub(crate) fn subject(cert: &CertificateHandle) -> String {
     cert.subject().to_string()
 }
 
@@ -693,7 +745,7 @@ fn fail(check: &str, detail: impl std::fmt::Display) -> Error {
 
 /// The message of a verification error without the shared prefix, for
 /// wrapping it under the name of the check that owns it.
-fn detail_of(e: &Error) -> String {
+pub(crate) fn detail_of(e: &Error) -> String {
     match e {
         Error::Verification(m) => m.clone(),
         other => other.to_string(),

@@ -61,6 +61,20 @@ impl CertificateHandle {
         self.parsed.tbs_certificate().subject()
     }
 
+    /// The subject `Name` exactly as encoded. Name matching in this codebase
+    /// is byte level: DER leaves exactly one spelling per name, and the
+    /// crates that compare names (chain building, CRL association) do not
+    /// all depend on `der`, so the bytes come from here.
+    pub fn subject_der(&self) -> Result<Vec<u8>> {
+        Ok(self.subject().to_der()?)
+    }
+
+    /// The issuer `Name` exactly as encoded, the counterpart of
+    /// [`Self::subject_der`].
+    pub fn issuer_der(&self) -> Result<Vec<u8>> {
+        Ok(self.issuer().to_der()?)
+    }
+
     pub fn serial_number(&self) -> &SerialNumber {
         self.parsed.tbs_certificate().serial_number()
     }

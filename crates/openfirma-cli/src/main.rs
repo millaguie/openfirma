@@ -176,6 +176,23 @@ struct SignArgs {
     /// checked against the signature value and a mismatch is an error.
     #[arg(long)]
     timestamp_token: Option<PathBuf>,
+
+    /// Certificate to archive in the PDF /DSS validation data on top of the
+    /// signer's own chain (a co-signer's, the TSA's), PEM or DER, repeatable.
+    /// PAdES B-LT and B-LTA only.
+    #[arg(long)]
+    validation_cert: Vec<PathBuf>,
+
+    /// CRL to archive in the PDF /DSS, PEM or DER, repeatable. Nothing is
+    /// fetched: the URL a CRL comes from is in the crlDistributionPoints of
+    /// the certificates it covers. PAdES B-LT and B-LTA only.
+    #[arg(long)]
+    crl: Vec<PathBuf>,
+
+    /// OCSP response to archive in the PDF /DSS, PEM or DER, repeatable.
+    /// Obtained by the caller, like the CRLs. PAdES B-LT and B-LTA only.
+    #[arg(long)]
+    ocsp: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -184,6 +201,15 @@ enum Format {
     Cades,
     #[value(name = "pades-b-b")]
     Pades,
+    /// PAdES with the B-LT validation data archived in the document's /DSS.
+    /// Combine with --tsa for the signature time-stamp the full B-LT level
+    /// asks for.
+    #[value(name = "pades-b-lt")]
+    PadesLt,
+    /// PAdES B-LT plus a document time-stamp over everything before it.
+    /// Needs --tsa: the token imprints bytes that exist only while signing.
+    #[value(name = "pades-b-lta")]
+    PadesLta,
     #[value(name = "xades-b-b")]
     Xades,
 }
@@ -193,6 +219,8 @@ impl Format {
         match self {
             Format::Cades => "CAdES-B-B",
             Format::Pades => "PAdES-B-B",
+            Format::PadesLt => "PAdES-B-LT",
+            Format::PadesLta => "PAdES-B-LTA",
             Format::Xades => "XAdES-B-B",
         }
     }
@@ -367,7 +395,33 @@ fn main() -> Result<()> {
                 alias,
                 tsa,
                 timestamp_token,
+                validation_cert,
+                crl,
+                ocsp,
             } = *args;
+            let ltv = matches!(format, Format::PadesLt | Format::PadesLta);
+            if !ltv && (!validation_cert.is_empty() || !crl.is_empty() || !ocsp.is_empty()) {
+                anyhow::bail!(
+                    "--validation-cert, --crl and --ocsp archive validation data in the PDF \
+                     /DSS, which only --format pades-b-lt and pades-b-lta have a place for"
+                );
+            }
+            if ltv && crl.is_empty() && ocsp.is_empty() {
+                anyhow::bail!(
+                    "{} archives revocation data and none was given: pass at least one --crl \
+                     or --ocsp, certificates alone are only half of B-LT",
+                    format.label()
+                );
+            }
+            if matches!(format, Format::PadesLta) && tsa.is_none() {
+                anyhow::bail!(
+                    "--format pades-b-lta needs --tsa: the document time-stamp imprints the \
+                     bytes of the document itself, which exist only while signing, so a token \
+                     fetched in advance cannot imprint them. --timestamp-token serves the B-T \
+                     signature time-stamp only."
+                );
+            }
+
             let content =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
             let signer = match (&p12, &password) {
@@ -402,25 +456,58 @@ fn main() -> Result<()> {
                 Format::Cades => sign(&content, &signer, &opts)?,
                 // PAdES fixes the CAdES shape itself: detached, no signingTime
                 // because the time is in /M, and no contentHint. The knobs
-                // above only apply to CAdES, see docs/pades.md.
-                Format::Pades => openfirma_pades::pades_sign(
-                    &content,
-                    &signer,
-                    &PadesOptions {
-                        digest: digest_alg,
-                        reason,
-                        location,
-                        contact_info,
-                        field_name,
-                        visible: rect.map(|r| Appearance {
-                            page,
-                            rect: r,
-                            label: label.clone(),
-                        }),
-                        timestamp: stamp,
-                        ..PadesOptions::default()
-                    },
-                )?,
+                // above only apply to CAdES, see docs/pades.md. B-LT and
+                // B-LTA add revisions after the signature: the /DSS with the
+                // validation data, then the document time-stamp.
+                Format::Pades | Format::PadesLt | Format::PadesLta => {
+                    let mut validation_certs = Vec::with_capacity(validation_cert.len());
+                    for c in &validation_cert {
+                        let bytes =
+                            std::fs::read(c).with_context(|| format!("reading {}", c.display()))?;
+                        validation_certs.push(parse_certificate(&bytes).with_context(|| {
+                            format!("{} is not a valid X.509 certificate", c.display())
+                        })?);
+                    }
+                    let mut revocation = Vec::with_capacity(crl.len() + ocsp.len());
+                    for c in &crl {
+                        revocation.push(openfirma_pades::RevocationBytes::Crl(read_der_blob(
+                            c, "CRL",
+                        )?));
+                    }
+                    for o in &ocsp {
+                        revocation.push(openfirma_pades::RevocationBytes::Ocsp(read_der_blob(
+                            o,
+                            "OCSP response",
+                        )?));
+                    }
+                    openfirma_pades::pades_sign(
+                        &content,
+                        &signer,
+                        &PadesOptions {
+                            digest: digest_alg,
+                            reason,
+                            location,
+                            contact_info,
+                            field_name,
+                            visible: rect.map(|r| Appearance {
+                                page,
+                                rect: r,
+                                label: label.clone(),
+                            }),
+                            // B-LTA is B-LT is B-T: the same TSA stamps the
+                            // signature value and then the document
+                            timestamp: stamp.clone(),
+                            validation_certs,
+                            revocation,
+                            document_timestamp: if matches!(format, Format::PadesLta) {
+                                stamp.clone()
+                            } else {
+                                None
+                            },
+                            ..PadesOptions::default()
+                        },
+                    )?
+                }
                 // XAdES-B-B is enveloped and signs XML, see docs/xades.md.
                 // --digest picks the signature algorithm; the reference
                 // digests stay SHA-512, AutoFirma's default. signingTime is
@@ -490,8 +577,8 @@ fn main() -> Result<()> {
                          bytes its own /ByteRange names"
                     );
                 }
-                let signatures = openfirma_pades::pades_verify(&bytes, &opts)?;
-                for (i, sig) in signatures.iter().enumerate() {
+                let document = openfirma_pades::pades_verify(&bytes, &opts)?;
+                for (i, sig) in document.signatures.iter().enumerate() {
                     let [a, b, c, d] = sig.byte_range;
                     println!(
                         "signature {} (object {} {}), /ByteRange [{a} {b} {c} {d}]:",
@@ -503,9 +590,53 @@ fn main() -> Result<()> {
                         print_report(report);
                     }
                 }
+                for (i, t) in document.document_timestamps.iter().enumerate() {
+                    let [a, b, c, d] = t.byte_range;
+                    println!(
+                        "document time-stamp {} (object {} {}): the token imprints {} of \
+                         the bytes its /ByteRange [{a} {b} {c} {d}] covers",
+                        i + 1,
+                        t.object.num,
+                        t.object.generation,
+                        t.digest.name()
+                    );
+                }
+                if let Some(dss) = &document.dss {
+                    println!(
+                        "validation data (/DSS): {} certificate(s), {} CRL(s), {} OCSP \
+                         response(s), all of them readable and every CRL signature verified",
+                        dss.certificates,
+                        dss.crls.len(),
+                        dss.ocsps
+                    );
+                    for crl in &dss.crls {
+                        println!(
+                            "  CRL issued by {}: {} revoked, next update {}",
+                            crl.issuer,
+                            crl.revoked_serials.len(),
+                            match crl.next_update {
+                                Some(t) => fmt_system_time(t),
+                                None => "none".to_string(),
+                            }
+                        );
+                    }
+                    for chain in &dss.chains {
+                        println!(
+                            "  signature {}: chain rebuilt from the /DSS alone: {}",
+                            chain.signature,
+                            chain.subjects.join(" -> ")
+                        );
+                    }
+                    for n in &dss.uncovered {
+                        println!(
+                            "  signature {n}: no /VRI entry, the archived validation data \
+                             does not cover it"
+                        );
+                    }
+                }
                 println!(
                     "OK: all {} signature(s) verify against the supplied trust anchors",
-                    signatures.len()
+                    document.signatures.len()
                 );
             } else {
                 let external = match &content {
@@ -582,6 +713,31 @@ fn load_signer(cert: &PathBuf, key: &PathBuf, chain: &[PathBuf]) -> Result<Softw
     }
     signer = signer.with_chain(chain_handles);
     Ok(signer)
+}
+
+/// Reads a DER blob, accepting the PEM wrapping around it. What gets
+/// archived in a /DSS is the DER, and a CRL or an OCSP response arrives in
+/// either shape depending on how the caller fetched it.
+fn read_der_blob(path: &PathBuf, what: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if !bytes.starts_with(b"-----BEGIN") {
+        return Ok(bytes);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let b64: String = text
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .map(|l| l.trim())
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .with_context(|| {
+            format!(
+                "{} is PEM but its base64 body does not decode to a DER {what}",
+                path.display()
+            )
+        })
 }
 
 fn parse_certificate(bytes: &[u8]) -> openfirma_core::Result<CertificateHandle> {

@@ -165,6 +165,80 @@ printf 'basicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSigna
 issue "$TMP/tsa.csr" tsa.crt intermediate.crt intermediate.key "$TMP/tsa.ext"
 to_pkcs8 "$TMP/tsa-raw.key" tsa.key
 
+echo "== CRLs, for the PAdES B-LT validation data tests =="
+# An empty CRL is a complete revocation datum: it is signed by the CA and says
+# that nothing it issued is revoked, which is exactly what a B-LT archive needs
+# for a healthy chain. `openssl ca -gencrl` is the portable way to produce one
+# (OpenSSL and the LibreSSL macOS ships alike), and it insists on a database,
+# so each CA gets a minimal throwaway one. The long validity is deliberate:
+# this is test material regenerated on demand, and a CRL that expires in the
+# usual 30 days would turn `cargo test` red on a stale testdata/certs.
+make_crl() {
+  # make_crl <name> <ca.crt> <ca.key>
+  local name="$1" cacert="$2" cakey="$3"
+  local db="$TMP/crl-$name"
+  mkdir -p "$db"
+  : > "$db/index.txt"
+  echo 01 > "$db/crlnumber"
+  {
+    echo "[ca]"
+    echo "default_ca = settings"
+    echo "[settings]"
+    echo "database = $db/index.txt"
+    echo "crlnumber = $db/crlnumber"
+    echo "default_md = sha256"
+    echo "default_crl_days = 3650"
+  } > "$db/ca.conf"
+  openssl ca -gencrl -config "$db/ca.conf" -cert "$cacert" -keyfile "$cakey" \
+    -out "$name.crl.pem"
+  openssl crl -in "$name.crl.pem" -outform DER -out "$name.crl.der"
+}
+# ca.crl covers the intermediate, intermediate.crl covers the signing certs:
+# one revocation datum per CA of the chain, which is what ETSI EN 319 142-1
+# asks B-LT to archive.
+make_crl ca ca.crt ca.key
+make_crl intermediate intermediate.crt intermediate.key
+
+echo "== OCSP responder delegate and one response, for the B-LT tests =="
+# The OCSP variant of a revocation datum. openssl's ocsp app can act as a
+# one-shot responder offline (-reqin/-respout) over a hand-built index.txt:
+# status, expiry, revocation date, serial, filename and subject, tab
+# separated. The fixed far-future expiry keeps the script off GNU date, which
+# macOS does not ship. The response says signer-rsa is good and comes from the
+# intermediate's "database", so its CertID hashes are the intermediate's,
+# which is what associates it with the chain. Some openssl builds lack the
+# one-shot responder; then this section warns and continues, and the tests
+# that need the response skip (the CRL path is the mandatory one).
+dn_conf "$TMP/ocsp.cnf" "C = ES" "O = openfirma test" "OU = Test OCSP Responder" \
+  "CN = openfirma Test OCSP"
+openssl req -newkey rsa:2048 -nodes -keyout "$TMP/ocsp-raw.key" -out "$TMP/ocsp.csr" \
+  -config "$TMP/ocsp.cnf"
+# extendedKeyUsage OCSPSigning, critical, is what makes openssl and every
+# validator accept this certificate as an OCSP responder delegate
+printf 'basicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSignature\nextendedKeyUsage = critical, OCSPSigning\n' > "$TMP/ocsp.ext"
+issue "$TMP/ocsp.csr" ocsp.crt intermediate.crt intermediate.key "$TMP/ocsp.ext"
+to_pkcs8 "$TMP/ocsp-raw.key" ocsp.key
+
+ocsp_response() {
+  # ocsp_response <cert.crt> <out.der>: a "good" response for the certificate
+  local cert="$1" out="$2" ser dn
+  ser="$(openssl x509 -in "$cert" -serial -noout | cut -d= -f2)"
+  dn="$(openssl x509 -in "$cert" -subject -noout -nameopt oneline | sed 's/^subject=//')"
+  printf 'V\t491231235959Z\t\t%s\tunknown\t%s\n' "$ser" "$dn" > "$TMP/ocsp-index.txt"
+  openssl ocsp -reqout "$TMP/ocsp.req" -issuer intermediate.crt -cert "$cert" -no_nonce
+  openssl ocsp -index "$TMP/ocsp-index.txt" -CA intermediate.crt \
+    -rsigner ocsp.crt -rkey ocsp.key \
+    -reqin "$TMP/ocsp.req" -respout "$out"
+}
+# a stale response from a previous PKI would carry the old issuer hashes
+rm -f signer-rsa.ocsp.der
+if ocsp_response signer-rsa.crt signer-rsa.ocsp.der 2>/dev/null; then
+  echo "signer-rsa.ocsp.der written"
+else
+  echo "WARNING: this openssl cannot answer an OCSP request offline;" >&2
+  echo "WARNING: signer-rsa.ocsp.der is missing and the OCSP tests will skip" >&2
+fi
+
 echo "== PKCS#12 for the official AutoFirma, chain included =="
 # AutoFirma loads .p12, so the golden files are produced with exactly the
 # certificate openfirma uses. Password is not a secret.
@@ -181,10 +255,11 @@ openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-ec.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-juridical.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-representative.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt tsa.crt
+openssl verify -CAfile ca.crt -untrusted intermediate.crt ocsp.crt
 
 echo "== every key must be PKCS#8, our loader accepts nothing else =="
 for k in ca.key intermediate.key signer-rsa.key signer-ec.key \
-         signer-juridical.key signer-representative.key tsa.key; do
+         signer-juridical.key signer-representative.key tsa.key ocsp.key; do
   # The pattern avoids spelling out the PEM header, tools/check-no-real-certs.sh
   # would flag this script for containing one
   head -1 "$k" | grep -qE '^-----BEGIN.*KEY-----$' || { echo "$k is not PKCS#8" >&2; exit 1; }

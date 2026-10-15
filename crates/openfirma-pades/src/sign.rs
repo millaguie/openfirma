@@ -1,5 +1,7 @@
 //! PAdES-B-B: a detached CAdES inside a PDF signature dictionary, added to the
-//! document as an incremental update.
+//! document as an incremental update. The long-term levels (B-LT validation
+//! data, B-LTA document time-stamp) are further revisions appended by
+//! `crate::ltv` after the signature this module writes exists.
 //!
 //! The signature covers the file except the value of `/Contents`, which is a
 //! chicken and egg problem: the digest has to be computed over bytes that
@@ -22,16 +24,18 @@ use std::time::SystemTime;
 
 use openfirma_cades::{CadesOptions, sign as cades_sign};
 use openfirma_core::alg::DigestAlg;
+use openfirma_core::cert::CertificateHandle;
 use openfirma_core::signer::Signer;
 use openfirma_core::{Error, Result, oid};
 
 use crate::appearance::{self, Appearance};
+use crate::ltv::{self, RevocationBytes};
 use crate::pdf::{self, Location, ObjRef};
 use crate::update::{Object, Update};
 
 /// Digits reserved for each number of `/ByteRange`. Ten covers files up to
 /// 9999999999 bytes, and the width has to be fixed before the layout is known.
-const BYTERANGE_WIDTH: usize = 10;
+pub(crate) const BYTERANGE_WIDTH: usize = 10;
 
 /// How much space to reserve for `/Contents` when the caller does not say.
 ///
@@ -72,6 +76,29 @@ pub struct PadesOptions {
     /// B-T: asked for a time-stamp token over the signature value. See
     /// [`openfirma_cades::TimestampFn`]; the transport is the caller's.
     pub timestamp: Option<openfirma_cades::TimestampFn>,
+
+    /// B-LT: certificates to archive in the document's `/DSS` on top of the
+    /// signer's own certificate and chain — a co-signer's chain, the TSA's,
+    /// cross certificates. Nothing is ever fetched: what is archived is
+    /// exactly what the caller hands over here and in
+    /// [`PadesOptions::revocation`].
+    pub validation_certs: Vec<CertificateHandle>,
+
+    /// B-LT: revocation data to archive in the `/DSS`. For the archive to
+    /// serve its purpose this needs at least one datum (a CRL, or an OCSP
+    /// response) per CA certificate of the chain, and `openfirma verify`
+    /// reports the archive as incomplete without it.
+    pub revocation: Vec<RevocationBytes>,
+
+    /// B-LTA: a document time-stamp appended after the validation data, as a
+    /// new signature field whose `/Contents` is an RFC 3161 token over
+    /// everything before it, the `/DSS` included. Same
+    /// [`openfirma_cades::TimestampFn`] mechanism as B-T — the closure is
+    /// called with the bytes the token must imprint — and the order is part
+    /// of the level: signature, then validation data, then this stamp.
+    /// Requires validation data in the same call or already in the document,
+    /// because B-LTA is B-LT plus the document time-stamp.
+    pub document_timestamp: Option<openfirma_cades::TimestampFn>,
 }
 
 impl Default for PadesOptions {
@@ -86,6 +113,9 @@ impl Default for PadesOptions {
             location: None,
             contact_info: None,
             timestamp: None,
+            validation_certs: Vec::new(),
+            revocation: Vec::new(),
+            document_timestamp: None,
         }
     }
 }
@@ -210,6 +240,23 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     out.extend_from_slice(&rendered.bytes);
 
     finish(&mut out, sig_at, signer, opts)?;
+
+    // B-LT and B-LTA are further revisions on top of the signature, and the
+    // order is part of the specification (ETSI EN 319 142-1): the signature
+    // exists first, then the validation data that lets it be checked years
+    // from now, then a document time-stamp over both. Each step is its own
+    // incremental update, so the revision boundaries line up with the levels.
+    if !opts.validation_certs.is_empty() || !opts.revocation.is_empty() {
+        let mut certs = vec![signer.certificate().clone()];
+        certs.extend_from_slice(signer.chain());
+        certs.extend_from_slice(&opts.validation_certs);
+        out = ltv::add_validation_data(&out, &certs, &opts.revocation)?;
+    }
+    if let Some(stamp) = &opts.document_timestamp {
+        // add_document_timestamp refuses a document without /DSS, which is
+        // the B-LTA rule: the archive stamp goes over validation data.
+        out = ltv::add_document_timestamp(&out, stamp, opts.digest, opts.contents_reserved)?;
+    }
     Ok(out)
 }
 
@@ -266,7 +313,13 @@ fn build_acroform(fields: &[ObjRef], helv: ObjRef, zadb: ObjRef) -> String {
 /// `/F 132` is `Print | Locked`, `/Rect [0 0 0 0]` with a blank appearance is
 /// an invisible signature, which is what AutoFirma writes when no position is
 /// given.
-fn build_field(name: String, appearance: ObjRef, page: ObjRef, sig: ObjRef, rect: &str) -> Vec<u8> {
+pub(crate) fn build_field(
+    name: String,
+    appearance: ObjRef,
+    page: ObjRef,
+    sig: ObjRef,
+    rect: &str,
+) -> Vec<u8> {
     let mut d = Vec::new();
     d.extend_from_slice(
         format!(
@@ -281,7 +334,7 @@ fn build_field(name: String, appearance: ObjRef, page: ObjRef, sig: ObjRef, rect
 }
 
 /// The page's `/Annots` with our field added, keeping the ones already there.
-fn merged_annots(page: &[u8], field: ObjRef) -> Result<Vec<u8>> {
+pub(crate) fn merged_annots(page: &[u8], field: ObjRef) -> Result<Vec<u8>> {
     match pdf::get(page, "/Annots") {
         Some(existing) => {
             let mut v = pdf::trim_ws(existing).to_vec();
@@ -300,7 +353,24 @@ fn merged_annots(page: &[u8], field: ObjRef) -> Result<Vec<u8>> {
 /// `/Contents`. `sig_at` is the absolute offset of the signature dictionary
 /// object in `out`.
 fn finish(out: &mut [u8], sig_at: usize, signer: &dyn Signer, opts: &PadesOptions) -> Result<()> {
-    let body = pdf::object_body(out, sig_at)?;
+    fill_hole(out, sig_at, "CMS", &|covered| {
+        cades_sign(covered, signer, &cades_options(opts))
+    })
+}
+
+/// The placeholder mechanism both `/Contents` holes share, the signature's
+/// and the document time-stamp's: patch `/ByteRange` with numbers of exactly
+/// the reserved width, digest the two ranges, and fill the hole with the hex
+/// of whatever `produce` makes from those bytes, zero padded.
+///
+/// `what` names the value in error messages ("CMS", "time-stamp token").
+pub(crate) fn fill_hole(
+    out: &mut [u8],
+    dict_at: usize,
+    what: &str,
+    produce: &dyn Fn(&[u8]) -> Result<Vec<u8>>,
+) -> Result<()> {
+    let body = pdf::object_body(out, dict_at)?;
     let dict = &out[body.clone()];
 
     let contents_rel = pdf::get_span(dict, "/Contents")
@@ -345,20 +415,20 @@ fn finish(out: &mut [u8], sig_at: usize, signer: &dyn Signer, opts: &PadesOption
     covered.extend_from_slice(&out[..contents_start]);
     covered.extend_from_slice(&out[contents_end..]);
 
-    let cms = cades_sign(&covered, signer, &cades_options(opts))?;
+    let value_der = produce(&covered)?;
 
     let hex_len = contents_end - contents_start - 2;
-    if cms.len() * 2 > hex_len {
+    if value_der.len() * 2 > hex_len {
         return Err(Error::Pdf(format!(
-            "the CMS needs {} bytes but /Contents only reserves {}; raise \
-             PadesOptions::contents_reserved",
-            cms.len(),
+            "the {what} needs {} bytes but /Contents only reserves {}; raise the reserved \
+             size (PadesOptions::contents_reserved)",
+            value_der.len(),
             hex_len / 2
         )));
     }
     // lower case hex, zero padded to the reserved width, which is what iText
     // writes and what readers expect: the DER is parsed and the padding ignored
-    let mut value = hex::encode(&cms).into_bytes();
+    let mut value = hex::encode(&value_der).into_bytes();
     value.resize(hex_len, b'0');
     out[contents_start + 1..contents_end - 1].copy_from_slice(&value);
     Ok(())
@@ -384,7 +454,7 @@ fn cades_options(opts: &PadesOptions) -> CadesOptions {
 }
 
 /// The `index`th page of the document, counting from 1.
-fn page_at(
+pub(crate) fn page_at(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
     catalog: &[u8],
@@ -478,12 +548,12 @@ fn readable_date(t: SystemTime) -> Result<String> {
 
 /// The signature fields already in the document, so that a second signature is
 /// added to `/Fields` instead of replacing the first one.
-struct ExistingFields {
-    refs: Vec<ObjRef>,
-    names: Vec<String>,
+pub(crate) struct ExistingFields {
+    pub refs: Vec<ObjRef>,
+    pub names: Vec<String>,
 }
 
-fn existing_signature_fields(
+pub(crate) fn existing_signature_fields(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
     catalog: &[u8],
@@ -523,10 +593,17 @@ fn existing_signature_fields(
 }
 
 fn next_field_name(taken: &[String]) -> String {
+    next_name("Signature", taken)
+}
+
+/// The first free `<prefix>1`, `<prefix>2`, ... among the taken names. The
+/// document time-stamp field is named `TimestampN` this way, so a co-signing
+/// tool and a time-stamping tool do not fight over `SignatureN`.
+pub(crate) fn next_name(prefix: &str, taken: &[String]) -> String {
     (1..)
-        .map(|n| format!("Signature{n}"))
+        .map(|n| format!("{prefix}{n}"))
         .find(|candidate| !taken.contains(candidate))
-        .unwrap_or_else(|| "Signature1".into())
+        .unwrap_or_else(|| format!("{prefix}1"))
 }
 
 /// Renders `text` as a PDF literal string.

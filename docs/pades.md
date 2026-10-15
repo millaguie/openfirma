@@ -108,3 +108,128 @@ The golden comparison runs both sides through `qpdf --qdf
 --object-streams=disable`, which collapses revisions and decompresses object
 streams, so the container difference disappears and what is left to compare is
 the signature semantics.
+
+## B-LT and B-LTA: the long-term levels
+
+ETSI EN 319 142-1 defines two levels on top of B-T, and both are further
+incremental updates appended **in a fixed order, which is part of the level**:
+the B-B signature exists first, then the validation data (B-LT), then a
+document time-stamp over everything before it (B-LTA). Appending is what makes
+the levels safe: every earlier signature's `/ByteRange` addresses absolute
+offsets, and none of the later revisions moves a byte of what it covered.
+
+### Why there is no AutoFirma golden for these levels
+
+The method of this repository is to measure AutoFirma's output, and for B-B
+that is what happened. For B-LT there is nothing to measure: **AutoFirma's
+default PAdES output carries no `/DSS`**. Its extension mechanism for
+long-term validation data, the "enhancer", ships disabled — every line of
+`afirma-crypto-pdf/src/main/resources/enhancer.properties`, including the
+`enhancerClassFile` that names the `PDFEnhancer` implementation, is commented
+out, and the reference 1.9 jar signs B-B (with B-T when a TSA is configured)
+and stops. Rather than invent a golden, the reference for these two levels is
+the specification text plus the independent verifiers of
+`docs/validation.md`: `openfirma verify`'s own `/DSS` checks, `openssl crl
+-verify` on the embedded CRLs, `openssl ts -verify` on the document time-stamp
+token against exactly the bytes its `/ByteRange` names, `qpdf --check`, and
+poppler `pdfsig` still reporting every earlier signature valid after the
+long-term revisions are appended. If a future AutoFirma ships an enabled
+enhancer, the golden diff is extended to cover it.
+
+### B-LT: the `/DSS`
+
+One more revision, adding to the catalog a `/DSS` dictionary (ISO 32000-2
+12.8.4.4, ETSI EN 319 142-1 5.4.2) and the stream objects it references:
+
+```
+catalog  /DSS <dss>
+dss      << /Type /DSS
+           /VRI << /<HEX40> << /CRL [ <streams> ] /Cert [ <streams> ]
+                               /OCSP [ <streams> ] >> ... >>
+           /Certs [ one stream per DER certificate ]
+           /CRLs  [ one stream per DER CertificateList ]
+           /OCSPs [ one stream per DER OCSPResponse ] >>
+stream   << /Length N >> stream <the DER, uncompressed> endstream
+```
+
+The details that are decisions rather than accidents:
+
+- **The `/VRI` key** is the upper case hex of the **SHA-1 of the complete
+  `/Contents` string** of each signature — the decoded bytes *including the
+  zero padding*, not the DER inside and not the CMS `signatureValue`. That is
+  the input ETSI EN 319 142-1 5.4.2.2 a) names ("the bytes that are hashed
+  shall be those of the complete hexadecimal string in the entry with the key
+  Contents") and exactly what the European Commission's DSS validator
+  recomputes in `PAdESSignature.getVRIKey()`, so a validator looking for a
+  signature's validation data finds it under this key and no other. The key is
+  written as a **name** (`/1A2B...`), because PDF dictionary keys are names
+  and qpdf rejects anything else; both spellings are read back.
+- **Nothing is fetched.** The certificates and the revocation data come from
+  `PadesOptions::validation_certs` and `PadesOptions::revocation`, or from
+  the signer's own chain. Where a CRL or an OCSP response came from is the
+  caller's business; a signature library that quietly went to the network
+  would be a different kind of program.
+- **One entry per signature in the document**, not just per new one: a B-LT
+  pass over a co-signed document archives the chains of every signature it can
+  see, and the data for each is indexed under that signature's own key.
+  Extending a document twice duplicates nothing: blobs already in the `/DSS`
+  are reused by reference, and signatures already keyed in `/VRI` are skipped.
+- `/TU` is left out: it is the collection time of the validation data, and
+  the library only ever sees bytes, not the moment they were fetched.
+- The streams are uncompressed on purpose. The point of the archive is to be
+  readable decades from now, and DER is already dense.
+- A signature added *after* the archive is simply not covered by it;
+  `openfirma verify` reports it as uncovered rather than failing, because a
+  later plain B-B signature is legal in a B-LT document.
+
+`openfirma verify` checks the archive when one is present: every `/Certs`
+entry parses as a certificate, every `/CRLs` entry parses, names a CA that is
+in the archive or the trust anchors, and its **signature verifies under that
+CA's key** (a CRL signed by anyone else is refused — the name is data, the
+signature is the statement), its dates hold at the validation time, every
+`/OCSPs` entry is a *successful* response, and for every signature the `/VRI`
+covers, the chain rebuilds **from the `/DSS` contents alone** with at least
+one revocation datum per CA certificate of that chain and no certificate of
+the chain revoked by the archived data.
+
+### B-LTA: the document time-stamp
+
+One more revision, adding a new signature field appended to `/Fields` (and to
+the page's `/Annots`), whose value is:
+
+```
+<< /ByteRange [0 x y z] /Contents <hex, zero padded>
+   /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161
+   /Type /DocTimeStamp >>
+```
+
+Its `/ByteRange` covers everything before the hole — the signature, its B-T
+token and the whole `/DSS` included — and `/Contents` holds an RFC 3161 token
+imprinting exactly those bytes. The token comes through the same
+`TimestampFn` closure as the B-T signature time-stamp: the library builds the
+query, the caller owns the transport, and the token's imprint is checked
+against the covered bytes **before** it is embedded, so a token over anything
+else is refused at embed time. The field is named `TimestampN`, the first free
+one, so it never collides with a `SignatureN`; there is no `/M`, because the
+time of a document time-stamp lives in its token and nowhere else. The
+document time-stamp requires the `/DSS` to exist first — B-LTA is B-LT plus
+the stamp, and the stamp is what freezes the archive.
+
+### Out of scope, and why
+
+- **CAdES ES-LT / ES-LTA.** The CAdES equivalents (validation data as
+  `certificate-values`/`revocation-values` unsigned attributes, archive
+  time-stamp chains) are deliberately not implemented: openfirma's long-term
+  path is PAdES, where the archive lives in the document's `/DSS`. The
+  revocation reading they would need (`openfirma-cades::revocation`) already
+  exists and is shared.
+- **OCSP response signatures are not verified.** `openfirma verify` reads an
+  archived OCSP response down to its `CertID`s and `certStatus` and
+  associates it with the CA by the RFC 6960 hashes, but verifying the
+  response's own signature needs the responder's certificate and the ESS
+  matching of RFC 6960 4.2.2.2 — a chain of trust of its own. The CRL is the
+  cryptographically checked revocation path; an archive that must stand
+  entirely on its own should carry CRLs.
+- **The time-stamp token's own signature** is not verified by
+  `openfirma verify` either (openssl does it in the crosscheck suite); the
+  verifier checks the imprint, which is the property the PDF layer owns.

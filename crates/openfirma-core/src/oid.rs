@@ -46,6 +46,10 @@ pub const ID_ARCHIVE_TIME_STAMP_V2: ObjectIdentifier =
 pub const ID_CT_TST_INFO: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
 
+// RFC 6960, OCSP: the response type of a BasicOCSPResponse
+pub const ID_PKIX_OCSP_BASIC: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.1");
+
 // ETSI arcs
 /// `CAdESAttributes.OID_id_aa_ets_mimeType`, TS 101 733 V2.1.1. AutoFirma
 /// puts the MIME type of the signed data under this OID, not under the RFC
