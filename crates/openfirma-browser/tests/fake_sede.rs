@@ -61,9 +61,13 @@ fn request(
         "Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     ));
-    stream.write_all(text.as_bytes()).unwrap();
-    stream.write_all(body).unwrap();
-    stream.flush().unwrap();
+    // Writing may fail, and that is part of the contract: when the endpoint
+    // refuses a request it answers and closes while a large body may still be
+    // in flight, and whether the write then succeeds is OS timing (macOS RSTs,
+    // Linux buffers), not an openfirma rule. The answer gets read regardless.
+    let _ = stream.write_all(text.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
     let mut raw = Vec::new();
     // The endpoint always closes; read to EOF. Cap the read so a server that
     // streamed forever would fail this test instead of hanging CI.
@@ -81,6 +85,29 @@ fn request(
                 raw.extend_from_slice(&buf[..n]);
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A refusal closes while our (possibly huge, deliberately refused)
+            // body may still be in flight; the OS may report the RST on read
+            // after we already hold the full answer. If the bytes so far are a
+            // complete response, that reset is the close we asked for.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    && raw
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .is_some_and(|split| {
+                            let len: Option<usize> = String::from_utf8_lossy(&raw[..split])
+                                .lines()
+                                .filter_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().to_owned())
+                                })
+                                .find_map(|v| v.parse().ok());
+                            len.is_none_or(|n| raw[split + 4..].len() >= n)
+                        }) =>
+            {
+                break;
+            }
             Err(e) => panic!("reading the answer failed: {e}"),
         }
     }
@@ -502,15 +529,24 @@ fn request_chunked(
         text.push_str(&format!("Origin: {o}\r\n"));
     }
     text.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
-    stream.write_all(text.as_bytes()).unwrap();
-    stream
-        .write_all(format!("{:x}\r\n", body.len()).as_bytes())
-        .unwrap();
-    stream.write_all(body).unwrap();
-    stream.write_all(b"\r\n0\r\n\r\n").unwrap();
-    stream.flush().unwrap();
+    // Same as `request`: the endpoint refuses chunked bodies without reading
+    // one byte of them, so our own chunk write racing its close is expected;
+    // what is asserted is the answer the read gets back.
+    let _ = stream.write_all(text.as_bytes());
+    let _ = stream.write_all(format!("{:x}\r\n", body.len()).as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.write_all(b"\r\n0\r\n\r\n");
+    let _ = stream.flush();
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).unwrap();
+    match stream.read_to_end(&mut raw) {
+        Ok(_) => {}
+        // ECONNRESET here means the refusal arrived and the close raced the
+        // unread body — the refusal itself, which is what this case asserts,
+        // may still be in the buffer before the reset; if it is not, the
+        // parse below fails loudly, as a missing refusal should.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("reading the answer failed: {e}"),
+    }
     parse_response(&raw)
 }
 
@@ -532,9 +568,13 @@ fn request_no_length(
     // no Content-Length at all — and the endpoint has nothing to cap, so it
     // must refuse rather than read until hope runs out.
     text.push_str("Connection: close\r\n\r\n");
-    stream.write_all(text.as_bytes()).unwrap();
-    stream.write_all(body).unwrap();
-    stream.flush().unwrap();
+    // Writing may fail, and that is part of the contract: when the endpoint
+    // refuses a request it answers and closes while a large body may still be
+    // in flight, and whether the write then succeeds is OS timing (macOS RSTs,
+    // Linux buffers), not an openfirma rule. The answer gets read regardless.
+    let _ = stream.write_all(text.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
     parse_response(&raw)

@@ -651,8 +651,18 @@ fn write_bytes(
     // module header. A same-origin page does not need it; a cross-origin one
     // must not get it.
     head.push_str("\r\n");
+    let result = write_and_flush(stream, &head, body);
+    // Graceful close before the socket drops: without it, a reply that is
+    // still in flight when the thread ends can be RST'd instead of FIN'd —
+    // macOS does this readily when the peer has already stopped reading (it
+    // never reads a refusal's body) — and the client sees "connection reset"
+    // where we promised a named refusal.
+    stream.shutdown(std::net::Shutdown::Both).ok();
+    result
+}
+
+fn write_and_flush(stream: &mut TcpStream, head: &str, body: &[u8]) -> std::io::Result<()> {
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
-    stream.flush()?;
-    Ok(())
+    stream.flush()
 }
