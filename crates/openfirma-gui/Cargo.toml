@@ -1,0 +1,45 @@
+[package]
+name = "openfirma-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "openfirma graphical client: one window that signs and verifies, built on the same library calls as the CLI (docs/adr-0006)"
+
+[[bin]]
+name = "openfirma-gui"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[features]
+# ON by default for local builds; CI passes `--no-default-features` on the
+# cross targets, where a windowing system cannot be linked at all (the reason
+# is spelled out in .github/workflows/ci.yml and docs/adr-0006).
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui", "dep:rfd"]
+
+[dependencies]# The GUI is a thin layer: everything it does, it does through these exact
+# library calls the CLI also makes. No format logic lives in this crate.
+openfirma-core.workspace = true
+openfirma-cades.workspace = true
+openfirma-pades.workspace = true
+openfirma-xades.workspace = true
+openfirma-keystore.workspace = true
+openfirma-browser.workspace = true
+anyhow.workspace = true
+zeroize.workspace = true
+# Only the errors module's unit tests fabricate a `der::Error` to prove ASN.1
+# chatter never reaches the plain line; the wrapper matches on the error kind.
+der.workspace = true
+# The window itself: egui immediate-mode UI through eframe on the glow
+# (OpenGL) backend. `glow` is in default-features below, never a webview.
+eframe = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
+rfd = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The windowless UI test harness: it renders the widget tree in memory so the
+# wizard's state machine is asserted by `cargo test`, not by hand (ADR-0006).
+egui_kittest.workspace = true
+

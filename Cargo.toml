@@ -8,6 +8,7 @@ members = [
     "crates/openfirma-keystore",
     "crates/openfirma-browser",
     "crates/openfirma-cli",
+    "crates/openfirma-gui",
 ]
 
 [workspace.package]
@@ -70,6 +71,29 @@ anyhow = "1"
 # its own MSRV above the workspace's rust-version = 1.85. The crate has no
 # unsafe beyond the FFI it wraps and pulls no C code.
 libloading = "0.8"
+# The file dialogs of openfirma-gui (docs/adr/0006). Not a second signing
+# stack: it only shows the OS's own open/save dialog, so on Linux and Windows
+# the dialog is GTK/Win32 (not RustCrypto, not crypto) — like every native
+# file picker. Version chosen by lookup: 0.16 is the current release, and its
+# rfd-derive proc macro is pure Rust. Everything else in the GUI goes through
+# egui itself, which drags no system library beyond OpenGL (see ADR-0006).
+rfd = "0.16"
+
+# --- GUI, feature-gated behind `gui` and never a CLI dependency: see ADR-0006 ---
+# eframe 0.37 is the current release; it is egui's own windowing framework.
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "x11",
+    "wayland",
+    "default_fonts",
+] }
+egui = "0.37"
+# The windowless UI test harness of egui (ADR-0006): it drives the widget tree
+# without a display, which is what lets `cargo test` assert the GUI's logic.
+# `accesskit` is what egui_kittest's eframe seam (`build_eframe`) requires of
+# eframe: the harness reads the widget tree through AccessKit, so the App must
+# publish it. The snapshot feature stays off — pixel tests would pin fonts.
+egui_kittest = { version = "0.37", features = ["eframe"] }
 
 # NOTE: no rcgen. It pulls ring or aws-lc-rs, which are C/asm, and that would
 # break the pure Rust rule even as a dev dependency. Test certificates come

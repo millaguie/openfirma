@@ -9,6 +9,7 @@ pub mod error;
 pub mod oid;
 pub mod signer;
 pub mod tlv;
+pub mod workflow;
 
 pub use alg::{DigestAlg, KeyAlgorithm, SignatureAlg};
 pub use cert::CertificateHandle;

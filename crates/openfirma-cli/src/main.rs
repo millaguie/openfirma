@@ -583,110 +583,19 @@ fn split_http_response(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(body_out)
 }
 
-/// One `--store` / `keystores list --store` descriptor, parsed.
-#[derive(Debug)]
-enum StoreSpec {
-    /// `pkcs11:/path/to/module.so[:token label][:]` — the token part is
-    /// optional and means "the first slot with a token"; a second colon after
-    /// the label marks a keystore that needs no PIN at all.
-    Pkcs11 {
-        module: PathBuf,
-        token: Option<String>,
-        wants_no_pin: bool,
-    },
-    /// `nss` or `nss:sql:/path/to/db` — without a database, `$HOME/.pki/nssdb`
-    /// is used, the standard location for a shared NSS database.
-    Nss {
-        db: String,
-    },
-    Windows,
-    Macos,
-}
+/// One `--store` / `keystores list --store` descriptor, parsed. The type and
+/// its parser live in `openfirma_core::workflow` (docs/adr-0006): the GUI's
+/// add-a-keystore field and this flag are ONE parser over ONE spelling, so a
+/// descriptor accepted by `openfirma sign --store` is accepted by the window
+/// and vice versa — the drift both frontends' tests would never catch. The
+/// local name stays because every match arm below reads it naturally.
+type StoreSpec = openfirma_core::workflow::StoreSpec;
 
-/// Parses a store descriptor. The module-path/`token label` split uses the
-/// *last* colon so unix paths keep working; `label:` only means a token when
-/// what precedes it names an existing file — a Windows drive letter is told
-/// apart that way too (`C:\tokens\mod.dll:mytoken` splits at the last colon,
-/// `C:\tokens\mod.dll` does not split at its colon).
+/// Parses a store descriptor through the shared rule (see above). The core
+/// parser's messages are already `--store`-phrased — they were written from
+/// this flag's own text when the code moved — so nothing is reworded.
 fn parse_store_spec(text: &str) -> Result<StoreSpec> {
-    let (kind, rest) = text.split_once(':').unwrap_or((text, ""));
-    // Two colons at the end (`…mod.so:label::`, or `…mod.so::` with no
-    // label): strip the marker once, up front, so splitting sees exactly one
-    // separator. A single trailing colon is a token split (or a drive), and
-    // stays for the rules below to resolve.
-    let (rest, wants_no_pin) = match rest.strip_suffix("::") {
-        Some(base) => (base, true),
-        None => (rest, false),
-    };
-    match kind.to_ascii_lowercase().as_str() {
-        "pkcs11" => {
-            if rest.is_empty() {
-                anyhow::bail!(
-                    "--store pkcs11: needs the module path: \
-                     --store pkcs11:/usr/lib/opensc-pkcs11.so[:token label]"
-                );
-            }
-            let (module, tail) = split_trailing_token(rest);
-            // One separator, at most: `label` is the token when present. A
-            // drive-letter path never gains a tail here — the split refuses to
-            // cut `C:` at index 1 — and the no-PIN marker was already stripped
-            // above, so nothing else can masquerade as a separator.
-            let token = match tail {
-                Some(tail) if !tail.is_empty() => Some(tail.to_string()),
-                _ => None,
-            };
-            Ok(StoreSpec::Pkcs11 {
-                module: PathBuf::from(module),
-                token,
-                wants_no_pin,
-            })
-        }
-        "nss" => {
-            let db = if rest.is_empty() {
-                let home = std::env::var("HOME").context(
-                    "the default NSS database is $HOME/.pki/nssdb and HOME is not set: \
-                     name the database with --store nss:sql:/path/to/db",
-                )?;
-                format!("sql:{home}/.pki/nssdb")
-            } else {
-                rest.to_string()
-            };
-            Ok(StoreSpec::Nss { db })
-        }
-        "windows" | "macos" | "apple" => {
-            if !rest.is_empty() {
-                anyhow::bail!("--store {kind} takes no argument, got {text:?}");
-            }
-            if kind.eq_ignore_ascii_case("windows") {
-                Ok(StoreSpec::Windows)
-            } else {
-                Ok(StoreSpec::Macos)
-            }
-        }
-        other => anyhow::bail!(
-            "unknown --store {other:?}: use pkcs11:/path/to/module.so[:token], \
-             nss[:sql:/path/to/db], windows, or macos"
-        ),
-    }
-}
-
-/// Splits `module[:token]` on the last colon — but only when what precedes it
-/// names a file. That rule protects Windows drive letters without any OS
-/// special case: `C:\path\mod.dll` has its trailing colon at index 1, where
-/// `C` is not a file, so nothing is split; `...\mod.dll:mytoken` splits after
-/// the module because the module exists. A path that does not exist reports
-/// through the loader's own error later, and there splitting is moot anyway.
-/// Two colons at the end (`module::label` style is a caller problem) are left
-/// to the caller to interpret; a bare trailing colon means "no label".
-fn split_trailing_token(rest: &str) -> (&str, Option<&str>) {
-    // Never cut inside `X:` (a drive letter): only colons from index 2 on can
-    // separate a module from its token. Windows-only in practice; the guard is
-    // free and makes the result identical everywhere.
-    let drive_colon = rest.get(1..2) == Some(":");
-    match rest.rfind(':') {
-        Some(i) if i >= 2 && !drive_colon => (&rest[..i], Some(&rest[i + 1..])),
-        _ => (rest, None),
-    }
+    StoreSpec::parse(text).map_err(anyhow::Error::msg)
 }
 
 /// The PIN for a keystore, read from the environment variable named by
@@ -807,31 +716,14 @@ fn store_signer(store: &DynStore, alias: Option<&str>) -> Result<Box<dyn Signer 
 /// one catches an output that is a symlink or a hard link to the input. The
 /// input is read whole before the output is written, so nothing is lost
 /// mechanically — what is refused is the silent case, where one typo turns a
-/// signature into a replacement of the only copy of a document.
 fn check_not_in_place(
     input: &std::path::Path,
     output: &std::path::Path,
     force: bool,
 ) -> Result<()> {
-    if force {
-        return Ok(());
-    }
-    let absolute_same = match (std::path::absolute(input), std::path::absolute(output)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    let canonical_same = match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    if absolute_same || canonical_same {
-        anyhow::bail!(
-            "{} is both the input and the output: signing would replace the document \
-             itself. Choose a different -o, or pass --force to overwrite it anyway",
-            input.display()
-        );
-    }
-    Ok(())
+    // The shared rule (openfirma-core's workflow): the window checks the same
+    // thing with the same function, so neither frontend signs a document away.
+    openfirma_core::workflow::check_not_in_place(input, output, force).map_err(anyhow::Error::msg)
 }
 
 /// Parses `llx,lly,urx,ury`, accepting commas or spaces as separators.
