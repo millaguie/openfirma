@@ -22,5 +22,6 @@ pub mod signed_data;
 pub mod tsp;
 pub mod verify;
 
+pub use revocation::read_ocsp_response;
 pub use signed_data::{CadesOptions, TimestampFn, sign};
 pub use verify::{Attributes, VerifyOptions, VerifyReport, verify};

@@ -41,6 +41,432 @@ fn ocsp_status_name(code: u32) -> &'static str {
     }
 }
 
+/// `id-kp-OCSPSigning` (RFC 6960 4.2.2.2): the extended key usage a respon-
+/// der other than the CA itself must carry to speak for that CA.
+const OID_EKU_OCSP_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.9");
+
+/// What reading an archived OCSP response establishes, part by part. Every
+/// part is reported separately because the archive consumer must be able to
+/// tell "nobody made this statement" from "the statement is genuine but its
+/// interval ended": only [`OcspStatus::verified`] counts as a revocation da-
+/// tum, but the reasons are what a user needs to hear.
+#[derive(Clone, Debug)]
+pub struct OcspStatus {
+    /// The signature over `tbsResponseData` verifies under some certificate
+    /// this response itself carries or the pool does.
+    pub signature_verified: bool,
+    /// That signer is the CA the CertIDs name, or a delegate that CA autho-
+    /// rized with `id-kp-OCSPSigning` and that chains to it (RFC 6960
+    /// 4.2.2.2). False also when the named CA is not in the pool at all.
+    pub chains_to_issuer: bool,
+    /// `at` falls inside `thisUpdate <= at < nextUpdate` (nextUpdate absent
+    /// means no upper bound known to RFC 6960, which keeps the statement cu-
+    /// rrent — same reading as a CRL without one).
+    pub current: bool,
+    /// `thisUpdate` of the first SingleResponse.
+    pub this_update: SystemTime,
+    /// `nextUpdate`, when present.
+    pub next_update: Option<SystemTime>,
+    /// The CertIDs, so /VRI-style association can proceed on a verified an-
+    /// swer without parsing it twice.
+    pub cert_ids: Vec<OcspCertId>,
+    /// Why the response does not count; `None` exactly when [`Self::verified`]
+    /// holds.
+    pub problem: Option<String>,
+}
+
+impl OcspStatus {
+    /// Whether this response may be counted as a revocation datum: every
+    /// part above checked out for `at`.
+    pub fn verified(&self) -> bool {
+        self.problem.is_none()
+    }
+}
+
+/// Reads AND verifies an OCSP response the way [`verify_crl`] does a CRL, so
+/// archived validation data can be trusted on its own years after signing
+/// (adversarial review A4). The signature is taken over the whole `tbsRes-
+/// ponseData` TLV as encoded — RFC 6960 signs those bytes, not a re-encoded
+/// model of them — under either the CA each CertID names by its hashes, or a
+/// certificate that response embeds whose EKU names `id-kp-OCSPSigning` and
+/// that chains to that CA. An absence of extendedKeyUsage means any purpose
+/// (RFC 5280 4.2.1.12), so the CA's own certificate never carries the delega-
+/// tion OID. A response signed by nobody in that set — even one whose crypto-
+/// graphic signature is perfectly readable under a leaf key — makes no state-
+/// ment and reports `signature_verified`/`chains_to_issuer` accordingly.
+pub fn read_ocsp_response(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> OcspStatus {
+    match read_and_check(der, issuers, at) {
+        Ok(status) => status,
+        Err(e) => OcspStatus {
+            signature_verified: false,
+            chains_to_issuer: false,
+            current: false,
+            this_update: SystemTime::UNIX_EPOCH,
+            next_update: None,
+            cert_ids: Vec::new(),
+            problem: Some(detail_of(&e)),
+        },
+    }
+}
+
+fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> Result<OcspStatus> {
+    // ---- structure down to tbsResponseData, kept as whole TLV bytes -------
+    let mut outer = Cur::new(der);
+    let resp = outer.expect(tlv::TAG_SEQUENCE, "the OCSPResponse")?;
+    if !outer.done() {
+        return Err(trailing("after the OCSPResponse"));
+    }
+    let mut r = Cur::new(resp.content);
+    let status = r.expect(0x0a, "responseStatus")?; // ENUMERATED
+    let code = enumerated(&status, "responseStatus")?;
+    if code != 0 {
+        return Err(Error::Verification(format!(
+            "the OCSP responder answered \"{}\" (status {code}), not \"successful\"",
+            ocsp_status_name(code)
+        )));
+    }
+    let bytes = r.expect(0xa0, "responseBytes")?;
+    let mut rb = Cur::new(bytes.content);
+    let seq = rb.expect(tlv::TAG_SEQUENCE, "ResponseBytes")?;
+    let mut s = Cur::new(seq.content);
+    let response_type = s.oid("ResponseBytes.responseType")?;
+    if response_type != oid::ID_PKIX_OCSP_BASIC {
+        return Err(Error::Verification(format!(
+            "the OCSP responseBytes carry {response_type}, only a BasicOCSPResponse \
+             ({}) can be read",
+            oid::ID_PKIX_OCSP_BASIC
+        )));
+    }
+    let basic_octets = s.expect(tlv::TAG_OCTET_STRING, "ResponseBytes.response")?;
+    let mut b = Cur::new(basic_octets.content);
+    let basic = b.expect(tlv::TAG_SEQUENCE, "the BasicOCSPResponse")?;
+    let mut t = Cur::new(basic.content);
+    let rd = t.expect(tlv::TAG_SEQUENCE, "tbsResponseData")?;
+    let sa = t.expect(tlv::TAG_SEQUENCE, "BasicOCSPResponse.signatureAlgorithm")?;
+    let sig = t.expect(tlv::TAG_BIT_STRING, "BasicOCSPResponse.signature")?;
+    // optional [0] certs: whatever the responder embedded to prove who speaks
+    let mut embedded: Vec<CertificateHandle> = Vec::new();
+    if t.peek_tag() == Some(0xa0) {
+        let certs = t.expect(0xa0, "BasicOCSPResponse.certs")?;
+        // `[0] EXPLICIT Certificate` — one certificate wrapped in a SEQUENCE,
+        // or RFC 6960's IMPLICIT SET OF reading: several bare certificates.
+        // from_der on each element decides which shape the content has.
+        let mut c = Cur::new(certs.content);
+        let mut first = true;
+        while !c.done() {
+            let cert = c.expect(tlv::TAG_SEQUENCE, "an embedded certificate")?;
+            match CertificateHandle::from_der(cert.whole) {
+                Ok(handle) => embedded.push(handle),
+                Err(first_err) => {
+                    // the explicit wrapper: its content is one whole certificate
+                    let mut inner = Cur::new(cert.content);
+                    let mut recovered = false;
+                    while !inner.done() {
+                        let one = inner.expect(tlv::TAG_SEQUENCE, "an embedded certificate")?;
+                        match CertificateHandle::from_der(one.whole) {
+                            Ok(handle) => {
+                                embedded.push(handle);
+                                recovered = true;
+                            }
+                            Err(e) => {
+                                // a SET OF reading where this element really is
+                                // no certificate: only then is it an error, and
+                                // only when nothing at all parsed before it
+                                if !recovered && first {
+                                    return Err(Error::Verification(format!(
+                                        "the OCSP response's embedded certificates do not \
+                                         parse: {first_err}; {e}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            first = false;
+        }
+    }
+
+    // ---- what the response says: responderID, interval, CertIDs ----------
+    let mut d = Cur::new(rd.content);
+    if d.peek_tag() == Some(0xa0) {
+        let _version = d.next()?; // [0] EXPLICIT version
+    }
+    let responder_id = match d.peek_tag() {
+        // [1] byName / [2] byKey: the constructed CHOICE alternatives, tag 0xA1
+        // or 0xA2. A `[x] EXPLICIT Name` spelling wraps them in an outer SEQUENCE,
+        // which is unwrapped below to reach the same choice anyway.
+        Some(0xa1) | Some(0xa2) => d.next()?,
+        _ => {
+            let wrapped = d.expect(tlv::TAG_SEQUENCE, "responderID")?;
+            match Cur::new(wrapped.content).peek_tag() {
+                Some(0xa1) | Some(0xa2) => wrapped,
+                _ => {
+                    return Err(Error::Verification(
+                        "responderID is neither byName [1] nor byKey [2]".into(),
+                    ));
+                }
+            }
+        }
+    };
+    let _produced_at = d.next()?; // GeneralizedTime: when, not what, was answered
+    let responses = d.expect(tlv::TAG_SEQUENCE, "the SingleResponse list")?;
+
+    let mut by_key_hash: Option<Vec<u8>> = None;
+    // the constructed CHOICE alternatives are 0xA1/0xA2; inside one, byName's
+    // content is a plain SEQUENCE Name (0x30) and byKey's an OCTET STRING.
+    let (choice, inner_first) = match responder_id.content.first().copied() {
+        Some(outer) if matches!(outer, 0xa1 | 0xa2) => {
+            let inner = Cur::new(responder_id.content).next()?;
+            (outer, inner)
+        }
+        _ => (responder_id.tag, Cur::new(responder_id.content).next()?),
+    };
+    match choice {
+        // [1] byName: a Name. A delegate's responderID is its own subject, so
+        // authority is judged from EKU and chain, not from this field.
+        0xa1 => {}
+        // [2] byKey: the SHA-1 of the responder's SubjectPublicKeyInfo
+        // (RFC 6960 4.1.1), which names a specific certificate outright.
+        0xa2 => by_key_hash = Some(inner_first.content.to_vec()),
+        other => {
+            return Err(Error::Verification(format!(
+                "responderID has tag {other:#04x}, expected [1] byName or [2] byKey"
+            )));
+        }
+    }
+
+    let mut this_update = None;
+    let mut next_update = None;
+    let mut cert_ids: Vec<OcspCertId> = Vec::new();
+    let mut rs = Cur::new(responses.content);
+    while !rs.done() {
+        let single = rs.expect(tlv::TAG_SEQUENCE, "a SingleResponse")?;
+        let mut sc = Cur::new(single.content);
+        let cert_id = sc.expect(tlv::TAG_SEQUENCE, "SingleResponse.certID")?;
+        let mut c = Cur::new(cert_id.content);
+        let mut alg = Cur::new(c.expect(tlv::TAG_SEQUENCE, "CertID.hashAlgorithm")?.content);
+        let hash_algorithm = alg.oid("CertID.hashAlgorithm")?;
+        let issuer_name_hash = c
+            .expect(tlv::TAG_OCTET_STRING, "CertID.issuerNameHash")?
+            .content
+            .to_vec();
+        let issuer_key_hash = c
+            .expect(tlv::TAG_OCTET_STRING, "CertID.issuerKeyHash")?
+            .content
+            .to_vec();
+        let serial = c
+            .expect(tlv::TAG_INTEGER, "CertID.serialNumber")?
+            .content
+            .to_vec();
+        let cert_status = sc.next()?;
+        match cert_status.tag {
+            0x80 | 0xa1 => {}
+            0x82 => {
+                return Err(Error::Verification(format!(
+                    "the OCSP response answers \"unknown\" for serial {}: the responder says \
+                     nothing about that certificate, which is not a revocation datum",
+                    hex::encode(&serial)
+                )));
+            }
+            other => {
+                return Err(Error::Verification(format!(
+                    "certStatus has tag {other:#04x}, expected [0] good, [1] revoked or [2] unknown"
+                )));
+            }
+        }
+        let this = time_value(&mut sc, "thisUpdate")?;
+        // nextUpdate [0] EXPLICIT GeneralizedTime OPTIONAL — the parser that
+        // read a bare UTCTime/GeneralizedTime here missed every real one: op-
+        // enssl and friends wrap it in the context tag, so reading raw walked
+        // past an answer's expiry entirely.
+        let next = match sc.peek_tag() {
+            Some(0xa0) => {
+                let wrapped = sc.expect(0xa0, "nextUpdate")?;
+                let mut inner = Cur::new(wrapped.content);
+                Some(time_value(&mut inner, "nextUpdate")?)
+            }
+            Some(tlv::TAG_UTC_TIME) | Some(0x18) => Some(time_value(&mut sc, "nextUpdate")?),
+            _ => None,
+        };
+        if this_update.is_none() {
+            this_update = Some(this);
+        } else if Some(this) != this_update {
+            return Err(Error::Verification(
+                "the SingleResponses of one response carry different thisUpdate values".into(),
+            ));
+        }
+        match (next_update, next) {
+            (None, _) => next_update = next,
+            (Some(seen), Some(now)) if seen != now => {
+                return Err(Error::Verification(
+                    "the SingleResponses of one response carry different nextUpdate values".into(),
+                ));
+            }
+            _ => {}
+        }
+        cert_ids.push(OcspCertId {
+            hash_algorithm,
+            issuer_name_hash,
+            issuer_key_hash,
+            serial,
+            revoked: cert_status.tag == 0xa1,
+        });
+    }
+    let this_update = this_update.ok_or_else(|| {
+        Error::Verification("the OCSP response answers for no certificate at all".into())
+    })?;
+
+    // ---- signature over the very bytes of tbsResponseData -----------------
+    let sig_oid = Cur::new(sa.content).oid("BasicOCSPResponse.signatureAlgorithm")?;
+    let digest = digest_from_signature_oid(&sig_oid)?;
+    let (unused, sig_bytes) = bit_string(&sig, "the OCSP response signature")?;
+    if unused != 0 {
+        return Err(Error::Verification(
+            "the OCSP response signature's BIT STRING says a partial final byte".into(),
+        ));
+    }
+    // The CertIDs hash the CA they name; the pool certificate matching those
+    // hashes is who may speak (directly or by delegation). SHA-1 in practice.
+    let mut named_cas: Vec<&CertificateHandle> = Vec::new();
+    for id in &cert_ids {
+        let alg = DigestAlg::from_oid(&id.hash_algorithm)
+            .map_err(|e| Error::Verification(detail_of(&e)))?;
+        // hashes over the WHOLE DER of the issuer Name and of its SubjectPublicKeyInfo —
+        // ocsp_issuer_hashes takes exactly that, from_der on bare content bytes would
+        // report a parse error as if the pool were wrong
+        let found = issuers.iter().find(|ca| match ocsp_issuer_hashes(ca, alg) {
+            Ok((name_hash, key_hash)) => {
+                name_hash == id.issuer_name_hash && key_hash == id.issuer_key_hash
+            }
+            Err(_) => false,
+        });
+        if let Some(ca) = found {
+            if !named_cas.iter().any(|other| other.der() == ca.der()) {
+                named_cas.push(ca);
+            }
+        }
+    }
+    if named_cas.is_empty() {
+        return Err(Error::Verification(
+            "the CA the CertIDs name as issuer is not among the supplied certificates: the \
+             response cannot be tied to any chain"
+                .into(),
+        ));
+    }
+
+    let pool: Vec<CertificateHandle> = embedded.iter().chain(issuers.iter()).cloned().collect();
+    let mut signature_verified = false;
+    let mut chains_to_issuer = false;
+    for candidate in &pool {
+        if verify_prehash(candidate, digest, &digest.digest(rd.whole), sig_bytes).is_err() {
+            continue;
+        }
+        signature_verified = true;
+        // byKey must name this certificate outright
+        if let Some(hash) = &by_key_hash {
+            let responder_key_hash = DigestAlg::Sha1.digest(&candidate.spki_der()?);
+            if responder_key_hash.as_slice() != hash.as_slice() {
+                continue;
+            }
+        }
+        for ca in &named_cas {
+            let authority = if candidate.der() == ca.der() {
+                // the CA itself answered
+                true
+            } else {
+                // a delegate: id-kp-OCSPSigning (or no EKU extension at all,
+                // which RFC 5280 reads as any purpose) and chains to that CA
+                let delegated = match eku_of(candidate) {
+                    None => true,
+                    Some(eku) => eku.contains(&OID_EKU_OCSP_SIGNING),
+                };
+                delegated && chain_certificates_ok(candidate, &embedded, &[(*ca).clone()], at)
+            };
+            if authority {
+                chains_to_issuer = true;
+                break;
+            }
+        }
+        if chains_to_issuer {
+            break;
+        }
+    }
+
+    // ---- interval ----------------------------------------------------------
+    let current = match next_update {
+        Some(next) => this_update <= at && at < next,
+        None => this_update <= at,
+    };
+
+    let problem: Option<String> = if !signature_verified {
+        Some(
+            "the OCSP response signature does not verify under any certificate it carries \
+             or any supplied one"
+                .to_string(),
+        )
+    } else if !chains_to_issuer {
+        Some(
+            "whoever signed the OCSP response is neither the CA the CertIDs name nor a dele- \
+             gate that CA authorized with id-kp-OCSPSigning (RFC 6960 4.2.2.2)"
+                .to_string(),
+        )
+    } else if !current {
+        Some(match next_update {
+            Some(next) => format!(
+                "the OCSP answer speaks for [{}, {}) and the validation time is outside \
+                 that interval",
+                fmt_time(this_update),
+                fmt_time(next)
+            ),
+            None => format!(
+                "the OCSP answer's thisUpdate, {}, is after the validation time",
+                fmt_time(this_update)
+            ),
+        })
+    } else {
+        None
+    };
+
+    Ok(OcspStatus {
+        signature_verified,
+        chains_to_issuer,
+        current,
+        this_update,
+        next_update,
+        cert_ids,
+        problem,
+    })
+}
+
+/// The extendedKeyUsage OIDs of a certificate, `None` when it carries no such
+/// extension (which RFC 5280 reads as any purpose).
+fn eku_of(cert: &CertificateHandle) -> Option<Vec<ObjectIdentifier>> {
+    use der::Decode as _;
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+    // the extendedKeyUsage OID, RFC 5280 4.2.1.12
+    const OID_EXTENDED_KEY_USAGE: &str = "2.5.29.37";
+    let tbs = cert.parsed().tbs_certificate();
+    for ext in tbs.extensions()? {
+        if ext.extn_id.to_string() == OID_EXTENDED_KEY_USAGE {
+            let Ok(eku) = ExtendedKeyUsage::from_der(ext.extn_value.as_bytes()) else {
+                return Some(Vec::new());
+            };
+            return Some(eku.0.to_vec());
+        }
+    }
+    None
+}
+
+fn chain_certificates_ok(
+    signer: &CertificateHandle,
+    embedded: &[CertificateHandle],
+    anchors: &[CertificateHandle],
+    at: SystemTime,
+) -> bool {
+    crate::verify::chain_certificates(signer, embedded, anchors, at).is_ok()
+}
+
 /// What a verified CRL says.
 #[derive(Clone, Debug)]
 pub struct CrlReport {
@@ -502,6 +928,20 @@ fn read_len(b: &[u8]) -> Result<(usize, usize)> {
         v = (v << 8) | usize::from(*x);
     }
     Ok((v, n + 1))
+}
+
+/// A DER `UTCTime` or `GeneralizedTime` (tag and length included), read as the
+/// instant it names; `None` for anything else. The OCSP regressions locate an
+/// archived response's interval this way without re-parsing it.
+pub fn parse_der_time(der: &[u8]) -> Option<SystemTime> {
+    use der::Decode as _;
+    match der.first()? {
+        0x17 => UtcTime::from_der(der).ok().map(|t| t.to_system_time()),
+        0x18 => GeneralizedTime::from_der(der)
+            .ok()
+            .map(|t| t.to_system_time()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

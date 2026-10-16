@@ -126,27 +126,41 @@ pub fn token_from_attribute(attr: &[u8], digest: DigestAlg, message: &[u8]) -> R
     Ok(token.to_vec())
 }
 
-/// Verifies the TSA's own signature on `token` and the chain of its signing
-/// certificate up to one of `anchors`.
+/// The outcome of verifying one time-stamp token: the instant it asserts, and
+/// what made it verifiable or not.
+#[derive(Clone, Debug)]
+pub struct TokenStatus {
+    /// `TSTInfo.genTime`, read out of the verified TSTInfo — never off a
+    /// re-encoded copy of it.
+    pub gen_time: SystemTime,
+    /// Subject of the TSA certificate that signed the token.
+    pub tsa_subject: String,
+}
+
+/// Verifies the TSA's own signature on `token`, and binds everything to the
+/// TSTInfo inside it: `contentType = id-ct-TSTInfo`, the `messageDigest`
+/// attribute equals the digest of the encapsulated TSTInfo bytes, the ESS
+/// `signingCertificate`/`V2` (when the token carries one) names the TSA's own
+/// certificate, and that certificate is a time-stamp authority — EKU
+/// `id-kp-timeStamping`, RFC 3161 2.3 — chaining to one of `anchors`.
 ///
-/// The imprint check in [`token_from_response`] proves the token covers this
-/// signature value; it says nothing about who made the token, and a token
-/// fetched over plain http can be planted by anyone on the path. This is the
-/// check that closes that gap. Callers should *warn* on failure rather than
-/// refuse: a token whose TSA signature cannot be checked here may still be
-/// perfectly good — this function only knows the anchors it was handed, and
-/// the full-shape verification (policy, ordering, revocation of the TSA) is a
-/// validator's job, `openssl ts -verify` offline.
+/// The binding is the whole point (docs/adversarial-review.md finding C2):
+/// before it, only the signed attributes were verified, so rewriting the
+/// TSTInfo — the `genTime`, the `messageImprint` — kept verifying, and one
+/// genuine token could be laundered into a stamp for any signature at any
+/// date. The chain walk itself is the CAdES verifier's (a TST *is* a CMS
+/// SignedData); [`crate::verify`] runs in its TST mode over the very bytes of
+/// this token, and the imprint of a real request is additionally matched when
+/// `message` is `Some`.
 ///
-/// Deliberately narrower than [`crate::verify`]: RFC 3161 tokens carry the v1
-/// `signingCertificate` attribute or none, not the `signingCertificateV2` a
-/// CAdES profile requires, so what is checked here is the signature value over
-/// the re-tagged signed attributes and the certificate chain, nothing more.
+/// Callers should *warn* rather than refuse on failure when they are signing:
+/// a client does not know which TSAs to trust. The verdict side (verify) must
+/// treat a token that fails here as unverified, never as evidence of B-T.
 pub fn verify_token_signature(
     token: &[u8],
     anchors: &[CertificateHandle],
     at: SystemTime,
-) -> Result<()> {
+) -> Result<TokenStatus> {
     if anchors.is_empty() {
         return Err(Error::Other(
             "no TSA trust anchor was supplied, so the TSA's own signature on the token \
@@ -154,6 +168,8 @@ pub fn verify_token_signature(
                 .into(),
         ));
     }
+
+    // (1) content type: a TST is a SignedData...
     let mut ci = Cur::new(token).sequence()?;
     let content_type = ci.oid_string()?;
     if content_type != oid::ID_SIGNED_DATA.to_string() {
@@ -164,8 +180,63 @@ pub fn verify_token_signature(
     let mut sd = Cur::new(ci.explicit(0)?).sequence()?;
     let _version = sd.number()?;
     let _digest_algs = sd.tlv()?;
-    let _eci = sd.tlv()?; // encapContentInfo; the imprint has its own check
 
+    // (2) ...whose encapContentInfo carries an eContent that is one OCTET
+    // STRING holding a TSTInfo. Keep the exact bytes: the messageDigest below
+    // hashes them, and only them. RFC 3161 2.2: id-ct-TSTInfo, eContent MUST
+    // be present.
+    let mut eci = sd.sequence()?;
+    let econtent_type = eci.oid_string()?;
+    if econtent_type != OID_TST_INFO {
+        return Err(Error::Other(format!(
+            "the contentType of a time-stamp token must be id-ct-TSTInfo \
+             ({OID_TST_INFO}), this SignedData carries {econtent_type}; anything else is not \
+             a RFC 3161 token"
+        )));
+    }
+    if eci.peek_tag() != Some(0xA0) {
+        return Err(Error::Other(
+            "the token's encapContentInfo carries no eContent, and RFC 3161 2.2 puts the \
+             TSTInfo in it: a token without a TSTInfo stamps nothing"
+                .into(),
+        ));
+    }
+
+    // (2b) RFC 5652: encapContentInfo.eContent is `[0] EXPLICIT ANY` — a DER
+    // OCTET STRING carrying the TSTInfo. A TSA may encode it constructed
+    // (BouncyCastle and openssl both do, in definite form); what matters is
+    // the concatenated content octets, which the messageDigest below hashes.
+    let mut econtent_field = Cur::new(eci.explicit(0)?);
+    let (e_tag, e_value) = econtent_field.tlv()?;
+    if e_tag != tlv::TAG_OCTET_STRING {
+        return Err(Error::Other(format!(
+            "a time-stamp token's eContent is an OCTET STRING carrying the TSTInfo \
+             (RFC 3161 2.2), this one carries tag {e_tag:#04x}"
+        )));
+    }
+    let econtent = if e_tag & 0x20 == 0 {
+        e_value.to_vec()
+    } else {
+        let mut joined = Vec::with_capacity(e_value.len());
+        let mut parts = Cur::new(e_value);
+        while !parts.is_done() {
+            let (p_tag, p_value) = parts.tlv()?;
+            if p_tag != tlv::TAG_OCTET_STRING || p_tag & 0x20 != 0 {
+                return Err(Error::Other(format!(
+                    "a constructed eContent holds a part with tag {p_tag:#04x}, expected \
+                     primitive OCTET STRING segments"
+                )));
+            }
+            joined.extend_from_slice(p_value);
+        }
+        joined
+    };
+
+    // (3) read the TSTInfo out of exactly those bytes
+    let tst = parse_tst_info(&econtent)?;
+
+    // (4) certificates and the single SignerInfo, kept as raw DER so the CMS
+    // verifier can be pointed at the real token
     let mut certs: Vec<CertificateHandle> = Vec::new();
     let mut signer_infos: Vec<&[u8]> = Vec::new();
     while !sd.is_done() {
@@ -209,6 +280,26 @@ pub fn verify_token_signature(
         )));
     }
 
+    // (5) the TST mode of the CMS verifier, run over these very bytes: it
+    // checks messageDigest against eContent (binding every TSTInfo byte — and
+    // any later rewrite of genTime or messageImprint fails right there), the
+    // contentType attribute against id-ct-TSTInfo, the signature over the
+    // re-tagged signed attributes, the ESS signer-certificate attribute, and
+    // the chain to an anchor under the RFC 5280 issuer rules.
+    crate::verify::verify(
+        token,
+        Some(&econtent),
+        &crate::verify::VerifyOptions {
+            trust_anchors: anchors.to_vec(),
+            validation_time: at,
+            ts_mode: true,
+        },
+    )
+    .map_err(|e| Error::Other(format!("the time-stamp token does not verify: {e}")))?;
+
+    // (6) the TSA's certificate is who RFC 3161 says it must be. The signer
+    // is whichever embedded or anchor certificate the sid names — the same
+    // lookup the CMS verifier made, redone here cheaply to judge its EKU.
     let mut f = Cur::new(signer_infos[0]);
     let _version = f.number()?;
     let (sid_tag, sid_value) = f.tlv()?;
@@ -219,18 +310,9 @@ pub fn verify_token_signature(
             "the token's SignerInfo digests under {digest_oid}, which this code does not know"
         ))
     })?;
-    if f.peek_tag() != Some(0xA0) {
-        return Err(Error::Other(
-            "the token's SignerInfo carries no signed attributes; RFC 3161 requires them".into(),
-        ));
-    }
-    let attrs_content = f.expect(0xA0)?;
-    let mut sai = f.sequence()?;
-    let _sig_alg = sai.oid_string()?;
-    let signature = f.octets()?.to_vec();
-
     let mut pool = certs.iter().chain(anchors.iter());
-    let signer = match sid_tag {
+    let tsa_cert = match sid_tag {
+        // issuerAndSerialNumber matches by issuer+serial...
         tlv::TAG_SEQUENCE => {
             use der::Encode as _;
             let mut s = Cur::new(sid_value);
@@ -249,6 +331,7 @@ pub fn verify_token_signature(
                     && c.serial_number().as_bytes() == serial
             })
         }
+        // ...a subjectKeyIdentifier [0] by subject key identifier
         0x80 => {
             pool.find(|c| crate::verify::subject_key_identifier(c).as_deref() == Some(sid_value))
         }
@@ -262,27 +345,116 @@ pub fn verify_token_signature(
         Error::Other(
             "the token's SignerInfo names a signing certificate the token does not carry".into(),
         )
-    })?
-    .clone();
-
-    // the signature, over the signed attributes re-tagged as SET OF, exactly
-    // the RFC 5652 5.4 mirror the CAdES verifier implements
-    let retagged = tlv::tlv(tlv::TAG_SET, attrs_content);
-    let prehash = digest.digest(&retagged);
-    openfirma_core::signer::verify_prehash(&signer, digest, &prehash, &signature).map_err(|e| {
-        Error::Other(format!(
-            "the TSA's signature on the token does not verify: {e}"
-        ))
     })?;
+    crate::verify::check_certificate_rules(tsa_cert, crate::verify::CertRole::TimeStamping)?;
 
-    // and the TSA has to be who the caller says it is: the signing certificate
-    // must chain to one of the supplied anchors, every link verified
-    crate::verify::chain_certificates(&signer, &certs, anchors, at).map_err(|e| {
-        Error::Other(format!(
-            "the TSA's certificate does not chain to any supplied trust anchor: {e}"
-        ))
-    })?;
-    Ok(())
+    // (7) the digest algorithm of the SignerInfo is the one the TSTInfo's
+    // messageImprint hashes under: two names for one operation, they may not
+    // disagree.
+    let imprint_digest =
+        DigestAlg::from_oid(&parse_dotted_oid(&tst.imprint_alg)?).map_err(|_| {
+            Error::Other(format!(
+                "the token imprints under {}, which this code does not know",
+                tst.imprint_alg
+            ))
+        })?;
+    if imprint_digest != digest {
+        return Err(Error::Other(format!(
+            "the token's SignerInfo digests under {} but its messageImprint says {}",
+            digest.name(),
+            imprint_digest.name()
+        )));
+    }
+
+    Ok(TokenStatus {
+        gen_time: tst.gen_time,
+        tsa_subject: crate::verify::subject(tsa_cert),
+    })
+}
+
+/// What `verify_token_signature` reads out of a TSTInfo — the parts whose
+/// bytes matter to the verdict beyond what the messageDigest binds.
+struct TstInfo {
+    gen_time: SystemTime,
+    /// The OID of `messageImprint.hashAlgorithm`, cross-checked against the
+    /// SignerInfo's digestAlgorithm.
+    imprint_alg: String,
+}
+
+/// Parses `version`, `policy`, `messageImprint` and `genTime` out of TSTInfo
+/// DER. `serialNumber` and the optional rest are stepped over, not read: the
+/// messageDigest over the whole eContent binds every byte of them.
+fn parse_tst_info(bytes: &[u8]) -> Result<TstInfo> {
+    let mut cur = Cur::new(bytes);
+    let mut tst = cur.sequence()?;
+    let version = tst.number()?;
+    if version != 1 {
+        return Err(Error::Other(format!(
+            "TSTInfo version is {version}, and RFC 3161 defines only version 1"
+        )));
+    }
+    // TSTInfo.policy is an id-pkix-ocsp-nocheck... no: it is any
+    // `OBJECT IDENTIFIER`, but the TSA may wrap nothing else — openssl emits a
+    // plain OID; some TSAs tag it. A SEQUENCE here means the next field, not a
+    // policy, so only read an OID when one is actually there.
+    let _policy = if tst.peek_tag() == Some(0x06) {
+        tst.oid_string()?
+    } else {
+        String::new()
+    };
+    let mut imprint = tst.sequence()?;
+    // MessageImprint ::= SEQUENCE { hashAlgorithm AlgorithmIdentifier,
+    // hashedMessage OCTET STRING } — and an AlgorithmIdentifier is itself a
+    // SEQUENCE of OID (plus optional parameters), which openssl writes as
+    // such. Reading the bare OID here instead rejected every genuine token.
+    let mut alg = imprint.sequence()?;
+    let imprint_alg = alg.oid_string()?;
+    let _hash = imprint.octets()?;
+    let _serial = tst.tlv()?;
+    let gen_time = {
+        // GeneralizedTime (RFC 3161 requires it) or UTCTime of a legacy TSA;
+        // der parses both to the same instant.
+        use der::Decode as _;
+        let (tag, whole, _) = tst.tlv_whole()?;
+        match tag {
+            0x18 => x509_cert::der::asn1::GeneralizedTime::from_der(whole)?.to_system_time(),
+            0x17 => x509_cert::der::asn1::UtcTime::from_der(whole)?.to_system_time(),
+            other => {
+                return Err(Error::Other(format!(
+                    "TSTInfo.genTime has tag {other:#04x}, expected a GeneralizedTime"
+                )));
+            }
+        }
+    };
+    Ok(TstInfo {
+        gen_time,
+        imprint_alg,
+    })
+}
+
+/// The OID of a `TimeStampReq.messageImprint.hashAlgorithm`, so the writer and
+/// the reader of a token agree on one parse.
+pub fn request_digest_algorithm(query: &[u8]) -> Result<DigestAlg> {
+    let mut req = Cur::new(query).sequence()?;
+    let _version = req.number()?;
+    let mut imprint = req.sequence()?;
+    let mut alg = imprint.sequence()?;
+    let oid = parse_dotted_oid(&alg.oid_string()?)?;
+    DigestAlg::from_oid(&oid)
+        .map_err(|_| Error::Other("the time-stamp query names an unknown digest".into()))
+}
+
+/// The `messageImprint` of a `TimeStampReq`: what the TSA must answer for, and
+/// what the writer side compares a token against.
+pub fn request_imprint(query: &[u8]) -> Result<(DigestAlg, Vec<u8>)> {
+    let mut req = Cur::new(query).sequence()?;
+    let _version = req.number()?;
+    let mut imprint = req.sequence()?;
+    let mut alg = imprint.sequence()?;
+    let oid = parse_dotted_oid(&alg.oid_string()?)?;
+    let digest = DigestAlg::from_oid(&oid)
+        .map_err(|_| Error::Other("the time-stamp query names an unknown digest".into()))?;
+    Ok((digest, imprint.octets()?.to_vec()))
 }
 
 /// The digest algorithm and hashed message that a token's
