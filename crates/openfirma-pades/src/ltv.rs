@@ -256,7 +256,14 @@ pub fn add_validation_data(
         }
     }
 
-    let mut update = Update::new(xref_at, trailer.root, trailer.info, trailer.size);
+    let (root, _, size) = trailer.mandatory()?;
+    let mut update = Update::new_with_trailer(
+        xref_at,
+        root,
+        trailer.info,
+        size,
+        &pdf::trailer_dict(pdf, xref_at)?,
+    )?;
     let mut next_num = update.next_object_number();
     let mut new_cert_refs: Vec<ObjRef> = Vec::new();
     for c in &certs {
@@ -480,7 +487,14 @@ pub fn add_document_timestamp(
         ));
     }
 
-    let mut update = Update::new(xref_at, trailer.root, trailer.info, trailer.size);
+    let (root, _, size) = trailer.mandatory()?;
+    let mut update = Update::new_with_trailer(
+        xref_at,
+        root,
+        trailer.info,
+        size,
+        &pdf::trailer_dict(pdf, xref_at)?,
+    )?;
     let first_new = update.next_object_number();
     let appearance = ObjRef::new(first_new, 0);
     let dts = ObjRef::new(first_new + 1, 0);
