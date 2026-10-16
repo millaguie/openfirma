@@ -20,21 +20,21 @@ use crate::pdf;
 /// Decodes the raw bytes of a stream according to its dictionary.
 ///
 /// Filters compose, and `/DecodeParms` is a parallel list, so the nth
-/// parameter set belongs to the nth filter.
+/// parameter set belongs to the nth filter. The cap applies to the whole
+/// chain and after every stage: `/FlateDecode` refuses past it on its own,
+/// but `/RunLengthDecode` multiplies what the previous filter produced by up
+/// to 128 per input byte, and each intermediate stage is an allocation — a
+/// chain that only checked its last output would still OOM in the middle of
+/// it. Checking after every stage bounds peak memory to roughly two stages,
+/// because an expansion is refused at the cap before it grows past it.
 pub fn decode(dict: &[u8], raw: &[u8]) -> Result<Vec<u8>> {
-    let filters = filter_names(dict)?;
-    let parms = parameter_sets(dict);
-    let mut data = raw.to_vec();
-    for (i, name) in filters.iter().enumerate() {
-        data = apply(name, &data, parms.get(i).copied().flatten())?;
-    }
-    Ok(data)
+    decode_capped(dict, raw, MAX_DECODED_STREAM)
 }
 
-fn apply(name: &str, data: &[u8], parms: Option<&[u8]>) -> Result<Vec<u8>> {
+fn apply(name: &str, data: &[u8], parms: Option<&[u8]>, cap: usize) -> Result<Vec<u8>> {
     match name {
         "/FlateDecode" => {
-            let inflated = inflate(data)?;
+            let inflated = inflate_capped(data, cap)?;
             apply_predictor(&inflated, parms)
         }
         "/LZWDecode" => Err(Error::Pdf(
@@ -44,12 +44,44 @@ fn apply(name: &str, data: &[u8], parms: Option<&[u8]>) -> Result<Vec<u8>> {
         )),
         "/ASCIIHexDecode" => ascii_hex(data),
         "/ASCII85Decode" => ascii85(data),
-        "/RunLengthDecode" => run_length(data),
+        // not reached through decode_capped, which handles this filter itself
+        // so it can pass the chain's cap; kept for the direct-call shape
+        "/RunLengthDecode" => run_length(data, cap),
         other => Err(Error::Pdf(format!(
             "stream filter {other} is not supported. The image filters are left out on \
              purpose, nothing that carries document structure uses them."
         ))),
     }
+}
+
+/// Shared by `decode` and the bounded unit tests below: run every filter of
+/// `dict` over `raw`. `cap` is the ceiling; `MAX_DECODED_STREAM` is what real
+/// decoding uses, and a test passes a small one to exercise the refusal of a
+/// chain without materializing a real bomb.
+fn decode_capped(dict: &[u8], raw: &[u8], cap: usize) -> Result<Vec<u8>> {
+    let filters = filter_names(dict)?;
+    let parms = parameter_sets(dict);
+    let mut data = raw.to_vec();
+    for (i, name) in filters.iter().enumerate() {
+        data = apply(name, &data, parms.get(i).copied().flatten(), cap)?;
+        check_stage(name, &data, cap)?;
+    }
+    Ok(data)
+}
+
+/// One stage's output must fit the cap: named refusal in the same words as
+/// `inflate_capped`'s, because `/RunLengthDecode` (×128) and the ASCII
+/// filters can each multiply what a capped earlier stage legally produced.
+fn check_stage(name: &str, data: &[u8], cap: usize) -> Result<()> {
+    if data.len() > cap {
+        return Err(Error::Pdf(format!(
+            "{name} expands the stream to more than {} bytes, the most openfirma decodes \
+             from one stream: a structural stream this large is a decompression bomb, not \
+             a document",
+            cap
+        )));
+    }
+    Ok(())
 }
 
 /// The most a single decoded stream may expand to.
@@ -69,12 +101,12 @@ pub(crate) const MAX_DECODED_STREAM: usize = 256 * 1024 * 1024;
 const MAX_PREDICTOR_PARM: i64 = 65_536;
 
 /// PDF's `FlateDecode` is zlib format, RFC 1950, not raw deflate.
-fn inflate(data: &[u8]) -> Result<Vec<u8>> {
-    inflate_capped(data, MAX_DECODED_STREAM)
-}
-
-/// Inflate with an explicit ceiling, so the refusal can be tested without
-/// materializing a real 256 MiB stream.
+///
+/// Inflate with a ceiling, so the refusal is testable without materializing a
+/// real 256 MiB stream. The cap is the chain's (`decode_capped`), not a
+/// constant, because an earlier stage of a chain may have produced far less
+/// than the global ceiling and this stage still has to be bounded by the same
+/// one the caller asked for.
 fn inflate_capped(data: &[u8], cap: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     // one byte over the cap is read so "exactly at the cap" still succeeds and
@@ -111,7 +143,17 @@ fn filter_names(dict: &[u8]) -> Result<Vec<String>> {
             if i >= value.len() || value[i] == b']' {
                 break;
             }
-            let end = pdf::token_end_pub(value, i);
+            // whole value, not a bare token: a filter name starts with '/',
+            // which is a delimiter, so token_end_pub would return `i` itself
+            // and this loop would never advance — a `/Filter [/FlateDecode]`
+            // array, which is legal and appears in real documents, used to
+            // spin forever pushing empty strings until the allocator died
+            let end = pdf::value_end(value, i)?;
+            if end <= i {
+                return Err(Error::Pdf(
+                    "/Filter holds an element that is not a value".into(),
+                ));
+            }
             out.push(String::from_utf8_lossy(&value[i..end]).into_owned());
             i = end;
         }
@@ -140,7 +182,17 @@ fn parameter_sets(dict: &[u8]) -> Vec<Option<&[u8]>> {
             if i >= value.len() || value[i] == b']' {
                 break;
             }
-            let end = pdf::token_end_pub(value, i);
+            // same trap as filter_names: a `<<…>>` or `null` element is a
+            // whole value whose first byte is a delimiter, and asking for a
+            // bare token there would not advance. Stop on anything unparsable
+            // rather than spin: the missing sets then leave the corresponding
+            // filter without parameters, which is the safe reading.
+            let Ok(end) = pdf::value_end(value, i) else {
+                break;
+            };
+            if end <= i {
+                break;
+            }
             let tok = &value[i..end];
             out.push(if tok == b"null" { None } else { Some(tok) });
             i = end;
@@ -403,34 +455,57 @@ fn accumulate85(group: u32, digit: u32) -> Result<u32> {
         })
 }
 
-fn run_length(data: &[u8]) -> Result<Vec<u8>> {
+/// `RunLengthDecode` with the cap enforced *as it decodes*: a repeat run is
+/// worth up to 128 output bytes per input byte, so an earlier stage's (capped)
+/// output can demand gigabytes from it. Growing `out` past the ceiling is
+/// refused at the run that crosses it — never allocated first and then judged.
+fn run_length(data: &[u8], cap: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < data.len() {
-        let len = data[i] as i16;
+        let len = data[i];
         i += 1;
-        match len {
-            128 => break, // end of data
-            0..=127 => {
-                let n = len as usize + 1;
-                if i + n > data.len() {
-                    return Err(Error::Pdf(
-                        "RunLengthDecode runs past the end of the stream".into(),
-                    ));
-                }
-                out.extend_from_slice(&data[i..i + n]);
-                i += n;
-            }
-            _ => {
-                let n = (256 - len) as usize + 1;
-                if i >= data.len() {
-                    return Err(Error::Pdf(
-                        "RunLengthDecode has a repeat with no byte to repeat".into(),
-                    ));
-                }
-                out.extend(std::iter::repeat_n(data[i], n));
-                i += 1;
-            }
+        if len == 128 {
+            break; // end of data
+        }
+        // one run's output: a literal copy of len+1 bytes (len < 128) or a
+        // repeat of 256-len+1 copies of the next byte (len > 127); both are
+        // paid for against the ceiling before anything is written
+        let (repeat, n) = if len < 128 {
+            (false, len as usize + 1)
+        } else {
+            (true, 256 - len as usize + 1)
+        };
+        if repeat && i >= data.len() {
+            return Err(Error::Pdf(
+                "RunLengthDecode has a repeat with no byte to repeat".into(),
+            ));
+        }
+        if !repeat && i + n > data.len() {
+            return Err(Error::Pdf(
+                "RunLengthDecode runs past the end of the stream".into(),
+            ));
+        }
+        // checked_add against the ceiling: an expansion bomb dies here rather
+        // than in the allocator
+        let grown = out
+            .len()
+            .checked_add(n)
+            .ok_or_else(|| Error::Pdf("RunLengthDecode expands past any allocation".into()))?;
+        if grown > cap {
+            return Err(Error::Pdf(format!(
+                "RunLengthDecode expands to more than {} bytes, the most openfirma decodes \
+                 from one stream: a structural stream this large is a decompression bomb, \
+                 not a document",
+                cap
+            )));
+        }
+        if repeat {
+            out.resize(grown, data[i]);
+            i += 1;
+        } else {
+            out.extend_from_slice(&data[i..i + n]);
+            i += n;
         }
     }
     Ok(out)
@@ -593,6 +668,68 @@ mod tests {
         let err = inflate_capped(&bomb, 1024).unwrap_err().to_string();
         assert!(err.contains("1024 bytes"), "{err}");
         assert!(err.contains("decompression bomb"), "{err}");
+    }
+
+    /// The chain the review's runlength-bomb PoC is: flate to a legal (capped)
+    /// intermediate, then RunLengthDecode ×128. The expansion is refused at
+    /// the cap during decoding, not allocated and then judged — the same test
+    /// shape as `inflate_stops_at_the_cap_and_names_it`, one stage further.
+    #[test]
+    fn a_runlength_stage_past_the_cap_is_refused_without_allocating_it() {
+        // 700 zero bytes inflate fine under a 1 KiB cap; encoded as RLE each
+        // is the head of a 128-fold repeat, so the stage wants ~87 KiB from
+        // what flate delivered legitimately.
+        let dict = b"<< /Filter [/FlateDecode /RunLengthDecode] >>";
+        // a legal RLE of one 128-fold repeat: 128 zeros, well under the cap
+        assert_eq!(
+            decode_capped(dict, &deflate(&[129u8, 0u8]), 1024).unwrap(),
+            vec![0u8; 128]
+        );
+        // 100 repeat pairs is 200 bytes inflated — legal under the 1 KiB cap —
+        // and asks RunLengthDecode for 12800, which is not
+        let mut rle = Vec::new();
+        for _ in 0..100 {
+            rle.push(129u8); // repeat the next byte 128 times
+            rle.push(0);
+        }
+        rle.push(128); // end of data marker — never reached, the cap trips first
+        let err = decode_capped(dict, &deflate(&rle), 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("RunLengthDecode"), "{err}");
+        assert!(err.contains("1024 bytes"), "the cap must be named: {err}");
+    }
+
+    /// A single /RunLengthDecode (no flate before it) is subject to the same
+    /// ceiling: every `129 x` pair decodes to 128 copies, so a few hundred of
+    /// them cross a 4 KiB cap and are refused instead of grown.
+    #[test]
+    fn a_runlength_stage_alone_respects_the_cap_too() {
+        let mut bomb = Vec::new();
+        for _ in 0..64 {
+            bomb.push(129u8); // -127: repeat the next byte 128 times
+            bomb.push(b'x');
+        }
+        bomb.push(128); // end of data, past where the cap trips
+        let dict = b"<< /Filter /RunLengthDecode >>";
+        // three pairs are 384 bytes and fit; the full stream does not
+        assert_eq!(decode_capped(dict, &bomb[..6], 4096).unwrap().len(), 384);
+        let err = decode_capped(dict, &bomb, 4096).unwrap_err().to_string();
+        assert!(err.contains("RunLengthDecode"), "{err}");
+        assert!(err.contains("4096 bytes"), "the cap must be named: {err}");
+    }
+
+    /// The other expansion filters are checked per stage as well: ASCIIHex
+    /// doubles its input, and a chain of them after a capped flate must not
+    /// multiply past the ceiling unchecked.
+    #[test]
+    fn every_stage_of_a_chain_is_checked() {
+        let hex = vec![b'4'; 3000]; // 1500 bytes out: fine under 2 KiB, over 1 KiB
+        let dict = b"<< /Filter [/ASCIIHexDecode] >>";
+        assert_eq!(decode_capped(dict, &hex, 2048).unwrap().len(), 1500);
+        let err = decode_capped(dict, &hex, 1024).unwrap_err().to_string();
+        assert!(err.contains("ASCIIHexDecode"), "{err}");
+        assert!(err.contains("1024 bytes"), "the cap must be named: {err}");
     }
 
     /// The predictor parameters come out of the file and size an allocation,

@@ -172,12 +172,6 @@ fn array_end(data: &[u8], start: usize) -> Result<usize> {
     Err(Error::Pdf("unterminated array".into()))
 }
 
-/// End of a bare token: a number, a name-like keyword, `true`, `false`,
-/// `null`, or the `R` of a reference.
-pub fn token_end_pub(data: &[u8], i: usize) -> usize {
-    token_end(data, i)
-}
-
 /// End of a bare token: a number, `true`, `false`, `null`, or the `R` of a
 /// reference.
 fn token_end(data: &[u8], i: usize) -> usize {
