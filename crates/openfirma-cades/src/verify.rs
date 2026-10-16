@@ -294,6 +294,16 @@ fn unsigned_values<'a>(content: &'a [u8], wanted: ObjectIdentifier) -> Result<Ve
 /// `Ok` holds one [`VerifyReport`] per signer and only happens when all of
 /// them pass. A failure names the signer (when there is more than one) and
 /// the check that failed.
+/// Whether `der` is shaped like a SignedData ContentInfo — the strictest
+/// cheap look a caller can take before committing to `verify`. A PAdES verifier
+/// uses it to refuse a `/Contents` that holds something else (a bare digest,
+/// another object's value) as "that is not what I signed", naming the shape
+/// mismatch instead of letting a half-read CMS fail on some unrelated check.
+/// Only structure: no signatures are checked and no trust is consulted.
+pub fn looks_like_signed_data(der: &[u8]) -> bool {
+    parse_signed_data(der).is_ok()
+}
+
 pub fn verify(
     der: &[u8],
     content: Option<&[u8]>,

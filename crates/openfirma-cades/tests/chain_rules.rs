@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use openfirma_cades::verify::{CertRole, check_certificate_rules};
-use openfirma_core::SoftwareSigner;
+use openfirma_cades::{CadesOptions, sign};
+use openfirma_core::{CertificateHandle, SoftwareSigner};
 
 fn certs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
@@ -63,6 +64,42 @@ fn of_sign(certs: &Path, cert: &str, key: &str, chain: &[&str], content: &[u8]) 
     .expect("signing failed")
 }
 
+fn openssl_available() -> bool {
+    Command::new("openssl")
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn scratch(name: &str) -> PathBuf {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace("::", "_");
+    let dir = std::env::temp_dir().join(format!("openfirma-{}-{test}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+/// `openfirma verify <cms>` with explicit anchors and no bundle from the
+/// environment: (ok, stdout+stderr).
+fn verify_cli(signature: &Path, content: Option<&Path>, trust: &[PathBuf]) -> (bool, String) {
+    let cli = openfirma_cli().expect("el binario openfirma no esta construido");
+    let mut cmd = Command::new(cli);
+    cmd.env_remove("OPENFIRMA_TRUST");
+    // the CLI takes its input with -i/--input, like `sign` does
+    cmd.arg("verify").arg("--input").arg(signature);
+    if let Some(content) = content {
+        cmd.arg("--content").arg(content);
+    }
+    for anchor in trust {
+        cmd.arg("--trust").arg(anchor);
+    }
+    let out = cmd.output().expect("openfirma no arranca");
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    (out.status.success(), text)
+}
 
 /// C1, the reviewer's PoC: `testdata/certs/signer-nonca.crt` is a perfectly
 /// ordinary CA:FALSE leaf of the test intermediate. The attack the verifier

@@ -235,16 +235,27 @@ printf 'basicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSigna
 issue "$TMP/ocsp.csr" ocsp.crt intermediate.crt intermediate.key "$TMP/ocsp.ext"
 to_pkcs8 "$TMP/ocsp-raw.key" ocsp.key
 
-ocsp_response() {
-  # ocsp_response <cert.crt> <out.der>: a "good" response for the certificate
-  local cert="$1" out="$2" ser dn
+ocsp_for() {
+  # ocsp_for <cert.crt> <signer.crt> <signer.key> <out.der>: a "good" answer
+  # for the certificate, signed with the given responder key. The CA that
+  # openssl treats as issuing is always the test intermediate.
+  local cert="$1" signer="$2" key="$3" out="$4" ser dn
   ser="$(openssl x509 -in "$cert" -serial -noout | cut -d= -f2)"
   dn="$(openssl x509 -in "$cert" -subject -noout -nameopt oneline | sed 's/^subject=//')"
   printf 'V\t491231235959Z\t\t%s\tunknown\t%s\n' "$ser" "$dn" > "$TMP/ocsp-index.txt"
   openssl ocsp -reqout "$TMP/ocsp.req" -issuer intermediate.crt -cert "$cert" -no_nonce
+  # -nmin: without it openssl answers with thisUpdate == nextUpdate, an inter-
+  # val of zero seconds that every validator reads as already expired at the
+  # very second it was produced. An hour is plenty for the tests, which vali-
+  # date "now" and also after the window to prove expiry is enforced.
   openssl ocsp -index "$TMP/ocsp-index.txt" -CA intermediate.crt \
-    -rsigner ocsp.crt -rkey ocsp.key \
-    -reqin "$TMP/ocsp.req" -respout "$out"
+    -rsigner "$signer" -rkey "$key" \
+    -reqin "$TMP/ocsp.req" -respout "$out" -nmin 60
+}
+
+ocsp_response() {
+  # ocsp_response <cert.crt> <out.der>: a "good" response for the certificate
+  ocsp_for "$1" ocsp.crt ocsp.key "$2"
 }
 # a stale response from a previous PKI would carry the old issuer hashes
 rm -f signer-rsa.ocsp.der
@@ -253,6 +264,14 @@ if ocsp_response signer-rsa.crt signer-rsa.ocsp.der 2>/dev/null; then
 else
   echo "WARNING: this openssl cannot answer an OCSP request offline;" >&2
   echo "WARNING: signer-rsa.ocsp.der is missing and the OCSP tests will skip" >&2
+fi
+
+# ocsp-unauthorized.der: a genuine "good" answer signed with the ordinary
+# signer's key — neither the CertID-named CA nor a delegate it authorized for
+# id-kp-OCSPSigning (RFC 6960 4.2.2.2). The verifier must refuse it; material
+# for the A4 regression test of the adversarial review.
+if ocsp_for signer-rsa.crt signer-rsa.crt signer-rsa.key ocsp-unauthorized.der 2>/dev/null; then
+  echo "ocsp-unauthorized.der written"
 fi
 
 echo "== PKCS#12 for the official AutoFirma, chain included =="
@@ -276,7 +295,8 @@ openssl verify -CAfile ca.crt -untrusted intermediate.crt ocsp.crt
 
 echo "== every key must be PKCS#8, our loader accepts nothing else =="
 for k in ca.key intermediate.key signer-rsa.key signer-ec.key \
-         signer-juridical.key signer-representative.key tsa.key ocsp.key; do
+         signer-juridical.key signer-representative.key signer-nonca.key \
+         tsa.key ocsp.key; do
   # The pattern avoids spelling out the PEM header, tools/check-no-real-certs.sh
   # would flag this script for containing one
   head -1 "$k" | grep -qE '^-----BEGIN.*KEY-----$' || { echo "$k is not PKCS#8" >&2; exit 1; }
