@@ -57,11 +57,11 @@ Very early, phase 1. What works today:
   each link's signature and every validity date checked at a validation time
   of your choice. RSA and ECDSA P-256. It is the in-repo verifier, not a
   substitute for VALIDe or the ETSI validators, see `docs/validation.md`.
-- CLI: `openfirma sign`, `openfirma verify` and `openfirma inspect`, the last
-  dumping any DER signature as a normalized tree for diffing.
+- CLI: `openfirma sign`, `openfirma verify`, `openfirma inspect` (dumping any
+  DER signature as a normalized tree for diffing), and `openfirma keystores
+  list`, which lists what a PKCS#11 token or NSS database holds.
 
-Not started yet: the system keystores (PKCS#11, DNIe, Windows, macOS,
-NSS), the browser protocol, the GUI, and FacturaE.
+Not started yet: the browser protocol, the GUI, and FacturaE.
 
 | Component | Status |
 |---|---|
@@ -73,7 +73,8 @@ NSS), the browser protocol, the GUI, and FacturaE.
 | PAdES B-LTA (document time-stamp over the archive) | works, crosschecked with openssl ts, qpdf and pdfsig |
 | CAdES ES-LT / ES-LTA (validation data inside the CMS) | out of scope: the long-term path is PAdES B-LT/B-LTA, see docs/pades.md |
 | Keystores: PKCS#12 | works, pure Rust, MAC checked before decrypting |
-| Keystores: PKCS#11, DNIe, Windows, macOS, NSS | not started |
+| Keystores: PKCS#11 tokens (OpenSC/DNIe shape), NSS shared DB | works, FFI into the vendor module at runtime, tested against SoftHSM and libsoftokn3 with signatures double-verified by openfirma and openssl |
+| Keystores: Windows cert store, macOS keychain | Windows compiles on CI and is untested at runtime; macOS lists, refuses to sign until tested, see docs/adr/0004-system-keystores.md |
 | XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
 | XAdES B-T and above, FacturaE, enveloping/detached shapes | not started |
 | Browser integration (`afirma://`, wss:// localhost, AutoScript) | not started |
@@ -113,6 +114,19 @@ OPENFIRMA_PASSWORD=... cargo run -- sign ... --p12 certificado.p12
 `--password` still exists and reads `OPENFIRMA_PASSWORD` when not given, but
 its help text says what it is: insecure.
 
+A key held by the system or a token — smartcard, DNIe, NSS database — signs
+without ever leaving its holder. The PIN travels in an environment variable,
+same rule as above:
+
+```
+cargo run -- keystores list \
+    --store pkcs11:/usr/lib/opensc-pkcs11.so:"3CM-ES..."   # what can sign
+export DRIE_PIN=...        # never on the command line
+cargo run -- sign -i doc.txt -o doc.csig \
+    --store pkcs11:/usr/lib/opensc-pkcs11.so:"3CM-ES..." --pin-env DRIE_PIN
+cargo run -- sign -i doc.txt -o doc.csig --store nss      # $HOME/.pki/nssdb
+```
+
 `tools/fetch-autofirma.sh` downloads the official AutoFirma so its output can
 be diffed against ours, see `docs/validation.md`.
 
@@ -124,6 +138,7 @@ crates/
   openfirma-cades    CMS / CAdES
   openfirma-pades    PDF reading, incremental updates, PAdES
   openfirma-xades    XML reader, Canonical XML, XAdES-B-B
+  openfirma-keystore PKCS#12 + system stores: PKCS#11/NSS FFI, Windows, macOS
   openfirma-cli      the `openfirma` binary
 docs/
   architecture.md    crate layering and data flow

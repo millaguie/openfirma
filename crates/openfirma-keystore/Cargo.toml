@@ -25,7 +25,10 @@ thiserror.workspace = true
 tracing.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
+libloading.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
 hex.workspace = true
+tracing-subscriber = "0.3"
+libloading.workspace = true

@@ -64,6 +64,11 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 tracing = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
+# dlopen/GetProcAddress for PKCS#11 modules (ADR-0004: a Cryptoki module is a
+# plugin loaded at runtime, never linked). Pinned to 0.8 because 0.9 raises
+# its own MSRV above the workspace's rust-version = 1.85. The crate has no
+# unsafe beyond the FFI it wraps and pulls no C code.
+libloading = "0.8"
 
 # NOTE: no rcgen. It pulls ring or aws-lc-rs, which are C/asm, and that would
 # break the pure Rust rule even as a dev dependency. Test certificates come

@@ -34,6 +34,27 @@ pub trait Signer {
     fn sign_prehash(&self, digest: DigestAlg, prehash: &[u8]) -> Result<Vec<u8>>;
 }
 
+/// A `&dyn Signer` is itself a `Signer`, so a caller that type-erased its
+/// signer (`Box<dyn Signer>`, one per source: file, PKCS#12, token) still
+/// satisfies the format crates' `S: Signer` bounds without a second box.
+impl<S: Signer + ?Sized> Signer for &S {
+    fn certificate(&self) -> &CertificateHandle {
+        (**self).certificate()
+    }
+
+    fn chain(&self) -> &[CertificateHandle] {
+        (**self).chain()
+    }
+
+    fn key_algorithm(&self) -> Result<crate::alg::KeyAlgorithm> {
+        (**self).key_algorithm()
+    }
+
+    fn sign_prehash(&self, digest: DigestAlg, prehash: &[u8]) -> Result<Vec<u8>> {
+        (**self).sign_prehash(digest, prehash)
+    }
+}
+
 enum SoftwareKey {
     Rsa(rsa::RsaPrivateKey),
     P256(p256::ecdsa::SigningKey),

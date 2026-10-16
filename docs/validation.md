@@ -244,10 +244,14 @@ Only the verdict and the reported level get written down, in
 `docs/validation-log.md`. The certificate, the key and the signed files stay in
 the scratch directory and are deleted afterwards.
 
-Today this needs an **exportable** FNMT software certificate (a `.p12`), because
-the CLI reads keys from files. A DNIe or a non-exportable FNMT key lives in a
-token and cannot be used until the PKCS#11 keystore exists, so those are out of
-scope for the acceptance run and in scope for the keystore work.
+Today an exportable FNMT software certificate (a `.p12`) signs from a file, and
+since the system keystores landed, so does a DNIe or a non-exportable FNMT key:
+`--store pkcs11:/usr/lib/opensc-pkcs11.so:<token> --pin-env <VAR>` signs with
+the key inside the card. The acceptance run against VALIDe through a reader is
+still pending a physical card in CI-adjacent hands; what *is* automated is the
+keystore itself, tested end to end against SoftHSM and an NSS database built by
+`tools/setup-test-keystores.sh` (see `crates/openfirma-keystore/tests/pkcs11.rs`
+and docs/adr/0004-system-keystores.md).
 
 The last step is the sedes electrónicas themselves: submit a real trámite with a
 document signed by openfirma. That is the only proof of protocol layer
@@ -279,8 +283,10 @@ signed with it, never enter the repository:
 - the acceptance run with a real FNMT or DNIe certificate happens outside the
   tree, in a scratch directory, and only the verdict and the reported signature
   level get written into `docs/validation-log.md`,
-- a real personal certificate cannot be used from the tests anyway until the
-  PKCS#11 keystore exists, because DNIe and most FNMT keys are not exportable.
+- tests never see real personal certificate material: the PKCS#11 and NSS tests
+  use the synthetic PKI imported into SoftHSM and an NSS DB under
+  `/tmp/opencode/keystores` by `tools/setup-test-keystores.sh`, so a real DNIe
+  card is never mounted in test infrastructure either.
 
 `tools/check-no-real-certs.sh` blocks the whole class of mistake, including a
 signature that embeds someone's certificate without anyone meaning to. See the

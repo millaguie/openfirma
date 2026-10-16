@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -6,6 +7,7 @@ use openfirma_cades::{CadesOptions, sign};
 use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
 use openfirma_core::signer::{Signer, SoftwareSigner};
+use openfirma_keystore::boxed_signer;
 use openfirma_pades::{Appearance, PadesOptions};
 use zeroize::Zeroizing;
 
@@ -30,6 +32,33 @@ enum Command {
     Inspect {
         #[arg(long, short = 'i')]
         input: PathBuf,
+    },
+    /// Work with system keystores (PKCS#11 tokens, NSS databases, the
+    /// platform certificate store)
+    Keystores {
+        #[command(subcommand)]
+        command: KeystoreCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeystoreCommand {
+    /// List the certificates each given keystore holds together with a key
+    /// openfirma can sign with. With no argument, lists what this machine can
+    /// see without a PIN: the platform store on Windows and macOS; nothing to
+    /// guess at elsewhere, where keystores are named one by one.
+    List {
+        /// One keystore descriptor in the same form as `sign --store`
+        /// (`pkcs11:/path[:token]`, `nss[:sql:/db]`, `windows`, `macos`),
+        /// repeatable.
+        #[arg(long = "store", short = 's')]
+        stores: Vec<String>,
+
+        /// Environment variable holding the PIN of every listed keystore.
+        /// Without it, tokens that hide their objects until login report how
+        /// to give one instead of pretending to be empty.
+        #[arg(long)]
+        pin_env: Option<String>,
     },
 }
 
@@ -113,6 +142,34 @@ struct SignArgs {
     /// friendlyName of the entry to use when the --p12 holds more than one key
     #[arg(long)]
     alias: Option<String>,
+
+    /// Sign with a certificate the system or a token holds, instead of a file.
+    /// Forms: `pkcs11:/path/to/module.so[:token label]` for any PKCS#11 module
+    /// (a smartcard's opensc-pkcs11.so included), `nss[:sql:/path/to/db]` for
+    /// an NSS shared database (Firefox/Thunderbird style; the module is found
+    /// on its own or via OPENFIRMA_NSS_MODULE), and `windows` or `macos` for
+    /// the platform's own certificate store. A descriptor ending in `::`
+    /// (`pkcs11:/mod.so:token::`) logs in with an empty PIN — the shape of an
+    /// unpassworded token; otherwise the PIN comes from --pin-env. Replaces
+    /// --p12/--cert/--key. The private key never leaves the store: openfirma
+    /// asks it to sign.
+    #[arg(long)]
+    store: Option<String>,
+
+    /// Environment variable holding the PIN of the --store keystore (its PKCS#11
+    /// user PIN, or the NSS database password; an unset variable means an empty
+    /// one). Like every secret here it must not appear on the command line:
+    /// export the variable, point this flag at its name. With no value after a
+    /// token label — `...module.so:My Token:` — nothing is looked up and the
+    /// token's own no-password login is attempted.
+    #[arg(long)]
+    pin_env: Option<String>,
+
+    /// Label of the certificate to sign with when --store holds more than one
+    /// (CKA_LABEL on PKCS#11, the NSS nickname). Without it a store holding
+    /// exactly one signer is used and more than one is an error that lists them.
+    #[arg(long)]
+    store_alias: Option<String>,
 
     /// Include the content inside the signature. AutoFirma leaves it out by
     /// default: its mode is "explicit", and in @firma vocabulary explicit
@@ -458,6 +515,223 @@ fn split_http_response(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(body_out)
 }
 
+/// One `--store` / `keystores list --store` descriptor, parsed.
+#[derive(Debug)]
+enum StoreSpec {
+    /// `pkcs11:/path/to/module.so[:token label][:]` — the token part is
+    /// optional and means "the first slot with a token"; a second colon after
+    /// the label marks a keystore that needs no PIN at all.
+    Pkcs11 {
+        module: PathBuf,
+        token: Option<String>,
+        wants_no_pin: bool,
+    },
+    /// `nss` or `nss:sql:/path/to/db` — without a database, `$HOME/.pki/nssdb`
+    /// is used, the standard location for a shared NSS database.
+    Nss {
+        db: String,
+    },
+    Windows,
+    Macos,
+}
+
+/// Parses a store descriptor. The module-path/`token label` split uses the
+/// *last* colon so unix paths keep working; `label:` only means a token when
+/// what precedes it names an existing file — a Windows drive letter is told
+/// apart that way too (`C:\tokens\mod.dll:mytoken` splits at the last colon,
+/// `C:\tokens\mod.dll` does not split at its colon).
+fn parse_store_spec(text: &str) -> Result<StoreSpec> {
+    let (kind, rest) = text.split_once(':').unwrap_or((text, ""));
+    // Two colons at the end (`…mod.so:label::`, or `…mod.so::` with no
+    // label): strip the marker once, up front, so splitting sees exactly one
+    // separator. A single trailing colon is a token split (or a drive), and
+    // stays for the rules below to resolve.
+    let (rest, wants_no_pin) = match rest.strip_suffix("::") {
+        Some(base) => (base, true),
+        None => (rest, false),
+    };
+    match kind.to_ascii_lowercase().as_str() {
+        "pkcs11" => {
+            if rest.is_empty() {
+                anyhow::bail!(
+                    "--store pkcs11: needs the module path: \
+                     --store pkcs11:/usr/lib/opensc-pkcs11.so[:token label]"
+                );
+            }
+            let (module, tail) = split_trailing_token(rest);
+            // One separator, at most: `label` is the token when present. A
+            // drive-letter path never gains a tail here — the split refuses to
+            // cut `C:` at index 1 — and the no-PIN marker was already stripped
+            // above, so nothing else can masquerade as a separator.
+            let token = match tail {
+                Some(tail) if !tail.is_empty() => Some(tail.to_string()),
+                _ => None,
+            };
+            Ok(StoreSpec::Pkcs11 {
+                module: PathBuf::from(module),
+                token,
+                wants_no_pin,
+            })
+        }
+        "nss" => {
+            let db = if rest.is_empty() {
+                let home = std::env::var("HOME").context(
+                    "the default NSS database is $HOME/.pki/nssdb and HOME is not set: \
+                     name the database with --store nss:sql:/path/to/db",
+                )?;
+                format!("sql:{home}/.pki/nssdb")
+            } else {
+                rest.to_string()
+            };
+            Ok(StoreSpec::Nss { db })
+        }
+        "windows" | "macos" | "apple" => {
+            if !rest.is_empty() {
+                anyhow::bail!("--store {kind} takes no argument, got {text:?}");
+            }
+            if kind.eq_ignore_ascii_case("windows") {
+                Ok(StoreSpec::Windows)
+            } else {
+                Ok(StoreSpec::Macos)
+            }
+        }
+        other => anyhow::bail!(
+            "unknown --store {other:?}: use pkcs11:/path/to/module.so[:token], \
+             nss[:sql:/path/to/db], windows, or macos"
+        ),
+    }
+}
+
+/// Splits `module[:token]` on the last colon — but only when what precedes it
+/// names a file. That rule protects Windows drive letters without any OS
+/// special case: `C:\path\mod.dll` has its trailing colon at index 1, where
+/// `C` is not a file, so nothing is split; `...\mod.dll:mytoken` splits after
+/// the module because the module exists. A path that does not exist reports
+/// through the loader's own error later, and there splitting is moot anyway.
+/// Two colons at the end (`module::label` style is a caller problem) are left
+/// to the caller to interpret; a bare trailing colon means "no label".
+fn split_trailing_token(rest: &str) -> (&str, Option<&str>) {
+    // Never cut inside `X:` (a drive letter): only colons from index 2 on can
+    // separate a module from its token. Windows-only in practice; the guard is
+    // free and makes the result identical everywhere.
+    let drive_colon = rest.get(1..2) == Some(":");
+    match rest.rfind(':') {
+        Some(i) if i >= 2 && !drive_colon => (&rest[..i], Some(&rest[i + 1..])),
+        _ => (rest, None),
+    }
+}
+
+/// The PIN for a keystore, read from the environment variable named by
+/// `--pin-env`. An unset variable is an empty PIN — that is how NSS shared
+/// databases (no password) are expressed.
+fn store_pin(pin_env: Option<&String>) -> Result<Option<String>> {
+    match pin_env {
+        Some(var) => Ok(Some(std::env::var(var).unwrap_or_default())),
+        None => Ok(None),
+    }
+}
+
+/// `SystemStore` is already object safe (`certificates` returns a sized
+/// `Vec`, and `sign_prehash` takes both arguments by reference), so the CLI
+/// needs no erasure shim — only this alias for the handle `open_store` hands
+/// back: an Arc, because the store must outlive every `StoreSigner` borrowed
+/// from it. The dyn shape keeps every backend out of the format crates'
+/// generics; see `boxed_signer`.
+type DynStore = Arc<dyn openfirma_keystore::SystemStore>;
+
+/// Opens a descriptor behind one `Arc`.
+fn open_store(spec: &StoreSpec, pin: Option<String>) -> Result<DynStore> {
+    let store: DynStore = match spec {
+        StoreSpec::Pkcs11 {
+            module,
+            token,
+            wants_no_pin,
+        } => Arc::new(openfirma_keystore::Pkcs11Store::open(
+            module,
+            token.as_deref(),
+            if *wants_no_pin && pin.is_none() {
+                // The descriptor said "no PIN": log in with an empty one, the
+                // shape a SoftHSM token initialized --pin '' accepts.
+                Some(String::new())
+            } else {
+                pin
+            },
+        )?),
+        StoreSpec::Nss { db } => match openfirma_keystore::nss::open(db, None, pin) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                // `nss` and `nspr` are separate packages on every Linux that
+                // ships the library anywhere a browser needs it; telling the
+                // user which to install beats "library not found".
+                let text = e.to_string();
+                if text.contains("OPENFIRMA_NSS_MODULE") {
+                    anyhow::bail!("{text} (on Debian/Ubuntu: apt install libnss3)");
+                }
+                return Err(e.into());
+            }
+        },
+        StoreSpec::Windows => {
+            #[cfg(target_os = "windows")]
+            {
+                Arc::new(openfirma_keystore::windows::WindowsStore::open()?)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                anyhow::bail!("--store windows is the Windows certificate store; run it on Windows")
+            }
+        }
+        StoreSpec::Macos => {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                Arc::new(openfirma_keystore::macos::MacStore::open()?)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                anyhow::bail!("--store macos is the macOS keychain; run it on macOS")
+            }
+        }
+    };
+    Ok(store)
+}
+
+/// Picks the signing certificate of a keystore for `sign --store`: by label
+/// when `--store-alias` gave one, otherwise requiring exactly one signer. An
+/// ambiguous pick is refused with the labels on offer — guessing which
+/// certificate signed a legal document is never acceptable.
+fn store_signer(store: &DynStore, alias: Option<&str>) -> Result<Box<dyn Signer + 'static>> {
+    let certs = store.certificates()?;
+    if certs.is_empty() {
+        anyhow::bail!("this keystore holds no certificate with a signable private key");
+    }
+    let chosen = match alias {
+        Some(want) => certs
+            .iter()
+            .find(|c| c.label.as_deref() == Some(want))
+            .with_context(|| {
+                let mut msg = format!("no keystore entry labeled '{want}'; entries present:");
+                for c in &certs {
+                    let cn = c.cert.subject_cn().unwrap_or_else(|| "<no CN>".into());
+                    msg.push_str(&format!("\n  {}", c.label.as_deref().unwrap_or(&cn)));
+                }
+                msg
+            })?
+            .clone(),
+        None if certs.len() == 1 => certs[0].clone(),
+        None => {
+            let mut msg = String::from(
+                "the keystore holds more than one signer; pick one with \
+                              --store-alias:",
+            );
+            for c in &certs {
+                let cn = c.cert.subject_cn().unwrap_or_else(|| "<no CN>".into());
+                msg.push_str(&format!("\n  {}", c.label.as_deref().unwrap_or(&cn)));
+            }
+            anyhow::bail!("{msg}")
+        }
+    };
+    Ok(boxed_signer(store.clone(), chosen))
+}
+
 /// Refuses `sign -i f -o f` unless `--force` says the overwrite is meant.
 ///
 /// Both paths are compared before any reading happens, and twice: the plain
@@ -542,6 +816,9 @@ fn main() -> Result<()> {
                 password,
                 password_file,
                 alias,
+                store,
+                pin_env,
+                store_alias,
                 tsa,
                 timestamp_token,
                 validation_cert,
@@ -576,24 +853,77 @@ fn main() -> Result<()> {
 
             let content =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+            // One `Box<dyn Signer>` covers every source: the software paths
+            // box up unchanged, and a system store's signer keeps its store
+            // alive behind an Arc (see boxed_signer).
             let password = p12_password(password, password_file)?;
-            let signer = match (&p12, &password) {
-                (Some(container), Some(pw)) => load_p12(container, pw, alias.as_deref())?,
-                (Some(_), None) => {
+            // The three sources are exclusive, checked before opening anything.
+            let named: Vec<&str> = [
+                store.as_ref().map(|_| "--store"),
+                p12.as_ref().map(|_| "--p12"),
+                match (&cert, &key) {
+                    (Some(_), Some(_)) => Some("--cert/--key"),
+                    _ => None,
+                },
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if named.len() > 1 {
+                anyhow::bail!(
+                    "{} name alternative sources for the signing key: give exactly one",
+                    named.join(" and ")
+                );
+            }
+            let signer: Box<dyn Signer> = if let Some(spec) = &store {
+                if alias.is_some() {
                     anyhow::bail!(
-                        "--p12 needs the container's password: --password-file (the safe \
-                         input), the OPENFIRMA_PASSWORD environment variable, or --password \
-                         (insecure, visible in ps and in shell history)"
-                    )
+                        "--alias names a PKCS#12 entry; the keystore entry of --store \
+                         is picked with --store-alias"
+                    );
                 }
-                (None, Some(_)) => {
-                    anyhow::bail!("a password only makes sense together with --p12")
+                if password.is_some() {
+                    anyhow::bail!(
+                        "a --password belongs to a --p12; the PIN of --store comes from \
+                         --pin-env VAR, naming the variable that holds it"
+                    );
                 }
-                (None, None) => {
-                    let cert = cert.context("--cert is required unless --p12 is given")?;
-                    let key = key.context("--key is required unless --p12 is given")?;
-                    load_signer(&cert, &key, &chain)?
+                let pin = store_pin(pin_env.as_ref())?;
+                let store = open_store(&parse_store_spec(spec)?, pin)?;
+                store_signer(&store, store_alias.as_deref())?
+            } else if let Some(container) = &p12 {
+                if pin_env.is_some() || store_alias.is_some() {
+                    anyhow::bail!("--pin-env and --store-alias belong to --store");
                 }
+                let pw = password.context(
+                    "--p12 needs the container's password: --password-file (the safe \
+                     input), the OPENFIRMA_PASSWORD environment variable, or --password \
+                     (insecure, visible in ps and in shell history)",
+                )?;
+                Box::new(load_p12(container, &pw, alias.as_deref())?)
+            } else if let (Some(c), Some(k)) = (&cert, &key) {
+                if pin_env.is_some() || store_alias.is_some() {
+                    anyhow::bail!("--pin-env and --store-alias belong to --store");
+                }
+                if password.is_some() {
+                    anyhow::bail!("a password only makes sense together with --p12");
+                }
+                Box::new(load_signer(c, k, &chain)?)
+            } else {
+                if cert.is_some() || key.is_some() {
+                    anyhow::bail!(
+                        "--cert and --key are a pair: {} is missing its partner \
+                         (or the intent was --store / --p12)",
+                        if cert.is_some() { "--key" } else { "--cert" }
+                    );
+                }
+                if password.is_some() {
+                    anyhow::bail!("a password only makes sense together with --p12");
+                }
+                anyhow::bail!(
+                    "a signing key is required: --cert and --key together, a --p12, \
+                     or a system keystore with --store"
+                )
             };
             let digest_alg: DigestAlg = digest.into();
 
@@ -624,7 +954,7 @@ fn main() -> Result<()> {
             }
 
             let signature = match format {
-                Format::Cades => sign(&content, &signer, &opts)?,
+                Format::Cades => sign(&content, &*signer, &opts)?,
                 // PAdES fixes the CAdES shape itself: detached, no signingTime
                 // because the time is in /M, and no contentHint. The knobs
                 // above only apply to CAdES, see docs/pades.md. B-LT and
@@ -645,7 +975,7 @@ fn main() -> Result<()> {
                     }
                     openfirma_pades::pades_sign(
                         &content,
-                        &signer,
+                        &*signer,
                         &PadesOptions {
                             digest: digest_alg,
                             reason,
@@ -680,7 +1010,7 @@ fn main() -> Result<()> {
                 // apply, and --mime-type feeds DataObjectFormat instead.
                 Format::Xades => openfirma_xades::xades_sign(
                     &content,
-                    &signer,
+                    &*signer,
                     &openfirma_xades::XadesOptions {
                         digest: digest_alg,
                         mime_type,
@@ -838,6 +1168,77 @@ fn main() -> Result<()> {
                     openfirma_core::der_dump(&bytes)
                         .with_context(|| format!("{} is not valid DER", input.display()))?
                 );
+            }
+        }
+        Command::Keystores {
+            command: KeystoreCommand::List { stores, pin_env },
+        } => {
+            let mut specs: Vec<StoreSpec> = Vec::new();
+            if stores.is_empty() {
+                // With nothing named, show what this machine owns without a
+                // PIN: the platform store. PKCS#11 modules are never guessed
+                // at — every token deserves to be asked for by path.
+                #[cfg(target_os = "windows")]
+                specs.push(StoreSpec::Windows);
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                specs.push(StoreSpec::Macos);
+                if specs.is_empty() {
+                    println!(
+                        "no keystore to show without being pointed at one: pass \
+                         --store pkcs11:/path/to/module.so[:token] or \
+                         --store nss[:sql:/path/to/db]"
+                    );
+                    return Ok(());
+                }
+            } else {
+                for text in &stores {
+                    specs.push(parse_store_spec(text)?);
+                }
+            }
+            let pin = store_pin(pin_env.as_ref())?;
+            // One failure must not hide the other keystores' listings: every
+            // descriptor is attempted, and a nonzero exit at the end says the
+            // run was not fully successful.
+            let mut failed = false;
+            for spec in &specs {
+                let described = match spec {
+                    StoreSpec::Pkcs11 { module, token, .. } => match token {
+                        Some(t) => format!("pkcs11:{}:{t}", module.display()),
+                        None => format!("pkcs11:{}", module.display()),
+                    },
+                    StoreSpec::Nss { db } => format!("nss:{db}"),
+                    StoreSpec::Windows => "windows".into(),
+                    StoreSpec::Macos => "macos".into(),
+                };
+                match open_store(spec, pin.clone()).and_then(|store| {
+                    let certs = store.certificates()?;
+                    Ok(certs)
+                }) {
+                    Ok(certs) => {
+                        println!("{described}:");
+                        if certs.is_empty() {
+                            println!("  (no certificate with a signable private key)");
+                        }
+                        for c in &certs {
+                            let cn = c.cert.subject_cn().unwrap_or_else(|| "<no CN>".into());
+                            let serial = hex::encode_upper(c.cert.serial_number().as_bytes());
+                            println!(
+                                "  {}  subject CN={cn}  serial=0x{serial}",
+                                c.label.as_deref().unwrap_or("<unlabeled>"),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        failed = true;
+                        println!("{described}:");
+                        for line in e.to_string().lines() {
+                            println!("  error: {line}");
+                        }
+                    }
+                }
+            }
+            if failed {
+                anyhow::bail!("at least one keystore could not be listed");
             }
         }
     }
@@ -1248,6 +1649,116 @@ mod tests {
             std::env::temp_dir().join(format!("openfirma-{}-{test}-{name}", std::process::id()));
         std::fs::write(&path, bytes).expect("cannot write temp file");
         path
+    }
+
+    #[test]
+    fn store_specs_parse_every_documented_shape() {
+        let spec = parse_store_spec("pkcs11:/usr/lib/opensc-pkcs11.so").unwrap();
+        match spec {
+            StoreSpec::Pkcs11 {
+                module,
+                token,
+                wants_no_pin,
+            } => {
+                assert_eq!(module, PathBuf::from("/usr/lib/opensc-pkcs11.so"));
+                assert_eq!(token, None);
+                assert!(!wants_no_pin);
+            }
+            other => panic!("expected a pkcs11 spec, got {other:?}"),
+        }
+        let spec = parse_store_spec("pkcs11:/tmp/x-mod.so:My Card").unwrap();
+        match spec {
+            StoreSpec::Pkcs11 {
+                module,
+                token,
+                wants_no_pin,
+            } => {
+                assert_eq!(module, PathBuf::from("/tmp/x-mod.so"));
+                assert_eq!(token.as_deref(), Some("My Card"));
+                assert!(!wants_no_pin);
+            }
+            other => panic!("expected a pkcs11 spec, got {other:?}"),
+        }
+        // The explicit no-PIN marker: `::` at the end, with and without label.
+        let spec = parse_store_spec("pkcs11:/usr/lib/nosuch-mod.so:My Card::").unwrap();
+        match spec {
+            StoreSpec::Pkcs11 {
+                module: _,
+                token,
+                wants_no_pin,
+            } => {
+                assert_eq!(token.as_deref(), Some("My Card"));
+                assert!(wants_no_pin);
+            }
+            other => panic!("expected a pkcs11 spec, got {other:?}"),
+        }
+        // A colon that does not follow an existing module file stays inside
+        // the path: on Windows this is how `C:\…\mod.dll` survives.
+        let spec = parse_store_spec("pkcs11:C:\\tokens\\mod.dll").unwrap();
+        match spec {
+            StoreSpec::Pkcs11 {
+                module,
+                token,
+                wants_no_pin: _,
+            } => {
+                assert_eq!(module, PathBuf::from("C:\\tokens\\mod.dll"));
+                assert_eq!(token, None);
+            }
+            other => panic!("expected a pkcs11 spec, got {other:?}"),
+        }
+        let spec = parse_store_spec("nss:sql:/home/u/.pki/nssdb").unwrap();
+        match spec {
+            StoreSpec::Nss { db } => assert_eq!(db, "sql:/home/u/.pki/nssdb"),
+            other => panic!("expected an nss spec, got {other:?}"),
+        }
+        // The bare forms: nss defaults to the shared-database location under
+        // $HOME; windows/macos take no argument and name no store elsewhere.
+        unsafe { std::env::set_var("HOME", "/home/u") };
+        match parse_store_spec("nss").unwrap() {
+            StoreSpec::Nss { db } => assert_eq!(db, "sql:/home/u/.pki/nssdb"),
+            other => panic!("expected an nss spec, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_store_spec("windows").unwrap(),
+            StoreSpec::Windows
+        ));
+        assert!(matches!(
+            parse_store_spec("macos").unwrap(),
+            StoreSpec::Macos
+        ));
+        assert!(matches!(
+            parse_store_spec("apple").unwrap(),
+            StoreSpec::Macos
+        ));
+        let err = parse_store_spec("pkcs11:").err().unwrap().to_string();
+        assert!(err.contains("module path"), "{err}");
+        let err = parse_store_spec("windows:/extra")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("takes no argument"), "{err}");
+        let err = parse_store_spec("tpm:foo").err().unwrap().to_string();
+        assert!(err.contains("--store") && err.contains("pkcs11:"), "{err}");
+    }
+
+    #[test]
+    fn store_pin_reads_the_named_variable_and_treats_absence_as_empty() {
+        unsafe { std::env::set_var("OPENFIRMA_TEST_PIN_VAR", "1234") };
+        assert_eq!(
+            store_pin(Some(&"OPENFIRMA_TEST_PIN_VAR".into()))
+                .unwrap()
+                .as_deref(),
+            Some("1234")
+        );
+        // An unset variable is an empty PIN: that is how an NSS database with
+        // no password travels, and it must not be a hard error here.
+        assert_eq!(
+            store_pin(Some(&"OPENFIRMA_TEST_PIN_ABSENT".into()))
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(store_pin(None).unwrap(), None);
     }
 
     /// A one answer TCP server, so `http_post` can be pointed at something

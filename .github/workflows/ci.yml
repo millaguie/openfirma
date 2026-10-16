@@ -90,11 +90,30 @@ jobs:
           openssl version
           ./tools/gen-testcert.sh
 
+      # The PKCS#11 integration tests need real modules to load: SoftHSM as a
+      # generic token and NSS's libsoftokn3 for the shared-DB path. Linux only
+      # — macOS and Windows have no packaged softhsm, and their keystore tests
+      # skip by design (the platform stores cannot be provisioned either).
+      - name: install PKCS#11 test modules (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc libnss3
+
       - name: build
         run: cargo build --all-targets --target ${{ matrix.target }}
 
       - name: test
-        run: cargo test --target ${{ matrix.target }}
+        env:
+          OPENFIRMA_TEST_PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
+          OPENFIRMA_TEST_NSS_DB: sql:/tmp/opencode/keystores/nssdb
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Rebuilds the token and NSS DB under /tmp/opencode/keystores and
+            # prints SOFTHSM2_CONF=..., which is how the SoftHSM module finds
+            # its token directory from here on.
+            ./tools/setup-test-keystores.sh | tee /tmp/keystore-setup.log
+            grep '^SOFTHSM2_CONF=' /tmp/keystore-setup.log >> "$GITHUB_ENV" || true
+          fi
+          cargo test --target ${{ matrix.target }}
 
   no-real-certs:
     runs-on: ubuntu-latest
