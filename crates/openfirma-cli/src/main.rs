@@ -2036,15 +2036,16 @@ mod tests {
         // handler that always failed.
         let dir =
             std::env::temp_dir().join(format!("openfirma-register-empty-{}", std::process::id()));
-        let cfg = dir.join("browser.toml");
-        let _ = std::fs::remove_file(&cfg);
         // The refusal must arrive BEFORE any file exists — the round-two state
         // was an install that printed its happy instructions and left a dead
-        // handler behind. HOME points at the same fresh directory: if a
-        // .desktop were written despite the refusal, this would show it.
+        // handler behind. HOME moves to this scratch tree for the duration:
+        // the platform block resolves its .desktop through it, so "nothing was
+        // written" is observable right here instead of in CI's real home.
         std::fs::create_dir_all(dir.join(".local/share/applications")).unwrap();
         let real_home = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &dir) };
+        let cfg = dir.join("browser.toml");
+        let _ = std::fs::remove_file(&cfg);
         let err = register_scheme(None, None, Some(&cfg))
             .unwrap_err()
             .to_string();
@@ -2067,11 +2068,13 @@ mod tests {
         );
 
         // and a half-pair (--password-file without --p12) is the OTHER named
-        // refusal: it would write half a key into the file.
+        // refusal: it would write half a key into the file. Same HOME scope.
         let pw = write_tmp("halfpair.pw", b"secreto\n");
+        unsafe { std::env::set_var("HOME", &dir) };
         let err = register_scheme(None, Some(pw.clone()), Some(&cfg))
             .unwrap_err()
             .to_string();
+        unsafe { std::env::remove_var("HOME") };
         assert!(
             err.contains("--p12 writes a p12") || err.contains("half a key"),
             "{err}"
@@ -2088,7 +2091,10 @@ mod tests {
             "openfirma-register-roundtrip-{}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
+        // HOME moves to this scratch tree for the duration only: --register's
+        // platform block writes its .desktop through HOME (restored right
+        // after the call below, set_var discipline as everywhere else).
+        std::fs::create_dir_all(dir.join(".local/share/applications")).unwrap();
         let cfg = dir.join("browser.toml");
         let _ = std::fs::remove_file(&cfg);
         let p12 = dir.join("Ana María/clave #7.p12");
@@ -2097,8 +2103,16 @@ mod tests {
         let pw = dir.join("pw.txt");
         std::fs::write(&pw, b"secreto\n").unwrap();
 
-        register_scheme(Some(p12.clone()), Some(pw.clone()), Some(&cfg))
-            .expect("a --register with a real key must write its config");
+        let real_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+        let wrote = register_scheme(Some(p12.clone()), Some(pw.clone()), Some(&cfg));
+        unsafe {
+            match real_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        wrote.expect("a --register with a real key must write its config");
 
         let back = browser_key_config(Some(&cfg))
             .unwrap()
