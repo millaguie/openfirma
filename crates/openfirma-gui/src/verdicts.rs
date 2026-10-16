@@ -41,6 +41,7 @@ pub fn verdicts_for(
     let opts = VerifyOptions {
         trust_anchors: anchors,
         validation_time: now(),
+        ts_mode: false,
     };
     match openfirma_core::workflow::Format::detect(bytes) {
         openfirma_core::workflow::Format::Pdf => Ok(verdicts_from_pdf(
@@ -88,8 +89,25 @@ fn technical_of(r: &VerifyReport) -> Vec<String> {
     if let Some(t) = r.attributes.signing_time {
         lines.push(format!("signingTime: {}", fmt_utc(t)));
     }
-    if r.attributes.signature_time_stamp_token {
-        lines.push("nivel: B-T (sellado de firma)".into());
+    // A level string is only ever a level the verifier PROVED (finding A2):
+    // an unverified token never contributes "B-T", and what failed travels in
+    // the technical lines so no screen can paint it green.
+    if r.timestamp.verified() {
+        let stamp_time = r
+            .timestamp
+            .gen_time()
+            .map(fmt_utc)
+            .unwrap_or_else(|| "instante no reportado".into());
+        lines.push(format!(
+            "nivel: B-T (sellado de firma verificado, genTime {stamp_time})"
+        ));
+    } else if !r.timestamp.tokens.is_empty() {
+        lines.push(format!(
+            "nivel: B-B (hay sello de tiempo pero NO esta verificado: {})",
+            r.timestamp.problem().unwrap_or_default()
+        ));
+    } else {
+        lines.push("nivel: B-B".into());
     }
     lines.push(format!("comprobaciones superadas: {}", r.passed.join(", ")));
     lines

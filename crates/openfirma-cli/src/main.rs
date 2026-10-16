@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
@@ -177,8 +177,12 @@ struct VerifyArgs {
     content: Option<PathBuf>,
 
     /// Trust anchor certificate, PEM or DER, repeatable. The signer's chain
-    /// has to reach one of them, and at least one is required.
-    #[arg(long, required = true)]
+    /// has to reach one of them. Without this flag the anchors come from
+    /// $OPENFIRMA_TRUST (a path list); with neither, verification refuses to
+    /// run — there is nothing to check a chain up to. Every block of a
+    /// chosen file that basicConstraints marks CA:FALSE is refused as an
+    /// anchor; bundles of several certificates load the CAs among them.
+    #[arg(long)]
     trust: Vec<PathBuf>,
 
     /// Validation time for the certificate validity dates, as an RFC 3339
@@ -1037,17 +1041,27 @@ fn main() -> Result<()> {
             let bytes =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
 
-            let mut anchors = Vec::with_capacity(trust.len());
-            for t in &trust {
-                let anchor =
-                    std::fs::read(t).with_context(|| format!("reading {}", t.display()))?;
-                anchors.push(parse_certificate(&anchor).with_context(|| {
-                    format!("{} is not a valid X.509 certificate", t.display())
-                })?);
+            // --trust, or the environment's list, and never a silent default:
+            // an unanchored chain verifies nothing. Each file loads through
+            // core's rule, which keeps CA:FALSE leaves out of the anchors.
+            let files = if trust.is_empty() {
+                openfirma_core::workflow::default_trust_anchors()
+            } else {
+                trust
+            };
+            if files.is_empty() {
+                bail!("no trust anchors: pass --trust or set $OPENFIRMA_TRUST");
+            }
+            let mut anchors = Vec::new();
+            for t in &files {
+                let loaded =
+                    openfirma_core::workflow::load_trust_anchors(t).map_err(anyhow::Error::msg)?;
+                anchors.extend(loaded);
             }
             let opts = openfirma_cades::VerifyOptions {
                 trust_anchors: anchors,
                 validation_time,
+                ts_mode: false,
             };
             println!("validation time: {}", fmt_system_time(validation_time));
 

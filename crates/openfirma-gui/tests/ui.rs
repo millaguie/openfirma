@@ -221,6 +221,55 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// Review C-1(06)/M-10, the GUI half. The anchor picker asks "¿en quién
+/// confías?"; picking a signer's LEAF certificate — CA:FALSE, one human of
+/// flesh and bone — must never light the window green. Before the fix the
+/// pick became an anchor for whoever held that key: any document that same
+/// attacker signed verified against it. Now core's anchor rule refuses the
+/// file at load, the Failed screen shows the reason, and nothing verifies.
+#[test]
+fn a_leaf_picked_as_anchor_is_refused_not_green() {
+    let p12 = testdata().join("certs/signer-rsa.p12");
+    let leaf = testdata().join("certs/signer-rsa.crt");
+    let dir = temp_doc("leaf-anchor");
+    let doc = dir.join("doc.pdf");
+    if require(
+        p12.is_file() && leaf.is_file() && testdata().join("inputs/simple.pdf").is_file(),
+        "the test PKI",
+    )
+    .is_none()
+    {
+        return;
+    }
+    std::fs::copy(testdata().join("inputs/simple.pdf"), &doc).unwrap();
+    let signed = sign_through_gui_code(&doc, &p12);
+    let out = dir.join("doc.signed.pdf");
+    std::fs::write(&out, &signed).unwrap();
+
+    // same drop as the verify test above, but the fixture answers the anchor
+    // picker with the signer's own leaf instead of a CA
+    let mut app = fixture_app(Some(leaf.clone()));
+    app.load_path_for_test(out.clone());
+    let mut harness = harness_for(app);
+    harness.run(); // the deferred ask fires; the fixture answers with the leaf
+    match harness.state().screen_ref_for_test() {
+        Screen::Failed { error, .. } => {
+            let text = format!("{} / {}", error.plain, error.technical);
+            assert!(
+                text.contains("CA:FALSE") || text.contains("autoridad"),
+                "the refusal must say why the picked file cannot anchor anything: {text}"
+            );
+        }
+        other => {
+            let _ = other;
+            panic!("a leaf anchor must land on Failed, not some other screen");
+        }
+    }
+    // and under no reading does a green verdict stand for this pick
+    assert!(harness.query_by_label_contains("Firma válida").is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn an_error_screen_is_plain_first_with_details_behind() {
     // Feed the failure directly: the window's job is presentation, and which
@@ -461,6 +510,7 @@ fn verify_after_gui_sign(signed: &Path) {
     let opts = openfirma_cades::VerifyOptions {
         trust_anchors: anchors,
         validation_time: std::time::SystemTime::now(),
+        ts_mode: false,
     };
     let document = openfirma_pades::pades_verify(&bytes, &opts).expect("the GUI's output verifies");
     assert_eq!(document.signatures.len(), 1);

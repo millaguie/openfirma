@@ -69,6 +69,9 @@ pub struct Tr {
     // --- window titles / dialogs -------------------------------------------
     pub dialog_open_file: String,
     pub dialog_open_cert: String,
+    /// Title of the anchor picker (review C-1): the file it asks for is a
+    /// certification authority to trust, not the user's own certificate.
+    pub dialog_open_anchor: String,
     pub dialog_save_sig: String,
 }
 
@@ -128,6 +131,8 @@ impl Tr {
             discard_result: "Cerrar sin guardar".into(),
             dialog_open_file: "Elige el documento".into(),
             dialog_open_cert: "Elige tu certificado".into(),
+            dialog_open_anchor: "Elige la autoridad en la que confías (ancla de verificación)"
+                .into(),
             dialog_save_sig: "Guardar la firma".into(),
         }
     }

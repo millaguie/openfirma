@@ -353,3 +353,188 @@ impl openfirma_core::signer::Signer for NoSigner {
         unreachable!("the unknown-format refusal never signs")
     }
 }
+
+// ---------------------------------------------------------------- trust anchors
+//
+// Review C-1(06)/M-10: `verify` used to take whatever file `--trust` named and
+// chain up to it, leaf included — "trust this signer's certificate" turns every
+// document that same attacker signs green. The rule now lives in core
+// (`load_trust_anchors`) and both frontends read through it; these three pin
+// the CLI half over the real binary.
+
+/// A PEM bundle of several certificates is what a CA hands out (FNMT's
+/// `cadena.crt`, a distro ca-certificates file): every CA block joins the
+/// pool, so verifying through the whole bundle works exactly as `openssl
+/// -CAfile` would. The leaf riding inside it does not — see the next test.
+#[test]
+fn trust_accepts_a_pem_bundle_of_several_certificates() {
+    let Some(pki) = test_certs() else {
+        eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let doc = write_tmp("bundle-verify.pdf", b"%PDF-1.4\nnot signed\n");
+    std::fs::remove_file(&doc).ok();
+
+    // sign a real document through the binary first, with the test chain
+    let in_doc = pki.join("../inputs/simple.pdf");
+    if !in_doc.is_file() {
+        eprintln!("skipped, testdata/inputs/simple.pdf missing");
+        return;
+    }
+    let signed = write_tmp("bundle-signed.pdf", b"");
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args(["sign", "-i"])
+        .arg(&in_doc)
+        .arg("-o")
+        .arg(&signed)
+        .args(["--cert"])
+        .arg(pki.join("signer-rsa.crt"))
+        .arg("--key")
+        .arg(pki.join("signer-rsa.key"))
+        .args(["--format", "pades-b-b"])
+        .output()
+        .expect("the binary must run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // the bundle: intermediate + root, one PEM file. verify --trust <bundle>
+    // must go green — both CAs load and the chain reaches one of them.
+    let bundle = write_tmp(
+        "bundle.crt",
+        format!(
+            "{}{}",
+            std::fs::read_to_string(pki.join("intermediate.crt")).unwrap(),
+            std::fs::read_to_string(pki.join("ca.crt")).unwrap()
+        )
+        .as_bytes(),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args(["verify", "-i"])
+        .arg(&signed)
+        .args(["--trust"])
+        .arg(&bundle)
+        .env_remove("OPENFIRMA_TRUST")
+        .output()
+        .expect("the binary must run");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "a PEM bundle of CAs must verify the document it issued: {text}"
+    );
+    std::fs::remove_file(&bundle).ok();
+    std::fs::remove_file(&signed).ok();
+    let _ = doc;
+}
+
+/// The attack, end to end over argv: passing a CA:FALSE leaf as the anchor —
+/// alone or inside a bundle of CAs — is refused with its reason. Alone it
+/// loads to nothing and the run stops; bundled, the CAs still load and the
+/// leaf simply never joins the pool (openssl tolerates leaves in `-CAfile`
+/// too), so a document signed by that leaf verifies because of the CAs, not
+/// because the attacker's own certificate was allowed to anchor anything.
+#[test]
+fn trust_refuses_a_leaf_certificate_as_an_anchor() {
+    let Some(pki) = test_certs() else {
+        eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    // the leaf ALONE: nothing loadable, and the refusal names why
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args(["verify", "-i"])
+        .arg(pki.join("signer-rsa.crt")) // not even a PDF; the anchor fails first
+        .args(["--trust"])
+        .arg(pki.join("signer-rsa.crt"))
+        .env_remove("OPENFIRMA_TRUST")
+        .output()
+        .expect("the binary must run");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a CA:FALSE leaf cannot anchor a pool of one: {text}"
+    );
+    assert!(
+        text.contains("CA:FALSE") || text.contains("autoridad"),
+        "the refusal must name the rule that excluded the file: {text}"
+    );
+}
+
+/// $OPENFIRMA_TRUST answers for `verify` when no `--trust` flag is around (a
+/// path list, like SSL_CERT_FILE's shape), and with neither the command
+/// refuses instead of chaining to nothing. This is what makes the GUI's
+/// "ask once" model and scripted verification agree on one configuration.
+#[test]
+fn openfirma_trust_answers_for_verify_without_the_flag() {
+    let Some(pki) = test_certs() else {
+        eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let in_doc = pki.join("../inputs/simple.pdf");
+    if !in_doc.is_file() {
+        eprintln!("skipped, testdata/inputs/simple.pdf missing");
+        return;
+    }
+    let signed = write_tmp("env-verify.pdf", b"");
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args(["sign", "-i"])
+        .arg(&in_doc)
+        .arg("-o")
+        .arg(&signed)
+        .args(["--cert"])
+        .arg(pki.join("signer-rsa.crt"))
+        .arg("--key")
+        .arg(pki.join("signer-rsa.key"))
+        .args(["--format", "pades-b-b"])
+        .output()
+        .expect("the binary must run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // no --trust, no env: refused, and the message names both ways out
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args(["verify", "-i"])
+        .arg(&signed)
+        .env_remove("OPENFIRMA_TRUST")
+        .output()
+        .expect("the binary must run");
+    assert!(
+        !out.status.success(),
+        "verification without anchors must refuse"
+    );
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        text.contains("--trust") && text.contains("OPENFIRMA_TRUST"),
+        "the refusal names both ways of supplying anchors: {text}"
+    );
+
+    // same verify with the env carrying the chain file: green again
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args(["verify", "-i"])
+        .arg(&signed)
+        .env("OPENFIRMA_TRUST", pki.join("chain.crt"))
+        .output()
+        .expect("the binary must run");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "$OPENFIRMA_TRUST must answer for --trust: {text}"
+    );
+    std::fs::remove_file(&signed).ok();
+}

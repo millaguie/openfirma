@@ -1084,7 +1084,11 @@ impl eframe::App for App {
             match action {
                 Deferred::OpenStore(d, pin) => self.open_descriptor(&d, pin),
                 Deferred::AskAnchor(path) => {
-                    let title = self.tr.dialog_open_cert.clone();
+                    // The anchor picker carries its own title (review C-1): it
+                    // asks for a certification AUTHORITY to trust, not "your
+                    // certificate" — and whatever gets picked passes core's
+                    // anchor rule, which refuses a CA:FALSE leaf outright.
+                    let title = self.tr.dialog_open_anchor.clone();
                     let anchor = self.open_file(&title);
                     self.finish_anchor(path, anchor);
                 }
