@@ -153,12 +153,23 @@ pub fn linux_install_paths() -> (PathBuf, &'static str) {
 /// this file names where a signing key lives, and writing it anywhere shared
 /// would let another user name someone else's key for everyone's handler.
 pub fn browser_config_path() -> Option<PathBuf> {
-    let mut dir = match std::env::var_os("XDG_CONFIG_HOME") {
+    browser_config_path_in(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+/// The same rule on inputs given, so the XDG semantics are testable without
+/// racing sibling threads over the process environment (cargo runs them all
+/// in one address space; an earlier draft of these tests proved that a
+/// `set_var` around an assertion is observable by another test mid-flight).
+fn browser_config_path_in(xdg: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    let mut dir = match xdg {
         Some(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
         // an unset or relative XDG_CONFIG_HOME is the specification's signal
         // to fall back to $HOME/.config, and a handler must resolve the same
         // file the installer wrote no matter which branch got taken.
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+        _ => PathBuf::from(home?).join(".config"),
     };
     dir.push("openfirma");
     dir.push("browser.toml");
@@ -498,42 +509,40 @@ mod tests {
 
     #[test]
     fn browser_config_path_follows_the_xdg_rule() {
-        // Like the HOME test in the CLI, mutating the environment is unsafe in
-        // edition 2024 because sibling threads see it; these are values this
-        // machine does not use and both go back before the test returns.
-        let xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", "/xdg-root");
-            std::env::set_var("HOME", "/home/unused");
-        }
-        let got = browser_config_path().unwrap();
+        // The resolution as a pure function of its two inputs: cargo's test
+        // threads share one environment, so these tests (unlike the CLI's
+        // single HOME test) never mutate it — `browser_config_path_in` makes
+        // every branch reachable without set_var at all.
+
+        // XDG_CONFIG_HOME names an absolute directory: that is the config root.
+        let got =
+            browser_config_path_in(Some("/xdg-root".as_ref()), Some(Path::new("/home/x"))).unwrap();
         assert_eq!(got, PathBuf::from("/xdg-root/openfirma/browser.toml"));
 
-        // a relative XDG_CONFIG_HOME is not a config root (spec: ignore it)
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", "relative/path") };
-        let got = browser_config_path().unwrap();
+        // a relative XDG_CONFIG_HOME is not a config root (spec: ignore it) —
+        // and on Windows semantics a drive-less "/xdg-root" is not absolute
+        // either, so this branch's fallback is the same code path everywhere.
+        let got =
+            browser_config_path_in(Some("relative/path".as_ref()), Some(Path::new("/home/x")))
+                .unwrap();
+        assert_eq!(got, PathBuf::from("/home/x/.config/openfirma/browser.toml"));
+
+        // unset XDG_CONFIG_HOME: the $HOME/.config fallback (the branch a
+        // handler lands on whenever the desktop session kept its variables to
+        // itself). No HOME at all resolves nowhere, and says so.
+        let got = browser_config_path_in(None, Some(Path::new("/home/unused-elsewhere"))).unwrap();
         assert_eq!(
             got,
-            PathBuf::from("/home/unused/.config/openfirma/browser.toml")
+            PathBuf::from("/home/unused-elsewhere/.config/openfirma/browser.toml")
         );
+        assert_eq!(browser_config_path_in(None, None), None);
 
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        let got = browser_config_path().unwrap();
-        assert_eq!(
-            got,
-            PathBuf::from("/home/unused/.config/openfirma/browser.toml")
-        );
-
-        unsafe {
-            match xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        // and the live function is this rule on the live environment — checked
+        // only for the shape both branches share (one file, under a directory
+        // called openfirma), because what the variables hold here is the
+        // developer's machine.
+        let live = browser_config_path().expect("this process has HOME or XDG_CONFIG_HOME");
+        assert_eq!(live.file_name().unwrap(), "browser.toml");
+        assert_eq!(live.parent().unwrap().file_name().unwrap(), "openfirma");
     }
 }
