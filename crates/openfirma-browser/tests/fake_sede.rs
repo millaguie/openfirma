@@ -241,6 +241,16 @@ fn ask(
     // token, so patience costs nothing an operation cares about: discarded
     // tokens never signed (a_quiet_half_header's "never burn without a full
     // request" rule) and each fresh one is the only thing ask promises.
+    //
+    // A discarded answer retries at once, minting a fresh token: that failure
+    // is the socket layer's, cheap and unrelated to capacity. A real 503 is
+    // different — the endpoint is saturated, and this helper serves callers
+    // who wait for the wave to age out (the handler's five-second stall
+    // deadline). A fast twelve-burst finishes inside a wave and reports every
+    // answer it never had a chance to see: observed on aarch64-windows as
+    // twelve 503s in twelve seconds while the caller's 90s patience loop
+    // waited for ask to surface an available slot. Capacity therefore pauses
+    // past the deadline between attempts.
     for attempt in 0..12 {
         let token = server.issue_token();
         let path = format!("/sign/{token}");
@@ -251,10 +261,20 @@ fn ask(
             return (status, headers, payload);
         }
         if attempt + 1 < 12 {
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            let pause = match status {
+                503 => std::time::Duration::from_millis(6_000),
+                u16::MAX => std::time::Duration::from_millis(250),
+                // any real answer returns to the caller; never slept past
+                other => unreachable!("ask sleeps only while {other:?} is retryable"),
+            };
+            std::thread::sleep(pause);
         }
     }
-    panic!("the endpoint discarded twelve consecutive answers unread");
+    panic!(
+        "the endpoint discarded twelve consecutive answers unread or stayed at capacity \
+         for a minute: a saturated endpoint whose stalled connections never age out is \
+         the failure this test exists to catch"
+    );
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {

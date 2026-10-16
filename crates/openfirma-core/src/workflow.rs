@@ -854,14 +854,20 @@ mod tests {
 
     #[test]
     fn trust_anchors_come_from_the_environment_and_default_to_none() {
-        // The variable name is fixed, and the one other test that touches the
-        // environment (`bare nss`-style HOME reads) does not read this one;
-        // env mutation stays scoped inside this thread and restores whatever
-        // was there. Rust 2024 marks it unsafe for exactly this reason: no
-        // sibling may be reading the same name, and none is.
+        // The separator is the platform's, not a colon: on Windows
+        // split_paths cuts at `;` and keeps `:` inside paths (a drive letter),
+        // so a hard-coded `a:b` fixture arrives back as ONE path there. The
+        // expected paths are built with the same join the rest of the file
+        // uses, which makes this assert the loader on every platform instead
+        // of asserting a string only Linux reads as a list.
+        let joined = std::env::join_paths([
+            std::ffi::OsStr::new("/tmp/a.pem"),
+            std::ffi::OsStr::new("/tmp/b.der"),
+        ])
+        .unwrap();
         let saved = std::env::var_os("OPENFIRMA_TRUST");
         unsafe {
-            std::env::set_var("OPENFIRMA_TRUST", "/tmp/a.pem:/tmp/b.der");
+            std::env::set_var("OPENFIRMA_TRUST", &joined);
             let anchors = default_trust_anchors();
             assert_eq!(anchors.len(), 2);
             assert_eq!(anchors[0], PathBuf::from("/tmp/a.pem"));
