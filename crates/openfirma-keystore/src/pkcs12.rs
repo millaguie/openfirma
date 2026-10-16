@@ -179,61 +179,50 @@ impl Pkcs12 {
 }
 
 // ---------------------------------------------------------------------------
-// a cursor over DER, just enough for this format
+// DER reading: the workspace's one bounds-checked cursor, wrapped so that a
+// malformed container always answers with the keystore error the CLI shows,
+// re-export hint included. The wrapper exists because a truncated .p12 used
+// to index `&b[1..=n]` past the buffer: `printf '\x30\x84' > trunc.p12`
+// panicked at the length read. There is now one reader with one set of
+// bounds rules for the whole workspace (openfirma_core::tlv::Cursor).
 
 struct Cur<'a> {
-    b: &'a [u8],
-    i: usize,
+    inner: openfirma_core::tlv::Cursor<'a>,
 }
 
 impl<'a> Cur<'a> {
     fn new(b: &'a [u8]) -> Self {
-        Cur { b, i: 0 }
+        Cur {
+            inner: openfirma_core::tlv::Cursor::with_options(b, openfirma_core::tlv::NO_HIGH_TAG),
+        }
     }
 
     fn is_done(&self) -> bool {
-        self.i >= self.b.len()
+        self.inner.done()
     }
 
-    fn tlv(&mut self) -> Result<(u8, &'a [u8])> {
-        let tag = *self
-            .b
-            .get(self.i)
-            .ok_or_else(|| Error::Keystore("the DER ends mid tag".into()))?;
-        if tag & 0x1f == 0x1f {
-            return Err(Error::Keystore(
-                "high tag number form in a PKCS#12, which DER does not use here".into(),
-            ));
-        }
-        self.i += 1;
-        let (len, n) = read_len(&self.b[self.i..])?;
-        self.i += n;
-        let end = self
-            .i
-            .checked_add(len)
-            .ok_or_else(|| Error::Keystore("an absurd length in the DER".into()))?;
-        if end > self.b.len() {
-            return Err(Error::Keystore(format!(
-                "a {len} byte value runs past the end of the container"
-            )));
-        }
-        let v = &self.b[self.i..end];
-        self.i = end;
-        Ok((tag, v))
+    /// One value of a PKCS#12; a malformed file produces the container's own
+    /// error with the way out, never a panic.
+    fn next(&mut self) -> Result<openfirma_core::tlv::Value<'a>> {
+        self.inner
+            .value()
+            .map_err(|e| Error::Keystore(format!("{e}. Re-export the file with `openssl pkcs12 -in old.p12 -out new.p12` if it came from elsewhere")))
     }
 
     fn expect(&mut self, tag: u8) -> Result<&'a [u8]> {
-        let (t, v) = self.tlv()?;
-        if t != tag {
+        let v = self.next()?;
+        if v.tag != tag {
             return Err(Error::Keystore(format!(
-                "expected tag {tag:#04x} in the PKCS#12, found {t:#04x}"
+                "expected tag {tag:#04x} in the PKCS#12, found {:#04x}. Re-export the                  file with `openssl pkcs12 -in old.p12 -out new.p12` if it came from                  elsewhere",
+                v.tag
             )));
         }
-        Ok(v)
+        Ok(v.content)
     }
 
     fn sequence(&mut self) -> Result<Cur<'a>> {
-        Ok(Cur::new(self.expect(0x30)?))
+        let content = self.expect(0x30)?;
+        Ok(Cur::new(content))
     }
 
     fn oid(&mut self) -> Result<ObjectIdentifier> {
@@ -243,12 +232,25 @@ impl<'a> Cur<'a> {
     }
 
     fn number(&mut self) -> Result<usize> {
-        let v = self.expect(0x02)?;
-        if v.len() > 8 {
-            return Err(Error::Keystore("an integer too large to be a count".into()));
+        // strict minimal-form INTEGER: the old reader's loop silently turned
+        // `00 01` into 1 and accepted negative counts; DER allows neither, and
+        // an iteration count is exactly where a hostile file lies
+        let v = self.next()?;
+        let c = v.content;
+        let bad =
+            || Error::Keystore("an integer that is not a minimal non negative count".to_string());
+        if v.tag != 0x02 {
+            return Err(bad());
+        }
+        if c.is_empty()
+            || c.len() > core::mem::size_of::<usize>()
+            || (c[0] & 0x80 != 0)
+            || (c[0] == 0 && c.get(1).is_some_and(|b| b & 0x80 == 0))
+        {
+            return Err(bad());
         }
         let mut n = 0usize;
-        for b in v {
+        for b in c {
             n = (n << 8) | *b as usize;
         }
         Ok(n)
@@ -262,31 +264,6 @@ impl<'a> Cur<'a> {
     fn explicit(&mut self, n: u8) -> Result<&'a [u8]> {
         self.expect(0xa0 | n)
     }
-}
-
-fn read_len(b: &[u8]) -> Result<(usize, usize)> {
-    let first = *b
-        .first()
-        .ok_or_else(|| Error::Keystore("the DER ends mid length".into()))?;
-    if first < 0x80 {
-        return Ok((first as usize, 1));
-    }
-    let n = (first & 0x7f) as usize;
-    if n == 0 {
-        return Err(Error::Keystore(
-            "indefinite length, which DER forbids and a PKCS#12 never carries".into(),
-        ));
-    }
-    if n > 4 {
-        return Err(Error::Keystore(
-            "a length field wider than four bytes".into(),
-        ));
-    }
-    let mut v = 0usize;
-    for x in &b[1..=n] {
-        v = (v << 8) | *x as usize;
-    }
-    Ok((v, n + 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +428,8 @@ fn decrypt_content_info(content: &[u8], password: &str) -> Result<Zeroizing<Vec<
     let _content_type = eci.oid()?;
     let (alg_oid, params) = read_algorithm(&mut eci)?;
     // [0] IMPLICIT OCTET STRING: the tag is 0x80, not 0x04
-    let (tag, encrypted) = eci.tlv()?;
+    let v = eci.next()?;
+    let (tag, encrypted) = (v.tag, v.content);
     if tag != 0x80 {
         return Err(Error::Keystore(format!(
             "the encrypted content carries tag {tag:#04x}, expected the implicit 0x80"
@@ -886,21 +864,26 @@ fn key_matches(key_pkcs8: &[u8], cert_der: &[u8]) -> bool {
 fn pkcs8_public_key(key_pkcs8: &[u8]) -> Result<Vec<u8>> {
     use openfirma_core::tlv;
     let mut s = Cur::new(key_pkcs8).sequence()?;
-    let _version = s.tlv()?; // INTEGER
-    let (alg_tag, alg_value) = s.tlv()?; // AlgorithmIdentifier
+    let _version = s.next()?; // INTEGER
+    let v = s.next()?;
+    let (alg_tag, alg_value) = (v.tag, v.content); // AlgorithmIdentifier
     let _private = s.octets()?;
     if s.is_done() {
         return Err(Error::Keystore(
             "the PKCS#8 key carries no public key to match against".into(),
         ));
     }
-    let (wrap_tag, wrapped) = s.tlv()?;
+    let v = s.next()?;
+    let (wrap_tag, wrapped) = (v.tag, v.content);
     if wrap_tag != 0xa0 {
         return Err(Error::Keystore(format!(
             "expected the [0] public key wrapper, found tag {wrap_tag:#04x}"
         )));
     }
-    let (bit_tag, bit_value) = Cur::new(wrapped).tlv()?;
+    let (bit_tag, bit_value) = {
+        let v = Cur::new(wrapped).next()?;
+        (v.tag, v.content)
+    };
     let mut content = tlv::tlv(alg_tag, alg_value);
     content.extend_from_slice(&tlv::tlv(bit_tag, bit_value));
     Ok(tlv::tlv(tlv::TAG_SEQUENCE, &content))

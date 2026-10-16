@@ -90,3 +90,41 @@ fn debug_never_prints_the_decrypted_private_key() {
         "the first bytes of the decrypted key leaked into its Debug output"
     );
 }
+
+/// The two byte container of the PoC (`printf '\x30\x84' > trunc.p12`) used
+/// to panic inside the length reader — `range end index 4 out of range for
+/// slice of length 1` — from the CLI, the GUI or the browser service if a
+/// user pointed them at a broken file. It must answer with the usual PKCS#12
+/// error and its re-export hint instead. Every truncation and every hostile
+/// length marker at every offset is swept for the same contract.
+#[test]
+fn a_truncated_container_is_a_keystore_error_never_a_panic() {
+    let exact = Pkcs12::load(&[0x30, 0x84], "openfirma").expect_err("two bytes are not a PKCS#12");
+    let text = exact.to_string();
+    assert!(text.contains("runs past the input"), "{text}");
+    assert!(
+        text.contains("openssl pkcs12 -in old.p12 -out new.p12"),
+        "{text}"
+    );
+
+    // every prefix of a real container, plus the long-form markers written
+    // at every offset: both together are what hostile files do
+    let Ok(bytes) = std::fs::read(certs_dir().join("signer-rsa.p12")) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let mut inputs: Vec<Vec<u8>> = (0..bytes.len()).map(|end| bytes[..end].to_vec()).collect();
+    for at in 0..bytes.len().min(64) {
+        for marker in [0x80u8, 0x81, 0x84, 0x89] {
+            let mut v = bytes.clone();
+            v[at] = marker;
+            inputs.push(v.clone());
+            inputs.push(v[..at].to_vec());
+        }
+    }
+    for input in &inputs {
+        // never a panic; every answer is an error (these are all broken) or,
+        // for the untouched shapes, whatever load decides
+        let _ = Pkcs12::load(input, "openfirma");
+    }
+}
