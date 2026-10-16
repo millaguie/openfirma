@@ -757,7 +757,14 @@ fn write_bytes(
     // module header. A same-origin page does not need it; a cross-origin one
     // must not get it.
     head.push_str("\r\n");
-    let result = write_and_flush(stream, &head, body);
+    // The response travels as ONE buffer: one write_all of the whole thing is
+    // one syscall, so no FIN can be queued between a header and its body — an
+    // ordering Windows lets a reader see otherwise, where an accepted socket
+    // closed with unread data gets RST'd and the client's first read fails
+    // before ever draining the answer.
+    let mut response = head.into_bytes();
+    response.extend_from_slice(body);
+    let result = write_and_flush(stream, &response);
     // Graceful close before the socket drops: without it, a reply that is
     // still in flight when the thread ends can be RST'd instead of FIN'd —
     // macOS does this readily when the peer has already stopped reading (it
@@ -767,8 +774,7 @@ fn write_bytes(
     result
 }
 
-fn write_and_flush(stream: &mut TcpStream, head: &str, body: &[u8]) -> std::io::Result<()> {
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
+fn write_and_flush(stream: &mut TcpStream, response: &[u8]) -> std::io::Result<()> {
+    stream.write_all(response)?;
     stream.flush()
 }

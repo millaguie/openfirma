@@ -94,13 +94,21 @@ fn request(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // A refusal closes while our (possibly huge, deliberately refused)
             // body may still be in flight; the OS may report the reset on read
-            // after we already hold the full answer. If the bytes so far are a
-            // complete response, that reset is the close we asked for.
+            // even when every answer byte had already been delivered — on
+            // Windows the RST can beat the socket read entirely and the first
+            // read() fails with zero bytes collected. The endpoint never
+            // streams without a Content-Length, so whatever bytes ARE held are
+            // only incomplete if the reset cut into their middle; a refusal in
+            // the very first chunk is as complete as it will ever get.
             Err(e)
-                if (e.kind() == std::io::ErrorKind::ConnectionReset
-                    || e.kind() == std::io::ErrorKind::ConnectionAborted)
-                    && complete_response(&raw) =>
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::ConnectionAborted =>
             {
+                assert!(
+                    raw.is_empty() || complete_response(&raw),
+                    "the answer was cut mid-response: {:?}",
+                    String::from_utf8_lossy(&raw)
+                );
                 break;
             }
             Err(e) => panic!("reading the answer failed: {e}"),
