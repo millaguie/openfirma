@@ -53,18 +53,26 @@ fn request(
     body: &[u8],
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
-    request_on(stream, addr, method, path, host, origin, body)
+    let answer = request_on(stream, addr, method, path, host, origin, body);
+    assert!(
+        answer.0 != u16::MAX,
+        "the endpoint's answer was discarded unread: callers that carry a token must go through `ask`, which re-mints one per attempt"
+    );
+    answer
 }
 
-/// The reader split from [`request`] so a reset that beat reading entirely can
-/// retry on a fresh socket (see the read loop's zero-byte arm). A retry lands
-/// on an endpoint whose slot just freed or whose token state has not changed
-/// for an unauthenticated refusal, and both callers of `request` here tolerate
-/// every answer by construction — this re-ask only recovers bytes Windows'
-/// close-with-unread-data rule discarded.
+/// The raw-request helper behind [`request`] and [`ask`]: writes the exact
+/// bytes, reads the answer with the reset rules of this harness, and hands
+/// back either a parsed response or the sentinel `(u16::MAX, …, …)` — "the
+/// endpoint's answer died unread in the socket layer" (Windows' rule that an
+/// accepted socket closed with data unread discards that data and RSTs). The
+/// sentinel exists so [`ask`] can re-mint a token instead of re-presenting one;
+/// `request` turns it into an honest panic. A reset after PARTIAL bytes stays
+/// a hard failure: those bytes should have been drained before the close, and
+/// cutting mid-response is not the discard this arm tolerates.
 fn request_on(
     mut stream: TcpStream,
-    addr: SocketAddr,
+    _addr: SocketAddr,
     method: &str,
     path: &str,
     host: &str,
@@ -91,70 +99,48 @@ fn request_on(
     let _ = stream.write_all(body);
     let _ = stream.flush();
     let mut raw = Vec::new();
-    // The endpoint always closes; read to EOF — but a reset after a complete
-    // response is also an EOF (see the read loop), because this test's answer
-    // has an exact Content-Length and Windows lets the queued RST land before
-    // the client ever drains the bytes its stack already delivered.
+    // One read at a time, judged against the response's own boundary:
+    // `complete_response` says when the bytes in hand ARE the whole answer,
+    // and nothing after that point is raced with the endpoint's close — on
+    // Windows even a perfectly delivered 200 can be followed by an RST of the
+    // still-open queue, and read errors past a complete response carry no
+    // information. Status u16::MAX is this harness's own sentinel for "the
+    // answer died unread in the socket layer" — Windows discards the buffer
+    // of an accepted socket closed with data unread (10054/10053 on the very
+    // first read). `ask` re-asks that case through a fresh token; `request`
+    // treats it as what it is for its callers: a failure to get an answer.
     let mut buf = [0u8; 16384];
-    let mut total = 0usize;
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                total += n;
+                raw.extend_from_slice(&buf[..n]);
+                // The endpoint caps responses far below any memory worry and
+                // never streams; a runaway answer is a bug worth failing on.
                 assert!(
-                    total < 64 * 1024 * 1024,
+                    raw.len() < 64 * 1024 * 1024,
                     "the endpoint streamed without end"
                 );
-                raw.extend_from_slice(&buf[..n]);
-                // Stop at the response's own boundary when it has one: no EOF
-                // and no reset need ever be raced for a fixed-length answer.
                 if complete_response(&raw) {
                     break;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // A refusal closes while our (possibly huge, deliberately refused)
-            // body may still be in flight; the OS may report the reset on read.
-            // Windows adds its own twist: closing an accepted socket that
-            // still holds UNREAD data discards that data and sends an RST, so
-            // a client that lost the race can fail its very first read with
-            // zero bytes collected. The answer then never existed for us (the
-            // stack dropped it), which is why `a_answered_socket` below asks
-            // the endpoint for it again instead of guessing: a reset is only
-            // trusted as an EOF when we already hold bytes, and those bytes
-            // must be the complete response.
             Err(e)
-                if (e.kind() == std::io::ErrorKind::ConnectionReset
-                    || e.kind() == std::io::ErrorKind::ConnectionAborted)
-                    && !raw.is_empty() =>
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
             {
+                if raw.is_empty() {
+                    return (u16::MAX, Vec::new(), Vec::new());
+                }
                 assert!(
                     complete_response(&raw),
                     "the answer was cut mid-response: {:?}",
                     String::from_utf8_lossy(&raw)
                 );
                 break;
-            }
-            Err(e)
-                if raw.is_empty()
-                    && matches!(
-                        e.kind(),
-                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-                    ) =>
-            {
-                // A signed request may NOT be re-sent: the endpoint can legally
-                // answer a presented token exactly once, so a retry would turn
-                // Windows' lost bytes into a fake 403. The probes are idempotent
-                // and re-asked on a fresh socket — the flood/stall tests read
-                // them at capacity and assert on status either way, never on
-                // silence; losing one to this race would fail them spuriously.
-                if path.starts_with("/sign/") {
-                    panic!("the unread answer was destroyed on a signing request: {e}");
-                }
-                let fresh =
-                    TcpStream::connect(addr).expect("the endpoint must accept a re-read probe");
-                return request_on(fresh, addr, method, path, host, origin, body);
             }
             Err(e) => panic!("reading the answer failed: {e}"),
         }
@@ -208,6 +194,33 @@ fn parse_response(raw: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
         }
     }
     (code, headers, raw[split + 4..].to_vec())
+}
+
+/// Request a signing endpoint through one token per attempt: every try gets
+/// its own freshly minted id, so Windows' occasional discard of an unread
+/// answer (see `request_on`) costs a token, never the fake 403 that
+/// re-presenting a burned one would manufacture. Use it for the tests that
+/// must see an answer to decide their next step *and* do not assert on a
+/// specific token's history; tests about tokens themselves use `request`.
+fn ask(
+    server: &LoopbackServer,
+    addr: SocketAddr,
+    method: &str,
+    host: &str,
+    origin: Option<&str>,
+    body: &[u8],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    for _ in 0..5 {
+        let token = server.issue_token();
+        let path = format!("/sign/{token}");
+        let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
+        let (status, headers, payload) =
+            request_on(stream, addr, method, &path, host, origin, body);
+        if status != u16::MAX {
+            return (status, headers, payload);
+        }
+    }
+    panic!("the endpoint discarded five consecutive answers unread");
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -935,11 +948,13 @@ fn stalled_connections_age_out_and_the_endpoint_never_shuts_down() {
         // five seconds of silence each, so well inside this test's patience).
         let signed = std::time::Instant::now();
         loop {
-            let token = server.issue_token();
-            let (status, _, payload) = request(
+            // `ask`, not `request`: a wave this saturated is exactly where the
+            // socket layer loses answers unread on Windows, and each of its
+            // attempts must present its OWN token — see ask's header.
+            let (status, _, payload) = ask(
+                &server,
                 addr,
                 "POST",
-                &format!("/sign/{token}"),
                 &host,
                 None,
                 uri_body(b"la sede firma entre olas de conexiones").as_bytes(),

@@ -72,6 +72,14 @@ impl TokenStore {
     /// time buys nothing here — the table lookup itself does not leak whether
     /// an id exists beyond timing that scales with live sessions (at most a
     // handful).
+    //
+    // Consumption means a PRESENTED token, and by the endpoint's own order of
+    // operations (serve.rs: the `take` runs after head *and* body have fully
+    // arrived) it happens before any header rule is judged. So even a POST
+    // that dies at bad-origin spent its one-time credential — a caller whose
+    // answer was lost in transit must never re-present one, and tests of the
+    // one-shot property need to see both halves: `take` grants once, then
+    // never again, whatever happened to the request that consumed it.
     pub fn take(&self, presented: &str) -> bool {
         if presented.is_empty() || presented.len() > 20 {
             return false;
