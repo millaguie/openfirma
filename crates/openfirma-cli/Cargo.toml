@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 openfirma-core.workspace = true
+# The one format dispatcher (`signing`): the terminal and the window sign a
+# given format through the exact same call sequence, so they cannot drift
+# (finding M-4). Headless: this crate links no UI at all.
 openfirma-browser.workspace = true
 openfirma-cades.workspace = true
 openfirma-pades.workspace = true

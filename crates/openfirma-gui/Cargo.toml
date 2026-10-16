@@ -20,7 +20,11 @@ default = ["gui"]
 gui = ["dep:eframe", "dep:egui", "dep:rfd"]
 
 [dependencies]# The GUI is a thin layer: everything it does, it does through these exact
-# library calls the CLI also makes. No format logic lives in this crate.
+# library calls the CLI also makes. No format logic lives in this crate: the
+# one shared dispatcher is openfirma-browser's `signing` module, which the
+# window calls through this crate's own `signing` (its header records the
+# delegation). No UI dependency leaks into it: eframe/egui/rfd stay behind the
+# optional `gui` feature.
 openfirma-core.workspace = true
 openfirma-cades.workspace = true
 openfirma-pades.workspace = true

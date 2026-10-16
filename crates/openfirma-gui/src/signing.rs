@@ -1,28 +1,24 @@
-//! The signing dispatcher: one chosen format string in, signature bytes out,
-//! through the exact library calls the CLI makes (`openfirma_cades::sign`,
-//! `openfirma_pades::pades_sign`, `openfirma_xades::xades_sign`) with the same
-//! fixed options PAdES/XAdES demand. This is the function the GUI and — after
-//! this change — the CLI's `sign` command share: a format that signs one way
-//! in the terminal and another way in the window is exactly the drift the
-//! project forbids, so the choice lives here once.
+//! El despachador de formatos de la ventana: una sola lista, una sola cadena
+//! de acceso al token, tanto para el terminal como para esta GUI.
+//!
+//! La lógica vive en `openfirma_browser::signing` — el único crate que depende
+//! de los tres de formato sin arrastrar nada gráfico — y este módulo la llama
+//! marcando la petición como venida de la ventana (`from_window`), para que un
+//! nivel largo-term incompleto reciba la frase honesta que señala al terminal
+//! en lugar de banderas que esta ventana nunca enseñó (hallazgo M-4: con tres
+//! `match`es separados, un formato renombrado firmaba en un sitio y era
+//! desconocido en otro sin que ningún test lo notase).
 
-use openfirma_cades::{CadesOptions, TimestampFn};
+use openfirma_cades::TimestampFn;
 use openfirma_core::alg::DigestAlg;
 use openfirma_core::signer::Signer;
-use openfirma_core::workflow::Format;
-use openfirma_core::{Error, Result};
-use openfirma_pades::{Appearance, PadesOptions};
+use openfirma_pades::Appearance;
 
-/// What a caller asks for: the format string (the same spelling the CLI's
-/// `--format` takes), the digest, an optional TSA provider already wired to
-/// its transport (each frontend owns its transport; see `signer_for` docs in
-/// openfirma-keystore ADR-0004 for why nothing here fetches), a visible
-/// appearance for PDFs, and a reason string. Everything long-term that needs
-/// caller-supplied material (CRLs, OCSP responses, validation certificates)
-/// is refused with the CLI's own honest sentence instead of silently signing
-/// a weaker document: B-LT without revocation data is nothing, and `openfirma
-/// verify` would say so afterwards.
-pub struct SignRequest<'a> {
+pub use openfirma_browser::signing::{all_formats, format_label};
+
+/// Lo que la ventana pide firmar: el formato (la misma ortografía que el
+/// `--format` del terminal), el digest y lo poco que la ventana recoge.
+pub struct WinRequest<'a> {
     pub format: &'a str,
     pub digest: DigestAlg,
     pub timestamp: Option<TimestampFn>,
@@ -30,23 +26,9 @@ pub struct SignRequest<'a> {
     pub reason: Option<String>,
 }
 
-/// The format string's fixed display name (the labels of the CLI's `--format`
-/// values; one table so both frontends print identical success lines).
-pub fn format_label(format: &str) -> &'static str {
-    match format {
-        "cades-b-b" => "CAdES-B-B",
-        "pades-b-b" => "PAdES-B-B",
-        "pades-b-lt" => "PAdES-B-LT",
-        "pades-b-lta" => "PAdES-B-LTA",
-        "xades-b-b" => "XAdES-B-B",
-        // An unknown string is echoed as given: it came from a caller's own
-        // flag, and inventing a prettier lie helps nobody.
-        _ => "desconocido",
-    }
-}
-
-/// Produce the signature for one request. `input` is the whole document to
-/// sign (what `openfirma sign -i` reads; a PDF, an XML, or plain bytes).
+/// Produce la firma de una petición de la ventana. `input` es el documento
+/// completo (lo que `openfirma sign -i` leería). Equivale exacta a lo que el
+/// terminal hace con los mismos argumentos; la diferencia es solo `from_window`.
 pub fn execute(
     format: &str,
     content: &[u8],
@@ -54,116 +36,46 @@ pub fn execute(
     digest: DigestAlg,
     timestamp: Option<TimestampFn>,
     reason: Option<String>,
-) -> Result<Vec<u8>> {
-    let detected = Format::detect(content);
-    execute_request(
-        &mut SignRequest {
-            format,
-            digest,
-            timestamp,
-            visible: None,
-            reason,
-        },
-        detected,
-        content,
-        signer,
-    )
+) -> openfirma_core::Result<Vec<u8>> {
+    let mut req = shared_request(WinRequest {
+        format,
+        digest,
+        timestamp,
+        visible: None,
+        reason,
+    });
+    openfirma_browser::signing::execute_with_detection(&mut req, content, signer)
 }
 
-/// The full form, with the GUI's extra knob (a visible rectangle).
+/// La forma completa, con la perilla extra de la GUI (un rectángulo visible).
 pub fn execute_request(
-    req: &mut SignRequest<'_>,
-    detected: Format,
+    req: WinRequest<'_>,
+    detected: openfirma_core::workflow::Format,
     content: &[u8],
     signer: &dyn Signer,
-) -> Result<Vec<u8>> {
-    // A format that cannot carry this file shape is refused here, before any
-    // signing: the citizen who picks CAdES for a PDF (or the reverse) gets
-    // one sentence about what they have, not an ASN.1 stack trace.
-    let allowed = detected.supported_formats();
-    if !allowed.contains(&req.format) {
-        return Err(Error::Other(format!(
-            "{} is not a format this file can be signed as (it holds {}).",
-            req.format,
-            match detected {
-                Format::Pdf => "a PDF document",
-                Format::Xml => "an XML document",
-                Format::Data => "plain data",
-            }
-        )));
-    }
-    match req.format {
-        // The CLI's CAdES defaults, verbatim (docs/pades.md records why PAdES
-        // pins its own shape): encapsulation is the caller's choice and the
-        // GUI keeps AutoFirma's default off — detached is the citizen answer.
-        "cades-b-b" => {
-            let mut opts = CadesOptions {
-                digest: req.digest,
-                encapsulate_content: false,
-                ..CadesOptions::default()
-            };
-            opts.timestamp = req.timestamp.clone();
-            openfirma_cades::sign(content, signer, &opts)
-        }
-        // PAdES fixes the CAdES shape itself: detached, no signingTime (the
-        // time lives in /M), no contentHint. B-LT/B-LTA need caller material
-        // the GUI does not collect; see the refusals below.
-        "pades-b-b" | "pades-b-lt" | "pades-b-lta" => {
-            let ltv = matches!(req.format, "pades-b-lt" | "pades-b-lta");
-            if ltv && req.timestamp.is_none() {
-                // The same honest refusal `openfirma sign` prints for the LTA
-                // level: the document time-stamp imprints bytes that exist
-                // only while signing, so a pre-fetched token cannot serve it.
-                return Err(Error::Other(
-                    "the long-term levels need a TSA url (advanced options): their \
-                     time-stamps imprint bytes that only exist while signing."
-                        .into(),
-                ));
-            }
-            if ltv {
-                // No CRL/OCSP path in the GUI, so B-LT cannot honestly claim
-                // what B-LT means. The CLI documents why it refuses half a
-                // level; the window says the same thing in one sentence.
-                return Err(Error::Other(
-                    "PAdES B-LT archives revocation data (CRLs or OCSP responses) that \
-                     openfirma never downloads, and this window collects none: use \
-                     `openfirma sign --format pades-b-lt --crl …` from a terminal for the \
-                     long-term level."
-                        .into(),
-                ));
-            }
-            openfirma_pades::pades_sign(
-                content,
-                signer,
-                &PadesOptions {
-                    digest: req.digest,
-                    reason: req.reason.clone(),
-                    visible: req.visible.take(),
-                    timestamp: req.timestamp.clone(),
-                    ..PadesOptions::default()
-                },
-            )
-        }
-        "xades-b-b" => openfirma_xades::xades_sign(
-            content,
-            signer,
-            &openfirma_xades::XadesOptions {
-                digest: req.digest,
-                mime_type: None,
-                ..Default::default()
-            },
-        ),
-        other => Err(Error::Other(format!("unknown signature format {other:?}"))),
-    }
+) -> openfirma_core::Result<Vec<u8>> {
+    let mut shared = shared_request(req);
+    openfirma_browser::signing::execute_request(&mut shared, detected, content, signer)
+}
+
+/// Traducción petición-ventana → petición-compartida; ningún otro camino debe
+/// existir: una knob nueva que la ventana llegue a controlar se añade aquí.
+fn shared_request(req: WinRequest<'_>) -> openfirma_browser::signing::SignRequest<'_> {
+    let mut out =
+        openfirma_browser::signing::SignRequest::new(req.format, req.digest).from_window();
+    out.timestamp = req.timestamp;
+    out.visible = req.visible;
+    out.reason = req.reason;
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The dispatcher must refuse a mismatched format *before* touching the
-    /// signer: the same guard runs whether bytes were read by file, drag or
-    /// paste. `none` stands for any signer — it is never called on a refusal.
+    /// La delegación debe negarse a un formato incompatible antes de tocar el
+    /// firmante: la misma guard corre aquí que en el despachador compartido.
+    /// `Mock` representa cualquier signer — nunca se llama cuando se niega.
     #[test]
     fn a_format_that_cannot_hold_the_file_is_refused() {
         let signer: &dyn Signer = &Mock;
@@ -181,15 +93,11 @@ mod tests {
                 .contains("not a format this file can be signed as"),
             "{err}"
         );
-        let err =
-            execute("pades-b-b", b"hello", signer, DigestAlg::Sha256, None, None).unwrap_err();
-        assert!(err.to_string().contains("plain data"), "{err}");
     }
 
     #[test]
     fn half_a_long_term_level_is_refused() {
-        // Without a TSA even B-LT cannot seal anything, so the first refusal
-        // is the missing url…
+        // Sin TSA, B-LT no puede sellar nada y lo primero que oye es la url…
         let err = execute(
             "pades-b-lt",
             b"%PDF-1.4\n",
@@ -200,8 +108,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("TSA url"), "{err}");
-        // …and with one, the missing CRL/OCSP collection is still refused
-        // with the CLI's pointer to the terminal (the GUI collects none).
+        // …y con ella sigue la negación honesta que esta ventana recoge: la
+        // frase de delegación es compartida y apunta al terminal (la GUI no
+        // recoge nada). La marca from_window hace la frase específica.
         let tsa: TimestampFn = std::sync::Arc::new(|_, _| Ok(vec![vec![0u8; 2]]));
         let err = execute(
             "pades-b-lt",
@@ -225,7 +134,7 @@ mod tests {
     struct Mock;
     impl Signer for Mock {
         fn certificate(&self) -> &CertificateHandle {
-            unreachable!("a refusal never asks who signs")
+            unreachable!("una negativa nunca pregunta quién firma")
         }
         fn chain(&self) -> &[CertificateHandle] {
             &[]
@@ -234,7 +143,7 @@ mod tests {
             Ok(openfirma_core::KeyAlgorithm::Rsa)
         }
         fn sign_prehash(&self, _: DigestAlg, _: &[u8]) -> openfirma_core::Result<Vec<u8>> {
-            unreachable!("a refusal never signs")
+            unreachable!("una negativa nunca firma")
         }
     }
 }

@@ -3,12 +3,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use openfirma_cades::{CadesOptions, sign};
 use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
 use openfirma_core::signer::{Signer, SoftwareSigner};
 use openfirma_keystore::boxed_signer;
-use openfirma_pades::{Appearance, PadesOptions};
+use openfirma_pades::Appearance;
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -73,6 +72,14 @@ enum Command {
         /// time, not from a browser call.
         #[arg(long)]
         register: bool,
+
+        /// Password of the --p12 container. INSECURE like `sign`'s own flag
+        /// (argv is visible in ps), but every command that opens a PKCS#12 —
+        /// `sign`, `afirma-uri`, `afirma-serve` — answers the same three
+        /// inputs: --password-file, OPENFIRMA_PASSWORD, or this one. A refusal
+        /// that offers OPENFIRMA_PASSWORD must always be able to read it.
+        #[arg(long, env = "OPENFIRMA_PASSWORD", hide_env_values = true)]
+        password: Option<std::ffi::OsString>,
     },
     /// Serve the loopback endpoint a sede page calls, and run every URI that
     /// arrives through it. The ephemeral port is printed at startup — like
@@ -86,6 +93,12 @@ enum Command {
 
         #[arg(long)]
         password_file: Option<PathBuf>,
+
+        /// Same insecure escape hatch as `afirma-uri --password` (see its
+        /// help): the endpoint's password comes from --password-file or
+        /// OPENFIRMA_PASSWORD like every other command that opens a PKCS#12.
+        #[arg(long, env = "OPENFIRMA_PASSWORD", hide_env_values = true)]
+        password: Option<std::ffi::OsString>,
 
         /// Address to bind. Only loopback addresses are accepted, and
         /// 127.0.0.1:0 (the default) is the documented form: the port that
@@ -368,14 +381,21 @@ enum Format {
 }
 
 impl Format {
-    fn label(self) -> &'static str {
+    /// The exact `--format` value this variant spells — the same string the
+    /// shared dispatcher matches on, and what the parity test compares
+    /// against `openfirma_browser::signing::all_formats()`.
+    fn flag_value(self) -> &'static str {
         match self {
-            Format::Cades => "CAdES-B-B",
-            Format::Pades => "PAdES-B-B",
-            Format::PadesLt => "PAdES-B-LT",
-            Format::PadesLta => "PAdES-B-LTA",
-            Format::Xades => "XAdES-B-B",
+            Format::Cades => "cades-b-b",
+            Format::Pades => "pades-b-b",
+            Format::PadesLt => "pades-b-lt",
+            Format::PadesLta => "pades-b-lta",
+            Format::Xades => "xades-b-b",
         }
+    }
+
+    fn label(self) -> &'static str {
+        openfirma_browser::signing::format_label(self.flag_value())
     }
 }
 
@@ -600,10 +620,12 @@ fn parse_store_spec(text: &str) -> Result<StoreSpec> {
 
 /// The PIN for a keystore, read from the environment variable named by
 /// `--pin-env`. An unset variable is an empty PIN — that is how NSS shared
-/// databases (no password) are expressed.
-fn store_pin(pin_env: Option<&String>) -> Result<Option<String>> {
+/// databases (no password) are expressed. The copy comes back already
+/// zeroizing: from this line on, every buffer that held it zeroes on drop
+/// (finding B-2: the p12 password had this posture and the token PIN did not).
+fn store_pin(pin_env: Option<&String>) -> Result<Option<Zeroizing<String>>> {
     match pin_env {
-        Some(var) => Ok(Some(std::env::var(var).unwrap_or_default())),
+        Some(var) => Ok(Some(Zeroizing::new(std::env::var(var).unwrap_or_default()))),
         None => Ok(None),
     }
 }
@@ -616,8 +638,11 @@ fn store_pin(pin_env: Option<&String>) -> Result<Option<String>> {
 /// generics; see `boxed_signer`.
 type DynStore = Arc<dyn openfirma_keystore::SystemStore>;
 
-/// Opens a descriptor behind one `Arc`.
-fn open_store(spec: &StoreSpec, pin: Option<String>) -> Result<DynStore> {
+/// Opens a descriptor behind one `Arc`. The PIN arrives zeroizing because it
+/// comes from the environment through `store_pin`; opening a store takes the
+/// plain string only for the moment of the login call, and every copy the
+/// store keeps wraps itself back up (see openfirma-keystore's Pkcs11Store).
+fn open_store(spec: &StoreSpec, pin: Option<Zeroizing<String>>) -> Result<DynStore> {
     let store: DynStore = match spec {
         StoreSpec::Pkcs11 {
             module,
@@ -631,22 +656,24 @@ fn open_store(spec: &StoreSpec, pin: Option<String>) -> Result<DynStore> {
                 // shape a SoftHSM token initialized --pin '' accepts.
                 Some(String::new())
             } else {
-                pin
+                pin.map(|p| p.to_string())
             },
         )?),
-        StoreSpec::Nss { db } => match openfirma_keystore::nss::open(db, None, pin) {
-            Ok(store) => Arc::new(store),
-            Err(e) => {
-                // `nss` and `nspr` are separate packages on every Linux that
-                // ships the library anywhere a browser needs it; telling the
-                // user which to install beats "library not found".
-                let text = e.to_string();
-                if text.contains("OPENFIRMA_NSS_MODULE") {
-                    anyhow::bail!("{text} (on Debian/Ubuntu: apt install libnss3)");
+        StoreSpec::Nss { db } => {
+            match openfirma_keystore::nss::open(db, None, pin.map(|p| p.to_string())) {
+                Ok(store) => Arc::new(store),
+                Err(e) => {
+                    // `nss` and `nspr` are separate packages on every Linux that
+                    // ships the library anywhere a browser needs it; telling the
+                    // user which to install beats "library not found".
+                    let text = e.to_string();
+                    if text.contains("OPENFIRMA_NSS_MODULE") {
+                        anyhow::bail!("{text} (on Debian/Ubuntu: apt install libnss3)");
+                    }
+                    return Err(e.into());
                 }
-                return Err(e.into());
             }
-        },
+        }
         StoreSpec::Windows => {
             #[cfg(target_os = "windows")]
             {
@@ -900,84 +927,65 @@ fn main() -> Result<()> {
             }
 
             let stamp = timestamp_provider(tsa, timestamp_token, validation_certs.clone())?;
-            let mut opts = CadesOptions {
-                digest: digest_alg,
-                encapsulate_content: encapsulate,
-                mime_type: mime_type.clone(),
-                content_hint,
-                include_issuer_serial: !no_issuer_serial,
-                timestamp: stamp.clone(),
-                ..CadesOptions::default()
-            };
+            let mut request =
+                openfirma_browser::signing::SignRequest::new(format.flag_value(), digest_alg);
+            request.timestamp = stamp.clone();
+            request.reason = reason;
+            // The CAdES attribute knobs (docs/cades.md): the shared request
+            // carries them so both frontends set them identically.
+            request.cades_encapsulate_content = encapsulate;
+            request.cades_mime_type = mime_type.clone();
+            request.cades_content_hint = content_hint;
+            request.cades_include_issuer_serial = !no_issuer_serial;
             if no_signing_time {
-                opts.signing_time = None;
+                request.cades_signing_time = None;
+                request.cades_no_signing_time = true;
             }
-
-            let signature = match format {
-                Format::Cades => sign(&content, &*signer, &opts)?,
-                // PAdES fixes the CAdES shape itself: detached, no signingTime
-                // because the time is in /M, and no contentHint. The knobs
-                // above only apply to CAdES, see docs/pades.md. B-LT and
-                // B-LTA add revisions after the signature: the /DSS with the
-                // validation data, then the document time-stamp.
-                Format::Pades | Format::PadesLt | Format::PadesLta => {
-                    let mut revocation = Vec::with_capacity(crl.len() + ocsp.len());
-                    for c in &crl {
-                        revocation.push(openfirma_pades::RevocationBytes::Crl(read_der_blob(
-                            c, "CRL",
-                        )?));
-                    }
-                    for o in &ocsp {
-                        revocation.push(openfirma_pades::RevocationBytes::Ocsp(read_der_blob(
-                            o,
-                            "OCSP response",
-                        )?));
-                    }
-                    openfirma_pades::pades_sign(
-                        &content,
-                        &*signer,
-                        &PadesOptions {
-                            digest: digest_alg,
-                            reason,
-                            location,
-                            contact_info,
-                            field_name,
-                            contents_reserved,
-                            visible: rect.map(|r| Appearance {
-                                page,
-                                rect: r,
-                                label: label.clone(),
-                            }),
-                            // B-LTA is B-LT is B-T: the same TSA stamps the
-                            // signature value and then the document
-                            timestamp: stamp.clone(),
-                            validation_certs,
-                            revocation,
-                            document_timestamp: if matches!(format, Format::PadesLta) {
-                                stamp.clone()
-                            } else {
-                                None
-                            },
-                            ..PadesOptions::default()
-                        },
-                    )?
-                }
-                // XAdES-B-B is enveloped and signs XML, see docs/xades.md.
-                // --digest picks the signature algorithm; the reference
-                // digests stay SHA-512, AutoFirma's default. signingTime is
-                // not optional here: the baseline profile requires it, so
-                // --no-signing-time and the CAdES attribute knobs do not
-                // apply, and --mime-type feeds DataObjectFormat instead.
-                Format::Xades => openfirma_xades::xades_sign(
-                    &content,
-                    &*signer,
-                    &openfirma_xades::XadesOptions {
-                        digest: digest_alg,
-                        mime_type,
-                        ..Default::default()
-                    },
-                )?,
+            request.location = location;
+            request.contact_info = contact_info;
+            request.field_name = field_name;
+            request.contents_reserved = Some(contents_reserved);
+            request.visible = rect.map(|r| Appearance {
+                page,
+                rect: r,
+                label: label.clone(),
+            });
+            // One dispatcher for both frontends (finding M-4): the terminal
+            // and the window sign every format through this exact call
+            // sequence — see openfirma_browser::signing, whose header records why
+            // the shared module lives there. A second `request` was born when
+            // the PAdES LTV material joined the same builder: the long-term
+            // fields now merge into the one request above instead of replacing
+            // it (an earlier shape here shadowed the first and silently dropped
+            // every CAdES knob set on it).
+            let mut revocation = Vec::with_capacity(crl.len() + ocsp.len());
+            for c in &crl {
+                revocation.push(openfirma_pades::RevocationBytes::Crl(read_der_blob(
+                    c, "CRL",
+                )?));
+            }
+            for o in &ocsp {
+                revocation.push(openfirma_pades::RevocationBytes::Ocsp(read_der_blob(
+                    o,
+                    "OCSP response",
+                )?));
+            }
+            request.validation_certs = validation_certs;
+            request.revocation = revocation;
+            // B-LTA is B-LT is B-T: the same TSA stamps the signature value
+            // and then the document (docs/pades.md). The gate above already
+            // refuses pades-b-lta without --tsa, so only a live TSA arrives.
+            request.document_timestamp = if matches!(format, Format::PadesLta) {
+                stamp.clone()
+            } else {
+                None
             };
+            let signature = openfirma_browser::signing::execute_with_detection(
+                &mut request,
+                &content,
+                signer.as_ref(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             std::fs::write(&output, &signature)
                 .with_context(|| format!("writing {}", output.display()))?;
@@ -1205,6 +1213,7 @@ fn main() -> Result<()> {
             uri,
             output,
             p12,
+            password,
             password_file,
             register,
         } => {
@@ -1226,7 +1235,7 @@ fn main() -> Result<()> {
                  the key a browser call signs with: openfirma is headless and has no \
                  AutoFirma-style certificate dialog to fall back on",
             )?;
-            let password = p12_password(None, password_file)?.context(
+            let password = p12_password(password, password_file)?.context(
                 "--p12 needs the container's password: --password-file (the safe \
                  input) or OPENFIRMA_PASSWORD; argv is not an option for a secret",
             )?;
@@ -1259,6 +1268,7 @@ fn main() -> Result<()> {
         }
         Command::AfirmaServe {
             p12,
+            password,
             password_file,
             bind,
             issue_token,
@@ -1268,7 +1278,7 @@ fn main() -> Result<()> {
                 .parse()
                 .with_context(|| format!("--bind {bind:?} is not an address like 127.0.0.1:0"))?;
             let container = p12.context("--p12 names the key the endpoint signs with")?;
-            let password = p12_password(None, password_file)?
+            let password = p12_password(password, password_file)?
                 .context("--p12 needs its password: --password-file or OPENFIRMA_PASSWORD")?;
             let server = openfirma_browser::serve::LoopbackServer::start(
                 addr,
@@ -1297,9 +1307,10 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             eprintln!(
-                "serving until interrupted or after {} requests; see \
-                 docs/adr/0005-browser-protocol.md for the endpoint's rules",
-                openfirma_browser::serve::MAX_REQUESTS
+                "serving until interrupted; at most {} requests are in flight at once, the \
+                 rest get a 503 — see docs/adr/0005-browser-protocol.md for the endpoint's \
+                 rules",
+                openfirma_browser::serve::MAX_CONCURRENT_CONNECTIONS
             );
             // Park the main thread: connection threads own their sockets, and
             // a Ctrl-C kills the process while the listener dies with it —
@@ -1327,8 +1338,16 @@ fn register_scheme() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let (path, reindex) = openfirma_browser::scheme::linux_install_paths();
-        std::fs::write(&path, openfirma_browser::scheme::linux_desktop_entry(&exe))
-            .with_context(|| format!("writing {}", path.display()))?;
+        // M-3: what cannot be a desktop entry value is refused here, before a
+        // file exists — an entry the desktop environment cannot parse looks
+        // installed and never fires, which no one ever notices.
+        let contents = openfirma_browser::scheme::linux_desktop_entry(&exe).map_err(|e| {
+            anyhow::anyhow!(
+                "el ejecutable no se puede registrar: {e} ({})",
+                exe.display()
+            )
+        })?;
+        std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
         println!("wrote {}", path.display());
         println!("then run:  {reindex}");
         println!(
@@ -1432,35 +1451,12 @@ fn p12_password(
     flag: Option<std::ffi::OsString>,
     file: Option<PathBuf>,
 ) -> Result<Option<Zeroizing<String>>> {
-    if let Some(path) = file {
-        let bytes = Zeroizing::new(
-            std::fs::read(&path)
-                .with_context(|| format!("reading the password file {}", path.display()))?,
-        );
-        // the first line, with one CRLF or LF ending ignored: `echo secret >
-        // file` must not sign with a newline in the password
-        let line = bytes.split(|b| *b == b'\n').next().unwrap_or(&[]);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let text = std::str::from_utf8(line).map_err(|_| non_utf8_secret_error())?;
-        return Ok(Some(Zeroizing::new(text.to_string())));
-    }
-    match flag {
-        Some(value) => Ok(Some(Zeroizing::new(
-            value.into_string().map_err(|_| non_utf8_secret_error())?,
-        ))),
-        None => Ok(None),
-    }
-}
-
-/// Why a password that is not UTF-8 cannot be used, and what to do about it.
-fn non_utf8_secret_error() -> anyhow::Error {
-    anyhow::anyhow!(
-        "the password is not valid UTF-8: it may contain non-ASCII characters in an \
-         encoding openfirma cannot represent. PKCS#12 encodes passwords as UTF-16 \
-         BMPStrings and openfirma re-encodes them from UTF-8; supply the password as \
-         UTF-8, or re-export the container with an ASCII password: \
-         `openssl pkcs12 -in old.p12 -out new.p12`"
-    )
+    // The resolution itself — flag, then file, then OPENFIRMA_PASSWORD — is a
+    // shared rule (openfirma_core::workflow) because `sign`, `afirma-uri` and
+    // `afirma-serve` all take a --p12 and must not drift on which inputs the
+    // password may come from; this wrapper only adapts the error type.
+    openfirma_core::workflow::p12_password(flag.as_deref(), file.as_deref())
+        .map_err(anyhow::Error::msg)
 }
 
 /// Reads a certificate and a PKCS#8 key, accepting PEM or DER for both.
@@ -1926,14 +1922,12 @@ mod tests {
             std::thread::current().name().unwrap_or("main")
         );
         unsafe { std::env::set_var(&var, "1234") };
-        assert_eq!(store_pin(Some(&var)).unwrap().as_deref(), Some("1234"));
+        assert_eq!(&*store_pin(Some(&var)).unwrap().unwrap(), "1234");
         // An unset variable is an empty PIN: that is how an NSS database with
         // no password travels, and it must not be a hard error here.
         assert_eq!(
-            store_pin(Some(&format!("{var}-absent")))
-                .unwrap()
-                .as_deref(),
-            Some("")
+            &*store_pin(Some(&format!("{var}-absent"))).unwrap().unwrap(),
+            ""
         );
         assert_eq!(store_pin(None).unwrap(), None);
         unsafe { std::env::remove_var(&var) };

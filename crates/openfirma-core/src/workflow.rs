@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::CertificateHandle;
+use zeroize::Zeroizing;
 
 /// What kind of file a set of bytes is, decided by its magic rather than its
 /// extension: an extension lies (renaming a PDF to `.txt` is common), the
@@ -339,15 +340,43 @@ impl StoreSpec {
 /// `C` is not a file, so nothing is split; `...\mod.dll:mytoken` splits after
 /// the module because the module exists. A path that does not exist reports
 /// through the loader's own error later, and there splitting is moot anyway.
+///
+/// The second guard is what makes paths that legitimately contain a colon
+/// parse whole: `pkcs11:C:\tokens\mod.dll:Mi Token` splits at the last colon
+/// because the token names no directory separator, while
+/// `pkcs11:/tmp/x:1/mod.so` and `C:\mis tokens:obj.dll` do *not* split — a
+/// token label is one flat name, so anything after the last colon that still
+/// contains `/` or `\` is part of the path, not a token. Without it a module
+/// living in a directory whose name holds a colon (legal on every Unix, and
+/// the reason the drive-letter guard exists on Windows) silently lost its
+/// trailing component to a phantom token label.
 fn split_trailing_token(rest: &str) -> (&str, Option<&str>) {
-    // Never cut inside `X:` (a drive letter): only colons from index 2 on can
-    // separate a module from its token. Windows-only in practice; the guard
-    // is free and makes the result identical everywhere.
-    let drive_colon = rest.get(1..2) == Some(":");
-    match rest.rfind(':') {
-        Some(i) if i >= 2 && !drive_colon => (&rest[..i], Some(&rest[i + 1..])),
-        _ => (rest, None),
+    // The separator between module and token is the LAST colon — a drive
+    // letter (index 1) never separates. Two guards decide whether that cut
+    // stands, both from what a real descriptor can look like:
+    //
+    // * the tail after the colon must be a flat name — no `/`, no `\`. A path
+    //   whose directories contain colons (`/tmp/x:1/mod.so`) stays whole: its
+    //   last colon still has separators behind it.
+    // * when the path has separators, the module's final segment — what sits
+    //   between the last separator and that colon — must look like a file
+    //   (carry a `.`). On Windows a folder may be named `mis tokens:`
+    //   (`C:\mis tokens:obj.dll`): there the cut colon has a flat tail AND
+    //   separators before it, yet "mis tokens" is a directory with a colon in
+    //   its name, not the module — this guard keeps the whole path in one
+    //   piece. The token spelling `C:\tokens\mod.dll:Mi Token` passes it
+    //   ("mod.dll"), so it splits exactly as users write it.
+    let Some(i) = rest.rfind(':') else {
+        return (rest, None);
+    };
+    if i < 2 || rest[i + 1..].contains(['/', '\\']) {
+        return (rest, None);
     }
+    let last_sep = rest[..i].rfind('/').max(rest[..i].rfind('\\'));
+    if last_sep.is_some_and(|s| !rest[s + 1..i].contains('.')) {
+        return (rest, None);
+    }
+    (&rest[..i], Some(&rest[i + 1..]))
 }
 
 /// The keystores the GUI lists without being pointed at one: on Windows and
@@ -365,6 +394,69 @@ pub fn discoverable_stores() -> Vec<StoreSpec> {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     specs.push(StoreSpec::Macos);
     specs
+}
+
+/// The environment variable every subcommand reads the PKCS#12 password from
+/// when its flag is absent. Public so no frontend can grow a private spelling
+/// of it; `p12_password` is the only reader.
+pub const PASSWORD_ENV: &str = "OPENFIRMA_PASSWORD";
+
+/// Resolve a PKCS#12 password from its three sources, in the order the CLI's
+/// help promises: `--password-file` first (it wins when both are given), else
+/// an explicit value (the insecure `--password` flag), else
+/// `$OPENFIRMA_PASSWORD`. Everything that carries a secret lands in
+/// [`Zeroizing`]; a wrong path or non-UTF-8 secret is refused with the reason.
+///
+/// The resolution lives here — not in any one subcommand — because all three
+/// of `sign`, `afirma-uri` and `afirma-serve` take a `--p12`, and an earlier
+/// revision wired the environment only into `sign`: the two browser commands
+/// printed an error offering `OPENFIRMA_PASSWORD` that they themselves did not
+/// read. A rule this small, duplicated, rots exactly like that.
+pub fn p12_password(
+    flag: Option<&std::ffi::OsStr>,
+    file: Option<&Path>,
+) -> Result<Option<Zeroizing<String>>, String> {
+    if let Some(path) = file {
+        let bytes = Zeroizing::new(
+            std::fs::read(path)
+                .map_err(|e| format!("reading the password file {}: {e}", path.display()))?,
+        );
+        // the first line, with one CRLF or LF ending ignored: `echo secret >
+        // file` must not sign with a newline in the password
+        let line = bytes.split(|b| *b == b'\n').next().unwrap_or(&[]);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let text = std::str::from_utf8(line).map_err(|_| non_utf8_secret_error())?;
+        return Ok(Some(Zeroizing::new(text.to_string())));
+    }
+    if let Some(value) = flag {
+        let value = value
+            .to_str()
+            .ok_or_else(non_utf8_secret_error)?
+            .to_string();
+        return Ok(Some(Zeroizing::new(value)));
+    }
+    match std::env::var_os(PASSWORD_ENV) {
+        Some(value) => {
+            let text = value
+                .to_str()
+                .ok_or_else(non_utf8_secret_error)?
+                .to_string();
+            Ok(Some(Zeroizing::new(text)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Why a password that is not UTF-8 cannot be used, and what to do about it.
+/// Lives with `p12_password` because the three entry points must refuse a
+/// non-UTF-8 secret with one identical sentence.
+fn non_utf8_secret_error() -> String {
+    "the password is not valid UTF-8: it may contain non-ASCII characters in an \
+     encoding openfirma cannot represent. PKCS#12 encodes passwords as UTF-16 \
+     BMPStrings and openfirma re-encodes them from UTF-8; supply the password as \
+     UTF-8, or re-export the container with an ASCII password: \
+     `openssl pkcs12 -in old.p12 -out new.p12`"
+        .to_string()
 }
 
 /// Refuses `sign -i f -o f` unless `--force` says the overwrite is meant.
@@ -709,6 +801,43 @@ mod tests {
         }
         let err = StoreSpec::parse("tpm:x").unwrap_err();
         assert!(err.contains("--store") && err.contains("pkcs11:"), "{err}");
+    }
+
+    #[test]
+    fn a_module_path_with_a_colon_in_its_directories_stays_whole() {
+        // A token label is one flat name; anything after the last colon that
+        // still contains a path separator belongs to the module, not to a
+        // token. Without this, `/tmp/x:1/mod.so` lost its `1/mod.so` tail to
+        // a phantom token and the real file was never even opened.
+        for text in [
+            "pkcs11:/tmp/x:1/mod.so",
+            "pkcs11:C:\\mis tokens:obj.dll",
+            "pkcs11:/opt/pkcs11:extra/nested/dir/mod.so",
+        ] {
+            let spec =
+                StoreSpec::parse(text).unwrap_or_else(|e| panic!("{text} must parse whole: {e}"));
+            match spec {
+                StoreSpec::Pkcs11 {
+                    module,
+                    token: None,
+                    ..
+                } => assert_eq!(module, PathBuf::from(text.trim_start_matches("pkcs11:"))),
+                other => panic!("{text} must keep its full path and no token, got {other:?}"),
+            }
+        }
+        // The Windows spelling of a real path *with* a token does split: the
+        // drive letter alone never separates, but once the path has been an
+        // absolute one since its first backslash, a later colon after the last
+        // separator introduces a flat label (`Mi Token`) — the shape SoftHSM
+        // and ActivClient users type on Windows.
+        let spec = StoreSpec::parse("pkcs11:C:\\tokens\\mod.dll:Mi Token").unwrap();
+        match spec {
+            StoreSpec::Pkcs11 { module, token, .. } => {
+                assert_eq!(module, PathBuf::from("C:\\tokens\\mod.dll"));
+                assert_eq!(token.as_deref(), Some("Mi Token"));
+            }
+            other => panic!("expected a split descriptor, got {other:?}"),
+        }
     }
 
     #[test]

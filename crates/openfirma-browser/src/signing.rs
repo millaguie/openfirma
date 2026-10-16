@@ -1,0 +1,438 @@
+//! The signing dispatcher every frontend shares: the terminal's `sign`, the
+//! window, and the browser protocol all sign a format through this exact call
+//! sequence (finding M-4: with three separate `match`es — one per frontend —
+//! a renamed or retuned format signed in one place and was unknown or subtly
+//! different in another, and no test could notice). The choice lives here,
+//! once.
+//!
+//! This module is where it *can* live once: openfirma-browser already depends
+//! on the three format crates and links nothing graphical, so both frontends
+//! reach it without pulling UI code into each other. (openfirma-core cannot:
+//! the format crates depend on core, not the reverse.)
+
+use openfirma_cades::{CadesOptions, TimestampFn};
+use openfirma_core::alg::DigestAlg;
+use openfirma_core::signer::Signer;
+use openfirma_core::workflow::Format;
+use openfirma_core::{Error, Result};
+use openfirma_pades::{Appearance, PadesOptions, RevocationBytes};
+
+/// What a caller asks for: the format string (the same spelling the CLI's
+/// `--format` takes), the digest, and an optional TSA provider already wired
+/// to its transport (each frontend owns its transport; see `signer_for` docs
+/// in openfirma-keystore ADR-0004 for why nothing here fetches). The CAdES
+/// attribute knobs and the long-term material (CRLs, OCSP responses,
+/// validation certificates) are what the terminal collects; the window and
+/// the browser leave them empty, and a request that names
+/// `pades-b-lt`/`pades-b-lta` without them is refused below with an honest
+/// sentence instead of silently signing a weaker document: B-LT without
+/// revocation data is nothing, and `openfirma verify` would say so afterwards.
+pub struct SignRequest<'a> {
+    pub format: &'a str,
+    /// SHA-256 through [`SignRequest::new`] — every frontend's default; there
+    /// is no [`Default`] for the whole request precisely so a caller cannot
+    /// forget this field into some other value.
+    pub digest: DigestAlg,
+    pub timestamp: Option<TimestampFn>,
+    pub visible: Option<Appearance>,
+    pub reason: Option<String>,
+    /// CAdES `encapsulatedContentInfo`: the terminal's `--encapsulate`.
+    pub cades_encapsulate_content: bool,
+    /// The MIME type both CMS shapes can carry: CAdES `SMimeTypes`-equivalent
+    /// content info and XAdES `DataObjectFormat` (the terminal's
+    /// `--mime-type`).
+    pub cades_mime_type: Option<String>,
+    /// CAdES `contentHint`: the terminal's advanced flag.
+    pub cades_content_hint: Option<String>,
+    /// Whether the SignerInfo names the issuer and serial (`--no-issuer-serial`
+    /// turns it off).
+    pub cades_include_issuer_serial: bool,
+    /// CAdES `signingTime`: `Some(t)` fixes it, `cades_no_signing_time` omits
+    /// the attribute (the terminal's `--no-signing-time`), and neither is
+    /// cades' own default of now.
+    pub cades_signing_time: Option<std::time::SystemTime>,
+    pub cades_no_signing_time: bool,
+    /// The PAdES `/SigFlags` form field name (`--field-name`).
+    pub field_name: Option<String>,
+    /// Width of the `/Contents` hole to reserve (the CLI's advanced flag).
+    /// `None` keeps pades' own default.
+    pub contents_reserved: Option<usize>,
+    /// PAdES `/Location` and `/ContactInfo` dictionary entries.
+    pub location: Option<String>,
+    pub contact_info: Option<String>,
+    /// Certificates whose chains the /DSS archives, and that anchor the TSA
+    /// token's trust (`--validation-cert`).
+    pub validation_certs: Vec<openfirma_core::CertificateHandle>,
+    /// Revocation material to archive (the CLI's `--crl`/`--ocsp` files).
+    pub revocation: Vec<RevocationBytes>,
+    /// B-LTA document time-stamp. The terminal passes `Some(stamp)` whenever
+    /// it asks for the level at all — its `--format pades-b-lta` gate says a
+    /// pre-fetched `--timestamp-token` cannot serve this stamp (it imprints
+    /// bytes that only exist while signing), so only `--tsa` reaches here.
+    pub document_timestamp: Option<TimestampFn>,
+    /// Which frontend is asking, so an incomplete long-term refusal can name
+    /// the flags the citizen actually has: the window offers none of the LTV
+    /// material and points at the terminal instead.
+    pub from_window: bool,
+}
+
+impl<'a> SignRequest<'a> {
+    /// The plain shape every caller starts from: format and digest given,
+    /// everything else at the shared default (detached CAdES, no appearance,
+    /// no LTV material).
+    pub fn new(format: &'a str, digest: DigestAlg) -> Self {
+        Self {
+            format,
+            digest,
+            timestamp: None,
+            visible: None,
+            reason: None,
+            cades_encapsulate_content: false,
+            cades_mime_type: None,
+            cades_content_hint: None,
+            // The CAdES default both frontends sign with unless told otherwise.
+            cades_include_issuer_serial: true,
+            cades_signing_time: Some(std::time::SystemTime::now()),
+            cades_no_signing_time: false,
+            field_name: None,
+            contents_reserved: None,
+            location: None,
+            contact_info: None,
+            validation_certs: Vec::new(),
+            revocation: Vec::new(),
+            document_timestamp: None,
+            from_window: false,
+        }
+    }
+
+    /// Mark the request as coming from the window, so an incomplete
+    /// long-term refusal points at the terminal instead of at flags the
+    /// citizen was never shown.
+    pub fn from_window(mut self) -> Self {
+        self.from_window = true;
+        self
+    }
+}
+
+/// Every format openfirma signs, in the order a UI should list them. The CLI
+/// builds its `--format` values from exactly this table (the parity test
+/// `every_format_is_one_table_across_terminal_window_and_dispatcher` fails if
+/// either side ever renames one), and the window lists the subset its chosen
+/// file supports through [`openfirma_core::workflow::Format::supported_formats`].
+pub fn all_formats() -> &'static [&'static str] {
+    &[
+        "cades-b-b",
+        "pades-b-b",
+        "pades-b-lt",
+        "pades-b-lta",
+        "xades-b-b",
+    ]
+}
+
+/// The format string's fixed display name (the labels of the CLI's `--format`
+/// values; one table so both frontends print identical success lines).
+pub fn format_label(format: &str) -> &'static str {
+    match format {
+        "cades-b-b" => "CAdES-B-B",
+        "pades-b-b" => "PAdES-B-B",
+        "pades-b-lt" => "PAdES-B-LT",
+        "pades-b-lta" => "PAdES-B-LTA",
+        "xades-b-b" => "XAdES-B-B",
+        // An unknown string is echoed as given: it came from a caller's own
+        // flag, and inventing a prettier lie helps nobody.
+        _ => "desconocido",
+    }
+}
+
+/// Produce the signature for one request against `detected`, the kind of file
+/// `content` actually is. The window's simple path (format picked in the UI,
+/// nothing else) arrives here; so does anything that wants the gate explicit.
+pub fn execute_request(
+    req: &mut SignRequest<'_>,
+    detected: Format,
+    content: &[u8],
+    signer: &dyn Signer,
+) -> Result<Vec<u8>> {
+    // A *known* format that cannot carry this file shape is refused here,
+    // before any signing: the citizen who picks CAdES for a PDF (or the
+    // reverse) gets one sentence about what they have, not an ASN.1 stack
+    // trace. A string the shared table does not know is NOT refused by this
+    // gate — even one spelled like a deeper level of a shape it fits: it
+    // falls through to the dispatcher, which answers "unknown signature
+    // format". A renamed level reaching an old frontend must hear that
+    // sentence, not a shape complaint (finding M-4).
+    let allowed = detected.supported_formats();
+    if !allowed.contains(&req.format) && all_formats().contains(&req.format) {
+        return Err(Error::Other(format!(
+            "{} is not a format this file can be signed as (it holds {}).",
+            req.format,
+            match detected {
+                Format::Pdf => "a PDF document",
+                Format::Xml => "an XML document",
+                Format::Data => "plain data",
+            }
+        )));
+    }
+    dispatch(req, content, signer)
+}
+
+/// [`execute_request`] with the detection folded in, for callers that only
+/// have bytes (the CLI): it gates on what the content actually holds rather
+/// than what its name claims.
+pub fn execute_with_detection(
+    req: &mut SignRequest<'_>,
+    content: &[u8],
+    signer: &dyn Signer,
+) -> Result<Vec<u8>> {
+    execute_request(req, Format::detect(content), content, signer)
+}
+
+/// The dispatcher itself: format string in, signature bytes out. Callers gate
+/// on the file shape first (`execute_request`/`execute_with_detection`).
+fn dispatch(req: &mut SignRequest<'_>, content: &[u8], signer: &dyn Signer) -> Result<Vec<u8>> {
+    match req.format {
+        // The CLI's CAdES defaults, verbatim (docs/pades.md records why PAdES
+        // pins its own shape): encapsulation is the caller's choice and the
+        // GUI keeps AutoFirma's default off — detached is the citizen answer.
+        "cades-b-b" => {
+            let mut opts = CadesOptions {
+                digest: req.digest,
+                encapsulate_content: req.cades_encapsulate_content,
+                mime_type: req.cades_mime_type.clone(),
+                content_hint: req.cades_content_hint.clone(),
+                include_issuer_serial: req.cades_include_issuer_serial,
+                ..CadesOptions::default()
+            };
+            opts.timestamp = req.timestamp.clone();
+            if req.cades_no_signing_time {
+                opts.signing_time = None;
+            } else if let Some(t) = req.cades_signing_time {
+                opts.signing_time = Some(t);
+            }
+            openfirma_cades::sign(content, signer, &opts)
+        }
+        // PAdES fixes the CAdES shape itself: detached, no signingTime (the
+        // time lives in /M), no contentHint. B-LT/B-LTA add revisions over
+        // material only the CLI collects; when a request names those levels
+        // without it, the refusal below is the one both frontends give.
+        "pades-b-b" | "pades-b-lt" | "pades-b-lta" => {
+            let ltv = matches!(req.format, "pades-b-lt" | "pades-b-lta");
+            if ltv && req.timestamp.is_none() {
+                // The same honest refusal `openfirma sign` prints for the LTA
+                // level: the document time-stamp imprints bytes that exist
+                // only while signing, so a pre-fetched token cannot serve it.
+                return Err(Error::Other(
+                    "the long-term levels need a TSA url (advanced options): their \
+                     time-stamps imprint bytes that only exist while signing."
+                        .into(),
+                ));
+            }
+            if ltv && req.revocation.is_empty() {
+                // B-LT without any revocation material is half a level, and
+                // `openfirma verify` would report the archive as incomplete
+                // afterwards. The window collects none, so it hears the CLI's
+                // pointer; a terminal request says which flag is missing.
+                return Err(Error::Other(if req.from_window {
+                    "PAdES B-LT archives revocation data (CRLs or OCSP responses) that \
+                     openfirma never downloads, and this window collects none: use \
+                     `openfirma sign --format pades-b-lt --crl …` from a terminal for the \
+                     long-term level."
+                        .into()
+                } else {
+                    "PAdES B-LT archives revocation data and none was given: pass at least \
+                     one --crl or --ocsp, certificates alone are only half of B-LT."
+                        .into()
+                }));
+            }
+            openfirma_pades::pades_sign(
+                content,
+                signer,
+                &PadesOptions {
+                    digest: req.digest,
+                    reason: req.reason.clone(),
+                    location: req.location.clone(),
+                    contact_info: req.contact_info.clone(),
+                    field_name: req.field_name.clone(),
+                    contents_reserved: req
+                        .contents_reserved
+                        .unwrap_or(openfirma_pades::DEFAULT_CONTENTS_RESERVED),
+                    visible: req.visible.take(),
+                    timestamp: req.timestamp.clone(),
+                    validation_certs: std::mem::take(&mut req.validation_certs),
+                    revocation: std::mem::take(&mut req.revocation),
+                    document_timestamp: req.document_timestamp.clone(),
+                    ..PadesOptions::default()
+                },
+            )
+        }
+        // XAdES-B-B is enveloped and signs XML, see docs/xades.md. --digest
+        // picks the signature algorithm; the reference digests stay SHA-512,
+        // AutoFirma's default. signingTime is not optional here: the baseline
+        // profile requires it, so the CAdES attribute knobs do not apply, and
+        // --mime-type feeds DataObjectFormat instead.
+        "xades-b-b" => openfirma_xades::xades_sign(
+            content,
+            signer,
+            &openfirma_xades::XadesOptions {
+                digest: req.digest,
+                mime_type: req.cades_mime_type.clone(),
+                ..Default::default()
+            },
+        ),
+        other => Err(Error::Other(format!("unknown signature format {other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dispatcher must refuse a mismatched format *before* touching the
+    /// signer: the same guard runs whether bytes were read by file, drag or
+    /// paste. `none` stands for any signer — it is never called on a refusal.
+    #[test]
+    fn a_format_that_cannot_hold_the_file_is_refused() {
+        let signer: &dyn Signer = &Mock;
+        let mut req = SignRequest::new("cades-b-b", DigestAlg::Sha256).from_window();
+        let err = execute_request(&mut req, Format::Pdf, b"%PDF-1.4\n", signer).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not a format this file can be signed as"),
+            "{err}"
+        );
+        let mut req = SignRequest::new("pades-b-b", DigestAlg::Sha256).from_window();
+        let err = execute_request(&mut req, Format::Data, b"hello", signer).unwrap_err();
+        assert!(err.to_string().contains("plain data"), "{err}");
+    }
+
+    #[test]
+    fn half_a_long_term_level_is_refused() {
+        // Without a TSA even B-LT cannot seal anything, so the first refusal
+        // is the missing url…
+        let mut req = SignRequest::new("pades-b-lt", DigestAlg::Sha256).from_window();
+        let err = execute_request(&mut req, Format::Pdf, b"%PDF-1.4\n", &Mock).unwrap_err();
+        assert!(err.to_string().contains("TSA url"), "{err}");
+        // …and with one, the missing CRL/OCSP collection is still refused —
+        // with the CLI's pointer to the terminal for a window request (the
+        // GUI collects none)…
+        let tsa: TimestampFn = std::sync::Arc::new(|_, _| Ok(vec![vec![0u8; 2]]));
+        let mut req = SignRequest::new("pades-b-lt", DigestAlg::Sha256).from_window();
+        req.timestamp = Some(tsa.clone());
+        let err = execute_request(&mut req, Format::Pdf, b"%PDF-1.4\n", &Mock).unwrap_err();
+        assert!(err.to_string().contains("openfirma sign"), "{err}");
+        // …and with the missing flag named for a terminal request.
+        let mut req = SignRequest::new("pades-b-lt", DigestAlg::Sha256);
+        req.timestamp = Some(tsa);
+        let err = execute_request(&mut req, Format::Pdf, b"%PDF-1.4\n", &Mock).unwrap_err();
+        assert!(err.to_string().contains("--crl"), "{err}");
+    }
+
+    #[test]
+    fn labels_are_the_clis_table() {
+        assert_eq!(format_label("pades-b-lta"), "PAdES-B-LTA");
+        assert_eq!(format_label("cades-b-b"), "CAdES-B-B");
+    }
+
+    /// The list every UI builds from, in listing order. The CLI's parity test
+    /// compares its clap `--format` values against this exact set.
+    #[test]
+    fn all_formats_lists_every_level_once() {
+        assert_eq!(
+            all_formats(),
+            &[
+                "cades-b-b",
+                "pades-b-b",
+                "pades-b-lt",
+                "pades-b-lta",
+                "xades-b-b"
+            ]
+        );
+        // every listed format has a label: an unnamed entry in the shared
+        // table would print "desconocido" on a signing that just worked
+        for f in all_formats() {
+            assert_ne!(format_label(f), "desconocido", "{f}");
+        }
+    }
+
+    /// The browser protocol is the third frontend (its own `Format` enum used
+    /// to be its own dispatch): whatever format a sede's page names, it must
+    /// reach exactly this dispatcher's signature for those bytes. A divergence
+    /// here is M-4 reappearing through the wire.
+    #[test]
+    fn the_browser_dispatch_signs_what_this_dispatcher_signs() {
+        use openfirma_core::signer::SoftwareSigner;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name));
+        let (Ok(cert), Ok(key)) = (read("certs/signer-rsa.crt"), read("certs/signer-rsa.key"))
+        else {
+            eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let signer = SoftwareSigner::from_pkcs8_pem(&cert, &key).expect("the test PKI is usable");
+        let pdf_path = dir.join("inputs/simple.pdf");
+        let Ok(pdf) = std::fs::read(&pdf_path) else {
+            eprintln!("skipped, the test PDF is missing, run tools/gen-testpdf.py");
+            return;
+        };
+
+        // The three shapes the protocol can name, over documents they accept.
+        for (format, doc) in [
+            (
+                "cades-b-b",
+                b"plain bytes for the dispatcher test".as_slice(),
+            ),
+            ("pades-b-b", pdf.as_slice()),
+            ("xades-b-b", b"<a/>".as_slice()),
+        ] {
+            // A detached shape with no signing-time attribute is byte-for-byte
+            // reproducible: same content, key, digest -> same CMS. That is the
+            // strongest equality two dispatchers can be held to without a
+            // clock mock.
+            let mut req = SignRequest::new(format, DigestAlg::Sha256);
+            req.cades_no_signing_time = true;
+            let expected = execute_with_detection(&mut req, doc, &signer)
+                .expect("each pair is a shape the dispatcher accepts");
+            // The protocol's own front door: format text as a sede writes it ->
+            // the request its dispatch builds. Reaching the same bytes through
+            // this module's `execute_with_detection` proves one dispatch.
+            let mut protocol = crate::dispatch::protocol_request_for(format, DigestAlg::Sha256)
+                .expect("a served format");
+            protocol.cades_no_signing_time = true;
+            let via_protocol = execute_with_detection(&mut protocol, doc, &signer)
+                .expect("the protocol request is a shape the dispatcher accepts");
+            // XAdES embeds fresh UUIDs in its element Ids, so only the CMS
+            // shapes are byte-reproducible; the XML one is held to equality
+            // of shape (same envelope size class) instead.
+            if format == "xades-b-b" {
+                assert_eq!(
+                    expected.len(),
+                    via_protocol.len(),
+                    "{format}: the browser and the terminal disagree in shape"
+                );
+                assert!(expected.starts_with(b"<?xml") && via_protocol.starts_with(b"<?xml"));
+            } else {
+                assert_eq!(
+                    expected, via_protocol,
+                    "{format}: the browser's request and the shared one disagree"
+                );
+            }
+        }
+    }
+
+    use openfirma_core::CertificateHandle;
+    struct Mock;
+    impl Signer for Mock {
+        fn certificate(&self) -> &CertificateHandle {
+            unreachable!("a refusal never asks who signs")
+        }
+        fn chain(&self) -> &[CertificateHandle] {
+            &[]
+        }
+        fn key_algorithm(&self) -> openfirma_core::Result<openfirma_core::KeyAlgorithm> {
+            Ok(openfirma_core::KeyAlgorithm::Rsa)
+        }
+        fn sign_prehash(&self, _: DigestAlg, _: &[u8]) -> openfirma_core::Result<Vec<u8>> {
+            unreachable!("a refusal never signs")
+        }
+    }
+}

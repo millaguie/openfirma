@@ -33,5 +33,6 @@
 pub mod dispatch;
 pub mod scheme;
 pub mod serve;
+pub mod signing;
 pub mod token;
 pub mod uri;

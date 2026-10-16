@@ -118,6 +118,80 @@ fn a_recorded_pdf_call_survives_percent_decoding_and_base64() {
     assert_eq!(&data[..4], b"%PDF", "dat decoded to a real document header");
 }
 
+/// A `dat` whose base64 is wrapped into 76-character MIME lines, exactly what
+/// `Base64.encode(x, DO_BREAK_LINES)` (AutoFirma's own encoder, and any server
+/// that wraps) produces. AutoFirma decodes it: its alphabet includes `\t \n
+/// \r` (`afirma-core/src/main/java/es/gob/afirma/core/misc/Base64.java:623`)
+/// and the decoder skips whitespace inside the stream (`DataDownloader.java:
+/// 127-137` takes the `isBase64` branch for such a payload). The document, not
+/// the wrapped text, is what must reach the signer.
+const WRAPPED_DAT_URI: &str = "afirma://sign?op=sign&format=CAdES&algorithm=SHA256withRSA&dat=\
+VGhpcyBpcyB0aGUgZG9jdW1lbnQgYSBjaXRpemVuIHdhbnRzIHNpZ25lZCwgbm90IHRoZSBiYXNl\r\n\
+NjQgdGV4dCBpdCB0cmF2ZWxzIGluLiBXcmFwcGVkIGF0IDc2IGNoYXJhY3RlcnMgYnkgYSBzZXJ2\r\n\
+ZXIgdGhhdCBrbm93cyBNSU1FIGFuZCByaWdodGx5IHNvLgo%3D";
+
+/// The same wrapped payload written with the other whitespace AutoFirma's
+/// alphabet carries: interior tabs and bare LF endings.
+const TAB_DAT_URI: &str = "afirma://sign?op=sign&format=CAdES&algorithm=SHA256withRSA&dat=\
+VGhpcyBpcyB0aGUgZG9jdW1l\nbnQgYSBjaXRpemVuIHdhbnRz\tIHNpZ25lZCwgbm90IHRoZSBiYXNl\r\n\
+NjQgdGV4dCBpdCB0cmF2ZWxzIGluLiBXcmFwcGVkIGF0IDc2IGNoYXJhY3RlcnMgYnkgYSBzZXJ2\r\n\
+ZXIgdGhhdCBrbm93cyBNSU1FIGFuZCByaWdodGx5IHNvLgo%3D";
+
+/// The document both URIs above carry: the base64 of these exact bytes, split
+/// across lines by the writer. Recomputing it here is what lets the assertion
+/// be "decoded == document" rather than a length coincidence.
+fn wrapped_document() -> Vec<u8> {
+    b"This is the document a citizen wants signed, not the base64 text it travels in. \
+Wrapped at 76 characters by a server that knows MIME and rightly so.\n"
+        .to_vec()
+}
+
+#[test]
+fn a_line_wrapped_dat_decodes_to_the_document_not_the_text() {
+    // The divergence this test exists for: the strict decoder rejects interior
+    // newlines, and an implementation that then signs the literal text
+    // produces a perfect-looking signature over bytes the sede never sent.
+    // AutoFirma's decoder ignores ASCII whitespace (Base64.java:623 puts \t,
+    // \n and \r in its alphabet), so openfirma must decode to the document.
+    let want = wrapped_document();
+    for uri_text in [WRAPPED_DAT_URI, TAB_DAT_URI] {
+        let uri = parse(uri_text)
+            .unwrap_or_else(|e| panic!("a MIME-wrapped dat AutoFirma decodes must parse: {e}"));
+        assert_eq!(
+            uri.data.as_deref(),
+            Some(want.as_slice()),
+            "CRLF/LF/tab wrapped base64 must decode to the document bytes, never sign the base64 text (AutoFirma Base64.java:623 skips whitespace; signing the text here was finding A-2)"
+        );
+    }
+}
+
+#[test]
+fn a_dat_that_is_not_base64_is_refused_instead_of_signed_literally() {
+    // The negative half of A-2: AutoFirma's literal-bytes fallback
+    // (DataDownloader.java:137) is deliberately NOT copied. A payload that
+    // does not decode is an error naming the parameter, because signing it as
+    // text would hand the sede a valid signature over the wrong bytes.
+    let err = parse(
+        "afirma://sign?op=sign&format=CAdES&algorithm=SHA256withRSA&dat=no%20es%20base64%20%21%21",
+    )
+    .expect_err("a non-base64 dat must be refused, never signed verbatim");
+    let text = err.to_string();
+    assert!(
+        text.contains("dat"),
+        "the error must name the URI parameter: {text}"
+    );
+    assert!(
+        text.contains("base64"),
+        "and say why it is not decodable: {text}"
+    );
+    // gzip=true never had a fallback and keeps its own refusal.
+    let err = parse(
+        "afirma://sign?op=sign&gzip=true&format=CAdES&algorithm=SHA256withRSA&dat=no%20es%20base64",
+    )
+    .expect_err("gzip without base64 was always an error");
+    assert!(err.to_string().contains("base64"), "{err}");
+}
+
 #[test]
 fn operations_are_the_launcher_set_matched_like_autofirma_matches_them() {
     // ProtocolInvocationLauncher dispatches on lowercase prefixes; the

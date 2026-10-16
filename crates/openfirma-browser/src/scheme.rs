@@ -30,10 +30,55 @@
 
 use std::path::{Path, PathBuf};
 
+/// Escape a path for the `Exec` value of a desktop entry. The desktop entry
+/// spec keeps quoting inside this one unquoted token: spaces are written
+/// `\s`, a tab `\t`, a newline `\n`, and the escaping character itself
+/// (`\\`) goes out doubled. Leaving any of them raw is how an install under
+/// `/home/Ana María/` used to produce an entry whose `Exec` the desktop
+/// environment could not parse at all (finding M-3): the registration looked
+/// installed and never fired.
+fn desktop_key(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            ' ' => out.push_str("\\s"),
+            '\t' => out.push_str("\\t"),
+            '\n' | '\r' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether a path can appear in a desktop entry at all. The escaping above
+/// covers the characters the format represents; what it cannot represent is a
+/// line break inside the value or an empty path no desktop environment would
+/// resolve. `--register` refuses those at generation time rather than writing
+/// a file whose handling breaks on first use, which is the whole difference
+/// between a broken install and a silent one.
+fn desktop_entry_usable(binary: &Path) -> Result<(), String> {
+    let text = binary.to_string_lossy();
+    if text.trim().is_empty() {
+        return Err("la ruta del ejecutable está vacía".into());
+    }
+    if text.chars().any(|c| c == '\n' || c == '\r') {
+        return Err(
+            "la ruta del ejecutable contiene saltos de línea, y un entry de escritorio \
+             no los representa"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// The Linux desktop entry that registers the scheme, as `--register` writes
-/// it to `~/.local/share/applications/openfirma-afirma.desktop`.
-pub fn linux_desktop_entry(binary: &Path) -> String {
-    format!(
+/// it to `~/.local/share/applications/openfirma-afirma.desktop`. An unusable
+/// path (empty, or one no desktop entry format can hold) is a refusal here,
+/// at generation time, instead of a file that installs and never fires.
+pub fn linux_desktop_entry(binary: &Path) -> Result<String, String> {
+    desktop_entry_usable(binary)?;
+    Ok(format!(
         "[Desktop Entry]\n\
          Version=1.0\n\
          Type=Application\n\
@@ -45,8 +90,8 @@ pub fn linux_desktop_entry(binary: &Path) -> String {
          NoDisplay=true\n\
          Categories=Office;Utilities;Signature;\n\
          MimeType=x-scheme-handler/afirma;\n",
-        binary = binary.display(),
-    )
+        binary = desktop_key(&binary.display().to_string()),
+    ))
 }
 
 /// The Windows registry file for the same scheme, the four values AutoFirma's
@@ -106,13 +151,70 @@ mod tests {
 
     #[test]
     fn linux_entry_registers_the_scheme_and_calls_the_real_subcommand() {
-        let entry = linux_desktop_entry(Path::new("/usr/local/bin/openfirma"));
+        let entry = linux_desktop_entry(Path::new("/usr/local/bin/openfirma")).unwrap();
         assert!(entry.contains("MimeType=x-scheme-handler/afirma;"));
         // The Exec must name a subcommand the CLI actually has: a registration
         // pointing at an argument AutoFirma's binary took and ours does not is
         // the quietest possible way for scheme handling to be broken.
         assert!(entry.contains("Exec=/usr/local/bin/openfirma afirma-uri \"%u\""));
         assert!(entry.contains("NoDisplay=true"));
+    }
+
+    #[test]
+    fn linux_entry_survives_the_paths_real_installs_have() {
+        // Finding M-3: spaces and other escaping characters used to go out
+        // raw, which is an Exec no desktop environment reassembles. Each of
+        // these is a directory someone actually installs into.
+        for path in [
+            "/home/Ana María/bin/openfirma",
+            "/opt/Local Tools/openfirma",
+            r"C:\Archivos\openfirma",
+        ] {
+            let entry = linux_desktop_entry(Path::new(path))
+                .unwrap_or_else(|e| panic!("{path} debe generar un entry válido: {e}"));
+            let exec = entry
+                .lines()
+                .find(|l| l.starts_with("Exec="))
+                .expect("el entry lleva siempre su Exec");
+            // The value is the spec's escaped form, checked by round-trip at
+            // the end of this block: whatever escaping we choose, re-reading
+            // the entry has to hand back the binary path exactly.
+            let value = exec.strip_prefix("Exec=").unwrap();
+            let command = value
+                .split(" afirma-uri ")
+                .next()
+                .expect("el Exec siempre llama a afirma-uri");
+            if path.contains(' ') {
+                assert!(
+                    command.contains("\\s"),
+                    "un espacio debe salir como \\s: {exec}"
+                );
+            }
+            if path.contains('\\') {
+                assert!(
+                    command.contains(r"\\"),
+                    "una barra invertida debe ir duplicada: {exec}"
+                );
+            }
+            // and what the escaping produced is reversible: unescaping gives
+            // back exactly the binary path
+            let restored = command
+                .replace(r"\\", "\u{0}")
+                .replace("\\s", " ")
+                .replace('\u{0}', "\\");
+            assert_eq!(restored, path, "{exec}");
+        }
+    }
+
+    #[test]
+    fn linux_entry_refuses_a_path_it_could_not_write() {
+        // generation-time refusal: what cannot be a desktop entry value never
+        // becomes a file that silently does nothing
+        let err = linux_desktop_entry(Path::new("")).unwrap_err();
+        assert!(err.contains("ejecutable"), "{err}");
+        let with_newline = std::path::PathBuf::from("/opt/open\nfirma");
+        let err = linux_desktop_entry(&with_newline).unwrap_err();
+        assert!(err.contains("saltos de línea"), "{err}");
     }
 
     #[test]

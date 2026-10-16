@@ -21,7 +21,7 @@
 use std::path::Path;
 
 use base64::Engine;
-use openfirma_cades::{CadesOptions, sign};
+
 use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
 use openfirma_core::signer::{Signer, SoftwareSigner};
@@ -186,13 +186,18 @@ fn load_signer(key: &KeySource<'_>) -> Result<Box<dyn Signer>, BrowserError> {
 /// not have). Unknown formats are refused by name — AutoFirma's own behaviour
 /// when its signer map misses.
 fn resolve_format(text: &str) -> Result<Format, BrowserError> {
-    if text.eq_ignore_ascii_case("auto") || text.eq_ignore_ascii_case("CAdES") {
+    // A sede sends "CAdES" (AutoFirma's spelling), and a client testing this
+    // seam — or copying the format out of `--help` — may well send the shared
+    // table's own id. Both spellings are one format: matching accepts both,
+    // so the wire list and `crate::signing::all_formats()` cannot drift apart.
+    let head = text.split('-').next().unwrap_or(text);
+    if text.eq_ignore_ascii_case("auto") || head.eq_ignore_ascii_case("CAdES") {
         return Ok(Format::Cades);
     }
-    if text.eq_ignore_ascii_case("PAdES") {
+    if head.eq_ignore_ascii_case("PAdES") {
         return Ok(Format::Pades);
     }
-    if text.eq_ignore_ascii_case("XAdES") {
+    if head.eq_ignore_ascii_case("XAdES") {
         return Ok(Format::Xades);
     }
     Err(BrowserError::new(
@@ -205,10 +210,39 @@ fn resolve_format(text: &str) -> Result<Format, BrowserError> {
     ))
 }
 
+#[derive(Clone, Copy)]
 enum Format {
     Cades,
     Pades,
     Xades,
+}
+
+/// The request the protocol builds for one format name — the exact front door
+/// both `execute` paths walk through, so a sede's format= text and the shared
+/// table can never again mean different signatures (finding M-4). This is what
+/// every browser signing call goes through: dispatch resolves the wire name
+/// here, fills in the digest parameter, and hands the request to
+/// `crate::signing`.
+pub fn protocol_request_for(
+    text: &str,
+    digest: openfirma_core::alg::DigestAlg,
+) -> Result<crate::signing::SignRequest<'static>, BrowserError> {
+    let mut req = protocol_request_for_format(resolve_format(text)?);
+    req.digest = digest;
+    Ok(req)
+}
+
+fn protocol_request_for_format(format: Format) -> crate::signing::SignRequest<'static> {
+    crate::signing::SignRequest::new(
+        match format {
+            Format::Cades => "cades-b-b",
+            Format::Pades => "pades-b-b",
+            Format::Xades => "xades-b-b",
+        },
+        // The digest is the protocol's other parameter; the request starts at
+        // the shared default and resolve_algorithm overwrites it.
+        openfirma_core::alg::DigestAlg::Sha256,
+    )
 }
 
 /// The `algorithm` list of AutoFirma's protocol (`UrlParametersToSign`:
@@ -283,35 +317,15 @@ fn sign_from_uri(
         )
     })?;
 
-    let produced: Vec<u8> = match format {
-        Format::Cades => {
-            let opts = CadesOptions {
-                digest,
-                // AutoFirma's default is explicit, which for it means the
-                // content stays outside — the same measured default as the CLI.
-                ..CadesOptions::default()
-            };
-            sign(content, signer, &opts).map_err(map_core)?
-        }
-        Format::Pades => openfirma_pades::pades_sign(
-            content,
-            signer,
-            &openfirma_pades::PadesOptions {
-                digest,
-                ..Default::default()
-            },
-        )
-        .map_err(map_core)?,
-        Format::Xades => openfirma_xades::xades_sign(
-            content,
-            signer,
-            &openfirma_xades::XadesOptions {
-                digest,
-                ..Default::default()
-            },
-        )
-        .map_err(map_core)?,
-    };
+    // The browser protocol is one more frontend over the ONE dispatcher
+    // (finding M-4): a sede's format= names the shared shape, and everything
+    // else — options, refusals, label table — is `crate::signing`'s.
+    let mut req = protocol_request_for(format_text, digest)?;
+    // AutoFirma's default is explicit, which for it means the content stays
+    // outside — the same measured default as the CLI. The protocol carries no
+    // more knobs than this; see docs/adr/0005.
+    let produced: Vec<u8> =
+        crate::signing::execute_with_detection(&mut req, content, signer).map_err(map_core)?;
 
     Ok(BrowserResult {
         payload: sign_response(signer.certificate(), &produced),
