@@ -21,6 +21,8 @@
 //! ASCII bytes cannot appear inside a UTF-8 multi byte sequence, so scanning
 //! bytes is safe for the whole UTF-8 repertoire.
 
+use std::collections::HashSet;
+
 use openfirma_core::{Error, Result};
 
 /// A qualified name as written in the document. The prefix is kept because
@@ -278,7 +280,11 @@ impl<'a> Parser<'a> {
 
         let mut ns_decls = Vec::new();
         let mut attributes = Vec::new();
-        let mut seen_names: Vec<(Option<String>, String)> = Vec::new();
+        // a set, not a scanned Vec: checking "attribute seen before" by
+        // linear search made one element with thousands of attributes cost
+        // the square of their count (99 KB of attributes took 0.65 s debug,
+        // and c14n then quadratic on top)
+        let mut seen_names: HashSet<(Option<String>, String)> = HashSet::new();
 
         // the declarations of this element apply to its own name, so they are
         // collected first and pushed onto the scope before anything is checked
@@ -360,14 +366,13 @@ impl<'a> Parser<'a> {
                 }
             };
             let key = (attr_ns.clone(), attr_name.local.clone());
-            if seen_names.contains(&key) {
+            if !seen_names.insert(key) {
                 return Err(self.err(&format!(
                     "the attribute {} appears twice on <{}>",
                     attr_name.to_string_with_prefix(),
                     name.to_string_with_prefix()
                 )));
             }
-            seen_names.push(key);
             attributes.push(Attribute {
                 name: attr_name,
                 namespace: attr_ns,
@@ -479,7 +484,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_attr_value(&mut self) -> Result<String> {
-        let quote = self.src[self.pos];
+        // `<a b=` cut at the end of the document used to index one past the
+        // source here: an attribute value is expected, so that is the error
+        let quote = match self.src.get(self.pos) {
+            Some(q) => *q,
+            None => return Err(self.err("an attribute value is expected")),
+        };
         if quote != b'"' && quote != b'\'' {
             return Err(self.err("an attribute value must be quoted"));
         }
