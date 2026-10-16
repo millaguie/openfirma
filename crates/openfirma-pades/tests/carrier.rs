@@ -17,8 +17,39 @@
 //! easy to misdescribe silently, and a wrong field order aborted the suite in a
 //! way no assertion could report. `/proc/self/maps` + `mprotect` ask the same
 //! kernel with an interface this file cannot misread.)
+//!
+//! Linux only, deliberately: `/proc/self/maps`, `getpagesize`, `mprotect` and
+//! glibc's `__errno_location` are exactly the platform this question is about —
+//! the ELF carrier geometry `pdf::carrier_split` reasons over exists nowhere
+//! else, and a Windows build of this file could only fake the answer. Even
+//! inside the Linux target the test checks `uname` before asserting: CI's
+//! arm64 jobs execute real ELF binaries under qemu-user, whose `/proc/self/maps`
+//! is the emulator's own memory, not a kernel's verdict on these program
+//! headers — there the honest answer is "not measurable here".
+
+#![cfg(target_os = "linux")]
 
 use openfirma_pades::pdf;
+
+/// Whether the *running kernel* is Linux, not merely whether we compiled for
+/// it. The CI matrix links and runs Linux arm64 binaries under qemu-user,
+/// where `/proc/self/maps` belongs to the emulator rather than to a kernel
+/// honouring this binary's program headers — every window comparison below
+/// would then measure the translation layer, which is not the claim. Same
+/// boundary as `pdf::carrier_split`, which parses only ELF; the two guards
+/// describe the same platform limit from each side.
+fn kernel_is_linux() -> bool {
+    unsafe extern "C" {
+        fn uname(buf: *mut u8) -> i32;
+    }
+    let mut buf = [0u8; 512];
+    if unsafe { uname(buf.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // struct utsname begins with sysname, NUL-terminated: "Linux" or not.
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    &buf[..end] == b"Linux"
+}
 
 fn page_size() -> usize {
     unsafe extern "C" {
@@ -91,6 +122,14 @@ fn probe_executable(addr: usize, len: usize, restore_perms: &str) -> Result<(), 
 /// space, and the loader maps exactly what the table declares*.
 #[test]
 fn a_running_process_reaches_exactly_what_its_program_headers_declare() {
+    if !kernel_is_linux() {
+        // Compiled for Linux, run under an emulator (CI's arm64 jobs use
+        // qemu-user): the maps this test reads is not a kernel's answer about
+        // these program headers, so the honest verdict is "not measurable
+        // here", never a pass or a failure.
+        eprintln!("skipped: not running on a Linux kernel (emulated target?)");
+        return;
+    }
     let exe = std::env::current_exe().expect("this binary's path");
     // The file identity the kernel records. `current_exe` answers with the
     // *deleted* name for a test binary cargo replaced between build and run
