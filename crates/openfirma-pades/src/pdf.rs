@@ -393,12 +393,65 @@ type XrefEntries = Vec<(ObjRef, Location)>;
 #[derive(Clone, Debug)]
 pub struct Trailer {
     pub root: ObjRef,
-    pub size: u32,
+    /// `/Size` as written by the file: `None` when the key is absent or not a
+    /// number (finding B-1 — read as 0 it made new objects reuse existing
+    /// numbers and silently overwrite pages).
+    pub size: Option<u32>,
     pub info: Option<ObjRef>,
     /// `startxref` of the previous revision, when this is an incremental update.
     pub prev: Option<usize>,
     /// Offset of the `xref` keyword or xref stream object of this revision.
     pub at: usize,
+    /// Trailer keys no earlier revision may change (ISO 32000-1 7.5.6): a
+    /// trailer that adds one which an earlier revision already had, with a
+    /// different value, changes the document without saying so in its new
+    /// cross-reference section. `/Encrypt` is the one a signature must never
+    /// smuggle past (finding C-2), because the new strings would not be
+    /// encrypted; `/ID` is the one PDF/A and PDF 2.0 require to be carried
+    /// over (finding A-1).
+    pub immutable: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl Trailer {
+    /// Keys of a trailer that the revision appended on top must not change.
+    /// `/ID`, `/Encrypt` and every future key in this family. `/Root`,
+    /// `/Info`, `/Size` and `/Prev` are deliberately absent: those are exactly
+    /// what an incremental update legitimately rewrites.
+    fn immutable_keys(dict: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+        const FIXED: [&str; 2] = ["/ID", "/Encrypt"];
+        let mut out = BTreeMap::new();
+        for (k, v) in items(dict)? {
+            let key = &dict[k];
+            if FIXED.iter().any(|f| key == f.as_bytes()) {
+                out.insert(key.to_vec(), dict[v].to_vec());
+            }
+        }
+        Ok(out)
+    }
+
+    /// `/Root`, `/Info` and `/Size` of the trailer, and refuses a trailer with
+    /// no readable `/Size` (finding B-1): every new object number derives from
+    /// it, and inventing one that collides with an existing page is a silent
+    /// document alteration. The error says what to run.
+    pub fn mandatory(&self) -> Result<(ObjRef, Option<ObjRef>, u32)> {
+        let size = self.size.ok_or_else(|| {
+            Error::Pdf(
+                "the trailer of this document has no readable /Size, so openfirma cannot know \
+                 which object numbers are free; rewrite the file first with `qpdf --decrypt` \
+                 (a repair pass fixes it even when the file is not encrypted)"
+                    .to_string(),
+            )
+        })?;
+        Ok((self.root, self.info, size))
+    }
+
+    /// The `/Info` reference of a new revision: the one it carries over, or,
+    /// when the original had none, `new_info_ref` — the object the caller is
+    /// about to write. A trailer that omits it would leave that dictionary
+    /// orphaned (finding M-1).
+    pub fn info_for_revision(&self, new_info_ref: ObjRef) -> ObjRef {
+        self.info.unwrap_or(new_info_ref)
+    }
 }
 
 /// Offset of the last `startxref` in the file, which is where the most recent
@@ -434,20 +487,44 @@ pub fn last_startxref(data: &[u8]) -> Result<usize> {
 /// Reads the trailer dictionary of the revision whose cross-reference section
 /// starts at `xref_at`.
 pub fn trailer(data: &[u8], xref_at: usize) -> Result<Trailer> {
+    // finding M-6: the offset comes from the file (a `startxref` number or a
+    // `/Prev`), so it may point past the end. Checked where it is read, before
+    // anything slices with it; `skip_ws` returns its argument unchanged past
+    // the end, so every caller would otherwise index `data[i..]` at a position
+    // one byte outside the buffer.
+    if xref_at > data.len() {
+        return Err(Error::Pdf(format!(
+            "the cross-reference offset {xref_at} is past the end of a {} byte file",
+            data.len()
+        )));
+    }
     let dict = trailer_dict(data, xref_at)?;
+    // finding C-2 before anything else: an encrypted document must be refused
+    // at the first thing a signing pass reads, not after it has parsed and
+    // rewritten pieces of a file whose streams are ciphertext.
+    if get(&dict, "/Encrypt").is_some() {
+        return Err(Error::Pdf(
+            "this PDF is encrypted: its trailer carries /Encrypt, and openfirma cannot sign \
+             an encrypted document — the signature strings it writes (/T, /M, /Reason) would \
+             not be encrypted while everything else stays ciphertext, and readers see a \
+             broken file. Decrypt it first: `qpdf --input-password=<pass> --decrypt in.pdf \
+             out.pdf` (drop --input-password when the user password is empty)"
+                .into(),
+        ));
+    }
     let root_bytes =
         get(&dict, "/Root").ok_or_else(|| Error::Pdf("the trailer has no /Root".into()))?;
     let root = parse_ref(root_bytes)
         .ok_or_else(|| Error::Pdf("/Root is not an indirect reference".into()))?;
-    let size = get(&dict, "/Size")
-        .and_then(|b| {
-            std::str::from_utf8(trim_ws(b))
-                .ok()?
-                .trim()
-                .parse::<u32>()
-                .ok()
-        })
-        .unwrap_or(0);
+    // finding B-1: absent or unreadable is None, not 0. Callers that need a
+    // number must go through Trailer::mandatory and refuse the document.
+    let size = get(&dict, "/Size").and_then(|b| {
+        std::str::from_utf8(trim_ws(b))
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    });
     let info = get(&dict, "/Info").and_then(parse_ref);
     let prev = get(&dict, "/Prev").and_then(|b| {
         std::str::from_utf8(trim_ws(b))
@@ -456,17 +533,73 @@ pub fn trailer(data: &[u8], xref_at: usize) -> Result<Trailer> {
             .parse::<usize>()
             .ok()
     });
+    // The encryption audit walks /Prev (finding C-2: a document encrypted from
+    // its first revision carries /Encrypt in every trailer; one that a hostile
+    // writer added only to an earlier revision is still the same reader-visible
+    // lie, and ISO 32000-1 7.5.6 forbids changing /ID or /Encrypt across
+    // revisions at all). A broken chain that never yields either key does not
+    // refuse a document the newest trailer describes honestly.
+    let mut immutable = Trailer::immutable_keys(&dict)?;
+    let mut seen = std::collections::BTreeSet::new();
+    seen.insert(xref_at);
+    let mut cur = prev;
+    for depth in 1..100 {
+        let Some(at) = cur else { break };
+        if at > data.len() || !seen.insert(at) {
+            // a dead end or a repeated section is not evidence of encryption;
+            // the bounds check also keeps this audit from slicing with an
+            // offset that comes from the file (finding M-6, the /Prev half)
+            break;
+        }
+        let Ok(dict) = trailer_dict(data, at) else {
+            break;
+        };
+        let found = Trailer::immutable_keys(&dict)?;
+        for (key, value) in found {
+            if key == b"/Encrypt" {
+                return Err(Error::Pdf(format!(
+                    "this PDF is encrypted: revision {} of it carries /Encrypt in its \
+                     trailer. openfirma cannot sign an encrypted document — the signature \
+                     strings it writes would not be encrypted. Decrypt it first: `qpdf \
+                     --input-password=<pass> --decrypt in.pdf out.pdf`",
+                    depth + 1
+                )));
+            }
+            if let Some(newer) = immutable.get(&key)
+                && newer != &value
+            {
+                return Err(Error::Pdf(format!(
+                    "revision {} changes {}, which the newest revision already fixed to a \
+                     different value; a conforming incremental update may not",
+                    depth + 1,
+                    String::from_utf8_lossy(&key)
+                )));
+            }
+            immutable.entry(key).or_insert(value);
+        }
+        cur = get(&dict, "/Prev").and_then(|b| {
+            std::str::from_utf8(trim_ws(b))
+                .ok()?
+                .trim()
+                .parse::<usize>()
+                .ok()
+        });
+    }
     Ok(Trailer {
         root,
         size,
         info,
         prev,
         at: xref_at,
+        immutable,
     })
 }
 
-/// The trailer dictionary of one revision, as owned bytes.
-fn trailer_dict(data: &[u8], xref_at: usize) -> Result<Vec<u8>> {
+/// The trailer dictionary of one revision as owned bytes: the classic table's
+/// `trailer << … >>`, a bare dictionary, or an xref stream object's dictionary.
+/// `trailer()` reads its fields from this; incremental writers carry it over
+/// whole (finding A-1), which is what [`Update::carry_trailer`] does with it.
+pub fn trailer_dict(data: &[u8], xref_at: usize) -> Result<Vec<u8>> {
     let i = skip_ws(data, xref_at);
     if data[i..].starts_with(b"xref") {
         // classic table: skip it, then read the trailer dictionary that follows
@@ -505,6 +638,14 @@ fn trailer_dict(data: &[u8], xref_at: usize) -> Result<Vec<u8>> {
                 }
                 let before = k;
                 k = skip_ws(data, k);
+                // same rule as read_xref_table: a subsection that ends without
+                // its mandatory end-of-line is followed straight by `trailer`,
+                // not by another header — three more tokens would eat the
+                // keyword and the trailer dictionary.
+                if data[k..].starts_with(b"trailer") {
+                    j = skip_ws(data, k + 7);
+                    return Ok(data[j..dict_end(data, j)?].to_vec());
+                }
                 let a = token_end(data, k);
                 k = skip_ws(data, a);
                 let b = token_end(data, k);
@@ -557,6 +698,16 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
                 "more than 100 revisions, /Prev is probably a loop".into(),
             ));
         }
+        // finding M-6: every offset here comes from the file — startxref,
+        // /XRefStm, /Prev — and one past the end used to index `data[i..]`
+        // and panic. Checked where it enters the loop.
+        if at > data.len() {
+            return Err(Error::Pdf(format!(
+                "the cross-reference offset {at} (revision {revisions}) is past the end of a \
+                 {} byte file",
+                data.len()
+            )));
+        }
         let i = skip_ws(data, at);
         let (entries, dict) = if data[i..].starts_with(b"xref") {
             read_xref_table(data, i)?
@@ -570,7 +721,10 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
         // points at a cross-reference stream for the objects only it knows
         // about. Both have to be read, or those objects look missing.
         if let Some(stm) = get(&dict, "/XRefStm").and_then(parse_uint) {
-            if let Ok((extra, _)) = read_xref_stream(data, stm as usize) {
+            // same bounds rule as above: /XRefStm is the file's claim
+            if (stm as usize) <= data.len()
+                && let Ok((extra, _)) = read_xref_stream(data, stm as usize)
+            {
                 for (r, loc) in extra {
                     map.entry(r).or_insert(loc);
                 }
@@ -598,6 +752,16 @@ fn read_xref_table(data: &[u8], i: usize) -> Result<(XrefEntries, Vec<u8>)> {
             return Ok((entries, data[t..end].to_vec()));
         }
         let first_end = token_end(data, j);
+        // A table that runs out of its own subsection headers before any
+        // `trailer` keyword (a hostile or broken writer's truncated append)
+        // would otherwise spin here forever: with no digits the header parse
+        // reads nothing and `j` never moves. The loop always makes progress on
+        // well-formed tables, where each header is followed by its entries.
+        if first_end == j {
+            return Err(Error::Pdf(
+                "the cross-reference table ends without a trailer keyword".into(),
+            ));
+        }
         let count_start = skip_ws(data, first_end);
         let count_end = token_end(data, count_start);
         let first = parse_uint(&data[j..first_end])
@@ -616,6 +780,16 @@ fn read_xref_table(data: &[u8], i: usize) -> Result<(XrefEntries, Vec<u8>)> {
                 )));
             }
             k = skip_ws(data, k);
+            // the standard's own spelling of a subsection start: object N on a
+            // line of its own, where the previous table ended without an
+            // end-of-line before `trailer` (every real writer emits one, and a
+            // header parse that read "trailer" as a number would otherwise
+            // refuse or misattribute the rest of the file)
+            if data[k..].starts_with(b"trailer") {
+                let t = skip_ws(data, k + 7);
+                let end = dict_end(data, t)?;
+                return Ok((entries, data[t..end].to_vec()));
+            }
             let off_end = token_end(data, k);
             let gen_start = skip_ws(data, off_end);
             let gen_end = token_end(data, gen_start);
@@ -723,7 +897,19 @@ fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, Vec<u8>)
             data.len()
         )));
     }
-    let starts = [0, widths[0] as usize, (widths[0] + widths[1]) as usize];
+    // finding M-6: the widths are the file's claim, and `widths[0] +
+    // widths[1]` as u32 panicked on overflow in debug builds (u32::MAX + 1).
+    // Computed in usize, which cannot overflow here on a 64 bit target. A
+    // single field wider than the whole row is legal by the letter of the
+    // specification — only `/W [0 0 0]` is not — and no conforming writer
+    // produces one; the reader tolerates it because the row-bound check below
+    // refuses every row before a field of such a width could be sliced, so
+    // the hostile shape costs an error, not a panic.
+    let starts = [
+        0usize,
+        widths[0] as usize,
+        widths[0] as usize + widths[1] as usize,
+    ];
 
     let mut entries = Vec::new();
     let mut pos = 0usize;
@@ -1286,7 +1472,7 @@ pub(crate) mod tests {
         let at = last_startxref(pdf).unwrap();
         let tr = trailer(pdf, at).unwrap();
         assert_eq!(tr.root, ObjRef::new(1, 0));
-        assert_eq!(tr.size, 6);
+        assert_eq!(tr.size, Some(6));
         assert!(tr.prev.is_none(), "the fixture is a single revision");
 
         let offs = object_locations(pdf, at).unwrap();
@@ -1369,7 +1555,14 @@ pub(crate) mod tests {
         // /Size is the highest object number plus one; an object numbered
         // u32::MAX used to wrap that sum to zero and publish a /Size no
         // reader can use
-        let mut update = crate::update::Update::new(0, ObjRef::new(1, 0), None, 1);
+        let mut update = crate::update::Update::new_with_trailer(
+            0,
+            ObjRef::new(1, 0),
+            None,
+            1,
+            b"<< /Size 1 >>",
+        )
+        .unwrap();
         update.push(crate::update::Object::new(
             ObjRef::new(u32::MAX, 0),
             b"<< >>".to_vec(),
@@ -1494,7 +1687,7 @@ pub(crate) mod tests {
         let at = last_startxref(&pdf).unwrap();
         let tr = trailer(&pdf, at).unwrap();
         assert_eq!(tr.root, ObjRef::new(1, 0));
-        assert_eq!(tr.size, 6);
+        assert_eq!(tr.size, Some(6));
 
         let locs = object_locations(&pdf, at).unwrap();
         assert_eq!(locs.len(), 5, "objects 1 to 5, object 0 is the free list");
