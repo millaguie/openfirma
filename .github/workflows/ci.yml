@@ -128,7 +128,12 @@ jobs:
         shell: bash
         run: |
           ./tools/setup-test-keystores.sh | tee /tmp/keystore-setup.log
-          grep '^SOFTHSM2_CONF=' /tmp/keystore-setup.log >> "$GITHUB_ENV" || true
+          # GITHUB_ENV is a dotenv file: only the value GitHub parses reaches
+          # the test step. The setup script's SOFTHSM2_CONF line is prose for
+          # humans — path plus "(token label …)" — so cut at the first space
+          # and export the bare path, which is all libsofthsm2 wants.
+          conf=$(sed -n "s/^SOFTHSM2_CONF=\([^ ]*\).*/\1/p" /tmp/keystore-setup.log)
+          [ -n "$conf" ] && echo "SOFTHSM2_CONF=$conf" >> "$GITHUB_ENV"
           echo "OPENFIRMA_TEST_PKCS11_MODULE=/usr/lib/softhsm/libsofthsm2.so" >> "$GITHUB_ENV"
           echo 'OPENFIRMA_TEST_NSS_DB=sql:/tmp/opencode/keystores/nssdb' >> "$GITHUB_ENV"
 
@@ -136,6 +141,11 @@ jobs:
         run: cargo build --all-targets --target ${{ matrix.target }}
 
       - name: test
+        # The default is a CI-only fallback so SoftHSM never silently reads
+        # /etc/softhsm2.conf and its world-writable token directory; on Linux
+        # GITHUB_ENV overrides it with the path the setup step created.
+        env:
+          SOFTHSM2_CONF: /tmp/opencode/keystores/softhsm/softhsm2.conf
         run: cargo test --target ${{ matrix.target }}
 
   no-real-certs:
