@@ -69,8 +69,10 @@ fn request(
     let _ = stream.write_all(body);
     let _ = stream.flush();
     let mut raw = Vec::new();
-    // The endpoint always closes; read to EOF. Cap the read so a server that
-    // streamed forever would fail this test instead of hanging CI.
+    // The endpoint always closes; read to EOF — but a reset after a complete
+    // response is also an EOF (see the read loop), because this test's answer
+    // has an exact Content-Length and Windows lets the queued RST land before
+    // the client ever drains the bytes its stack already delivered.
     let mut buf = [0u8; 16384];
     let mut total = 0usize;
     loop {
@@ -83,28 +85,21 @@ fn request(
                     "the endpoint streamed without end"
                 );
                 raw.extend_from_slice(&buf[..n]);
+                // Stop at the response's own boundary when it has one: no EOF
+                // and no reset need ever be raced for a fixed-length answer.
+                if complete_response(&raw) {
+                    break;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // A refusal closes while our (possibly huge, deliberately refused)
-            // body may still be in flight; the OS may report the RST on read
+            // body may still be in flight; the OS may report the reset on read
             // after we already hold the full answer. If the bytes so far are a
             // complete response, that reset is the close we asked for.
             Err(e)
-                if e.kind() == std::io::ErrorKind::ConnectionReset
-                    && raw
-                        .windows(4)
-                        .position(|w| w == b"\r\n\r\n")
-                        .is_some_and(|split| {
-                            let len: Option<usize> = String::from_utf8_lossy(&raw[..split])
-                                .lines()
-                                .filter_map(|l| {
-                                    let (k, v) = l.split_once(':')?;
-                                    k.eq_ignore_ascii_case("content-length")
-                                        .then(|| v.trim().to_owned())
-                                })
-                                .find_map(|v| v.parse().ok());
-                            len.is_none_or(|n| raw[split + 4..].len() >= n)
-                        }) =>
+                if (e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::ConnectionAborted)
+                    && complete_response(&raw) =>
             {
                 break;
             }
@@ -112,6 +107,27 @@ fn request(
         }
     }
     parse_response(&raw)
+}
+
+/// Is `raw` a complete HTTP response already — header block plus the body its
+/// Content-Length declares? A reset that arrives after this point carries no
+/// information the bytes do not already hold, and both reset kinds (Windows
+/// reports an aborted local connection as `ConnectionAborted`, a peer's RST as
+/// `ConnectionReset`) are then the close every endpoint here performs.
+fn complete_response(raw: &[u8]) -> bool {
+    raw.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .is_some_and(|split| {
+            let len: Option<usize> = String::from_utf8_lossy(&raw[..split])
+                .lines()
+                .filter_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().to_owned())
+                })
+                .find_map(|v| v.parse().ok());
+            len.is_none_or(|n| raw[split + 4..].len() >= n)
+        })
 }
 
 fn parse_response(raw: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
