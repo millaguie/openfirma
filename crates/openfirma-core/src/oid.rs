@@ -26,6 +26,10 @@ pub const ID_CONTENT_HINT: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.4");
 
 // RFC 5035, ESS
+/// `ESS_SIGNING_CERT` (`signingCertificate`, RFC 5035 2): the v1 attribute a
+/// TSA includes in its token so the signer certificate is bound to it.
+pub const ID_SIGNING_CERTIFICATE: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.12");
 /// `SIGNATURE_TIMESTAMP_TOKEN_OID` in AutoFirma, used for the CAdES B-T
 /// signature timestamp.
 pub const ID_SIGNATURE_TIME_STAMP_TOKEN: ObjectIdentifier =

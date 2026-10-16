@@ -19,10 +19,15 @@
 //!   certificate valid at the validation time.
 //!
 //! What is *not* checked, because it is layer 3/4 territory in
-//! docs/validation.md: revocation (CRL/OCSP), key usage and other certificate
-//! policies, RSASSA-PSS, attribute certificates, and the countersignature
-//! tree. This verifier answers "is this a genuine signature by this
-//! certificate, chained to this anchor", nothing more.
+//! docs/validation.md: revocation (CRL/OCSP), certificate policies, and the
+//! countersignature tree. Chain construction itself follows RFC 5280: an
+//! issuer is only ever accepted when `basicConstraints` says `cA = TRUE`, its
+//! `keyUsage` (when present) allows `keyCertSign`, its `pathLenConstraint`
+//! still leaves room, and no critical extension escapes interpretation. The
+//! signer certificate must be allowed to sign (`digitalSignature` or
+//! `nonRepudiation` when `keyUsage` is present). Without these rules any leaf
+//! could issue a fake certificate at anyone's name and the chain would climb
+//! over it — see docs/adversarial-review.md, finding C1.
 
 use std::time::SystemTime;
 
@@ -33,7 +38,45 @@ use openfirma_core::alg::{DigestAlg, KeyAlgorithm, SignatureAlg};
 use openfirma_core::cert::CertificateHandle;
 use openfirma_core::signer::verify_prehash;
 use openfirma_core::{Error, Result, oid, tlv};
+use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
 use x509_cert::name::Name;
+
+/// `id-kp-timeStamping` (RFC 3161 2.3): the extended key usage a TSA's
+/// certificate must carry for its tokens to mean anything.
+pub const OID_EKU_TIME_STAMPING: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
+
+/// `basicConstraints` (RFC 5280 4.2.1.9). The same OID as
+/// `const_oid::db::rfc5280::ID_CE_BASIC_CONSTRAINTS`, spelled out here in the
+/// dotted form every other OID in this file uses.
+const OID_BASIC_CONSTRAINTS: &str = "2.5.29.19";
+/// `keyUsage` (RFC 5280 4.2.1.3).
+const OID_KEY_USAGE: &str = "2.5.29.15";
+/// `extendedKeyUsage` (RFC 5280 4.2.1.12).
+const OID_EXTENDED_KEY_USAGE: &str = "2.5.29.37";
+/// `nameConstraints` (RFC 5280 4.2.1.10).
+const OID_NAME_CONSTRAINTS: &str = "2.5.29.30";
+
+/// Extensions RFC 5280 defines and this verifier interprets, so a certificate
+/// that marks any of them critical is still readable here. A critical
+/// extension outside this list is one whose meaning we cannot know, and
+/// RFC 5280 4.2 says the certificate must then be rejected.
+const KNOWN_EXTENSIONS: &[ObjectIdentifier] = &[
+    ObjectIdentifier::new_unwrap("2.5.29.14"), // subjectKeyIdentifier
+    ObjectIdentifier::new_unwrap(OID_KEY_USAGE),
+    ObjectIdentifier::new_unwrap("2.5.29.17"), // subjectAltName
+    ObjectIdentifier::new_unwrap("2.5.29.18"), // issuerAltName
+    ObjectIdentifier::new_unwrap(OID_BASIC_CONSTRAINTS),
+    ObjectIdentifier::new_unwrap(OID_EXTENDED_KEY_USAGE),
+    ObjectIdentifier::new_unwrap("2.5.29.31"), // cRLDistributionPoints
+    ObjectIdentifier::new_unwrap("2.5.29.32"), // certificatePolicies
+    ObjectIdentifier::new_unwrap("2.5.29.33"), // policyMappings
+    ObjectIdentifier::new_unwrap("2.5.29.35"), // authorityKeyIdentifier
+    ObjectIdentifier::new_unwrap("2.5.29.36"), // policyConstraints
+    ObjectIdentifier::new_unwrap(OID_NAME_CONSTRAINTS),
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.1.1"), // authorityInfoAccess
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.5"), // ocspNoCheck
+];
 
 /// Name of the check that the `sid` resolves to an embedded certificate.
 pub const CHECK_SIGNER_CERTIFICATE: &str = "signerCertificate";
@@ -64,6 +107,14 @@ pub struct VerifyOptions {
     /// yesterday verifies today by default; pass the claimed signing time to
     /// reproduce what a validator saw back then.
     pub validation_time: SystemTime,
+
+    /// Verify as a RFC 3161 time-stamp token (`tsp::verify_token_signature`
+    /// runs the verifier in this mode). The CMS rules are shared on purpose,
+    /// but a TST is not a CAdES signature and two profile rules differ: the
+    /// ESS signer-certificate attribute is v1 or v2 or absent there (RFC 3161
+    /// 2.4.2 says MUST include one, so v1 is accepted), and its content type
+    /// is `id-ct-TSTInfo`, not `id-data`.
+    pub ts_mode: bool,
 }
 
 impl VerifyOptions {
@@ -72,6 +123,17 @@ impl VerifyOptions {
         Self {
             trust_anchors,
             validation_time: SystemTime::now(),
+            ts_mode: false,
+        }
+    }
+
+    /// A CAdES `VerifyOptions` with the checks of a RFC 3161 token instead of
+    /// the CAdES profile ones — the one implementation behind both verdicts.
+    pub fn tst(trust_anchors: Vec<CertificateHandle>, validation_time: SystemTime) -> Self {
+        Self {
+            trust_anchors,
+            validation_time,
+            ts_mode: true,
         }
     }
 
@@ -102,9 +164,74 @@ pub struct Attributes {
     pub other_signed: Vec<ObjectIdentifier>,
     /// Every unsigned attribute type, in the order they appear.
     pub unsigned_attributes: Vec<ObjectIdentifier>,
-    /// Whether `signature-time-stamp-token` is among the unsigned attributes,
-    /// which is what raises a signature to B-T.
+    /// Whether `signature-time-stamp-token` is among the unsigned attributes.
+    /// Presence alone says nothing about the level; whether that token then
+    /// verified is [`VerifyReport::timestamp`].
     pub signature_time_stamp_token: bool,
+}
+
+/// What the verifier found and concluded about one CAdES/ES time-stamp token
+/// (`signatureTimeStampToken`).
+///
+/// The rule this type encodes (docs/adversarial-review.md A2): a level is
+/// claimed only when its evidence was verified. A present-but-unverifiable
+/// token is reported with the cause, never as if the check had passed.
+#[derive(Clone, Debug, Default)]
+pub struct TimestampTokenStatus {
+    /// The tokens the signature carries, in attribute order. Empty means no
+    /// time-stamp attribute at all.
+    pub tokens: Vec<TimestampToken>,
+}
+
+/// One time-stamp token inside a signature, with the outcome of verifying it.
+#[derive(Clone, Debug)]
+pub struct TimestampToken {
+    /// The unsigned attribute OID that carried the token.
+    pub attribute: ObjectIdentifier,
+    /// Whether the TSA's signature over the signed attributes verifies and
+    /// those attributes digest the very TSTInfo this token carries (the whole
+    /// set of checks in `tsp::verify_token_signature`).
+    pub verified: bool,
+    /// The token's `genTime`, only when `verified`. This is the assertion a
+    /// B-T level is allowed to make.
+    pub gen_time: Option<SystemTime>,
+    /// What makes this token unverified, when it is: never empty then, and it
+    /// names the check that failed and what to do about it.
+    pub problem: Option<String>,
+}
+
+impl TimestampTokenStatus {
+    /// No time-stamp attribute at all.
+    pub fn absent() -> Self {
+        TimestampTokenStatus::default()
+    }
+
+    /// Whether any token carried by the signature verified; that is what
+    /// raises a signature to B-T.
+    pub fn verified(&self) -> bool {
+        self.tokens.iter().any(|t| t.verified)
+    }
+
+    /// The genTime of the first verified token, the time the level asserts.
+    pub fn gen_time(&self) -> Option<SystemTime> {
+        self.tokens.iter().find_map(|t| t.gen_time)
+    }
+
+    /// The combined cause when a token is present but none verified: what a
+    /// verdict line shows instead of a level it cannot prove.
+    pub fn problem(&self) -> Option<String> {
+        let problems: Vec<&str> = self
+            .tokens
+            .iter()
+            .filter(|t| !t.verified)
+            .filter_map(|t| t.problem.as_deref())
+            .collect();
+        if problems.is_empty() {
+            None
+        } else {
+            Some(problems.join("; "))
+        }
+    }
 }
 
 /// The outcome of verifying one `SignerInfo`. One report per signer, and a
@@ -128,6 +255,33 @@ pub struct VerifyReport {
     /// The checks that passed, by their [`CHECK_SIGNER_CERTIFICATE`] style
     /// names, in the order they ran.
     pub passed: Vec<&'static str>,
+    /// The time-stamp tokens among the unsigned attributes and whether each
+    /// one verified. A level (B-T) may rest on a `verified` token only; when
+    /// a token is present and none verified, [`TimestampTokenStatus::problem`]
+    /// says why, and no frontend may show the signature as timestamped.
+    pub timestamp: TimestampTokenStatus,
+}
+
+/// The value of each unsigned attribute whose OID is `wanted`, whole-value
+/// TLVs in attribute order. Unsigned attributes are `[1] IMPLICIT` over the
+/// same `Attribute` SEQUENCE as the signed ones (RFC 5652 11.3, and
+/// `signed_data::sign` writes them that way).
+fn unsigned_values<'a>(content: &'a [u8], wanted: ObjectIdentifier) -> Result<Vec<Tlv<'a>>> {
+    let mut out = Vec::new();
+    let mut cur = Cur::new(content);
+    while !cur.done() {
+        let attr = cur.expect(tlv::TAG_SEQUENCE, "an unsigned Attribute")?;
+        let mut a = Cur::new(attr.content);
+        let attr_type = a.oid("the Attribute type")?;
+        if attr_type == wanted {
+            let values = a.expect(tlv::TAG_SET, "the Attribute values SET")?;
+            let mut vs = Cur::new(values.content);
+            while !vs.done() {
+                out.push(vs.next()?);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Verifies every `SignerInfo` of a CMS `SignedData`.
@@ -198,6 +352,18 @@ fn verify_signer_info(
     })?;
     let attrs = parse_attributes(attrs_content)?;
 
+    // RFC 3161 2.4.2: a time-stamp token must carry the contentType signed
+    // attribute and it must say id-ct-TSTInfo. The encapContentInfo check in
+    // tsp::verify_token_signature reads the same name from the other place
+    // where CMS records the type; both have to agree on what was stamped.
+    if opts.ts_mode && attrs.content_type.is_none() {
+        return Err(fail(
+            CHECK_CONTENT_TYPE,
+            "the token's signed attributes carry no contentType attribute, and RFC 3161 \
+             2.4.2 requires one naming id-ct-TSTInfo",
+        ));
+    }
+
     // the contentType attribute, when present, has to name the same type as
     // encapContentInfo: RFC 5652 11.1, repeated as a verification rule in
     // 5.6. A mismatch means the signed attributes describe a different
@@ -224,8 +390,31 @@ fn verify_signer_info(
         )
     })?;
     let content = match (sd.econtent, external) {
-        // encapsulated content wins: that is the content the signer digested
-        (Some(inner), _) => inner,
+        // An encapsulated signature carries the very bytes the signer
+        // digested, so they are what gets verified. But when the caller also
+        // supplied content (a `--content` on the command line), silently
+        // ignoring it would let a signature over one document pass as a
+        // signature over another: the reviewer's a.txt/b.txt case. The two
+        // must agree byte for byte, and if they do not, the verdict is a
+        // refusal that names what happened.
+        (Some(inner), Some(given)) => {
+            if given != inner {
+                return Err(fail(
+                    CHECK_MESSAGE_DIGEST,
+                    format!(
+                        "the signature encapsulates {} bytes while the content supplied to \
+                         verify against holds {}, and the two are not the same document; \
+                         pass the file that was signed, or drop --content and let the \
+                         encapsulated bytes speak for themselves",
+                        inner.len(),
+                        given.len()
+                    ),
+                ));
+            }
+            inner
+        }
+        // no external content: the encapsulated bytes are the signer's own
+        (Some(inner), None) => inner,
         (None, Some(given)) => given,
         (None, None) => {
             return Err(fail(
@@ -261,14 +450,27 @@ fn verify_signer_info(
         .map_err(|e| fail(CHECK_SIGNATURE_VALUE, detail_of(&e)))?;
     passed.push(CHECK_SIGNATURE_VALUE);
 
-    // (d) signingCertificateV2 hashes to the signer certificate
-    let v2 = attrs.signing_cert_v2.ok_or_else(|| {
+    // (d) signingCertificateV2 hashes to the signer certificate. A TST may
+    // carry the v1 `signingCertificate` instead (RFC 3161 2.4.2: the TSA MUST
+    // include one, many TSAs still emit ESSCertID); a CAdES signature must
+    // carry v2, and says so with its own rule name.
+    let attr = if opts.ts_mode {
+        attrs.signing_cert_v2.or(attrs.signing_cert)
+    } else {
+        attrs.signing_cert_v2
+    };
+    let attr = attr.ok_or_else(|| {
         fail(
             CHECK_SIGNING_CERTIFICATE_V2,
-            "the attribute is missing, and every CAdES profile requires it",
+            if opts.ts_mode {
+                "the token carries neither signingCertificate nor signingCertificateV2; \
+                 RFC 3161 2.4.2 makes the TSA include one"
+            } else {
+                "the attribute is missing, and every CAdES profile requires it"
+            },
         )
     })?;
-    check_signing_certificate_v2(&v2, cert)?;
+    check_signing_certificate_v2(&attr, cert)?;
     passed.push(CHECK_SIGNING_CERTIFICATE_V2);
 
     // (e) chain to a trust anchor, dates against the validation time
@@ -285,12 +487,91 @@ fn verify_signer_info(
         KeyAlgorithm::Rsa => SignatureAlg::RsaPkcs1v15(si.digest_alg),
         KeyAlgorithm::EcPrimeField(_) => SignatureAlg::Ecdsa(si.digest_alg),
     };
+    let signature_value_digest = {
+        // The bytes a B-T token imprints for this signature, EN 319 122-1
+        // 6.1: the DER of the signer certificate followed by the OCTET
+        // STRING content of `signatureValue`, hashed under the token's own
+        // algorithm. This is what `signed_data::sign` stamps with, so a
+        // genuine stamp matches and one for anything else cannot.
+        let mut input = Vec::with_capacity(cert.der().len() + si.signature.len());
+        input.extend_from_slice(cert.der());
+        input.extend_from_slice(si.signature);
+        input
+    };
     let unsigned_attributes = match si.unsigned_attrs {
         Some(content) => attribute_oids(content)?,
         None => Vec::new(),
     };
     let signature_time_stamp_token =
         unsigned_attributes.contains(&oid::ID_SIGNATURE_TIME_STAMP_TOKEN);
+
+    // The time-stamp tokens among the unsigned attributes, each verified
+    // against the bytes of this very signature. A token is attached AFTER the
+    // signature (that is what makes B-T possible without breaking it), so its
+    // failures never invalidate the signature itself; but a level may only be
+    // claimed on a verified token — presence proves nothing (finding A2).
+    let mut timestamp = TimestampTokenStatus::absent();
+    if let Some(content) = si.unsigned_attrs {
+        for value in unsigned_values(content, oid::ID_SIGNATURE_TIME_STAMP_TOKEN)? {
+            // The attribute value is the ContentInfo TLV itself; some
+            // producers wrap it in an OCTET STRING instead (a BER habit), so
+            // unwrap that first when present.
+            let mut token = value.content;
+            if token.first().copied() == Some(tlv::TAG_OCTET_STRING) {
+                let mut c = Cur::new(token);
+                token = c.next()?.content;
+            }
+            match crate::tsp::verify_token_signature(
+                token,
+                &opts.trust_anchors,
+                opts.validation_time,
+            ) {
+                Ok(status) => {
+                    // B-T's contract: the token imprints THIS signature value
+                    // (EN 319 122-1 6.1), so its messageImprint must equal the
+                    // digest of `signatureValue` under the token's own
+                    // algorithm. The token already proved — by its verified
+                    // messageDigest over its eContent — that this imprint is
+                    // its real one; matching it here is what binds the stamp
+                    // to this signature and not to another document's.
+                    let bound = crate::tsp::token_imprint(token)
+                        .and_then(|(alg, hash)| {
+                            if alg == si.digest_alg && hash == signature_value_digest {
+                                Ok(())
+                            } else {
+                                Err(Error::Other(format!(
+                                    "the token's messageImprint is not the {} of this \
+                                     signature value: it time-stamps a different signature \
+                                     and says nothing about this one",
+                                    si.digest_alg.name()
+                                )))
+                            }
+                        })
+                        .map(|()| status.gen_time);
+                    match bound {
+                        Ok(gen_time) => timestamp.tokens.push(TimestampToken {
+                            attribute: oid::ID_SIGNATURE_TIME_STAMP_TOKEN,
+                            verified: true,
+                            gen_time: Some(gen_time),
+                            problem: None,
+                        }),
+                        Err(e) => timestamp.tokens.push(TimestampToken {
+                            attribute: oid::ID_SIGNATURE_TIME_STAMP_TOKEN,
+                            verified: false,
+                            gen_time: None,
+                            problem: Some(detail_of(&e)),
+                        }),
+                    }
+                }
+                Err(e) => timestamp.tokens.push(TimestampToken {
+                    attribute: oid::ID_SIGNATURE_TIME_STAMP_TOKEN,
+                    verified: false,
+                    gen_time: None,
+                    problem: Some(detail_of(&e)),
+                }),
+            }
+        }
+    }
 
     Ok(VerifyReport {
         signer_subject: subject(cert),
@@ -310,6 +591,7 @@ fn verify_signer_info(
             signature_time_stamp_token,
         },
         passed,
+        timestamp,
     })
 }
 
@@ -442,7 +724,11 @@ fn check_signing_certificate_v2(value: &Tlv<'_>, cert: &CertificateHandle) -> Re
             })?;
             (d, e.expect(tlv::TAG_OCTET_STRING, "ESSCertIDv2.certHash")?)
         }
-        // absent hashAlgorithm means the DEFAULT, SHA-256
+        // absent hashAlgorithm means the default: SHA-256 for a V2
+        // (RFC 5035 3), SHA-1 for the v1 ESSCertID, whose hash is exactly 20
+        // bytes and nothing else. A 32-byte hash with no algorithm would be
+        // ambiguous DER and stays refused below.
+        tlv::TAG_OCTET_STRING if first.content.len() == 20 => (DigestAlg::Sha1, first),
         tlv::TAG_OCTET_STRING => (DigestAlg::Sha256, first),
         other => {
             return Err(fail(
@@ -501,16 +787,239 @@ fn check_signing_certificate_v2(value: &Tlv<'_>, cert: &CertificateHandle) -> Re
     Ok(())
 }
 
+/// The role a certificate plays in the verification, which decides what RFC
+/// 5280 requires of it. The rules run once per certificate that joins a chain
+/// and once for each special certificate the verifier looks at on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertRole {
+    /// The end entity that produced the signature: when `keyUsage` is present
+    /// it must allow `digitalSignature` or `nonRepudiation`.
+    Signer,
+    /// An issuer above the signer (intermediate or anchor): `cA = TRUE`, and
+    /// `keyCertSign` when `keyUsage` is present. A trust anchor that carries
+    /// no `basicConstraints` at all is still accepted: RFC 5280 6.1.1(e)/(p)
+    /// treats the trust anchor's properties as configuration data, and pre-v3
+    /// roots exist in real PKIs. Anything else must say CA.
+    Issuer {
+        /// How many certificates sit below this one in the chain being built;
+        /// `pathLenConstraint`, when present, must not be smaller.
+        depth_below: usize,
+    },
+    /// A certificate that signs CRLs for some CA (a CRL issuer that is not
+    /// itself an issuer of the chain): `cRLSign` when `keyUsage` is present.
+    CrlIssuer,
+    /// The TSA's signing certificate: `keyUsage` must allow a non-repudiation
+    /// style signature and `extendedKeyUsage` must name `id-kp-timeStamping`.
+    TimeStamping,
+}
+
+/// The RFC 5280 rules a certificate must satisfy for the role it plays. Every
+/// failure names the extension and the rule that failed, so the user sees
+/// which certificate is not fit for what it was asked to do.
+pub fn check_certificate_rules(cert: &CertificateHandle, role: CertRole) -> Result<()> {
+    let tbs = cert.parsed().tbs_certificate();
+    // RFC 5280 4.1.2.9: an issuer certificate that is not v3 cannot carry
+    // basicConstraints, so it can never issue. (v1 certificates have no
+    // extensions at all and are refused here too.)
+    let version = tbs.version() as u8;
+    if matches!(role, CertRole::Issuer { .. }) && version < 2 {
+        return Err(fail(
+            CHECK_CERTIFICATE_CHAIN,
+            format!(
+                "\"{}\" is asked to be a CA but it is an X.509 v{version} certificate, and \
+                 only v3 certificates can carry basicConstraints",
+                subject(cert)
+            ),
+        ));
+    }
+
+    let mut saw_basic_constraints = false;
+    for ext in tbs.extensions().into_iter().flatten() {
+        let oid = ext.extn_id.to_string();
+        // RFC 5280 4.2: a critical extension the verifier does not understand
+        // condemns the certificate, whatever role it plays.
+        if ext.critical && !KNOWN_EXTENSIONS.contains(&ext.extn_id) {
+            return Err(fail(
+                CHECK_CERTIFICATE_CHAIN,
+                format!(
+                    "\"{}\" marks extension {oid} critical and this verifier does not \
+                     implement its meaning; RFC 5280 4.2 forbids accepting it",
+                    subject(cert)
+                ),
+            ));
+        }
+        match oid.as_str() {
+            OID_BASIC_CONSTRAINTS => {
+                saw_basic_constraints = true;
+                let bc = BasicConstraints::from_der(ext.extn_value.as_bytes()).map_err(|e| {
+                    fail(
+                        CHECK_CERTIFICATE_CHAIN,
+                        format!(
+                            "the basicConstraints of \"{}\" do not parse: {e}",
+                            subject(cert)
+                        ),
+                    )
+                })?;
+                if let CertRole::Issuer { depth_below } = role {
+                    if !bc.ca {
+                        return Err(fail(
+                            CHECK_CERTIFICATE_CHAIN,
+                            format!(
+                                "\"{}\" is asked to certify other certificates but its \
+                                 basicConstraints says CA:FALSE; only a certificate with \
+                                 cA = TRUE may issue another one (RFC 5280 4.2.1.9)",
+                                subject(cert)
+                            ),
+                        ));
+                    }
+                    if let Some(limit) = bc.path_len_constraint {
+                        // A pathLenConstraint of N allows at most N further certifications
+                        // below this CA; the chain asks it to make depth_below of them.
+                        if depth_below > usize::from(limit) {
+                            return Err(fail(
+                                CHECK_CERTIFICATE_CHAIN,
+                                format!(
+                                    "\"{}\" carries pathLenConstraint {limit} but the chain \
+                                     below it has {depth_below} certificate(s); one \
+                                     certificate too many sit under this CA",
+                                    subject(cert)
+                                ),
+                            ));
+                        }
+                    }
+                }
+                // A leaf that calls itself a CA is not signature fraud, so the
+                // signer role does not refuse it; but the chain rules will make
+                // any certificate issued *under* it prove itself.
+            }
+            OID_KEY_USAGE => {
+                let ku = KeyUsage::from_der(ext.extn_value.as_bytes()).map_err(|e| {
+                    fail(
+                        CHECK_CERTIFICATE_CHAIN,
+                        format!("the keyUsage of \"{}\" does not parse: {e}", subject(cert)),
+                    )
+                })?;
+                match role {
+                    CertRole::Signer => {
+                        if !(ku.digital_signature() || ku.non_repudiation()) {
+                            return Err(fail(
+                                CHECK_CERTIFICATE_CHAIN,
+                                format!(
+                                    "\"{}\" signs but its keyUsage allows neither \
+                                     digitalSignature nor nonRepudiation (RFC 5280 4.2.1.3)",
+                                    subject(cert)
+                                ),
+                            ));
+                        }
+                    }
+                    CertRole::Issuer { .. } => {
+                        if !ku.key_cert_sign() {
+                            return Err(fail(
+                                CHECK_CERTIFICATE_CHAIN,
+                                format!(
+                                    "\"{}\" issues certificates but its keyUsage has no \
+                                     keyCertSign (RFC 5280 4.2.1.3)",
+                                    subject(cert)
+                                ),
+                            ));
+                        }
+                    }
+                    CertRole::CrlIssuer => {
+                        if !ku.crl_sign() {
+                            return Err(fail(
+                                CHECK_CERTIFICATE_CHAIN,
+                                format!(
+                                    "\"{}\" signs CRLs but its keyUsage has no cRLSign \
+                                     (RFC 5280 4.2.1.3)",
+                                    subject(cert)
+                                ),
+                            ));
+                        }
+                    }
+                    CertRole::TimeStamping => {
+                        if !(ku.digital_signature() || ku.non_repudiation()) {
+                            return Err(fail(
+                                CHECK_CERTIFICATE_CHAIN,
+                                format!(
+                                    "the TSA certificate \"{}\" has a keyUsage that allows no \
+                                     signature at all (RFC 5280 4.2.1.3)",
+                                    subject(cert)
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            OID_EXTENDED_KEY_USAGE if role == CertRole::TimeStamping => {
+                let eku = ExtendedKeyUsage::from_der(ext.extn_value.as_bytes()).map_err(|e| {
+                    fail(
+                        CHECK_CERTIFICATE_CHAIN,
+                        format!(
+                            "the extendedKeyUsage of \"{}\" does not parse: {e}",
+                            subject(cert)
+                        ),
+                    )
+                })?;
+                if !eku.0.contains(&OID_EKU_TIME_STAMPING) {
+                    return Err(fail(
+                        CHECK_CERTIFICATE_CHAIN,
+                        format!(
+                            "the TSA certificate \"{}\" carries an extendedKeyUsage that does \
+                             not name id-kp-timeStamping ({OID_EKU_TIME_STAMPING}); RFC 3161 \
+                             2.3 requires it of every time-stamp authority",
+                            subject(cert)
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A would-be issuer that carries no basicConstraints at all: a self-signed
+    // trust anchor is exempt (its properties are the configuration that chose
+    // it), everything else is not an authority.
+    if matches!(role, CertRole::Issuer { .. }) && !saw_basic_constraints {
+        return Err(fail(
+            CHECK_CERTIFICATE_CHAIN,
+            format!(
+                "\"{}\" is asked to certify other certificates but carries no basicConstraints \
+                 extension at all; without cA = TRUE it may not issue (RFC 5280 4.2.1.9)",
+                subject(cert)
+            ),
+        ));
+    }
+    if role == CertRole::TimeStamping
+        && !tbs
+            .extensions()
+            .into_iter()
+            .flatten()
+            .any(|e| e.extn_id.to_string() == OID_EXTENDED_KEY_USAGE)
+    {
+        return Err(fail(
+            CHECK_CERTIFICATE_CHAIN,
+            format!(
+                "the TSA certificate \"{}\" carries no extendedKeyUsage at all; RFC 3161 2.3 \
+                 requires id-kp-timeStamping ({OID_EKU_TIME_STAMPING}) of every time-stamp \
+                 authority",
+                subject(cert)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Walks from the signer certificate upwards. At each step the issuer is
 /// looked for first among the trust anchors and then among the certificates
 /// embedded in the signature, and every candidate has to verify the current
-/// certificate's signature with its public key. Dates are checked on every
-/// certificate that joins the chain, anchors included.
+/// certificate's signature with its public key *and* pass [`check_certificate_rules`]
+/// as an issuer: `basicConstraints.cA = TRUE`, `keyCertSign` when present, a
+/// `pathLenConstraint` that still fits. Dates are checked on every certificate
+/// that joins the chain, anchors included. The signer itself is judged as a
+/// Signer (it must be allowed to sign).
 ///
-/// Returns the chain signer first, *excluding* the anchor, and the anchor it
-/// stands on. The one case where the two overlap is a chain that already
-/// contains the anchor as an embedded root, and the caller tells that apart
-/// by comparing the last element with the anchor.
+/// Returns the chain signer first, *including* the anchor when the chain
+/// already carries it embedded, and the anchor it stands on.
 fn build_chain_refs<'c, 'a>(
     signer: &'c CertificateHandle,
     embedded: &'c [CertificateHandle],
@@ -524,18 +1033,47 @@ fn build_chain_refs<'c, 'a>(
         ));
     }
     check_validity(signer, at)?;
+    check_certificate_rules(signer, CertRole::Signer)?;
     let mut chain: Vec<&'c CertificateHandle> = vec![signer];
     let mut visited: Vec<&[u8]> = vec![signer.der()];
     let mut current: &'c CertificateHandle = signer;
 
-    for _ in 0..MAX_CHAIN_DEPTH {
-        // the chain already stands on the anchor itself: an embedded root
+    for step in 0..MAX_CHAIN_DEPTH {
+        // The chain stands on a certificate that is also one of the anchors.
+        // Two shapes reach this point and they are not alike:
+        //
+        // * the signer alone, standing on itself as its own anchor — nobody
+        //   above it vouches for anything, so the same rule as everywhere
+        //   else decides: only something that may certify certificates (cA =
+        //   TRUE and keyCertSign; a pre-v3 certificate never) may be its own
+        //   authority. This is finding C1's self-anchored attack ("FIRMA
+        //   VALIDA" for any leaf the user points at), and a real self-signed
+        //   root passes it as what it is: a CA that signed itself.
+        // * a middle link that merely equals an anchor of the pool (a cross-
+        //   signed certificate the user chose to trust): its own signature
+        //   was already checked by the walk one step below, exactly like any
+        //   other accepted issuer, and RFC 5280's final constraint is about
+        //   the *candidate issuer*, not about this terminal. Trusting it as
+        //   an anchor is the user's decision, which the verifier implements
+        //   without a second opinion — openssl's `-trusted` behaves the same.
         if let Some(anchor) = anchors.iter().find(|a| a.der() == current.der()) {
+            if step > 0 {
+                return Ok((chain, anchor));
+            }
+            check_certificate_rules(
+                current,
+                CertRole::Issuer {
+                    depth_below: chain.len(),
+                },
+            )?;
             return Ok((chain, anchor));
         }
         let issuer_der = current.issuer().to_der()?;
         let mut name_matches = 0usize;
         let mut signature_failures = 0usize;
+        // certificates below `current` (the signer counts as one): the
+        // candidate issuer's pathLenConstraint bounds exactly these
+        let depth_below = chain.len();
 
         for anchor in anchors {
             if anchor.subject().to_der()? != issuer_der {
@@ -545,6 +1083,7 @@ fn build_chain_refs<'c, 'a>(
             match check_cert_signature(current, anchor) {
                 Ok(()) => {
                     check_validity(anchor, at)?;
+                    check_certificate_rules(anchor, CertRole::Issuer { depth_below })?;
                     return Ok((chain, anchor));
                 }
                 Err(_) => signature_failures += 1,
@@ -559,6 +1098,12 @@ fn build_chain_refs<'c, 'a>(
             if check_cert_signature(current, candidate).is_err() {
                 signature_failures += 1;
                 continue;
+            }
+            // an embedded certificate that equals a trust anchor is the
+            // anchor: the user named it, no issuer rules to prove
+            let stands_on_anchor = anchors.iter().any(|a| a.der() == candidate.der());
+            if !stands_on_anchor {
+                check_certificate_rules(candidate, CertRole::Issuer { depth_below })?;
             }
             check_validity(candidate, at)?;
             if visited.contains(&candidate.der()) {
@@ -988,6 +1533,9 @@ struct ParsedAttrs<'a> {
     message_digest: Option<&'a [u8]>,
     /// The whole attribute value TLV, parsed later against the signer cert.
     signing_cert_v2: Option<Tlv<'a>>,
+    /// The v1 ESS `signingCertificate` (RFC 5035 2, ESSCertID). A CAdES
+    /// signature must carry the V2; a RFC 3161 token may carry either.
+    signing_cert: Option<Tlv<'a>>,
     content_hint: Option<String>,
     mime_type: Option<String>,
     other: Vec<ObjectIdentifier>,
@@ -1051,6 +1599,13 @@ fn parse_attributes(content: &[u8]) -> Result<ParsedAttrs<'_>> {
             t if t == oid::ID_SIGNING_CERTIFICATE_V2 => {
                 let v = one_value(&mut vs, &attr_type)?;
                 out.signing_cert_v2 = Some(v);
+            }
+            t if t == oid::ID_SIGNING_CERTIFICATE => {
+                // ESS signingCertificate (v1): RFC 3161 TSAs still emit it,
+                // and ts_mode accepts it. `check_signing_certificate_v2`
+                // reads the v1 ESSCertID shape by its hash length.
+                let v = one_value(&mut vs, &attr_type)?;
+                out.signing_cert = Some(v);
             }
             t if t == oid::ID_CONTENT_HINT => {
                 let v = one_value(&mut vs, &attr_type)?;

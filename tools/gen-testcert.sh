@@ -154,6 +154,17 @@ openssl req -newkey rsa:2048 -nodes -keyout "$TMP/rep-raw.key" -out "$TMP/rep.cs
 to_pkcs8 "$TMP/rep-raw.key" signer-representative.key
 issue "$TMP/rep.csr" signer-representative.crt intermediate.crt intermediate.key "$SUB_EXT"
 
+echo "== adversario CA:FALSE emitido por la intermedia (revisión C1) =="
+# Un certificado normal y corriente (CA:FALSE) que un atacante usaria para
+# firmar. Antes del arreglo de reglas de cadena, si ademas se ponian sus
+# propios certificados como ancla de confianza el CLI decia "FIRMA VALIDA".
+dn_conf "$TMP/no_ca.cnf" "C = ES" "O = openfirma test" "OU = Test PKI" \
+  "CN = FALSO MINISTRO"
+openssl req -newkey rsa:2048 -nodes -keyout "$TMP/no-ca-raw.key" -out "$TMP/no-ca.csr" \
+  -config "$TMP/no_ca.cnf"
+to_pkcs8 "$TMP/no-ca-raw.key" signer-nonca.key
+issue "$TMP/no-ca.csr" signer-nonca.crt intermediate.crt intermediate.key "$SUB_EXT"
+
 echo "== TSA certificate, for offline B-T tests with openssl ts =="
 # extendedKeyUsage timeStamping, critical, is what makes openssl and every
 # validator accept this certificate as a time-stamp authority.
@@ -259,6 +270,7 @@ openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-rsa.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-ec.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-juridical.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-representative.crt
+openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-nonca.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt tsa.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt ocsp.crt
 

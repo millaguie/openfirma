@@ -11,7 +11,15 @@
 
 use std::path::{Path, PathBuf};
 
+use der::Decode;
+use x509_cert::ext::pkix::BasicConstraints;
+
 use crate::CertificateHandle;
+
+/// basicConstraints (RFC 5280 4.2.1.9), the extension that says whether a
+/// certificate may issue others at all — and therefore whether it can stand
+/// as a trust anchor.
+const OID_BASIC_CONSTRAINTS: &str = "2.5.29.19";
 use zeroize::Zeroizing;
 
 /// What kind of file a set of bytes is, decided by its magic rather than its
@@ -124,22 +132,21 @@ fn looks_like_markup(body: &[u8]) -> bool {
 ///    its "what certificate do you trust?" affordance instead of pretending.
 ///
 /// The default trust anchors of both frontends' verify path: today exactly
-/// one source, `$OPENFIRMA_TRUST`, a `:`-separated list of PEM/DER files.
-/// There is deliberately no second source yet — reading the platform's root
-/// store would need either a C-backed trust crate or per-platform FFI beyond
-/// what openfirma-keystore does with certificates, and inventing anchors is
-/// worse than having none: an empty list makes `openfirma_cades::verify`
-/// refuse every chain, which is the correct behaviour (trusting nothing
-/// verifies nothing), and the GUI's verify screen then says so and asks the
-/// user for a certificate to trust instead of reporting an unfounded verdict.
+/// one source, `$OPENFIRMA_TRUST`, a search-path list of PEM/DER files (the
+/// platform separator — `:` on unix, `;` on Windows, so paths carrying a
+/// drive letter survive). There is deliberately no second source yet — reading
+/// the platform's root store would need either a C-backed trust crate or per-
+/// platform FFI beyond what openfirma-keystore does with certificates, and
+/// inventing anchors is worse than having none: an empty list makes
+/// `openfirma_cades::verify` refuse every chain, which is the correct
+/// behaviour (trusting nothing verifies nothing), and the GUI's verify screen
+/// then says so and asks the user for a certificate to trust instead of
+/// reporting an unfounded verdict.
 pub fn default_trust_anchors() -> Vec<PathBuf> {
-    match std::env::var("OPENFIRMA_TRUST") {
-        Ok(list) if !list.trim().is_empty() => list
-            .split(':')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .collect(),
+    match std::env::var_os("OPENFIRMA_TRUST") {
+        Some(list) if !list.to_string_lossy().trim().is_empty() => {
+            std::env::split_paths(&list).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -154,6 +161,16 @@ pub fn default_trust_anchors() -> Vec<PathBuf> {
 /// -CAfile` reads; DER files hold one. The verifier closes each signature's
 /// chain against whichever anchor in the pool fits, so dropping any block of
 /// a bundle would silently refuse a document its own CA file verifies.
+///
+/// An ANCHOR is configuration that stands for "a certification authority I
+/// trust", so every certificate the file names must be fit to issue: one
+/// marked `basicConstraints CA:FALSE` (a signer's leaf — exactly what the
+/// review's attack handed the picker, green-lighting any document signed by
+/// that same attacker) is refused here, in both frontends, at once. A file
+/// whose every block fails the rule is an error naming each one; a bundle
+/// where some blocks pass keeps those — `openssl -CAfile` tolerates leaves
+/// sitting inside CA bundles too, and what matters is that no leaf joins the
+/// pool as an anchor.
 pub fn load_trust_anchors(path: &Path) -> Result<Vec<CertificateHandle>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let certs = if bytes.starts_with(b"-----BEGIN") {
@@ -175,11 +192,58 @@ pub fn load_trust_anchors(path: &Path) -> Result<Vec<CertificateHandle>, String>
                 .map_err(|e| format!("{} is not a valid X.509 certificate: {e}", path.display()))?,
         ]
     };
-    Ok(certs)
+    let mut anchors = Vec::with_capacity(certs.len());
+    let mut refused: Vec<String> = Vec::new();
+    for cert in certs {
+        match anchor_rule(&cert) {
+            Ok(()) => anchors.push(cert),
+            Err(reason) => refused.push(reason),
+        }
+    }
+    if anchors.is_empty() {
+        return Err(format!(
+            "{} cannot be a trust anchor: {}",
+            path.display(),
+            refused.join("; ")
+        ));
+    }
+    Ok(anchors)
 }
 
-/// The `-----BEGIN CERTIFICATE-----` chunks of a PEM text, each rebuilt as a
-/// single-certificate PEM string the parser accepts.
+/// What makes a certificate fit to stand as a trust anchor: it must not say
+/// it cannot issue (RFC 5280 4.2.1.9 — `basicConstraints cA = FALSE` is that
+/// statement). A certificate with no basicConstraints at all stays admissible:
+/// pre-v3 roots exist in real PKIs, and RFC 5280 6.1.1(e)/(p) treats the trust
+/// anchor's own properties as configuration data — the same exemption the
+/// chain builder applies to anchors. Leaf certificates (the attacker's own),
+/// which is what the review picked, carry CA:FALSE in every real PKI and here.
+fn anchor_rule(cert: &CertificateHandle) -> Result<(), String> {
+    for ext in cert
+        .parsed()
+        .tbs_certificate()
+        .extensions()
+        .into_iter()
+        .flatten()
+    {
+        if ext.extn_id.to_string() == OID_BASIC_CONSTRAINTS {
+            let Ok(bc) = BasicConstraints::from_der(ext.extn_value.as_bytes()) else {
+                return Err("its basicConstraints do not parse".to_string());
+            };
+            if !bc.ca {
+                let who = cert
+                    .subject_cn()
+                    .unwrap_or_else(|| cert.subject().to_string());
+                return Err(format!(
+                    "\"{who}\" says CA:FALSE in its basicConstraints: it is a certificate \
+                     that cannot issue certificates, so trusting it as an authority would \
+                     validate nothing beyond whoever holds it. Choose the issuing \
+                     authority's certificate instead"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 fn pem_blocks(text: &str) -> Vec<&str> {
     const BEG: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
@@ -676,6 +740,63 @@ fn decode_directory_string(tag: u8, value: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leaf_certificate_is_refused_as_a_trust_anchor() {
+        // The review's C-1 attack in one line: hand the verifier (both
+        // frontends share this loader) the SIGNER's own certificate and every
+        // document that attacker signs turns green. A CA:FALSE leaf is now
+        // refused as an anchor, with the reason in words.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs");
+        if !dir.join("signer-rsa.crt").is_file() {
+            return; // pure-unit crate may run where testdata is absent
+        }
+        let err = load_trust_anchors(&dir.join("signer-rsa.crt"))
+            .expect_err("a signer leaf cannot be an authority");
+        assert!(
+            err.contains("CA:FALSE"),
+            "the refusal names the rule: {err}"
+        );
+
+        // A real CA file still loads as one anchor.
+        let anchors =
+            load_trust_anchors(&dir.join("ca.crt")).expect("the root CA is a fine anchor");
+        assert_eq!(anchors.len(), 1);
+
+        // The review's exact bundle: chain.crt + the attacker's leaf appended.
+        // Every CA block survives; the leaf never joins the pool.
+        let mut text = std::fs::read_to_string(dir.join("chain.crt")).unwrap();
+        text.push('\n');
+        text.push_str(&std::fs::read_to_string(dir.join("signer-rsa.crt")).unwrap());
+        let both =
+            std::env::temp_dir().join(format!("openfirma-{}-mixed-bundle.crt", std::process::id()));
+        std::fs::write(&both, &text).unwrap();
+        let chain_len = load_trust_anchors(&dir.join("chain.crt"))
+            .expect("the chain bundle loads")
+            .len();
+        let anchors = load_trust_anchors(&both).expect("the bundle's CAs survive");
+        assert_eq!(anchors.len(), chain_len, "exactly the CA blocks remain");
+        std::fs::remove_file(&both).ok();
+    }
+
+    #[test]
+    fn a_bundle_of_only_leaves_is_the_anchored_refusal() {
+        // FNMT-style files in the wild sometimes hold only end entities; every
+        // block refused is an error naming them, not a silent empty pool.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs");
+        if !dir.join("signer-rsa.crt").is_file() {
+            return;
+        }
+        let one =
+            std::env::temp_dir().join(format!("openfirma-{}-two-leaves.crt", std::process::id()));
+        let mut text = std::fs::read_to_string(dir.join("signer-rsa.crt")).unwrap();
+        text.push('\n');
+        text.push_str(&std::fs::read_to_string(dir.join("signer-ec.crt")).unwrap());
+        std::fs::write(&one, &text).unwrap();
+        let err = load_trust_anchors(&one).expect_err("no CA inside: nothing to trust");
+        assert!(err.contains("CA:FALSE"), "both refusals are quoted: {err}");
+        std::fs::remove_file(&one).ok();
+    }
 
     #[test]
     fn detection_follows_magic_not_extension() {
