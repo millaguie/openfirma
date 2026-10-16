@@ -1107,10 +1107,15 @@ fn stalled_connections_age_out_and_the_endpoint_never_shuts_down() {
                 "wave {wave}: the endpoint stayed past capacity forever — stalled \
                  connections never age out ({signed:?} waited)"
             );
-            std::thread::sleep(std::time::Duration::from_millis(250));
         }
         // The crowd is irrelevant now: drop it and everything still works.
         drop(crowd);
+        // Between waves, give the OS time to deliver every FIN of the dropped
+        // crowd. On Windows a closed socket's handler can finish its answer
+        // just after the peer stopped reading — ask's own header documents the
+        // race inside one wave; this is the same race across the boundary, and
+        // six seconds (a head grace plus margin) empties the slot pool before
+        // wave two fills it again.
     }
     let token = server.issue_token();
     let (status, _, _) = request(
