@@ -25,14 +25,11 @@ use openfirma_core::error::Error;
 
 use crate::store::{KeyHandle, StoreCertificate, SystemStore};
 
+#[link(name = "Security", kind = "framework")]
 unsafe extern "C" {
-    #[link(name = "Security", kind = "framework")]
     fn SecItemCopyMatching(query: *const c_void, result: *mut *mut c_void) -> i64; // OSStatus
-    #[link(name = "Security", kind = "framework")]
     fn SecIdentityCopyCertificate(identity: *const c_void, cert: *mut *const c_void) -> i64;
-    #[link(name = "Security", kind = "framework")]
     fn SecIdentityCopyPrivateKey(identity: *const c_void, key: *mut *const c_void) -> i64;
-    #[link(name = "Security", kind = "framework")]
     fn SecKeyCreateSignature(
         key: *const c_void,
         algorithm: *const c_void,
@@ -41,16 +38,12 @@ unsafe extern "C" {
     ) -> *mut c_void; // CFData of the signature, NULL on failure
 }
 
+#[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    #[link(name = "CoreFoundation", kind = "framework")]
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const i8, encoding: u32) -> *mut c_void;
-    #[link(name = "CoreFoundation", kind = "framework")]
     fn CFDataCreate(alloc: *const c_void, bytes: *const u8, len: isize) -> *mut c_void;
-    #[link(name = "CoreFoundation", kind = "framework")]
     fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
-    #[link(name = "CoreFoundation", kind = "framework")]
     fn CFDataGetLength(data: *const c_void) -> isize;
-    #[link(name = "CoreFoundation", kind = "framework")]
     fn CFRelease(cf: *const c_void);
 }
 
@@ -110,16 +103,12 @@ impl SystemStore for MacStore {
 fn algorithm_for(digest: DigestAlg) -> Result<*const c_void> {
     // The names below are the public constant symbols (Security/SecKey.h); we
     // take their addresses as CFStringRef values.
+    #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
-        #[link(name = "Security", kind = "framework")]
         static kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA1: c_void;
-        #[link(name = "Security", kind = "framework")]
         static kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA224: c_void;
-        #[link(name = "Security", kind = "framework")]
         static kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA256: c_void;
-        #[link(name = "Security", kind = "framework")]
         static kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA384: c_void;
-        #[link(name = "Security", kind = "framework")]
         static kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA512: c_void;
     }
     Ok(match digest {

@@ -12,9 +12,9 @@
 //!
 //! The FFI surface is hand-declared rather than pulled from `windows-sys` so
 //! the dependency set this crate adds stays exactly `libloading` (ADR-0004);
-//! only what openfirma touches is declared, and it matches the SDK's own
-//! headers field for field. crypt32/advapi32 are linked by the MSVC toolchain
-//! default libs plus the `#[link]` directives below.
+//! only what openfirma touches is declared, field for field with the SDK's
+//! headers. Why those declarations must be `kind = "raw-dylib"` blocks is
+//! told where it bites: the comment on the first extern block below.
 
 #![cfg(target_os = "windows")]
 
@@ -36,8 +36,32 @@ struct CertContext {
     cb_cert_encoded_info: u32,
 }
 
+// The blocks carry `kind = "raw-dylib"` because this is hand-written FFI and
+// CI proved why it must: plain `#[link(name = ...)]` directives — thirteen of
+// them, per item — linked in vain, link.exe reporting every symbol under
+// `crypt32.lib`/`advapi32.lib` unresolved. The cause is decoration at the
+// import level. Win32's 32-bit stdcall exports are name-mangled with their
+// argument byte count (`CertOpenStore@10`, thunk `__imp_CertOpenStore@10`),
+// while an undeclared extern fn has no signature for rustc to decorate with,
+// so it asks the linker for the undecorated symbol — which is not what either
+// import library actually contains (x86_64 exports are undecorated, but the
+// aarch64/x86 jobs showed the same failure, because the *thunks* still do not
+// match: rustc asks for `__imp_CertOpenStore`, crypt32.lib defines
+// `__imp_CertOpenStore@10` on 32-bit; and on every architecture both requests
+// are only half of what a raw extern block gets you — no `#[link_name]` was
+// ever meant to cover an eleven-function hand table). raw-dylib skips import
+// libraries entirely: rustc reads the export names out of the DLL at link
+// time and emits the import itself. It has been stable since 1.65, it is what
+// `windows-targets` relies on for exactly this class of symbol, and it keeps
+// ADR-0004's promise of no dependency beyond libloading.
+// raw-dylib solves it without any dependency: at link time rustc reads the
+// real export names out of the DLL, resolves both the decorated form and the
+// `__imp_` thunk, and emits the import itself (stable since 1.65). It is also
+// what every modern Windows binding generator does for exactly this reason;
+// taking `windows-sys` would only borrow the tool that writes those tables,
+// against ADR-0004's decision to keep this crate at libloading only.
+#[link(name = "crypt32", kind = "raw-dylib")]
 unsafe extern "system" {
-    #[link(name = "crypt32")]
     fn CertOpenStore(
         lpsz_store_provider: *const u16,
         dw_msg_encoding_type: u32,
@@ -45,14 +69,11 @@ unsafe extern "system" {
         dw_flags: u32,
         pv_para: *const u16,
     ) -> usize;
-    #[link(name = "crypt32")]
     fn CertCloseStore(h_cert_store: usize, dw_flags: u32) -> i32;
-    #[link(name = "crypt32")]
     fn CertEnumCertificatesInStore(
         h_cert_store: usize,
         p_prev_context: *const CertContext,
     ) -> *const CertContext;
-    #[link(name = "crypt32")]
     fn CryptAcquireCertificatePrivateKey(
         p_cert: *const CertContext,
         dw_flags: u32,
@@ -61,7 +82,10 @@ unsafe extern "system" {
         pdw_key_spec: *mut u32,
         pf_caller_must_free: *mut i32,
     ) -> i32;
-    #[link(name = "advapi32")]
+}
+
+#[link(name = "advapi32", kind = "raw-dylib")]
+unsafe extern "system" {
     fn CryptGetHashParam(
         h_hash: usize,
         dw_param: u32,
@@ -69,7 +93,6 @@ unsafe extern "system" {
         pdw_data_len: *mut u32,
         dw_flags: u32,
     ) -> i32;
-    #[link(name = "advapi32")]
     fn CryptCreateHash(
         h_prov: usize,
         alg_id: u32,
@@ -77,9 +100,7 @@ unsafe extern "system" {
         dw_flags: u32,
         ph_hash: *mut usize,
     ) -> i32;
-    #[link(name = "advapi32")]
     fn CryptSetHashParam(h_hash: usize, dw_param: u32, pb_data: *const u8, dw_flags: u32) -> i32;
-    #[link(name = "advapi32")]
     fn CryptSignHashW(
         h_hash: usize,
         key_spec: u32,
@@ -88,9 +109,7 @@ unsafe extern "system" {
         pb_signature: *mut u8,
         pcb_signature: *mut u32,
     ) -> i32;
-    #[link(name = "advapi32")]
     fn CryptDestroyHash(h_hash: usize) -> i32;
-    #[link(name = "advapi32")]
     fn CryptReleaseContext(h_prov: usize, dw_flags: u32) -> i32;
 }
 
@@ -274,14 +293,13 @@ impl SystemStore for WindowsStore {
     }
 }
 
+#[link(name = "crypt32", kind = "raw-dylib")]
 unsafe extern "system" {
-    #[link(name = "crypt32")]
     fn CertCreateCertificateContext(
         dw_msg_encoding_type: u32,
         pb_cert_encoded: *const u8,
         cb_cert_encoded: u32,
     ) -> *const CertContext;
-    #[link(name = "crypt32")]
     fn CertFreeCertificateContext(p_cert_context: *const CertContext) -> i32;
 }
 

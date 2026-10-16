@@ -8,10 +8,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The OpenSSL crosscheck tests skip themselves when the test PKI is missing.
-  # In CI the material is generated on purpose, so a skip there means the
-  # generation step silently broke and the suite would go green without
-  # verifying anything. This turns a skip into a failure.
+  # The crosscheck tests skip themselves when the test PKI is missing. In CI
+  # the material is generated on purpose, so a skip there means the generation
+  # step silently broke and the suite would go green without verifying
+  # anything. This turns a skip into a failure — EXCEPT for OPENFIRMA_ALLOW_SKIP
+  # below: keystores cannot be provisioned everywhere. Windows runners have no
+  # packaged SoftHSM and their cert store holds no enrolled user certificate;
+  # macOS runners likewise have no softhsm and an empty keychain. On those, a
+  # keystore skip is the honest outcome, not a broken step, so they say so
+  # while every other test keeps the panic-on-skip guarantee. (The Linux jobs
+  # install and build the real modules, so REQUIRE_TESTS bites there fully.)
   OPENFIRMA_REQUIRE_TESTS: "1"
 
 jobs:
@@ -89,6 +95,15 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
           openssl version
           ./tools/gen-testcert.sh
+
+      # Where no keystore can be built (see the two linux-only steps above),
+      # the keystore tests must skip instead of panicking under
+      # OPENFIRMA_REQUIRE_TESTS: the platform stores on macOS and Windows are
+      # empty on a CI runner, which is an environment fact, not a bug.
+      - name: allow keystore skips where no store exists (macos, windows)
+        if: runner.os != 'Linux'
+        run: echo "OPENFIRMA_ALLOW_SKIP=1" >> "$GITHUB_ENV"
+        shell: bash
 
       # The PKCS#11 integration tests need real modules to load: SoftHSM as a
       # generic token and NSS's libsoftokn3 for the shared-DB path. Linux only
