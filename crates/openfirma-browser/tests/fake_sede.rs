@@ -39,11 +39,13 @@ fn p12() -> Option<PathBuf> {
 }
 
 /// One raw request as a page would send it: method/path/Host/Origin/body, all
-/// explicit here so every test decides its own headers byte for byte. A reset
-/// can beat reading entirely (see the read loop's zero-byte arm): the retry is
-/// one socket deep — request_on re-asks only an idempotent probe, and a probe
-/// has no token to burn; if even the second answer dies unread the test panics
-/// rather than looping.
+/// explicit here so every test decides its own headers byte for byte. A probe
+/// (`/echo`) carries no credential: an answer discarded unread in the socket
+/// layer is simply asked again, up to a bounded number of tries — that is how
+/// the flood/stall loops read the endpoint at capacity, where Windows' close-
+/// and-discard rule bites hardest. A token-bearing path must go through
+/// [`ask`], which re-mints a token per attempt instead (a consumed one must
+/// never come back; see TokenStore::take), so `request` refuses those here.
 fn request(
     addr: SocketAddr,
     method: &str,
@@ -52,13 +54,27 @@ fn request(
     origin: Option<&str>,
     body: &[u8],
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
-    let answer = request_on(stream, addr, method, path, host, origin, body);
-    assert!(
-        answer.0 != u16::MAX,
-        "the endpoint's answer was discarded unread: callers that carry a token must go through `ask`, which re-mints one per attempt"
-    );
-    answer
+    // Re-asking an unread answer is free only where no credential rides along
+    // — /echo probes and a /sign id that could never have been minted (see
+    // sign_path_may_reask). A real one-shot token must never come back (B-4;
+    // TokenStore::take), so `request` gives up after ONE attempt there with an
+    // honest panic, while credential-free paths retry five times: they are the
+    // flood/stall probes that read the endpoint exactly when its accept queue
+    // is saturated and Windows discards answers most. Tests whose flow must
+    // survive a discarded real answer call `ask`, which mints fresh per try.
+    let may_reask = !path.starts_with("/sign/") || sign_path_may_reask(path);
+    let tries = if may_reask { 5 } else { 1 };
+    for _ in 0..tries {
+        let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
+        let answer = request_on(stream, addr, method, path, host, origin, body);
+        if answer.0 != u16::MAX {
+            return answer;
+        }
+    }
+    panic!(
+        "the endpoint's answer on {path:?} was discarded unread{}: a test that presents a          real token and must survive this race uses `ask`, which mints one per attempt",
+        if may_reask { " five times" } else { "" }
+    )
 }
 
 /// The raw-request helper behind [`request`] and [`ask`]: writes the exact
@@ -234,6 +250,23 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .iter()
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.as_str())
+}
+
+/// A /sign path is safe to re-ask when its id could never have been minted —
+/// our tokens are exactly 16 lowercase alphanumerics (token.rs), so a guessed
+/// or truncated id can only ever be refused, burning nothing. `request` trusts
+/// nothing else: every other /sign path is treated as carrying a real one-shot
+/// token and must go through [`ask`] instead. Test-harness bookkeeping alone.
+fn sign_path_may_reask(path: &str) -> bool {
+    match path.strip_prefix("/sign/") {
+        Some(id) => {
+            !(id.len() == 16
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+        }
+        None => true,
+    }
 }
 
 fn server_on(key: &Path) -> LoopbackServer {
