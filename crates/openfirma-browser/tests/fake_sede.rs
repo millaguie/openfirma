@@ -39,7 +39,11 @@ fn p12() -> Option<PathBuf> {
 }
 
 /// One raw request as a page would send it: method/path/Host/Origin/body, all
-/// explicit here so every test decides its own headers byte for byte.
+/// explicit here so every test decides its own headers byte for byte. A reset
+/// can beat reading entirely (see the read loop's zero-byte arm): the retry is
+/// one socket deep — request_on re-asks only an idempotent probe, and a probe
+/// has no token to burn; if even the second answer dies unread the test panics
+/// rather than looping.
 fn request(
     addr: SocketAddr,
     method: &str,
@@ -48,7 +52,25 @@ fn request(
     origin: Option<&str>,
     body: &[u8],
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    let mut stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
+    let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
+    request_on(stream, addr, method, path, host, origin, body)
+}
+
+/// The reader split from [`request`] so a reset that beat reading entirely can
+/// retry on a fresh socket (see the read loop's zero-byte arm). A retry lands
+/// on an endpoint whose slot just freed or whose token state has not changed
+/// for an unauthenticated refusal, and both callers of `request` here tolerate
+/// every answer by construction — this re-ask only recovers bytes Windows'
+/// close-with-unread-data rule discarded.
+fn request_on(
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    host: &str,
+    origin: Option<&str>,
+    body: &[u8],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
@@ -93,23 +115,46 @@ fn request(
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // A refusal closes while our (possibly huge, deliberately refused)
-            // body may still be in flight; the OS may report the reset on read
-            // even when every answer byte had already been delivered — on
-            // Windows the RST can beat the socket read entirely and the first
-            // read() fails with zero bytes collected. The endpoint never
-            // streams without a Content-Length, so whatever bytes ARE held are
-            // only incomplete if the reset cut into their middle; a refusal in
-            // the very first chunk is as complete as it will ever get.
+            // body may still be in flight; the OS may report the reset on read.
+            // Windows adds its own twist: closing an accepted socket that
+            // still holds UNREAD data discards that data and sends an RST, so
+            // a client that lost the race can fail its very first read with
+            // zero bytes collected. The answer then never existed for us (the
+            // stack dropped it), which is why `a_answered_socket` below asks
+            // the endpoint for it again instead of guessing: a reset is only
+            // trusted as an EOF when we already hold bytes, and those bytes
+            // must be the complete response.
             Err(e)
-                if e.kind() == std::io::ErrorKind::ConnectionReset
-                    || e.kind() == std::io::ErrorKind::ConnectionAborted =>
+                if (e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::ConnectionAborted)
+                    && !raw.is_empty() =>
             {
                 assert!(
-                    raw.is_empty() || complete_response(&raw),
+                    complete_response(&raw),
                     "the answer was cut mid-response: {:?}",
                     String::from_utf8_lossy(&raw)
                 );
                 break;
+            }
+            Err(e)
+                if raw.is_empty()
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+            {
+                // A signed request may NOT be re-sent: the endpoint can legally
+                // answer a presented token exactly once, so a retry would turn
+                // Windows' lost bytes into a fake 403. The probes are idempotent
+                // and re-asked on a fresh socket — the flood/stall tests read
+                // them at capacity and assert on status either way, never on
+                // silence; losing one to this race would fail them spuriously.
+                if path.starts_with("/sign/") {
+                    panic!("the unread answer was destroyed on a signing request: {e}");
+                }
+                let fresh =
+                    TcpStream::connect(addr).expect("the endpoint must accept a re-read probe");
+                return request_on(fresh, addr, method, path, host, origin, body);
             }
             Err(e) => panic!("reading the answer failed: {e}"),
         }
