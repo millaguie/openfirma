@@ -144,10 +144,211 @@ pub fn linux_install_paths() -> (PathBuf, &'static str) {
     )
 }
 
+/// Where `--register` writes the browser config so the registered handler can
+/// find a key (finding M-3b: the Exec it installs named no keystore at all,
+/// so every real sede call died demanding `--p12`). One file, one place: the
+/// XDG configuration directory — `$XDG_CONFIG_HOME/openfirma/browser.toml`,
+/// or `$HOME/.config/openfirma/browser.toml` when the variable is unset (the
+/// specification's own fallback). A deliberate non-place is a *system* path:
+/// this file names where a signing key lives, and writing it anywhere shared
+/// would let another user name someone else's key for everyone's handler.
+pub fn browser_config_path() -> Option<PathBuf> {
+    let mut dir = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
+        // an unset or relative XDG_CONFIG_HOME is the specification's signal
+        // to fall back to $HOME/.config, and a handler must resolve the same
+        // file the installer wrote no matter which branch got taken.
+        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    dir.push("openfirma");
+    dir.push("browser.toml");
+    Some(dir)
+}
+
+/// The two values one browser handler needs to be able to sign: the PKCS#12
+/// container, and a file whose first line is its password. Only those two —
+/// an environment variable name would put a secret's location inside a
+/// install-time file whose whole point is surviving without a terminal (no
+/// caller's environment can be assumed there), and a store/PIN story belongs
+/// to `--store` invocations, not to the one key the scheme channel signs with.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BrowserConfig {
+    pub p12: Option<PathBuf>,
+    pub password_file: Option<PathBuf>,
+}
+
+/// Parse the config file's own tiny grammar: `key = "value"` lines, comments
+/// from `#` to end of line, blank lines ignored. Deliberately not a TOML
+/// dependency — two keys do not need a parser crate and the vendor offline
+/// rule says the same thing. The value is either a double-quoted string (a
+/// plain `\` escapes the next character) or bare text taken to the end of the
+/// line, trimmed. Anything unrepresentable refuses at the key that broke it:
+/// this file decides which key signs browser calls, and a silently-misread
+/// line is exactly the quiet failure the handler story cannot afford twice.
+fn parse_config(text: &str) -> Result<BrowserConfig, String> {
+    let mut out = BrowserConfig::default();
+    for (n, line) in text.lines().enumerate() {
+        let line = strip_comment(line);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "línea {}: se esperaba `clave = \"valor\"`, no {line:?}",
+                n + 1
+            ));
+        };
+        let key = key.trim();
+        let value = parse_value(value.trim()).map_err(|e| format!("línea {}: {e}", n + 1))?;
+        match key {
+            "p12" => out.p12 = Some(PathBuf::from(value)),
+            "password_file" => out.password_file = Some(PathBuf::from(value)),
+            other => {
+                return Err(format!(
+                    "línea {}: clave desconocida {other:?} (solo p12 y password_file)",
+                    n + 1
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Comments run from an unquoted `#` to end of line. The quoting rule keeps
+/// paths with `#` in them writable (`/home/ana/caso#7.p12` is a real path):
+/// inside quotes, `#` is data unless it was written `\#`.
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_quotes = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_quotes => i += 1, // the escaped character is data
+            b'"' => in_quotes = !in_quotes,
+            b'#' if !in_quotes => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+fn parse_value(value: &str) -> Result<String, String> {
+    if let Some(rest) = value.strip_prefix('"') {
+        let mut out = String::with_capacity(rest.len());
+        let mut chars = rest.chars();
+        loop {
+            match chars.next() {
+                None => return Err("la clave va entre comillas dobles y falta la de cierre".into()),
+                Some('"') => {
+                    if chars.next().is_some() {
+                        return Err("sobran caracteres tras el cierre de comillas".into());
+                    }
+                    return Ok(out);
+                }
+                Some('\\') => {
+                    match chars.next() {
+                        Some(c @ ('"' | '\\')) => out.push(c),
+                        Some('#') => out.push('#'),
+                        Some(_) | None => return Err(
+                            "una barra invertida solo admite los escapes \\\", \\\\\\\\ y \\\\#"
+                                .into(),
+                        ),
+                    }
+                }
+                Some(c) => out.push(c),
+            }
+        }
+    }
+    // bare value: the whole rest of the (comment-stripped) line, trimmed. A
+    // quoted-looking or empty one is refused, never guessed at.
+    let value = value.trim();
+    if value.is_empty() || value.starts_with('#') {
+        return Err("la clave va entre comillas dobles".into());
+    }
+    Ok(value.to_string())
+}
+
+/// The preamble every generated config carries: what the file is and which
+/// two keys exist. A const so the writer, its escaping, and the test all read
+/// the same bytes back.
+const CONFIG_PREAMBLE: &str = "# openfirma's browser handler configuration.\n\
+# Written by `openfirma afirma-uri --register`; edit freely.\n\
+# The key a browser call signs with: one PKCS#12 and a file whose\n\
+# first line is its password (never the password itself here).\n";
+
+impl BrowserConfig {
+    /// Read the config file at `path`. A file that does not exist is no
+    /// configuration at all (`Ok(None)`) — before `--register` has run, every
+    /// invocation lives in this branch, and it must not be an error. A file
+    /// that exists and cannot be read or understood is the opposite: the user
+    /// asked for a key by writing it, and answering `Ok(None)` would sign
+    /// with nothing after being told otherwise, so load refuses with what
+    /// exactly broke.
+    pub fn load(path: &Path) -> Result<Option<Self>, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(format!(
+                    "reading the browser config {}: {e}",
+                    path.display()
+                ));
+            }
+        };
+        let parsed = parse_config(&text)?;
+        if parsed.p12.is_none() && parsed.password_file.is_none() {
+            return Err(format!(
+                "the browser config {} names neither p12 nor password_file",
+                path.display()
+            ));
+        }
+        Ok(Some(parsed))
+    }
+
+    /// The bytes `--register` writes. Exactly the shape `load` reads back —
+    /// and the test round-trips it, so what the installer ships cannot drift
+    /// from what the handler parses. Paths are quoted with a doubled backslash
+    /// and an escaped hash, the same rule that makes an install under
+    /// `/home/Ana María/` work for the desktop entry.
+    pub fn to_toml(&self) -> String {
+        let mut out = String::from(CONFIG_PREAMBLE);
+        if let Some(p) = &self.p12 {
+            out.push_str(&format!(
+                "p12 = \"{}\"\n",
+                quote_value(&p.display().to_string())
+            ));
+        }
+        if let Some(p) = &self.password_file {
+            out.push_str(&format!(
+                "password_file = \"{}\"\n",
+                quote_value(&p.display().to_string())
+            ));
+        }
+        out
+    }
+}
+
+fn quote_value(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    for c in text.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '#' => out.push_str("\\#"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn linux_entry_registers_the_scheme_and_calls_the_real_subcommand() {
@@ -227,5 +428,112 @@ mod tests {
             "@=\"\\\"C:\\\\Program Files\\\\openfirma\\\\openfirma.exe\\\" \
              afirma-uri \\\"%1\\\"\""
         ));
+    }
+
+    #[test]
+    fn browser_config_round_trips_the_paths_real_installs_have() {
+        // What the installer writes must be what the handler reads, byte for
+        // byte through the parse: every path here is one a real home directory
+        // has contained, including the awkward characters that broke the
+        // desktop entry once (finding M-3a) — spaces, backslashes, and a `#`
+        // that must not be mistaken for the start of a comment.
+        for p12 in [
+            "/home/user/certificado.p12",
+            "/home/Ana María/certificado.p12",
+            r"C:\Archivos\openfirma\clave.p12",
+            "/tmp/caso#7.p12",
+            "/tmp/con \"comillas\"\\.p12",
+        ] {
+            let config = BrowserConfig {
+                p12: Some(PathBuf::from(p12)),
+                password_file: Some(PathBuf::from(format!("{p12}.pw"))),
+            };
+            let text = config.to_toml();
+            let back =
+                parse_config(&text).unwrap_or_else(|e| panic!("{p12} no vuelve a leerse: {e}"));
+            assert_eq!(back, config, "round trip of {p12:?} through to_toml");
+        }
+    }
+
+    #[test]
+    fn browser_config_load_distinguishes_absent_from_broken() {
+        // Absent is the normal state (nothing registered yet) and no error.
+        let missing = std::env::temp_dir().join("openfirma-no-such-config-ever.toml");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(BrowserConfig::load(&missing).unwrap(), None);
+
+        let dir = std::env::temp_dir().join("openfirma-browser-config-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+
+        // readable and complete: Some with both keys, comments stripped.
+        std::fs::write(
+            &path,
+            "# a comment\np12 = \"/home/x/clave.p12\" # trailing\npassword_file = \"/home/x/pw\"\n",
+        )
+        .unwrap();
+        let got = BrowserConfig::load(&path).unwrap().expect("config exists");
+        assert_eq!(got.p12, Some(PathBuf::from("/home/x/clave.p12")));
+        assert_eq!(got.password_file, Some(PathBuf::from("/home/x/pw")));
+
+        // broken content REFUSES rather than reporting no configuration: after the
+        // user asked for a key by writing this file, silence would sign with
+        // nothing while claiming there was no configuration.
+        std::fs::write(&path, "p12 = \"/home/x/clave.p12\n").unwrap();
+        let err = BrowserConfig::load(&path).unwrap_err();
+        assert!(err.contains("línea 1"), "{err}");
+
+        std::fs::write(&path, "store = \"pkcs11:/x\"\n").unwrap();
+        let err = BrowserConfig::load(&path).unwrap_err();
+        assert!(err.contains("desconocida"), "{err}");
+
+        // an empty (or comment-only) file names no key at all: also a refusal,
+        // because someone wrote the file expecting it to mean something.
+        std::fs::write(&path, "# nothing here\n").unwrap();
+        let err = BrowserConfig::load(&path).unwrap_err();
+        assert!(err.contains("neither p12 nor password_file"), "{err}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn browser_config_path_follows_the_xdg_rule() {
+        // Like the HOME test in the CLI, mutating the environment is unsafe in
+        // edition 2024 because sibling threads see it; these are values this
+        // machine does not use and both go back before the test returns.
+        let xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "/xdg-root");
+            std::env::set_var("HOME", "/home/unused");
+        }
+        let got = browser_config_path().unwrap();
+        assert_eq!(got, PathBuf::from("/xdg-root/openfirma/browser.toml"));
+
+        // a relative XDG_CONFIG_HOME is not a config root (spec: ignore it)
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "relative/path") };
+        let got = browser_config_path().unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from("/home/unused/.config/openfirma/browser.toml")
+        );
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let got = browser_config_path().unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from("/home/unused/.config/openfirma/browser.toml")
+        );
+
+        unsafe {
+            match xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 }

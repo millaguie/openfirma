@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -66,10 +66,11 @@ enum Command {
         #[arg(long)]
         password_file: Option<PathBuf>,
 
-        /// Print where the `afirma://` scheme registration belongs on this OS
-        /// and write only those files — never a registry entry, never a
-        /// system path. Reads no key and needs no --p12; run it at install
-        /// time, not from a browser call.
+        /// Install the `afirma://` scheme on this OS: write the per-user
+        /// registration file(s) and the browser handler config that names the
+        /// signing key (see --config), never a registry entry nor a system
+        /// path. Reads nothing from a URI; run it at install time, not from a
+        /// browser call. Without this flag the command answers a URI instead.
         #[arg(long)]
         register: bool,
 
@@ -80,6 +81,15 @@ enum Command {
         /// that offers OPENFIRMA_PASSWORD must always be able to read it.
         #[arg(long, env = "OPENFIRMA_PASSWORD", hide_env_values = true)]
         password: Option<std::ffi::OsString>,
+
+        /// Browser handler configuration (p12 + password_file) to resolve the
+        /// key from when --p12 is not given — this is how the registered
+        /// scheme handler, which carries no flags but argv's URI, can sign at
+        /// all (finding M-3b). Defaults to $XDG_CONFIG_HOME/openfirma/
+        /// browser.toml ($HOME/.config/openfirma/browser.toml unset-XDG); see
+        /// `--register`, which writes it. A named --p12 always wins.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Serve the loopback endpoint a sede page calls, and run every URI that
     /// arrives through it. The ephemeral port is printed at startup — like
@@ -99,6 +109,13 @@ enum Command {
         /// OPENFIRMA_PASSWORD like every other command that opens a PKCS#12.
         #[arg(long, env = "OPENFIRMA_PASSWORD", hide_env_values = true)]
         password: Option<std::ffi::OsString>,
+
+        /// Browser handler configuration (p12 + password_file), the same file
+        /// `afirma-uri --config` reads and `--register` writes: with it, an
+        /// endpoint started from a desktop launcher needs no key flags either.
+        /// A named --p12 always wins over what the config says.
+        #[arg(long)]
+        config: Option<PathBuf>,
 
         /// Address to bind. Only loopback addresses are accepted, and
         /// 127.0.0.1:0 (the default) is the documented form: the port that
@@ -1215,6 +1232,7 @@ fn main() -> Result<()> {
             p12,
             password,
             password_file,
+            config,
             register,
         } => {
             if register {
@@ -1224,21 +1242,57 @@ fn main() -> Result<()> {
                          with it would be ambiguous about which one this invocation is"
                     );
                 }
-                return register_scheme();
+                return register_scheme(p12, password_file, config.as_deref());
             }
             let uri = uri.context(
                 "afirma-uri needs the afirma://… URI the browser handed over (or --register \
                  to install the scheme instead of answering a call)",
             )?;
-            let container = p12.context(
-                "--p12 (and its password by --password-file or OPENFIRMA_PASSWORD) names \
-                 the key a browser call signs with: openfirma is headless and has no \
-                 AutoFirma-style certificate dialog to fall back on",
-            )?;
-            let password = p12_password(password, password_file)?.context(
-                "--p12 needs the container's password: --password-file (the safe \
-                 input) or OPENFIRMA_PASSWORD; argv is not an option for a secret",
-            )?;
+            // M-3b: the URI channel's key has two homes. argv (--p12 plus its
+            // password inputs) wins whenever it names one — that is what an
+            // explicit invocation asked for. Otherwise the browser config
+            // resolves it (the file `--register` writes), because the OS hands
+            // the handler only the URI and nothing else. Both missing is still
+            // the named refusal, now with the fix the user can actually apply.
+            let (container, password) = match p12 {
+                Some(container) => (
+                    container,
+                    p12_password(password, password_file)?.context(
+                        "--p12 needs the container's password: --password-file (the safe \
+                         input) or OPENFIRMA_PASSWORD; argv is not an option for a secret",
+                    )?,
+                ),
+                None => {
+                    let config = browser_key_config(config.as_deref())?;
+                    match config.and_then(|c| c.p12.zip(c.password_file)) {
+                        Some((container, password_file)) => {
+                            eprintln!(
+                                "signing with the browser config's key: {}",
+                                container.display()
+                            );
+                            (
+                                container,
+                                p12_password(None, Some(password_file))?.context(
+                                    "the browser config names a p12 but no password_file; \
+                                     add one (a file whose first line is the password)",
+                                )?,
+                            )
+                        }
+                        _ => {
+                            anyhow::bail!(
+                                "--p12 (and its password by --password-file or \
+                                 OPENFIRMA_PASSWORD) names the key a browser call signs \
+                                 with: openfirma is headless and has no AutoFirma-style \
+                                 certificate dialog to fall back on. The scheme handler, \
+                                 which argv cannot give flags, reads them from the \
+                                 browser config instead — run `openfirma afirma-uri \
+                                 --register --p12 certificado.p12 \
+                                 --password-file pw.txt` once to write it."
+                            )
+                        }
+                    }
+                }
+            };
             let key = openfirma_browser::dispatch::KeySource::P12 {
                 path: &container,
                 password: &password,
@@ -1270,6 +1324,7 @@ fn main() -> Result<()> {
             p12,
             password,
             password_file,
+            config,
             bind,
             issue_token,
             token_only,
@@ -1277,9 +1332,30 @@ fn main() -> Result<()> {
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .with_context(|| format!("--bind {bind:?} is not an address like 127.0.0.1:0"))?;
-            let container = p12.context("--p12 names the key the endpoint signs with")?;
-            let password = p12_password(password, password_file)?
-                .context("--p12 needs its password: --password-file or OPENFIRMA_PASSWORD")?;
+            // Same two homes as `afirma-uri`: argv first, then the config file.
+            let (container, password) = match p12 {
+                Some(container) => (
+                    container,
+                    p12_password(password, password_file)?.context(
+                        "--p12 needs its password: --password-file or OPENFIRMA_PASSWORD",
+                    )?,
+                ),
+                None => {
+                    let config = browser_key_config(config.as_deref())?;
+                    match config.and_then(|c| c.p12.zip(c.password_file)) {
+                        Some((container, password_file)) => (
+                            container,
+                            p12_password(None, Some(password_file))?
+                                .context("the browser config names a p12 but no password_file")?,
+                        ),
+                        None => anyhow::bail!(
+                            "--p12 names the key the endpoint signs with, or write the \
+                             browser config (`afirma-uri --register`) that names it for \
+                             endpoints started without key flags"
+                        ),
+                    }
+                }
+            };
             let server = openfirma_browser::serve::LoopbackServer::start(
                 addr,
                 openfirma_browser::serve::OwnedKeySource::P12 {
@@ -1330,7 +1406,69 @@ fn main() -> Result<()> {
 /// prompt). Nothing here touches a system location or a registry: scheme
 /// registration is an install-time act the user performs, and docs/adr/0005
 /// keeps it that way on purpose.
-fn register_scheme() -> Result<()> {
+/// The browser key file to read: `--config` when named, otherwise the XDG
+/// location (`$XDG_CONFIG_HOME/openfirma/browser.toml`, `$HOME/.config/…`
+/// without it). Absent is fine (the caller falls back or refuses by name);
+/// unreadable or malformed refuses — a file the user wrote to name their key
+/// must never be silently ignored.
+fn browser_key_config(
+    named: Option<&Path>,
+) -> Result<Option<openfirma_browser::scheme::BrowserConfig>> {
+    let path = match named {
+        Some(path) => path.to_path_buf(),
+        None => openfirma_browser::scheme::browser_config_path().context(
+            "no --config was given and the default browser config location needs \
+             $XDG_CONFIG_HOME or $HOME, neither of which this process has",
+        )?,
+    };
+    openfirma_browser::scheme::BrowserConfig::load(&path)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("reading the browser config {}", path.display()))
+}
+
+/// `afirma-uri --register`: install this platform's scheme files and the
+/// browser handler config. The two are one transaction in spirit — the Exec
+/// names no key (argv carries only the URI), so without a config that does,
+/// the installed handler dies on its first call; that is why a register with
+/// nothing named and nothing written yet refuses before writing anything.
+fn register_scheme(
+    p12: Option<PathBuf>,
+    password_file: Option<PathBuf>,
+    config_path: Option<&Path>,
+) -> Result<()> {
+    // M-3b: the Exec the installer writes carries no key flags (the desktop
+    // hands the handler argv's URI and nothing else), so a registration is
+    // only complete once the signing key has a home the handler can find —
+    // this config file. It is decided FIRST, before any file exists: printing
+    // "wrote …, now run update-desktop-database" and refusing afterwards
+    // would leave exactly the M-3b machine state — installed-looking, and
+    // dead on every browser call. What never gets written into it is a
+    // password: only paths (the p12, and the file whose first line is it).
+    let config = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => openfirma_browser::scheme::browser_config_path().context(
+            "no --config was given and the default browser config location needs \
+             $XDG_CONFIG_HOME or $HOME, neither of which this process has",
+        )?,
+    };
+    if p12.is_none() && password_file.is_none() {
+        let existing =
+            openfirma_browser::scheme::BrowserConfig::load(&config).map_err(anyhow::Error::msg)?;
+        match existing.as_ref().and_then(|c| c.p12.as_ref()) {
+            Some(key) => println!(
+                "keeping the browser config that is already there: {} signs with {}",
+                config.display(),
+                key.display()
+            ),
+            None => anyhow::bail!(
+                "--register needs --p12 and --password-file to write a handler config \
+                 that can sign (or an existing {} to keep): the installed Exec carries \
+                 no key flags, so without this file every browser call dies demanding \
+                 --p12",
+                config.display(),
+            ),
+        }
+    }
     let exe = std::env::current_exe().context(
         "the registration must name openfirma's own absolute path (the OS starts this \
          process from a path already, so this failure means the OS lied about argv0)",
@@ -1393,6 +1531,48 @@ fn register_scheme() -> Result<()> {
              point your browser's handler at `openfirma afirma-uri \"%u\"` by hand"
         );
     }
+
+    if p12.is_some() || password_file.is_some() {
+        let container = p12.context(
+            "--register writes a p12 into the handler config; --password-file without \
+             --p12 would write half a key pair",
+        )?;
+        let pw_file = password_file.context(
+            "--register needs --password-file next to --p12 (the file whose first line \
+             is its password): the config never stores a password itself, and argv has \
+             no flag for one on purpose",
+        )?;
+        if !container.is_file() {
+            anyhow::bail!(
+                "--p12 {} is not a file this user can sign with now; --register refuses \
+                 to write a handler config pointing at a key that does not exist yet",
+                container.display()
+            );
+        }
+        if !pw_file.is_file() {
+            anyhow::bail!(
+                "--password-file {} is not a file; the handler would open every browser \
+                 call against a password that cannot be read",
+                pw_file.display()
+            );
+        }
+        let contents = openfirma_browser::scheme::BrowserConfig {
+            p12: Some(container.clone()),
+            password_file: Some(pw_file.clone()),
+        }
+        .to_toml();
+        if let Some(dir) = config.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(&config, contents)
+            .with_context(|| format!("writing {}", config.display()))?;
+        println!("wrote {}", config.display());
+        println!(
+            "the handler signs with {} (password: first line of {})",
+            container.display(),
+            pw_file.display()
+        );
+    }
     Ok(())
 }
 
@@ -1451,7 +1631,7 @@ fn p12_password(
     flag: Option<std::ffi::OsString>,
     file: Option<PathBuf>,
 ) -> Result<Option<Zeroizing<String>>> {
-    // The resolution itself — flag, then file, then OPENFIRMA_PASSWORD — is a
+    // The resolution itself — file, then flag, then OPENFIRMA_PASSWORD — is a
     // shared rule (openfirma_core::workflow) because `sign`, `afirma-uri` and
     // `afirma-serve` all take a --p12 and must not drift on which inputs the
     // password may come from; this wrapper only adapts the error type.
@@ -1805,6 +1985,132 @@ mod tests {
             std::env::temp_dir().join(format!("openfirma-{}-{test}-{name}", std::process::id()));
         std::fs::write(&path, bytes).expect("cannot write temp file");
         path
+    }
+
+    /// Parsing `args` (program name included) as the real CLI would. A test
+    /// that never parses argv cannot tell a wired flag from a documented one.
+    fn parse(argv: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("openfirma").chain(argv.iter().copied()))
+            .expect("the arguments must parse")
+    }
+
+    #[test]
+    fn the_scheme_channel_reads_its_key_from_the_browser_config() {
+        // M-3b: the installed Exec carries no flags but the URI, so `--config`
+        // is what makes it sign. The flag must exist on both browser commands
+        // and land where the resolution code reads it.
+        let cli = parse(&["afirma-uri", "afirma://sign?op=selectCert"]);
+        match &cli.command {
+            Command::AfirmaUri { config, .. } => assert!(config.is_none()),
+            _ => panic!("expected afirma-uri"),
+        }
+        let cli = parse(&[
+            "afirma-uri",
+            "afirma://sign?op=selectCert",
+            "--config",
+            "/tmp/mi-config.toml",
+        ]);
+        match &cli.command {
+            Command::AfirmaUri { config, .. } => {
+                assert_eq!(config.as_deref(), Some(Path::new("/tmp/mi-config.toml")))
+            }
+            _ => panic!("expected afirma-uri"),
+        }
+        let cli = parse(&["afirma-serve", "--config", "/tmp/served.toml"]);
+        match &cli.command {
+            Command::AfirmaServe { config, .. } => {
+                assert_eq!(config.as_deref(), Some(Path::new("/tmp/served.toml")))
+            }
+            _ => panic!("expected afirma-serve"),
+        }
+        // The default-location rule itself is the browser crate's own function
+        // (tested there); what this test pins is that argv knows the file at
+        // all — without the flag below, `--register`'s config had no reader.
+    }
+
+    #[test]
+    fn register_without_any_key_source_names_the_refusal_it_cannot_sign_with() {
+        // The refusal a fresh `--register` (no --p12 anywhere) must print:
+        // naming the fix, not just the missing flag — the whole point of the
+        // round-two finding was an install step that "succeeded" into a
+        // handler that always failed.
+        let dir =
+            std::env::temp_dir().join(format!("openfirma-register-empty-{}", std::process::id()));
+        let cfg = dir.join("browser.toml");
+        let _ = std::fs::remove_file(&cfg);
+        // The refusal must arrive BEFORE any file exists — the round-two state
+        // was an install that printed its happy instructions and left a dead
+        // handler behind. HOME points at the same fresh directory: if a
+        // .desktop were written despite the refusal, this would show it.
+        std::fs::create_dir_all(dir.join(".local/share/applications")).unwrap();
+        let real_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+        let err = register_scheme(None, None, Some(&cfg))
+            .unwrap_err()
+            .to_string();
+        unsafe {
+            match real_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let desktop = dir.join(".local/share/applications/openfirma-afirma.desktop");
+        assert!(
+            !desktop.exists(),
+            "--register wrote {} despite refusing for want of a key",
+            desktop.display()
+        );
+        assert!(err.contains("--p12"), "{err}");
+        assert!(
+            err.contains("--register writes a p12") || err.contains("existing"),
+            "{err}"
+        );
+
+        // and a half-pair (--password-file without --p12) is the OTHER named
+        // refusal: it would write half a key into the file.
+        let pw = write_tmp("halfpair.pw", b"secreto\n");
+        let err = register_scheme(None, Some(pw.clone()), Some(&cfg))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--p12 writes a p12") || err.contains("half a key"),
+            "{err}"
+        );
+        std::fs::remove_file(&pw).ok();
+    }
+
+    #[test]
+    fn register_writes_a_config_the_handler_reads_back() {
+        // The round trip that closes M-3b: what `--register` writes must be
+        // exactly what `afirma-uri` reads with no flags but the URI — spaces
+        // and all, because installs under `/home/Ana María/` are real.
+        let dir = std::env::temp_dir().join(format!(
+            "openfirma-register-roundtrip-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("browser.toml");
+        let _ = std::fs::remove_file(&cfg);
+        let p12 = dir.join("Ana María/clave #7.p12");
+        std::fs::create_dir_all(p12.parent().unwrap()).unwrap();
+        std::fs::write(&p12, b"not really a p12 but a file").unwrap();
+        let pw = dir.join("pw.txt");
+        std::fs::write(&pw, b"secreto\n").unwrap();
+
+        register_scheme(Some(p12.clone()), Some(pw.clone()), Some(&cfg))
+            .expect("a --register with a real key must write its config");
+
+        let back = browser_key_config(Some(&cfg))
+            .unwrap()
+            .expect("the config exists after registering");
+        assert_eq!(back.p12.as_deref(), Some(p12.as_path()));
+        assert_eq!(back.password_file.as_deref(), Some(pw.as_path()));
+
+        // and browser_key_config follows the same rule without --config: an
+        // absent default is no error (the caller decides whether that is a
+        // refusal), a present one is read.
+        std::fs::remove_file(&cfg).ok();
+        let _ = dir;
     }
 
     #[test]

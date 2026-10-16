@@ -143,11 +143,14 @@ cargo run -- sign -i doc.txt -o doc.csig --store nss      # $HOME/.pki/nssdb
 
 A sede's browser call answers through the same signing code. The scheme and
 the loopback endpoint's rules are docs/adr/0005-browser-protocol.md; at install
-time you register the scheme once (it writes only your own files, never a
-system path), then pages hand URIs to the endpoint:
+time you register the scheme once, naming the key the handler signs with (it
+writes only your own files — the `.desktop` entry plus a browser config under
+`$XDG_CONFIG_HOME/openfirma/browser.toml` that stores paths, never a password),
+then pages hand URIs to the endpoint:
 
 ```
-cargo run -- afirma-uri --register          # writes and explains the registration
+cargo run -- afirma-uri --register \
+    --p12 certificado.p12 --password-file pw.txt   # registration + handler config
 cargo run -- afirma-serve \
     --p12 certificado.p12 --password-file pw.txt   # prints its port and one token
 cargo run -- afirma-uri "afirma://sign?op=sign&format=CAdES&algorithm=SHA256&dat=…" \
