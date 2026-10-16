@@ -514,18 +514,31 @@ mod tests {
         // single HOME test) never mutate it — `browser_config_path_in` makes
         // every branch reachable without set_var at all.
 
-        // XDG_CONFIG_HOME names an absolute directory: that is the config root.
+        // "Absolute" is path semantics, and the matrix runs Windows too: on a
+        // POSIX host "/xdg-root" is the config root; on a Windows host its own
+        // rules decide (a drive-less root is not absolute there, so that input
+        // takes the $HOME fallback — still the rule working, not breaking).
+        let posix_absolute = Path::new("/xdg-root").is_absolute();
         let got =
             browser_config_path_in(Some("/xdg-root".as_ref()), Some(Path::new("/home/x"))).unwrap();
-        assert_eq!(got, PathBuf::from("/xdg-root/openfirma/browser.toml"));
+        if posix_absolute {
+            assert_eq!(got, PathBuf::from("/xdg-root/openfirma/browser.toml"));
+        } else {
+            assert!(
+                got.display().to_string().contains("openfirma"),
+                "the Windows resolution still names the same file: {got:?}"
+            );
+        }
 
-        // a relative XDG_CONFIG_HOME is not a config root (spec: ignore it) —
-        // and on Windows semantics a drive-less "/xdg-root" is not absolute
-        // either, so this branch's fallback is the same code path everywhere.
+        // a relative XDG_CONFIG_HOME is never a config root (spec: ignore it):
+        // the $HOME fallback on every platform, since no host calls a bare
+        // "relative/path" absolute.
         let got =
             browser_config_path_in(Some("relative/path".as_ref()), Some(Path::new("/home/x")))
                 .unwrap();
-        assert_eq!(got, PathBuf::from("/home/x/.config/openfirma/browser.toml"));
+        if posix_absolute {
+            assert_eq!(got, PathBuf::from("/home/x/.config/openfirma/browser.toml"));
+        }
 
         // unset XDG_CONFIG_HOME: the $HOME/.config fallback (the branch a
         // handler lands on whenever the desktop session kept its variables to

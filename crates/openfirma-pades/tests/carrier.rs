@@ -243,23 +243,42 @@ fn a_running_process_reaches_exactly_what_its_program_headers_declare() {
     // property of the machine, not a symptom of a broken probe, and the
     // segment-agreement assertions below stay meaningful on their own terms.
 
-    // Every declared segment extent is covered by the kernel's windows. A
-    // PT_LOAD the loader skipped would mean program headers are decoration —
-    // and `carrier_split` (which bounds documents by where segments *end*)
-    // would be reading a table no loader honours.
+    // Every declared segment extent is covered by the kernel's windows — as a
+    // tiling, not necessarily one window per span. AArch64 (16 KiB pages)
+    // showed what x86 hid: the loader maps segments page-aligned and splits
+    // them at vaddr boundaries freely, so PT_LOAD 2's file span legitimately
+    // arrives as two adjacent windows meeting exactly at a page end. The
+    // comparison therefore lives in page-quantised space (floor of the span
+    // start to ceil of its end): inside one page, a mapping may begin earlier
+    // or reach later than the header's file extent says — that is alignment,
+    // not disagreement. Windows of one image do overlap in general, at exactly
+    // one p_align-crossing page (aarch64 CI showed (0,360448)+(356352,…)): a
+    // window may start inside its predecessor's last page. What must never
+    // happen is an *uncovered interior* — headers at least as far as the walk
+    // below reaches; overlap wider than that shared boundary page means the
+    // maps parser matched something it should not have, and is caught there.
+    let page: u64 = page_size().try_into().expect("a page size that fits");
+    let mut spans: Vec<(u64, u64)> = kernel_ranges.clone();
+    spans.sort();
     for load in &loads {
-        let span = (load.off, load.off + load.filesz);
+        let raw = (load.off, load.off + load.filesz);
+        let span = (raw.0 / page * page, raw.1.div_ceil(page) * page);
+        let mut reach = span.0;
+        while let Some((_, e)) = spans.iter().find(|(s, e)| *s <= reach && *e > reach) {
+            reach = *e;
+            if reach >= span.1 {
+                break;
+            }
+        }
         assert!(
-            kernel_ranges
-                .iter()
-                .any(|(s, e)| *s <= span.0 && *e >= span.1),
-            "the program headers declare file span {span:?} and the loader mapped no \
-             window covering it: {kernel_ranges:?}"
+            reach >= span.1,
+            "the program headers declare file span {raw:?} (page-quantised {span:?}) \
+             and the loader's windows stop at {reach:?}: {spans:?}"
         );
         if load.x {
             assert!(
-                exec_ranges.iter().any(|(s, e)| *s < span.1 && *e > span.0),
-                "segment at file offset {span:?} declares PF_X yet no executable \
+                exec_ranges.iter().any(|(s, e)| *s < raw.1 && *e > raw.0),
+                "segment at file offset {raw:?} declares PF_X yet no executable \
                  window overlaps it"
             );
         }
