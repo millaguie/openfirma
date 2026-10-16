@@ -111,12 +111,12 @@ pub fn read_ocsp_response(der: &[u8], issuers: &[CertificateHandle], at: SystemT
 
 fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> Result<OcspStatus> {
     // ---- structure down to tbsResponseData, kept as whole TLV bytes -------
-    let mut outer = Cur::new(der);
+    let mut outer = der_cursor(der);
     let resp = outer.expect(tlv::TAG_SEQUENCE, "the OCSPResponse")?;
     if !outer.done() {
         return Err(trailing("after the OCSPResponse"));
     }
-    let mut r = Cur::new(resp.content);
+    let mut r = der_cursor(resp.content);
     let status = r.expect(0x0a, "responseStatus")?; // ENUMERATED
     let code = enumerated(&status, "responseStatus")?;
     if code != 0 {
@@ -126,9 +126,9 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
         )));
     }
     let bytes = r.expect(0xa0, "responseBytes")?;
-    let mut rb = Cur::new(bytes.content);
+    let mut rb = der_cursor(bytes.content);
     let seq = rb.expect(tlv::TAG_SEQUENCE, "ResponseBytes")?;
-    let mut s = Cur::new(seq.content);
+    let mut s = der_cursor(seq.content);
     let response_type = s.oid("ResponseBytes.responseType")?;
     if response_type != oid::ID_PKIX_OCSP_BASIC {
         return Err(Error::Verification(format!(
@@ -138,9 +138,9 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
         )));
     }
     let basic_octets = s.expect(tlv::TAG_OCTET_STRING, "ResponseBytes.response")?;
-    let mut b = Cur::new(basic_octets.content);
+    let mut b = der_cursor(basic_octets.content);
     let basic = b.expect(tlv::TAG_SEQUENCE, "the BasicOCSPResponse")?;
-    let mut t = Cur::new(basic.content);
+    let mut t = der_cursor(basic.content);
     let rd = t.expect(tlv::TAG_SEQUENCE, "tbsResponseData")?;
     let sa = t.expect(tlv::TAG_SEQUENCE, "BasicOCSPResponse.signatureAlgorithm")?;
     let sig = t.expect(tlv::TAG_BIT_STRING, "BasicOCSPResponse.signature")?;
@@ -151,7 +151,7 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
         // `[0] EXPLICIT Certificate` — one certificate wrapped in a SEQUENCE,
         // or RFC 6960's IMPLICIT SET OF reading: several bare certificates.
         // from_der on each element decides which shape the content has.
-        let mut c = Cur::new(certs.content);
+        let mut c = der_cursor(certs.content);
         let mut first = true;
         while !c.done() {
             let cert = c.expect(tlv::TAG_SEQUENCE, "an embedded certificate")?;
@@ -159,7 +159,7 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
                 Ok(handle) => embedded.push(handle),
                 Err(first_err) => {
                     // the explicit wrapper: its content is one whole certificate
-                    let mut inner = Cur::new(cert.content);
+                    let mut inner = der_cursor(cert.content);
                     let mut recovered = false;
                     while !inner.done() {
                         let one = inner.expect(tlv::TAG_SEQUENCE, "an embedded certificate")?;
@@ -188,18 +188,18 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
     }
 
     // ---- what the response says: responderID, interval, CertIDs ----------
-    let mut d = Cur::new(rd.content);
+    let mut d = der_cursor(rd.content);
     if d.peek_tag() == Some(0xa0) {
-        let _version = d.next()?; // [0] EXPLICIT version
+        let _version = d.value()?; // [0] EXPLICIT version
     }
     let responder_id = match d.peek_tag() {
         // [1] byName / [2] byKey: the constructed CHOICE alternatives, tag 0xA1
         // or 0xA2. A `[x] EXPLICIT Name` spelling wraps them in an outer SEQUENCE,
         // which is unwrapped below to reach the same choice anyway.
-        Some(0xa1) | Some(0xa2) => d.next()?,
+        Some(0xa1) | Some(0xa2) => d.value()?,
         _ => {
             let wrapped = d.expect(tlv::TAG_SEQUENCE, "responderID")?;
-            match Cur::new(wrapped.content).peek_tag() {
+            match der_cursor(wrapped.content).peek_tag() {
                 Some(0xa1) | Some(0xa2) => wrapped,
                 _ => {
                     return Err(Error::Verification(
@@ -209,7 +209,7 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
             }
         }
     };
-    let _produced_at = d.next()?; // GeneralizedTime: when, not what, was answered
+    let _produced_at = d.value()?; // GeneralizedTime: when, not what, was answered
     let responses = d.expect(tlv::TAG_SEQUENCE, "the SingleResponse list")?;
 
     let mut by_key_hash: Option<Vec<u8>> = None;
@@ -217,10 +217,10 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
     // content is a plain SEQUENCE Name (0x30) and byKey's an OCTET STRING.
     let (choice, inner_first) = match responder_id.content.first().copied() {
         Some(outer) if matches!(outer, 0xa1 | 0xa2) => {
-            let inner = Cur::new(responder_id.content).next()?;
+            let inner = der_cursor(responder_id.content).value()?;
             (outer, inner)
         }
-        _ => (responder_id.tag, Cur::new(responder_id.content).next()?),
+        _ => (responder_id.tag, der_cursor(responder_id.content).value()?),
     };
     match choice {
         // [1] byName: a Name. A delegate's responderID is its own subject, so
@@ -239,13 +239,13 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
     let mut this_update = None;
     let mut next_update = None;
     let mut cert_ids: Vec<OcspCertId> = Vec::new();
-    let mut rs = Cur::new(responses.content);
+    let mut rs = der_cursor(responses.content);
     while !rs.done() {
         let single = rs.expect(tlv::TAG_SEQUENCE, "a SingleResponse")?;
-        let mut sc = Cur::new(single.content);
+        let mut sc = der_cursor(single.content);
         let cert_id = sc.expect(tlv::TAG_SEQUENCE, "SingleResponse.certID")?;
-        let mut c = Cur::new(cert_id.content);
-        let mut alg = Cur::new(c.expect(tlv::TAG_SEQUENCE, "CertID.hashAlgorithm")?.content);
+        let mut c = der_cursor(cert_id.content);
+        let mut alg = der_cursor(c.expect(tlv::TAG_SEQUENCE, "CertID.hashAlgorithm")?.content);
         let hash_algorithm = alg.oid("CertID.hashAlgorithm")?;
         let issuer_name_hash = c
             .expect(tlv::TAG_OCTET_STRING, "CertID.issuerNameHash")?
@@ -259,7 +259,7 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
             .expect(tlv::TAG_INTEGER, "CertID.serialNumber")?
             .content
             .to_vec();
-        let cert_status = sc.next()?;
+        let cert_status = sc.value()?;
         match cert_status.tag {
             0x80 | 0xa1 => {}
             0x82 => {
@@ -283,7 +283,7 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
         let next = match sc.peek_tag() {
             Some(0xa0) => {
                 let wrapped = sc.expect(0xa0, "nextUpdate")?;
-                let mut inner = Cur::new(wrapped.content);
+                let mut inner = der_cursor(wrapped.content);
                 Some(time_value(&mut inner, "nextUpdate")?)
             }
             Some(tlv::TAG_UTC_TIME) | Some(0x18) => Some(time_value(&mut sc, "nextUpdate")?),
@@ -318,7 +318,7 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
     })?;
 
     // ---- signature over the very bytes of tbsResponseData -----------------
-    let sig_oid = Cur::new(sa.content).oid("BasicOCSPResponse.signatureAlgorithm")?;
+    let sig_oid = der_cursor(sa.content).oid("BasicOCSPResponse.signatureAlgorithm")?;
     let digest = digest_from_signature_oid(&sig_oid)?;
     let (unused, sig_bytes) = bit_string(&sig, "the OCSP response signature")?;
     if unused != 0 {
@@ -502,15 +502,15 @@ pub struct OcspCertId {
 /// `at` is the validation time: a CRL whose `nextUpdate` has passed says
 /// nothing about the present and is refused, with the way out named.
 pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> Result<CrlReport> {
-    let mut outer = Cur::new(der);
+    let mut outer = der_cursor(der);
     let list = outer.expect(tlv::TAG_SEQUENCE, "the CertificateList")?;
     if !outer.done() {
         return Err(trailing("after the CertificateList"));
     }
 
-    let mut f = Cur::new(list.content);
+    let mut f = der_cursor(list.content);
     let tbs = f.expect(tlv::TAG_SEQUENCE, "tbsCertList")?;
-    let mut t = Cur::new(tbs.content);
+    let mut t = der_cursor(tbs.content);
     // version is OPTIONAL and defaults to v1: an INTEGER up front is the
     // explicit version, anything else is already the signature algorithm
     if t.peek_tag() == Some(tlv::TAG_INTEGER) {
@@ -521,7 +521,7 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
             )));
         }
     }
-    let mut sig_alg = Cur::new(
+    let mut sig_alg = der_cursor(
         t.expect(tlv::TAG_SEQUENCE, "tbsCertList.signature")?
             .content,
     );
@@ -534,11 +534,11 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
     };
     let mut revoked_serials = Vec::new();
     if t.peek_tag() == Some(tlv::TAG_SEQUENCE) {
-        let revoked_list = t.next()?;
-        let mut rc = Cur::new(revoked_list.content);
+        let revoked_list = t.value()?;
+        let mut rc = der_cursor(revoked_list.content);
         while !rc.done() {
             let entry = rc.expect(tlv::TAG_SEQUENCE, "a revokedCertificates entry")?;
-            let mut e = Cur::new(entry.content);
+            let mut e = der_cursor(entry.content);
             let serial = e.expect(tlv::TAG_INTEGER, "the revoked serial number")?;
             revoked_serials.push(serial.content.to_vec());
             // revocationDate and any entry extensions carry nothing we check
@@ -546,7 +546,7 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
     }
     // crlExtensions [0] is not interpreted
 
-    let mut sa = Cur::new(f.expect(tlv::TAG_SEQUENCE, "signatureAlgorithm")?.content);
+    let mut sa = der_cursor(f.expect(tlv::TAG_SEQUENCE, "signatureAlgorithm")?.content);
     let sig_oid = sa.oid("signatureAlgorithm")?;
     if sig_oid != tbs_sig_oid {
         return Err(Error::Verification(format!(
@@ -625,13 +625,13 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
 /// anything. This is what the writer side associates a CRL with the
 /// certificates of a chain by; the checking is [`verify_crl`]'s job.
 pub fn crl_issuer_der(der: &[u8]) -> Result<Vec<u8>> {
-    let mut outer = Cur::new(der);
+    let mut outer = der_cursor(der);
     let list = outer.expect(tlv::TAG_SEQUENCE, "the CertificateList")?;
-    let mut f = Cur::new(list.content);
+    let mut f = der_cursor(list.content);
     let tbs = f.expect(tlv::TAG_SEQUENCE, "tbsCertList")?;
-    let mut t = Cur::new(tbs.content);
+    let mut t = der_cursor(tbs.content);
     if t.peek_tag() == Some(tlv::TAG_INTEGER) {
-        let _version = t.next()?;
+        let _version = t.value()?;
     }
     let _signature = t.expect(tlv::TAG_SEQUENCE, "tbsCertList.signature")?;
     let issuer = t.expect(tlv::TAG_SEQUENCE, "tbsCertList.issuer")?;
@@ -646,12 +646,12 @@ pub fn crl_issuer_der(der: &[u8]) -> Result<Vec<u8>> {
 /// successful answer is a statement about anything. The signature of the
 /// `BasicOCSPResponse` is not verified, see the module documentation.
 pub fn parse_ocsp_response(der: &[u8]) -> Result<Vec<OcspCertId>> {
-    let mut outer = Cur::new(der);
+    let mut outer = der_cursor(der);
     let resp = outer.expect(tlv::TAG_SEQUENCE, "the OCSPResponse")?;
     if !outer.done() {
         return Err(trailing("after the OCSPResponse"));
     }
-    let mut r = Cur::new(resp.content);
+    let mut r = der_cursor(resp.content);
     let status = r.expect(0x0a, "responseStatus")?; // ENUMERATED
     let code = enumerated(&status, "responseStatus")?;
     if code != 0 {
@@ -667,9 +667,9 @@ pub fn parse_ocsp_response(der: &[u8]) -> Result<Vec<OcspCertId>> {
         ));
     }
     let bytes = r.expect(0xa0, "responseBytes")?;
-    let mut rb = Cur::new(bytes.content);
+    let mut rb = der_cursor(bytes.content);
     let seq = rb.expect(tlv::TAG_SEQUENCE, "ResponseBytes")?;
-    let mut s = Cur::new(seq.content);
+    let mut s = der_cursor(seq.content);
     let response_type = s.oid("ResponseBytes.responseType")?;
     if response_type != oid::ID_PKIX_OCSP_BASIC {
         return Err(Error::Verification(format!(
@@ -682,28 +682,28 @@ pub fn parse_ocsp_response(der: &[u8]) -> Result<Vec<OcspCertId>> {
 
     // BasicOCSPResponse ::= SEQUENCE { tbsResponseData, signatureAlgorithm,
     //                                  signature, certs [0] OPTIONAL }
-    let mut b = Cur::new(basic_octets.content);
+    let mut b = der_cursor(basic_octets.content);
     let basic = b.expect(tlv::TAG_SEQUENCE, "the BasicOCSPResponse")?;
-    let mut t = Cur::new(basic.content);
+    let mut t = der_cursor(basic.content);
     let rd = t.expect(tlv::TAG_SEQUENCE, "tbsResponseData")?;
-    let mut d = Cur::new(rd.content);
+    let mut d = der_cursor(rd.content);
     // version [0] EXPLICIT DEFAULT v1
     if d.peek_tag() == Some(0xa0) {
-        let _version = d.next()?;
+        let _version = d.value()?;
     }
     // responderID: [1] byName or [2] byKey; not interpreted, see module docs
-    let _responder_id = d.next()?;
+    let _responder_id = d.value()?;
     let _produced_at = d.expect(0x18, "producedAt")?; // GeneralizedTime
     let responses = d.expect(tlv::TAG_SEQUENCE, "the SingleResponse list")?;
 
     let mut out = Vec::new();
-    let mut rs = Cur::new(responses.content);
+    let mut rs = der_cursor(responses.content);
     while !rs.done() {
         let single = rs.expect(tlv::TAG_SEQUENCE, "a SingleResponse")?;
-        let mut sc = Cur::new(single.content);
+        let mut sc = der_cursor(single.content);
         let cert_id = sc.expect(tlv::TAG_SEQUENCE, "SingleResponse.certID")?;
-        let mut c = Cur::new(cert_id.content);
-        let mut alg = Cur::new(c.expect(tlv::TAG_SEQUENCE, "CertID.hashAlgorithm")?.content);
+        let mut c = der_cursor(cert_id.content);
+        let mut alg = der_cursor(c.expect(tlv::TAG_SEQUENCE, "CertID.hashAlgorithm")?.content);
         let hash_algorithm = alg.oid("CertID.hashAlgorithm")?;
         let issuer_name_hash = c
             .expect(tlv::TAG_OCTET_STRING, "CertID.issuerNameHash")?
@@ -720,7 +720,7 @@ pub fn parse_ocsp_response(der: &[u8]) -> Result<Vec<OcspCertId>> {
         // certStatus ::= CHOICE { good [0] IMPLICIT NULL, revoked [1]
         // IMPLICIT RevokedInfo, unknown [2] IMPLICIT UnknownInfo } — good is
         // primitive and empty, which only a real responder's output teaches
-        let cert_status = sc.next()?;
+        let cert_status = sc.value()?;
         match cert_status.tag {
             0x80 | 0xa1 => {}
             0x82 => {
@@ -780,11 +780,22 @@ fn bit_string<'a>(t: &Tlv<'a>, what: &str) -> Result<(u8, &'a [u8])> {
     Ok((unused, &t.content[1..]))
 }
 
+/// `OCSPResponseStatus` and `CRLReason` are ENUMERATEDs; some producers write
+/// them with the INTEGER tag, which DER reserves for 0x0A alone. The review
+/// round fixed the reader to accept both, so keep accepting both: decode an
+/// INTEGER through the strict shared helper and take anything else's content
+/// as a small unsigned value.
 fn enumerated(t: &Tlv<'_>, what: &str) -> Result<u32> {
+    let bad = |v: u8| {
+        Error::Verification(format!(
+            "{what} is tag {v:#04x} carrying a value that is not a small non negative integer"
+        ))
+    };
+    if t.tag == tlv::TAG_INTEGER {
+        return tlv::Cursor::integer_u32(t, what).map_err(|_| bad(t.tag));
+    }
     if t.content.len() > 4 || t.content.first().is_some_and(|b| *b & 0x80 != 0) {
-        return Err(Error::Verification(format!(
-            "{what} is negative or too large"
-        )));
+        return Err(bad(t.tag));
     }
     let mut v = 0u32;
     for b in t.content {
@@ -794,7 +805,7 @@ fn enumerated(t: &Tlv<'_>, what: &str) -> Result<u32> {
 }
 
 fn time_value(c: &mut Cur<'_>, what: &str) -> Result<SystemTime> {
-    let t = c.next()?;
+    let t = c.value()?;
     match t.tag {
         tlv::TAG_UTC_TIME => UtcTime::from_der(t.whole)
             .map(|u| u.to_system_time())
@@ -828,106 +839,17 @@ fn trailing(where_: &str) -> Error {
 }
 
 // ---------------------------------------------------------------------------
-// a cursor over DER, in the style of the ones in tsp.rs and verify.rs
+// the shared DER cursor of `openfirma_core::tlv`, under the names this module
+// already used. Revocation data comes from a CA or an OCSP responder, not
+// from us: it is parsed strictly (NO_HIGH_TAG) but with the INTEGER readers
+// that accept a BER-style zero pad, so a slightly loose responder is not a
+// verification failure.
 
-struct Tlv<'a> {
-    tag: u8,
-    content: &'a [u8],
-    /// Tag, length and content: the exact bytes of this value, which is what
-    /// a signature is computed over.
-    whole: &'a [u8],
-}
+type Tlv<'a> = tlv::Value<'a>;
+type Cur<'a> = tlv::Cursor<'a>;
 
-struct Cur<'a> {
-    b: &'a [u8],
-    i: usize,
-}
-
-impl<'a> Cur<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Cur { b, i: 0 }
-    }
-
-    fn done(&self) -> bool {
-        self.i >= self.b.len()
-    }
-
-    fn peek_tag(&self) -> Option<u8> {
-        self.b.get(self.i).copied()
-    }
-
-    fn next(&mut self) -> Result<Tlv<'a>> {
-        let start = self.i;
-        let tag = *self
-            .b
-            .get(start)
-            .ok_or_else(|| Error::Verification("the revocation data ends mid tag".into()))?;
-        let (len, n) = read_len(&self.b[start + 1..])?;
-        let content_start = start + 1 + n;
-        let end = content_start.checked_add(len).ok_or_else(|| {
-            Error::Verification("a DER length overflows the address space".into())
-        })?;
-        if end > self.b.len() {
-            return Err(Error::Verification(format!(
-                "a value with tag {tag:#04x} claims {len} bytes but only {} are left",
-                self.b.len().saturating_sub(content_start)
-            )));
-        }
-        self.i = end;
-        Ok(Tlv {
-            tag,
-            content: &self.b[content_start..end],
-            whole: &self.b[start..end],
-        })
-    }
-
-    fn expect(&mut self, tag: u8, what: &str) -> Result<Tlv<'a>> {
-        let t = self.next()?;
-        if t.tag != tag {
-            return Err(Error::Verification(format!(
-                "expected {what} (tag {tag:#04x}), found tag {:#04x} — is this the right \
-                 kind of DER? A CRL is a CertificateList, an OCSP response an OCSPResponse",
-                t.tag
-            )));
-        }
-        Ok(t)
-    }
-
-    fn oid(&mut self, what: &str) -> Result<ObjectIdentifier> {
-        let t = self.expect(tlv::TAG_OID, what)?;
-        ObjectIdentifier::from_bytes(t.content)
-            .map_err(|e| Error::Verification(format!("{what} is not a readable OID: {e}")))
-    }
-
-    fn small_uint(&mut self, what: &str) -> Result<u32> {
-        let t = self.expect(tlv::TAG_INTEGER, what)?;
-        enumerated(&t, what)
-    }
-}
-
-fn read_len(b: &[u8]) -> Result<(usize, usize)> {
-    let first = *b
-        .first()
-        .ok_or_else(|| Error::Verification("the revocation data ends mid length".into()))?;
-    if first < 0x80 {
-        return Ok((first as usize, 1));
-    }
-    let n = (first & 0x7f) as usize;
-    if n == 0 {
-        return Err(Error::Verification(
-            "indefinite length is BER, and this reads DER".into(),
-        ));
-    }
-    if n > 8 || b.len() < 1 + n {
-        return Err(Error::Verification(
-            "a DER length that is overlong or runs past the input".into(),
-        ));
-    }
-    let mut v = 0usize;
-    for x in &b[1..=n] {
-        v = (v << 8) | usize::from(*x);
-    }
-    Ok((v, n + 1))
+fn der_cursor(bytes: &[u8]) -> Cur<'_> {
+    tlv::Cursor::with_options(bytes, tlv::NO_HIGH_TAG)
 }
 
 /// A DER `UTCTime` or `GeneralizedTime` (tag and length included), read as the

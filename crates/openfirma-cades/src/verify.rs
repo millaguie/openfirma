@@ -268,16 +268,16 @@ pub struct VerifyReport {
 /// `signed_data::sign` writes them that way).
 fn unsigned_values<'a>(content: &'a [u8], wanted: ObjectIdentifier) -> Result<Vec<Tlv<'a>>> {
     let mut out = Vec::new();
-    let mut cur = Cur::new(content);
+    let mut cur = der_cursor(content);
     while !cur.done() {
         let attr = cur.expect(tlv::TAG_SEQUENCE, "an unsigned Attribute")?;
-        let mut a = Cur::new(attr.content);
+        let mut a = der_cursor(attr.content);
         let attr_type = a.oid("the Attribute type")?;
         if attr_type == wanted {
             let values = a.expect(tlv::TAG_SET, "the Attribute values SET")?;
-            let mut vs = Cur::new(values.content);
+            let mut vs = der_cursor(values.content);
             while !vs.done() {
-                out.push(vs.next()?);
+                out.push(vs.value()?);
             }
         }
     }
@@ -528,8 +528,8 @@ fn verify_signer_info(
             // unwrap that first when present.
             let mut token = value.content;
             if token.first().copied() == Some(tlv::TAG_OCTET_STRING) {
-                let mut c = Cur::new(token);
-                token = c.next()?.content;
+                let mut c = der_cursor(token);
+                token = c.value()?.content;
             }
             match crate::tsp::verify_token_signature(
                 token,
@@ -710,21 +710,21 @@ fn check_signing_certificate_v2(value: &Tlv<'_>, cert: &CertificateHandle) -> Re
     // certs ::= SEQUENCE OF ESSCertIDv2. Three nested SEQUENCEs, the same
     // three the encoder in attributes.rs builds.
     let wrapper = expect_tag(value, tlv::TAG_SEQUENCE, "SigningCertificateV2")?;
-    let mut w = Cur::new(wrapper.content);
+    let mut w = der_cursor(wrapper.content);
     let certs = w.expect(tlv::TAG_SEQUENCE, "SigningCertificateV2.certs")?;
     // the optional policies sequence is not interpreted
 
-    let mut cs = Cur::new(certs.content);
+    let mut cs = der_cursor(certs.content);
     let ess = cs.expect(tlv::TAG_SEQUENCE, "an ESSCertIDv2")?;
     // RFC 5035: the first ESSCertIDv2 identifies the signer certificate;
     // anything after it references other certificates and is ignored here
-    let mut e = Cur::new(ess.content);
-    let first = e.next()?;
+    let mut e = der_cursor(ess.content);
+    let first = e.value()?;
     let (hash_alg, cert_hash) = match first.tag {
         // an explicit hashAlgorithm, which our encoder only writes for
         // digests other than the ASN.1 DEFAULT
         tlv::TAG_SEQUENCE => {
-            let mut ai = Cur::new(first.content);
+            let mut ai = der_cursor(first.content);
             let h_oid = ai.oid("ESSCertIDv2.hashAlgorithm")?;
             let d = DigestAlg::from_oid(&h_oid).map_err(|_| {
                 fail(
@@ -769,13 +769,13 @@ fn check_signing_certificate_v2(value: &Tlv<'_>, cert: &CertificateHandle) -> Re
         if !e.done() {
             return Err(trailing("in ESSCertIDv2"));
         }
-        let mut isc = Cur::new(is.content);
+        let mut isc = der_cursor(is.content);
         let names = isc.expect(tlv::TAG_SEQUENCE, "IssuerSerial.issuer")?;
         let serial = isc.expect(tlv::TAG_INTEGER, "IssuerSerial.serialNumber")?;
         if !isc.done() {
             return Err(trailing("in IssuerSerial"));
         }
-        let mut nc = Cur::new(names.content);
+        let mut nc = der_cursor(names.content);
         let name = nc.expect(0xA4, "the directoryName GeneralName")?;
         if !nc.done() {
             return Err(trailing("in GeneralNames"));
@@ -1245,9 +1245,9 @@ fn check_cert_signature(cert: &CertificateHandle, issuer: &CertificateHandle) ->
 /// The `tbsCertificate` exactly as encoded, sliced out of the raw DER rather
 /// than re-encoded, because the signature is over these bytes and only these.
 fn tbs_der(cert: &CertificateHandle) -> Result<Vec<u8>> {
-    let mut outer = Cur::new(cert.der());
+    let mut outer = der_cursor(cert.der());
     let seq = outer.expect(tlv::TAG_SEQUENCE, "the certificate")?;
-    let mut inner = Cur::new(seq.content);
+    let mut inner = der_cursor(seq.content);
     let tbs = inner.expect(tlv::TAG_SEQUENCE, "tbsCertificate")?;
     Ok(tbs.whole.to_vec())
 }
@@ -1366,13 +1366,13 @@ enum SignerId<'a> {
 }
 
 fn parse_signed_data(der: &[u8]) -> Result<SignedData<'_>> {
-    let mut outer = Cur::new(der);
+    let mut outer = der_cursor(der);
     let content_info = outer.expect(tlv::TAG_SEQUENCE, "the ContentInfo")?;
     if !outer.done() {
         return Err(trailing("after the ContentInfo"));
     }
 
-    let mut ci = Cur::new(content_info.content);
+    let mut ci = der_cursor(content_info.content);
     let content_type = ci.oid("ContentInfo.contentType")?;
     if content_type != oid::ID_SIGNED_DATA {
         return Err(Error::Verification(format!(
@@ -1384,13 +1384,13 @@ fn parse_signed_data(der: &[u8]) -> Result<SignedData<'_>> {
         return Err(trailing("in the ContentInfo"));
     }
 
-    let mut sd_cur = Cur::new(content.content);
+    let mut sd_cur = der_cursor(content.content);
     let sd = sd_cur.expect(tlv::TAG_SEQUENCE, "the SignedData")?;
     if !sd_cur.done() {
         return Err(trailing("after the SignedData"));
     }
 
-    let mut f = Cur::new(sd.content);
+    let mut f = der_cursor(sd.content);
     let version = f.small_uint("SignedData.version")?;
     if !(1..=5).contains(&version) {
         return Err(Error::Verification(format!(
@@ -1399,7 +1399,7 @@ fn parse_signed_data(der: &[u8]) -> Result<SignedData<'_>> {
     }
     let _digest_algorithms = f.expect(tlv::TAG_SET, "SignedData.digestAlgorithms")?;
 
-    let mut eci = Cur::new(
+    let mut eci = der_cursor(
         f.expect(tlv::TAG_SEQUENCE, "SignedData.encapContentInfo")?
             .content,
     );
@@ -1410,7 +1410,7 @@ fn parse_signed_data(der: &[u8]) -> Result<SignedData<'_>> {
         if !eci.done() {
             return Err(trailing("in encapContentInfo"));
         }
-        let mut w = Cur::new(wrapper.content);
+        let mut w = der_cursor(wrapper.content);
         let octets = w.expect(tlv::TAG_OCTET_STRING, "the eContent")?;
         if !w.done() {
             return Err(Error::Verification(
@@ -1424,12 +1424,12 @@ fn parse_signed_data(der: &[u8]) -> Result<SignedData<'_>> {
     let mut certificates = Vec::new();
     let mut signer_infos = Vec::new();
     while !f.done() {
-        let item = f.next()?;
+        let item = f.value()?;
         match item.tag {
             0xA0 => {
-                let mut certs = Cur::new(item.content);
+                let mut certs = der_cursor(item.content);
                 while !certs.done() {
-                    let c = certs.next()?;
+                    let c = certs.value()?;
                     if c.tag != tlv::TAG_SEQUENCE {
                         return Err(Error::Verification(
                             "SignedData.certificates carries a choice that is not a plain X.509 \
@@ -1443,7 +1443,7 @@ fn parse_signed_data(der: &[u8]) -> Result<SignedData<'_>> {
             // CRLs are accepted and ignored: revocation is layer 3 territory
             0xA1 => {}
             tlv::TAG_SET => {
-                let mut infos = Cur::new(item.content);
+                let mut infos = der_cursor(item.content);
                 while !infos.done() {
                     let si = infos.expect(tlv::TAG_SEQUENCE, "a SignerInfo")?;
                     signer_infos.push(parse_signer_info(si.content)?);
@@ -1465,7 +1465,7 @@ fn parse_signed_data(der: &[u8]) -> Result<SignedData<'_>> {
 }
 
 fn parse_signer_info(content: &[u8]) -> Result<SignerInfo<'_>> {
-    let mut f = Cur::new(content);
+    let mut f = der_cursor(content);
     let version = f.small_uint("SignerInfo.version")?;
     if version != 1 && version != 3 {
         return Err(Error::Verification(format!(
@@ -1473,10 +1473,10 @@ fn parse_signer_info(content: &[u8]) -> Result<SignerInfo<'_>> {
              (subjectKeyIdentifier) are supported"
         )));
     }
-    let sid_item = f.next()?;
+    let sid_item = f.value()?;
     let sid = match sid_item.tag {
         tlv::TAG_SEQUENCE => {
-            let mut s = Cur::new(sid_item.content);
+            let mut s = der_cursor(sid_item.content);
             let issuer = s.expect(tlv::TAG_SEQUENCE, "the sid issuerAndSerialNumber Name")?;
             let serial = s.expect(tlv::TAG_INTEGER, "the sid serialNumber")?;
             if !s.done() {
@@ -1495,7 +1495,7 @@ fn parse_signer_info(content: &[u8]) -> Result<SignerInfo<'_>> {
         }
     };
 
-    let mut dai = Cur::new(
+    let mut dai = der_cursor(
         f.expect(tlv::TAG_SEQUENCE, "SignerInfo.digestAlgorithm")?
             .content,
     );
@@ -1505,10 +1505,10 @@ fn parse_signer_info(content: &[u8]) -> Result<SignerInfo<'_>> {
 
     let mut signed_attrs = None;
     if f.peek_tag() == Some(0xA0) {
-        signed_attrs = Some(f.next()?.content);
+        signed_attrs = Some(f.value()?.content);
     }
 
-    let mut sai = Cur::new(
+    let mut sai = der_cursor(
         f.expect(tlv::TAG_SEQUENCE, "SignerInfo.signatureAlgorithm")?
             .content,
     );
@@ -1520,7 +1520,7 @@ fn parse_signer_info(content: &[u8]) -> Result<SignerInfo<'_>> {
 
     let mut unsigned_attrs = None;
     if f.peek_tag() == Some(0xA1) {
-        unsigned_attrs = Some(f.next()?.content);
+        unsigned_attrs = Some(f.value()?.content);
     }
     if !f.done() {
         return Err(trailing("in the SignerInfo"));
@@ -1554,10 +1554,10 @@ struct ParsedAttrs<'a> {
 fn parse_attributes(content: &[u8]) -> Result<ParsedAttrs<'_>> {
     let mut out = ParsedAttrs::default();
     let mut seen: Vec<ObjectIdentifier> = Vec::new();
-    let mut cur = Cur::new(content);
+    let mut cur = der_cursor(content);
     while !cur.done() {
         let attr = cur.expect(tlv::TAG_SEQUENCE, "an Attribute")?;
-        let mut a = Cur::new(attr.content);
+        let mut a = der_cursor(attr.content);
         let attr_type = a.oid("the Attribute type")?;
         let values = a.expect(tlv::TAG_SET, "the Attribute values")?;
         if !a.done() {
@@ -1570,7 +1570,7 @@ fn parse_attributes(content: &[u8]) -> Result<ParsedAttrs<'_>> {
         }
         seen.push(attr_type);
 
-        let mut vs = Cur::new(values.content);
+        let mut vs = der_cursor(values.content);
         match attr_type {
             t if t == oid::ID_CONTENT_TYPE => {
                 let v = one_value(&mut vs, &attr_type)?;
@@ -1619,10 +1619,11 @@ fn parse_attributes(content: &[u8]) -> Result<ParsedAttrs<'_>> {
             }
             t if t == oid::ID_CONTENT_HINT => {
                 let v = one_value(&mut vs, &attr_type)?;
-                let mut hint = Cur::new(expect_tag(&v, tlv::TAG_SEQUENCE, "contentHint")?.content);
+                let mut hint =
+                    der_cursor(expect_tag(&v, tlv::TAG_SEQUENCE, "contentHint")?.content);
                 let mut description = String::new();
                 while !hint.done() {
-                    let part = hint.next()?;
+                    let part = hint.value()?;
                     match part.tag {
                         // the OPTIONAL contentDescription comes first
                         0x0C => description = String::from_utf8_lossy(part.content).into_owned(),
@@ -1657,17 +1658,17 @@ fn parse_attributes(content: &[u8]) -> Result<ParsedAttrs<'_>> {
 /// is interpreted beyond recognising the time-stamp token.
 fn attribute_oids(content: &[u8]) -> Result<Vec<ObjectIdentifier>> {
     let mut out = Vec::new();
-    let mut cur = Cur::new(content);
+    let mut cur = der_cursor(content);
     while !cur.done() {
         let attr = cur.expect(tlv::TAG_SEQUENCE, "an Attribute")?;
-        let mut a = Cur::new(attr.content);
+        let mut a = der_cursor(attr.content);
         out.push(a.oid("the Attribute type")?);
     }
     Ok(out)
 }
 
 fn one_value<'a>(values: &mut Cur<'a>, attr_type: &ObjectIdentifier) -> Result<Tlv<'a>> {
-    let v = values.next()?;
+    let v = values.value()?;
     if !values.done() {
         return Err(Error::Verification(format!(
             "attribute {attr_type} carries more than one value"
@@ -1687,124 +1688,13 @@ fn expect_tag<'a>(v: &Tlv<'a>, tag: u8, what: &str) -> Result<Tlv<'a>> {
 }
 
 // ---------------------------------------------------------------------------
-// a cursor over DER, in the style of the one in tsp.rs
+// the shared DER cursor of `openfirma_core::tlv`, under the names this module
+// already used. CMS DER must be strict DER, so every cursor here is built
+// with NO_HIGH_TAG; a helper keeps that one line short.
 
-struct Tlv<'a> {
-    tag: u8,
-    content: &'a [u8],
-    /// Tag, length and content: the exact bytes this value occupies.
-    whole: &'a [u8],
-}
+pub(crate) type Tlv<'a> = tlv::Value<'a>;
+type Cur<'a> = tlv::Cursor<'a>;
 
-// a Tlv is a plain borrowed view; copying it is cheaper than re-slicing
-impl Copy for Tlv<'_> {}
-impl Clone for Tlv<'_> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-struct Cur<'a> {
-    b: &'a [u8],
-    i: usize,
-}
-
-impl<'a> Cur<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Cur { b, i: 0 }
-    }
-
-    fn done(&self) -> bool {
-        self.i >= self.b.len()
-    }
-
-    fn peek_tag(&self) -> Option<u8> {
-        self.b.get(self.i).copied()
-    }
-
-    fn next(&mut self) -> Result<Tlv<'a>> {
-        let start = self.i;
-        let tag = *self
-            .b
-            .get(start)
-            .ok_or_else(|| Error::Verification("the CMS ends mid tag".into()))?;
-        if tag & 0x1F == 0x1F {
-            return Err(Error::Verification(format!(
-                "tag {tag:#04x} uses the multi octet form, which no CMS field needs"
-            )));
-        }
-        let (len, n) = read_len(&self.b[start + 1..])?;
-        let content_start = start + 1 + n;
-        let end = content_start.checked_add(len).ok_or_else(|| {
-            Error::Verification("a DER length overflows the address space".into())
-        })?;
-        if end > self.b.len() {
-            return Err(Error::Verification(format!(
-                "a value with tag {tag:#04x} claims {len} bytes but only {} are left",
-                self.b.len().saturating_sub(content_start)
-            )));
-        }
-        self.i = end;
-        Ok(Tlv {
-            tag,
-            content: &self.b[content_start..end],
-            whole: &self.b[start..end],
-        })
-    }
-
-    fn expect(&mut self, tag: u8, what: &str) -> Result<Tlv<'a>> {
-        let t = self.next()?;
-        if t.tag != tag {
-            return Err(Error::Verification(format!(
-                "expected {what} (tag {tag:#04x}), found tag {:#04x}",
-                t.tag
-            )));
-        }
-        Ok(t)
-    }
-
-    fn oid(&mut self, what: &str) -> Result<ObjectIdentifier> {
-        let t = self.expect(tlv::TAG_OID, what)?;
-        ObjectIdentifier::from_bytes(t.content)
-            .map_err(|e| Error::Verification(format!("{what} is not a readable OID: {e}")))
-    }
-
-    fn small_uint(&mut self, what: &str) -> Result<u32> {
-        let t = self.expect(tlv::TAG_INTEGER, what)?;
-        if t.content.len() > 4 || t.content.first().is_some_and(|b| b & 0x80 != 0) {
-            return Err(Error::Verification(format!(
-                "{what} is negative or too large to be a version"
-            )));
-        }
-        let mut v = 0u32;
-        for b in t.content {
-            v = (v << 8) | u32::from(*b);
-        }
-        Ok(v)
-    }
-}
-
-fn read_len(b: &[u8]) -> Result<(usize, usize)> {
-    let first = *b
-        .first()
-        .ok_or_else(|| Error::Verification("the CMS ends mid length".into()))?;
-    if first < 0x80 {
-        return Ok((first as usize, 1));
-    }
-    let n = (first & 0x7f) as usize;
-    if n == 0 {
-        return Err(Error::Verification(
-            "indefinite length is BER, and this verifier reads DER".into(),
-        ));
-    }
-    if n > 8 || b.len() < 1 + n {
-        return Err(Error::Verification(
-            "a DER length that is overlong or runs past the input".into(),
-        ));
-    }
-    let mut v = 0usize;
-    for x in &b[1..=n] {
-        v = (v << 8) | usize::from(*x);
-    }
-    Ok((v, n + 1))
+pub(crate) fn der_cursor(bytes: &[u8]) -> Cur<'_> {
+    tlv::Cursor::with_options(bytes, tlv::NO_HIGH_TAG)
 }
