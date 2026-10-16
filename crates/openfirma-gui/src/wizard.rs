@@ -320,9 +320,16 @@ mod descriptor_tests {
     fn the_form_parses_through_the_library_rule() {
         // The add-a-keystore field and `openfirma keystores list` parse the
         // same text with the same function, so a spelling accepted by one is
-        // accepted by the other. `nss` expands to the discovered database;
-        // an empty pkcs11 module never passes anywhere.
-        assert!(parse_descriptor("nss").is_ok());
+        // accepted by the other. An explicit nss database never depends on
+        // this machine (a bare `nss` wants $HOME/.pki/nssdb, which a Windows
+        // CI runner has no reason to hold); an empty pkcs11 module fails
+        // everywhere with the same sentence telling what to type.
+        assert_eq!(
+            parse_descriptor("nss:sql:/tmp/opencode/keystores/nssdb")
+                .unwrap()
+                .descriptor(),
+            "nss:sql:/tmp/opencode/keystores/nssdb"
+        );
         assert!(parse_descriptor("pkcs11:").is_err());
     }
 }
