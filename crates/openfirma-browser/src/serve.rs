@@ -92,18 +92,35 @@ pub const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 /// `WouldBlock` and the earlier loop continued on it, re-arming the timeout
 /// forever (finding M-2: the 30 s promise of ADR-0005 was dead code there).
 /// While bytes are ARRIVING both read loops renew their inactivity window
-/// instead ([`HEAD_GRACE`]), so this number bounds total cost, and only a peer
-/// that keeps talking for half a minute ever reaches it.
+/// ([`HEAD_GRACE`]) — but never past this absolute budget: the deadline is set
+/// once, at accept, to `now + CONNECTION_TIMEOUT`, and no renewal may push it
+/// later. Renewals without a ceiling were finding M-2's other half: a peer
+/// dribbling one byte every few seconds kept re-arming the timer and lived
+/// forever, so the 30 s was dead code again. Total cost stays bounded by this
+/// number whatever the peer's rhythm; what the grace protects — a real caller
+/// whose bytes keep coming on a loaded machine — is protected inside it.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a connection may stay SILENT mid-request — before its head, or
 /// between body parts. The full 30 s is the whole-request budget; counting an
 /// idle first second of that against a real caller punished exactly the client
 /// the defence exists to protect (a loaded CI runner schedules localhost worse
+/// than a laptop does). A peer that stalls, sends half a request and then will
 /// never speak again ages out in this window and frees their slot for it. A
-/// peer whose bytes keep coming never sees it fire — the total-request bound is
-/// `CONNECTION_TIMEOUT`, enforced on every read loop that touches it.
+/// peer whose bytes keep coming sees the window re-armed — up to
+/// `CONNECTION_TIMEOUT` after accept, the absolute bound no renewal crosses
+/// (M-2): both loops below take that instant alongside the grace and always
+/// obey whichever of the two comes first.
 const HEAD_GRACE: Duration = Duration::from_secs(5);
+
+/// The deadline one more arriving byte buys a connection: [`HEAD_GRACE`] from
+/// now, but never later than the connection's absolute budget (M-2 — renewals
+/// that could cross the total made that total a lie). Every read loop re-arms
+/// through exactly this function so no path can forget the ceiling.
+fn head_deadline(absolute: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    (now + HEAD_GRACE).min(absolute)
+}
 
 /// How many live connection threads may exist at once. A bare connection that
 /// never speaks is closed by the deadline, so this only bounds the threads of
@@ -306,7 +323,7 @@ fn accept_loop(listener: TcpListener, tokens: Arc<TokenStore>, key: SharedKey) {
 /// the deadline, not waited on (M-2). Every other malformed head keeps the
 /// generic 400 it has always answered.
 fn write_head_refusal(stream: &mut TcpStream, error: &'static str) -> std::io::Result<()> {
-    if error.starts_with("the request head did not finish") {
+    if error.contains("its total budget") || error.starts_with("the request head did not finish") {
         return write_refusal(
             stream,
             599,
@@ -331,21 +348,25 @@ fn handle_connection(
     tokens: &TokenStore,
     key: &SharedKey,
 ) -> std::io::Result<()> {
-    // The deadline that ages an attacker's stalled connection out cannot also
-    // be the patience a real request asks of this machine: CI runners have
-    // been seen to sit between accept() and the first read for well over a
-    // second, and losing THAT socket's answer is what "slowloris defence"
-    // would never mean to do — the defence exists for connections that never
-    // send a request. The handshake therefore gets its own shorter window;
-    // the long CONNECTION_TIMEOUT still bounds every read once real bytes
-    // start arriving (M-2).
+    // Two clocks, one rule: silence is what costs a peer time (HEAD_GRACE),
+    // and total cost is capped by an absolute budget that accept fixes for the
+    // connection (CONNECTION_TIMEOUT). A CI runner that sat between accept()
+    // and the first read for seconds must not lose the socket's answer — the
+    // defence exists for connections that never send a request — while a peer
+    // that dribbles bytes forever must still die, which renewals alone could
+    // never deliver: they re-armed past every promise (finding M-2).
     stream.set_read_timeout(Some(HEAD_GRACE)).ok();
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT)).ok();
-    let mut deadline = std::time::Instant::now() + HEAD_GRACE;
+    // The budget is one absolute instant, fixed here and never moved by a
+    // renewal again (M-2). `deadline` starts as the head's own grace because
+    // at accept that is the stricter of the two; every arriving byte re-arms
+    // it through [`head_deadline`] — capped by `absolute`.
+    let absolute = std::time::Instant::now() + CONNECTION_TIMEOUT;
+    let deadline = head_deadline(absolute);
 
     // The header cap is what protects the read loop itself; a body is only
     // ever read after Content-Length passed its own (much smaller) cap.
-    let raw = match read_request_head(&mut stream, 64 * 1024, deadline) {
+    let raw = match read_request_head(&mut stream, 64 * 1024, deadline, absolute) {
         Ok(raw) => raw,
         Err(e) => {
             // A timeout gets its own named refusal (M-2's test asserts it);
@@ -355,9 +376,8 @@ fn handle_connection(
         }
     };
     let (request_line, headers, body_prefix) = split_request(&raw)?;
-    // A complete head means a client that is actually talking: from here the
-    // full connection budget applies to the rest of its request.
-    deadline = std::time::Instant::now() + CONNECTION_TIMEOUT;
+    // A complete head means a client that was actually talking; the body now
+    // runs inside whatever is left of `absolute` (below), never beyond it.
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() != 3 || !parts[2].starts_with("HTTP/1.") {
@@ -519,7 +539,7 @@ fn handle_connection(
     if have < want {
         let remaining = want - have;
         let mut rest = vec![0u8; remaining];
-        match read_exact_timeout(&mut stream, &mut rest, deadline) {
+        match read_exact_timeout(&mut stream, &mut rest, deadline, absolute) {
             Ok(()) => body.extend_from_slice(&rest),
             Err(e) => {
                 return write_refusal(
@@ -587,6 +607,7 @@ fn read_request_head(
     stream: &mut TcpStream,
     cap: usize,
     mut deadline: std::time::Instant,
+    absolute: std::time::Instant,
 ) -> Result<Vec<u8>, &'static str> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -606,11 +627,12 @@ fn read_request_head(
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 // Headline rule: time counts against a peer that stops
-                // talking, not against a slow scheduler on our own machine.
-                // Bytes received reset the head's grace window — this is what
-                // keeps a real request alive on a loaded runner while an idle
-                // attacker still ages out in [HEAD_GRACE] of silence (M-2).
-                deadline = std::time::Instant::now() + HEAD_GRACE;
+                // talking, not against a slow scheduler on our own machine —
+                // arriving bytes re-arm the head's grace window. The renewal
+                // is CAPPED by the connection's absolute budget (M-2): as far
+                // as grace reaches and no further, so a dribbling peer dies at
+                // `accept + CONNECTION_TIMEOUT` whatever its rhythm.
+                deadline = head_deadline(absolute);
                 if buf.windows(4).any(|w| w == b"\r\n\r\n") || ends_with_double_lf(&buf) {
                     return Ok(buf);
                 }
@@ -620,14 +642,18 @@ fn read_request_head(
                 // deadline, not the socket option, decides what happens next.
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 if left.is_zero() {
-                    return Err("the request head did not finish within the connection timeout");
+                    return Err(
+                        "the connection exceeded its total budget before its request head finished",
+                    );
                 }
                 // A spurious non-blocking wakeup inside the window is retried,
                 // with the socket option re-armed to whatever time remains.
                 let _ = stream.set_read_timeout(Some(left.max(Duration::from_millis(50))));
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return Err("the request head did not finish within the connection timeout");
+                return Err(
+                    "the connection exceeded its total budget before its request head finished",
+                );
             }
             Err(_) => return Err("the read of the request head failed"),
         }
@@ -681,23 +707,21 @@ fn split_request(raw: &[u8]) -> std::io::Result<RequestParts<'_>> {
 fn read_exact_timeout(
     stream: &mut TcpStream,
     buf: &mut [u8],
+    mut deadline: std::time::Instant,
     absolute: std::time::Instant,
 ) -> std::io::Result<()> {
     let mut filled = 0;
-    // Body reads live in the body's own window: CONNECTION_TIMEOUT is the
-    // total-request bound, HEAD_GRACE what an arriving-then-silent peer may
-    // not exceed. The stricter of the two decides when to give up.
-    let mut silence_deadline = std::time::Instant::now()
-        + HEAD_GRACE.min(absolute.saturating_duration_since(std::time::Instant::now()));
+    // Body reads live in the body's own window: `deadline` enters as whatever
+    // is stricter — grace left or budget left — and every arriving byte re-arms
+    // it exactly like the head's loop does, capped by `absolute` (M-2).
     while filled < buf.len() {
         match stream.read(&mut buf[filled..]) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => {
                 filled += n;
-                // Same silence rule as the head: dribbling bytes keep a peer's
-                // window alive, going quiet past HEAD_GRACE does not.
-                let left_total = absolute.saturating_duration_since(std::time::Instant::now());
-                silence_deadline = std::time::Instant::now() + HEAD_GRACE.min(left_total);
+                // Same capped rule as the head: arriving bytes re-arm the
+                // grace, the absolute budget ends the argument either way.
+                deadline = head_deadline(absolute);
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // A body that stops arriving is refused under the existing
@@ -707,11 +731,11 @@ fn read_exact_timeout(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                let left = silence_deadline.saturating_duration_since(std::time::Instant::now());
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
                 if left.is_zero() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        "the body did not arrive within the connection timeout",
+                        "the connection exceeded its total budget before the body arrived",
                     ));
                 }
                 let _ = stream.set_read_timeout(Some(left.max(Duration::from_millis(50))));

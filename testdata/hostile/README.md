@@ -12,6 +12,11 @@ every byte is synthetic and every file is a few hundred bytes long.
   `%%EOF` line, so the object header scan runs off the end of the file. The
   error *message* for that case used to slice eight bytes past the end and
   panic before it could be returned.
+- `xref-entries-bomb.pdf` — an 86 KB document whose cross-reference stream
+  declares `/Size 30000000` with `/W [1 1 1]`: a ~90 MB row table behind a
+  file smaller than a page. Before the entry cap it died by allocation
+  inside `Vec::with_capacity`, so no error could even be returned; now the
+  walk refuses the claim by name before materialising anything.
 
 The tests that use them live in `crates/openfirma-pades/tests/hostile.rs`,
 which also builds further hostile documents (impossible `/ByteRange`

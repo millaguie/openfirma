@@ -28,7 +28,43 @@ use crate::pdf;
 /// it. Checking after every stage bounds peak memory to roughly two stages,
 /// because an expansion is refused at the cap before it grows past it.
 pub fn decode(dict: &[u8], raw: &[u8]) -> Result<Vec<u8>> {
-    decode_capped(dict, raw, MAX_DECODED_STREAM)
+    decode_with(dict, raw, MAX_DECODED_STREAM)
+}
+
+/// `decode` with the caller's file in hand. A filter chain gets exactly the
+/// shared cap — an expansion is what the bound exists for; its refusal stays
+/// `check_stage`'s own wording. What the container may change is the bound
+/// on a *raw* stream: a carrier object (see `pdf::stream_decode_cap`)
+/// declares bytes the file already holds, and copying them allocates nothing
+/// beyond it. Past the bound the judgement is the same as the filters', so
+/// this path names itself instead of naming a filter that never ran.
+/// The same bound `pdf::stream_decode_cap` draws, exposed under the name the
+/// raw-copying path (`pdf::stream_raw`) reads: what one stream's *copied*
+/// bytes may reach. Identical numbers, one definition — the cap must not mean
+/// two things depending on which side of the copy a caller stands on.
+pub(crate) fn raw_stream_cap(data: &[u8], dict: &[u8]) -> usize {
+    pdf::stream_decode_cap(data, dict)
+}
+
+pub fn decode_in(data: &[u8], dict: &[u8], raw: &[u8]) -> Result<Vec<u8>> {
+    if !filter_names(dict)?.is_empty() {
+        return decode_with(dict, raw, MAX_DECODED_STREAM);
+    }
+    let cap = pdf::stream_decode_cap(data, dict);
+    if raw.len() > cap {
+        return Err(Error::Pdf(format!(
+            "the stream declares {} bytes, more than the {} a file of {} can carry: \
+             a structural stream this large is not a document",
+            raw.len(),
+            cap,
+            data.len()
+        )));
+    }
+    Ok(raw.to_vec())
+}
+
+fn decode_with(dict: &[u8], raw: &[u8], cap: usize) -> Result<Vec<u8>> {
+    decode_capped(dict, raw, cap)
 }
 
 fn apply(name: &str, data: &[u8], parms: Option<&[u8]>, cap: usize) -> Result<Vec<u8>> {
@@ -92,7 +128,7 @@ fn check_stage(name: &str, data: &[u8], cap: usize) -> Result<()> {
 /// bomb, and reading it to the end before deciding is how a signing tool ends
 /// up an out of memory victim. The cap is generous enough that no legitimate
 /// document comes near it.
-pub(crate) const MAX_DECODED_STREAM: usize = 256 * 1024 * 1024;
+pub const MAX_DECODED_STREAM: usize = 256 * 1024 * 1024;
 
 /// The most any one `/Colors`, `/BitsPerComponent` or `/Columns` predictor
 /// parameter may claim. These numbers multiply into an allocation, so they are

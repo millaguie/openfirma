@@ -694,7 +694,9 @@ pub(crate) fn acroform_of(
             .map(|b| Some((Some(r), b.into_owned())))
             .map_err(|e| {
                 Error::Pdf(format!(
-                    "the document's /AcroForm points at object {r}, which does not resolve                      ({e}); signing anyway would replace the whole form dictionary and lose                      what it held, so this is refused instead of guessed around"
+                    "the document's /AcroForm points at object {r}, which does not resolve \
+                     ({e}); signing anyway would replace the whole form dictionary and lose \
+                     what it held, so this is refused instead of guessed around"
                 ))
             }),
         None => Ok(Some((None, pdf::trim_ws(value).to_vec()))),

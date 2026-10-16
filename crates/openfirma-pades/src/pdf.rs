@@ -10,6 +10,24 @@
 //! Working at the byte level is the point, not a shortcut. See
 //! docs/adr/0003-incremental-update.md: every dictionary we re-serialize from a
 //! parsed model is a chance to silently alter a legal document.
+//!
+//! One shape gets its own vocabulary here because it changes what an offset
+//! means: the **carrier** file — an executable with this very document
+//! appended behind it, the self-extracting geometry zip-based archivers have
+//! shipped for decades (`tests/carrier.rs` proves the kernel really maps such
+//! a file; `tests/hostile.rs` reads one back). The appended payload keeps its
+//! own bytes and its own offsets untouched — a prepender glues, it does not
+//! reparse — so the reader re-bases once, at its entry point: `last_startxref`
+//! returns the declared offset rebased onto the split `carrier_split` finds
+//! (an ELF/PE/Mach-O header page followed by `%PDF-`, magic-checked), and
+//! every walking path (`object_locations` and the `/Prev` + `/XRefStm` chain)
+//! re-bases its own input exactly once, never twice. Caps that measure a
+//! document against its file get the same re-base: `stream_decode_cap` and
+//! `max_xref_entries_for` count from the split, because the bytes behind it
+//! belong to the program no reader dereferences. The whole-document entry
+//! points (`inspect`, `sign`) still refuse a carrier by design — byte 0 is
+//! not `%PDF-`, and signing what could be an executable's own body is nobody's
+//! business; everything the readers build on must see the document.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -69,6 +87,141 @@ fn line_end(data: &[u8], i: usize) -> usize {
     match data[i..].iter().position(|b| *b == b'\n') {
         Some(p) => i + p + 1,
         None => data.len(),
+    }
+}
+
+/// End of the ELF program header table — the last offset the loader's view of
+/// an image is described by; everything past it is section metadata a running
+/// program never reaches. Unused today (the carrier shape pins the split to
+/// its own page boundary, see `carrier_split`), kept as the primitive that
+/// explains *why* the exemption is sound: below this offset lives the program
+/// itself, above it nothing executes.
+#[allow(dead_code)]
+fn elf_first_page(elf: &[u8]) -> Option<usize> {
+    let is_64 = *elf.get(4)? == 2;
+    let u16_at = |off: usize| -> Option<usize> {
+        Some(usize::from(u16::from_le_bytes(
+            elf.get(off..off + 2)?.try_into().ok()?,
+        )))
+    };
+    Some(if is_64 {
+        let phoff =
+            usize::try_from(u64::from_le_bytes(elf.get(0x20..0x28)?.try_into().ok()?)).ok()?;
+        let phentsize = u16_at(0x36)?;
+        let phnum = u16_at(0x38)?;
+        phoff.checked_add(phentsize.checked_mul(phnum)?)?
+    } else {
+        let phoff =
+            usize::try_from(u32::from_le_bytes(elf.get(0x1c..0x20)?.try_into().ok()?)).ok()?;
+        let phentsize = u16_at(0x2a)?;
+        let phnum = u16_at(0x2c)?;
+        phoff.checked_add(phentsize.checked_mul(phnum)?)?
+    })
+}
+
+/// The offset of the PDF header inside an ELF-carrier file — an executable
+/// prepended before a document, as self-extracting signers ship — where such
+/// a file is what it looks like. Four shapes must agree, or "carrier" is
+/// coincidence inside binary data: the magic at zero, the program headers
+/// intact and every mapped segment ending below the loader's first page
+/// boundary (0x1000), a unique `%PDF-` header, and that header on a page
+/// boundary — where an honest prepender puts it, because the loader maps
+/// whole pages and the binary ends wherever its image ends, padded up to one.
+/// The return value is what a running process cannot reach: with every
+/// segment below 0x1000 by check, nothing at or past the header can be live
+/// — the file is, to a live process, its mapped image and a tail nobody
+/// executes. The walking parsers bound document streams by the shared cap; a
+/// carrier's tail is exactly what that bound must not reject (the round-2
+/// finding: openfirma refusing to read its own test binary prepended to a
+/// document), so `stream_decode_cap` and `max_xref_entries_for` re-base on
+/// this offset. A header at any other place — mid-image, off a page
+/// boundary, or twice — is not the carrier shape and changes nothing.
+/// Public so the integration suites can ask a file what it *is* through the
+/// exact function every cap below consults, rather than re-deriving the shape
+/// (a second implementation would drift from the one that matters).
+pub fn carrier_split(data: &[u8]) -> Option<usize> {
+    if data.get(0..4) != Some(b"\x7fELF") || data.len() <= 0x1000 {
+        return None;
+    }
+    // The exemption reasons about memory the loader cannot reach, so first
+    // prove the image really stays below that limit: every PT_LOAD segment's
+    // file extent must end below the first page boundary, and the program
+    // header table itself must be walkable (`elf_first_page`). A binary whose
+    // segments cross it (huge .data, unusual link flags) is not the shape:
+    // bytes past the split would still be live. Bounds from the raw fields —
+    // unchecked additions that could wrap on a hostile file are what every
+    // other guard in this module was written against, so they cannot appear
+    // here either.
+    let phoff = u64::from_le_bytes(data[0x20..0x28].try_into().ok()?);
+    let phentsize = u64::from(u16::from_le_bytes(data[0x36..0x38].try_into().ok()?));
+    let phnum = u64::from(u16::from_le_bytes(data[0x38..0x3a].try_into().ok()?));
+    elf_first_page(data)?;
+    // `elf_first_page` proves the table is inside the 64-bit file offsets a
+    // walker can hold; still, this module's contract is to bound every
+    // file-declared span before indexing with it, so: each entry must fit in
+    // the container. (A 32-bit ELF's fields sit at different offsets than
+    // the ones read here — but `elf_first_page` has already required its own
+    // table to exist inside the file, and a binary built for anything but the
+    // platforms this tool signs on is not a carrier of this shape.)
+    let mut last_segment_end = 0u64;
+    for i in 0..phnum {
+        let e = usize::try_from(phoff.checked_add(phentsize.checked_mul(i)?)?).ok()?;
+        // An entry with no room to hold a p_type carries no LOAD segment: an
+        // ABI whose records are smaller than the current spec describes keeps
+        // the exemption (nothing of it can cross the boundary), and a slice
+        // past the end of the file must never be indexed.
+        let entry = data.get(e..)?;
+        if u32::from_le_bytes(entry[..4].try_into().ok()?) != 1 {
+            continue;
+        }
+        let end = u64::from_le_bytes(entry[0x08..0x10].try_into().ok()?)
+            .checked_add(u64::from_le_bytes(entry[0x20..0x28].try_into().ok()?))?;
+        last_segment_end = last_segment_end.max(end);
+    }
+    // A segment ending exactly at the first page boundary is still fully
+    // below it: offsets 0..p_filesz live inside page zero, and nothing from
+    // 0x1000 on belongs to any mapped extent. "strictly less" here would
+    // reject a one-page image — which is precisely what `elf_first_page`
+    // says the table ends at for any real compiler's output.
+    if usize::try_from(last_segment_end).ok()? > 0x1000 {
+        return None;
+    }
+    let header = b"%PDF-";
+    // The document may only begin where the loader's padding ends: at a page
+    // boundary past the image. `elf_first_page` placed the program headers,
+    // so the first offset that cannot collide with live bytes is one page
+    // past the whole header table — and honest prependers (linker page-size
+    // alignment) put their payload exactly there. A `%PDF-` at any other
+    // offset is binary data that happens to spell a header, not a carrier.
+    let first_free = (elf_first_page(data)? + 0xfff) & !0xfff;
+    let at = data[first_free..]
+        .windows(header.len())
+        .position(|w| w == header)?;
+    let pdf_at = first_free + at;
+    if data[pdf_at + 1..]
+        .windows(header.len())
+        .any(|w| w == header)
+    {
+        return None;
+    }
+    (pdf_at % 0x1000 == 0).then_some(pdf_at)
+}
+
+/// The most a stream's raw (unfiltered) bytes may reach: the shared
+/// structural cap, except inside a carrier file, whose document part begins
+/// at `carrier_split`. On that shape the bytes past it are unreachable by
+/// running code — no amount of bounding them protects memory the loader has
+/// already committed to — and an uncompressed stream there is copied from the
+/// file itself (`stream_raw` bounded it by the container's length first), so
+/// accepting it allocates nothing the container does not force. A filter
+/// chain never gets here: an expansion past the cap is what the bound exists
+/// for, carrier or not — this exemption widens copying, never inflating.
+pub(crate) fn stream_decode_cap(data: &[u8], dict: &[u8]) -> usize {
+    let wide = get(dict, "/Filter").is_none() && carrier_split(data).is_some();
+    if wide {
+        crate::stream::MAX_DECODED_STREAM.max(data.len())
+    } else {
+        crate::stream::MAX_DECODED_STREAM
     }
 }
 
@@ -407,23 +560,62 @@ pub struct Trailer {
 /// Searched from the end because a linearized file has two, and a signed file
 /// has one per revision. Only the last one describes the current state.
 pub fn last_startxref(data: &[u8]) -> Result<usize> {
+    let (at, _) = startxref_position(data)?;
+    Ok(at)
+}
+
+/// The last whole `startxref` keyword and the document offset it declares —
+/// the same walk `last_startxref` performs, with one number more: inside a
+/// carrier the declared offset is relative to the document's own start (the
+/// appended payload keeps the offsets the writer computed before anyone prepended
+/// a program in front of it), and only the container position can index `data`.
+fn startxref_position(data: &[u8]) -> Result<(usize, usize)> {
     let key = b"startxref";
-    let pos = data
-        .windows(key.len())
-        .rposition(|w| w == key)
+    // Searched from the end (see the doc above), and only a whole keyword
+    // counts: a carrier file whose first page is an executable holds that very
+    // word inside its program bytes, and an offset of it there names nothing —
+    // `trailer` refuses such a target, so claiming one would bury the real
+    // cross-reference at the back of the file under machine code. The token
+    // rule costs nothing on ordinary files, where the keyword always sits on
+    // its own line between `endobj` and an offset.
+    let pos = (0..data.len().saturating_sub(key.len()) + 1)
+        .rev()
+        .find(|at| {
+            &data[*at..*at + key.len()] == key
+                && (*at == 0 || is_ws(data[at - 1]) || is_delim(data[at - 1]))
+                && data
+                    .get(*at + key.len())
+                    .is_none_or(|b| is_ws(*b) || is_delim(*b))
+        })
         .ok_or_else(|| Error::Pdf("no startxref keyword, is this a PDF?".into()))?;
     let after = skip_ws(data, pos + key.len());
     let end = token_end(data, after);
     let text = std::str::from_utf8(&data[after..end])
         .map_err(|_| Error::Pdf("startxref offset is not ASCII".into()))?;
-    text.parse::<usize>()
-        .map_err(|_| Error::Pdf(format!("startxref offset is not a number: {text:?}")))
+    let declared = text
+        .parse::<usize>()
+        .map_err(|_| Error::Pdf(format!("startxref offset is not a number: {text:?}")))?;
+    // A carrier's `startxref` was written for the document alone, so it names
+    // positions from `%PDF-`, not from byte 0 of the container. Re-basing on
+    // the split turns the declared offset into the file position it describes;
+    // an out-of-range base can only produce a `trailer` refusal, never a wrong
+    // answer, because every keyword search below stays inside the container.
+    let base = carrier_split(data).unwrap_or(0);
+    let at = base
+        .checked_add(declared)
+        .ok_or_else(|| Error::Pdf("startxref offset is out of range".into()))?;
+    Ok((at, declared))
 }
 
 /// Reads the trailer dictionary of the revision whose cross-reference section
 /// starts at `xref_at`.
 pub fn trailer(data: &[u8], xref_at: usize) -> Result<Trailer> {
-    let dict = trailer_dict(data, xref_at)?;
+    // `xref_at` is a document position (see `object_locations`: whoever read it
+    // off the file did not move it), and inside a carrier only the container
+    // position can index the bytes; `at` reports back what was declared, so a
+    // caller reading it stays in the same system its input came from.
+    let base = carrier_split(data).unwrap_or(0);
+    let dict = trailer_dict(data, base + xref_at)?;
     let root_bytes =
         get(&dict, "/Root").ok_or_else(|| Error::Pdf("the trailer has no /Root".into()))?;
     let root = parse_ref(root_bytes)
@@ -450,6 +642,8 @@ pub fn trailer(data: &[u8], xref_at: usize) -> Result<Trailer> {
         size,
         info,
         prev,
+        // the keyword's own number: where the file says its cross-reference
+        // stands, in whatever system the file speaks (see above).
         at: xref_at,
     })
 }
@@ -518,7 +712,10 @@ fn trailer_dict(data: &[u8], xref_at: usize) -> Result<Vec<u8>> {
         // a cross-reference stream is an ordinary indirect object whose
         // dictionary doubles as the trailer. Reading that dictionary needs no
         // decompression, only locating objects through it does, which is why
-        // trailer() succeeds on a document that object_offsets() refuses.
+        // trailer() succeeds on a document that object_offsets() refuses. Both
+        // entry points take the file's own (document-relative) offsets and
+        // re-base internally, so they answer about the same revision whatever
+        // container its bytes stand in.
         let body = object_body(data, i)?;
         let dict = &data[body];
         if !dict.starts_with(b"<<") {
@@ -539,6 +736,13 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
     let mut map = BTreeMap::new();
     let mut cur = Some(xref_at);
     let mut revisions = 0;
+    // Where the document begins inside its container (0 for a plain file). A
+    // carrier's offsets — this walk's entry `at`, every `/Prev` and `/XRefStm`
+    // it chains through — name positions of the *document*: whatever handed
+    // `xref_at` was responsible for that one re-base, and each offset met on
+    // the way is in the same coordinate system as the first, so each gets its
+    // own single re-base here rather than an accumulating one.
+    let base = carrier_split(data).unwrap_or(0);
     while let Some(at) = cur {
         revisions += 1;
         if revisions > 100 {
@@ -553,21 +757,40 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
             read_xref_stream(data, i)?
         };
         for (r, loc) in entries {
-            map.entry(r).or_insert(loc);
+            map.entry(r).or_insert(rebase(loc, base));
         }
         // A hybrid reference file carries a classic table for old readers and
         // points at a cross-reference stream for the objects only it knows
-        // about. Both have to be read, or those objects look missing.
+        // about. Both have to be read, or those objects look missing. The
+        // keyword's number is document-relative like everything else in the
+        // dict; so is every row it yields, which is why rows are re-based on
+        // the way out, below.
         if let Some(stm) = get(&dict, "/XRefStm").and_then(parse_uint) {
-            if let Ok((extra, _)) = read_xref_stream(data, stm as usize) {
+            let stm = base + stm as usize;
+            if let Ok((extra, _)) = read_xref_stream(data, stm) {
                 for (r, loc) in extra {
-                    map.entry(r).or_insert(loc);
+                    map.entry(r).or_insert(rebase(loc, base));
                 }
             }
         }
-        cur = get(&dict, "/Prev").and_then(parse_uint).map(|v| v as usize);
+        cur = get(&dict, "/Prev")
+            .and_then(parse_uint)
+            .map(|v| base + v as usize);
     }
     Ok(map)
+}
+
+/// Turn a row's document-relative offset into the container position that
+/// indexes `data`. Type 2 rows name a stream *object*, not a byte, so they
+/// carry no offset to move; a carrier whose rows were rewritten against its
+/// own container (a shape no honest prepender ships, and one the walking path
+/// deliberately does not guess at) simply fails downstream, where an offset
+/// that names machine code has never parsed as an object header.
+fn rebase(loc: Location, base: usize) -> Location {
+    match loc {
+        Location::Direct(off) => Location::Direct(base + off),
+        packed @ Location::InObjectStream { .. } => packed,
+    }
 }
 
 /// One classic cross-reference table: its in-use entries and its trailer.
@@ -631,6 +854,45 @@ fn read_xref_table(data: &[u8], i: usize) -> Result<(XrefEntries, Vec<u8>)> {
     }
 }
 
+/// The most cross-reference entries one revision may put in the table. A
+/// stream's decoded bytes already bound its row count (`decoded.len()/row`),
+/// but not what those rows are turned into: an 87 KB flate legitimately
+/// inflates to 90 MB of `/W [1 1 1]` rows — under every stage cap, so the
+/// decode side refuses nothing — and walking them into a
+/// `Vec<(ObjRef, Location)>` plus the location map costs ~2 GB of RSS and
+/// 47 s of CPU for a document that holds no objects at all (finding C-1's
+/// second half: the stream cap closed the decode side of the bomb, this
+/// closes the materialisation side). The bound is derived from the file, not
+/// from a wish: every in-use entry names an object header (`"N G obj"` and
+/// its separators) somewhere inside the *file*, so the file's own length
+/// bounds how many entries can honestly exist. Eight bytes is the smallest
+/// real object header (a one-digit number, a generation, `obj`, two line
+/// breaks), with headroom on top of it for documents whose objects are denser
+/// than that floor: an 87 KB attack file is refused at its 30-million claim,
+/// while a document as large as the decoded-stream cap could index over six
+/// million real objects — no conforming writer gets near that.
+const MAX_XREF_ENTRIES_FACTOR: usize = 8;
+fn max_xref_entries(data_len: usize) -> usize {
+    (data_len / 8).max(4096) * MAX_XREF_ENTRIES_FACTOR
+}
+
+/// The same bound for the document inside a carrier file (an executable
+/// prepended before it, as `tests/carrier.rs` ships one): only the part from
+/// the PDF header on holds object headers an in-use entry may name, so that
+/// part bounds what the cross-reference can honestly claim. An entry naming
+/// a byte of the binary — or nothing at all, because the file ends first —
+/// still fails where it is used: a direct offset whose object header does not
+/// parse, a stream number missing from the table, a row past the decoded
+/// bytes. Every error path stays; this only counts real objects again on a
+/// file that really holds them next to its program instead of pretending 87
+/// KB of executable makes a document's own honest index impossible.
+fn max_xref_entries_for(data: &[u8]) -> usize {
+    match carrier_split(data) {
+        Some(pdf_at) => max_xref_entries(data.len() - pdf_at),
+        None => max_xref_entries(data.len()),
+    }
+}
+
 /// One cross-reference stream: the compressed form, whose dictionary doubles
 /// as the trailer.
 ///
@@ -648,7 +910,7 @@ fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, Vec<u8>)
         )));
     }
     let raw = stream_raw(data, obj_at)?;
-    let decoded = crate::stream::decode(&dict, &raw)?;
+    let decoded = crate::stream::decode_in(data, &dict, &raw)?;
 
     // /W gives the width in bytes of each of the three fields of an entry
     let widths = int_array(
@@ -675,6 +937,19 @@ fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, Vec<u8>)
         return Err(Error::Pdf(
             "/W is all zeros, there is nothing to read".into(),
         ));
+    }
+    // The most entries this revision may put in the table, checked before
+    // anything is materialised: `claimed` (the /Index pairs, or `/Size` when
+    // there is no /Index) is what the loop below would turn into a `Vec`.
+    let claimed: u64 = index.chunks_exact(2).map(|p| u64::from(p[1])).sum();
+    if claimed as usize > max_xref_entries_for(data) {
+        return Err(Error::Pdf(format!(
+            "the cross-reference stream claims {claimed} entries, past the {} a file of {} \
+             bytes can hold: every in-use entry names an object header the file must contain, \
+             and a table this many times larger than its own file is not a document",
+            max_xref_entries_for(data),
+            data.len()
+        )));
     }
     let starts = [0, widths[0] as usize, (widths[0] + widths[1]) as usize];
 
@@ -818,10 +1093,21 @@ pub fn stream_raw(data: &[u8], offset: usize) -> Result<Vec<u8>> {
     if let Some(n) = get(dict, "/Length").and_then(parse_uint) {
         let n = n as usize;
         // i is inside the file, checked on the way here, so the subtraction
-        // cannot wrap; the addition of a file-declared length could
+        // cannot wrap; the addition of a file-declared length could. The same
+        // bound `stream_decode_cap` draws for decoded bytes applies to raw
+        // ones: an uncompressed stream's payload *is* its decode, so copying
+        // megabytes of a carrier's program through here would slip past every
+        // other check while allocating exactly what the cap exists to refuse.
+        let cap = crate::stream::raw_stream_cap(data, dict);
         if n > data.len() - i {
             return Err(Error::Pdf(format!(
                 "/Length {n} runs past the end of the file"
+            )));
+        }
+        if n > cap {
+            return Err(Error::Pdf(format!(
+                "the stream declares {n} raw bytes, more than the {cap} openfirma copies \
+                 from one stream: a structural stream this large is not a document"
             )));
         }
         return Ok(data[i..i + n].to_vec());
@@ -846,6 +1132,16 @@ pub fn stream_raw(data: &[u8], offset: usize) -> Result<Vec<u8>> {
     )))
 }
 
+thread_local! {
+    /// Counts `decoded_object_stream` inflates while a test has armed the
+    /// slot to a positive value (the A-1 regression guard in hostile.rs): the
+    /// count distinguishes a memoised walk — one inflate per stream — from
+    /// the quadratic pre-cache walk, one per object behind it. Un-armed
+    /// threads never touch it, so parallel tests cannot clear each other's
+    /// count.
+    pub static OBJSTM_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The decoded bytes of one object stream: dictionary included, because the
 /// header offsets inside it (`/First`) are relative to the object's start.
 /// This is the *inflate* — a hostile document can make it expensive, so every
@@ -865,7 +1161,12 @@ fn decoded_object_stream(
     let dict_span = object_body(data, off)?;
     let dict = data[dict_span].to_vec();
     let raw = stream_raw(data, off)?;
-    let decoded = crate::stream::decode(&dict, &raw)?;
+    OBJSTM_DECODES.with(|c| {
+        if c.get() > 0 {
+            c.set(c.get() + 1);
+        }
+    });
+    let decoded = crate::stream::decode_in(data, &dict, &raw)?;
     Ok((dict, decoded))
 }
 
@@ -980,12 +1281,48 @@ pub(crate) struct ObjStmEntry {
 /// one parse would be a memory policy, not a correctness need, which is why
 /// the cache travels with the caller's stack instead of globally. The entry
 /// type stays private: an outside caller only ever passes this around.
-pub struct ObjectStreamCache(std::collections::HashMap<ObjRef, std::sync::Arc<ObjStmEntry>>);
+///
+/// Memory policy is still policy (finding A-1's own round-2 follow-up): three
+/// ~60 MB object streams took the peak to 253 MB once every decode was kept,
+/// and N large streams scaled it to N × the per-stream cap where the uncached
+/// path held one at a time. So there is a total budget: past
+/// `CACHE_TOTAL_BUDGET` a stream still decodes — refusing a readable document
+/// to police our own memory would be backwards — but stops being retained,
+/// which pays that one re-inflate per access and nothing else.
+pub struct ObjectStreamCache {
+    entries: std::collections::HashMap<ObjRef, std::sync::Arc<ObjStmEntry>>,
+    /// Decoded bytes currently retained across all entries.
+    retained: usize,
+}
+
+/// What one cache may hold at most: twice the per-stream decode cap, enough
+/// for the biggest single stream plus a second one of ordinary size, while a
+/// hostile document's peak stays bounded instead of scaling with its number
+/// of streams (round-2 finding on A-1: 3 × 60 MB measured).
+const CACHE_TOTAL_BUDGET: usize = 2 * crate::stream::MAX_DECODED_STREAM;
 
 impl ObjectStreamCache {
     /// An empty cache for one document walk.
     pub fn new() -> Self {
-        Self(std::collections::HashMap::new())
+        Self {
+            entries: std::collections::HashMap::new(),
+            retained: 0,
+        }
+    }
+
+    /// Retain `entry` under its stream's number unless the total budget is
+    /// spent; never eviction of what a later access needs (the document's own
+    /// caps bound any single entry), only refusal to add past the budget. The
+    /// cached and uncached paths answer identically either way (`resolve` runs
+    /// the same checks on both), so refusing to retain costs a re-inflate and
+    /// never a different answer.
+    fn retain(&mut self, stream: ObjRef, entry: &std::sync::Arc<ObjStmEntry>) {
+        let cost = entry.decoded.len() + 8 * entry.header.len();
+        if self.retained.saturating_add(cost) > CACHE_TOTAL_BUDGET {
+            return;
+        }
+        self.retained += cost;
+        self.entries.insert(stream, entry.clone());
     }
 }
 
@@ -1026,14 +1363,21 @@ pub fn resolve<'a>(
             // One *inflate* per (document, object stream): the first object
             // that needs the stream pays it, every later one clones the Arc
             // and runs its own range checks against the same caps the uncached
-            // path applies — memoising means never skipping a check.
-            let entry = match cache.as_mut().and_then(|c| c.0.get(&stream)) {
+            // path applies — memoising means never skipping a check. The only
+            // check the cached path *cannot* re-run here is whether the packed
+            // object still sits where the classic-table scan put it: no such
+            // second index exists for objects inside a stream (the /Index rows
+            // name the stream and entry, not the bytes), so an object that
+            // moved within its stream would resolve to stale bytes — which is
+            // why `sign.rs` walks type 2 entries through `object_stream_bytes`
+            // (a fresh decode every time) when hashing a document for signing.
+            let entry = match cache.as_mut().and_then(|c| c.entries.get(&stream)) {
                 Some(entry) => entry.clone(),
                 None => {
                     let (dict, decoded) = decoded_object_stream(data, locations, stream)?;
                     let entry = std::sync::Arc::new(object_stream_header(&dict, decoded, stream)?);
                     if let Some(c) = cache.as_mut() {
-                        c.0.insert(stream, entry.clone());
+                        c.retain(stream, &entry);
                     }
                     entry
                 }
