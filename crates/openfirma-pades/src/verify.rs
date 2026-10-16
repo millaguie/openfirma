@@ -35,6 +35,7 @@ use openfirma_core::{Error, Result};
 
 use crate::inspect;
 use crate::ltv;
+use crate::pdf;
 use crate::pdf::ObjRef;
 
 /// One signature dictionary of the document, with its CAdES reports. A
@@ -129,11 +130,27 @@ pub fn verify(pdf: &[u8], opts: &VerifyOptions) -> Result<DocumentReport> {
             sig.object.generation
         );
         match verify_one(pdf, sig, opts) {
-            Ok(reports) => sig_reports.push(SignatureReport {
-                object: sig.object,
-                byte_range: sig.byte_range,
-                reports,
-            }),
+            Ok(reports) => {
+                // and the revisions gate: everything appended after this
+                // signature's own revision has to be admissible archive data
+                let problems = revision_gate_problems(pdf, sig.byte_range)?;
+                if problems.is_empty() {
+                    sig_reports.push(SignatureReport {
+                        object: sig.object,
+                        byte_range: sig.byte_range,
+                        reports,
+                    });
+                } else {
+                    // the same sentence the time-stamp gate uses: the attack
+                    // IS a following revision that no archive may append, and
+                    // naming it is what tells the user which layer refused
+                    for p in problems {
+                        failures.push(format!(
+                            "{label} was followed by changes no archive may append: {p}"
+                        ));
+                    }
+                }
+            }
             Err(e) => failures.push(format!("{label}: {}", unwrap(&e))),
         }
     }
@@ -150,12 +167,29 @@ pub fn verify(pdf: &[u8], opts: &VerifyOptions) -> Result<DocumentReport> {
             // read_document_timestamp only leaves the digest unset when it
             // also left problems, so an empty problem list always has one
             let digest = t.digest.unwrap_or(DigestAlg::Sha256);
-            dts_reports.push(DocTimeStampReport {
-                object: t.object,
-                byte_range: t.byte_range,
-                digest,
-                token: t.token.clone(),
-            });
+            // A timestamp that carries no problems still has to pass the
+            // revisions gate: its token covers a revision, and what came after
+            // it is only admissible if it is validation data or plumbing —
+            // otherwise B-LTA would certify documents whose pages were swapped
+            // after the stamp.
+            let mut problems = revision_gate_problems(pdf, t.byte_range)?;
+            for p in problems.drain(..) {
+                failures.push(format!(
+                    "document time-stamp {} (object {} {}) was followed by changes no \
+                     archive may append: {p}",
+                    i + 1,
+                    t.object.num,
+                    t.object.generation
+                ));
+            }
+            if problems.is_empty() {
+                dts_reports.push(DocTimeStampReport {
+                    object: t.object,
+                    byte_range: t.byte_range,
+                    digest,
+                    token: t.token.clone(),
+                });
+            }
         } else {
             for p in &t.problems {
                 failures.push(format!("{label}: {p}"));
@@ -177,6 +211,246 @@ pub fn verify(pdf: &[u8], opts: &VerifyOptions) -> Result<DocumentReport> {
         document_timestamps: dts_reports,
         dss,
     })
+}
+
+/// The revisions gate (adversarial review C-1): the bytes a later pass appends
+/// after a signature are limited to what an archive may append at all — new
+/// signature objects, their plumbing in the field and form trees, validation
+/// data under `/DSS`, and document time-stamps. Anything else that redefines
+/// what this signature covered means the document changed underneath it, and
+/// no verdict may rest on a document whose signed bytes are not the whole of
+/// what it covers. Returns the refusals; empty means every later change is one
+/// an archive is allowed to make.
+fn revision_gate_problems(pdf: &[u8], byte_range: [usize; 4]) -> Result<Vec<String>> {
+    let revisions = crate::revisions::revisions(pdf)?;
+    let [_, _, c, d] = byte_range;
+    // checked: the numbers come from the document, and a pair whose sum does
+    // not fit in an offset describes no segment of any file. Inspect refused
+    // one already; refusing again keeps this total.
+    let coverage_end = match c.checked_add(d) {
+        Some(end) => end,
+        None => {
+            return Err(Error::Verification(format!(
+                "/ByteRange [{c} + {d}] overflows any file offset"
+            )));
+        }
+    };
+    let redefined = crate::revisions::redefinitions_after(pdf, &revisions, coverage_end)?;
+    let classified = crate::revisions::classify(pdf, &redefined)?;
+    Ok(classified
+        .into_iter()
+        .filter(|(_, change)| !change.allowed())
+        .map(|(_, change)| change.to_string())
+        .collect())
+}
+
+fn is_ws(b: u8) -> bool {
+    matches!(b, 0x00 | b'\t' | b'\n' | 0x0c | b'\r' | b' ')
+}
+
+fn is_delim(b: u8) -> bool {
+    matches!(
+        b,
+        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+    )
+}
+
+/// Where every key of a dictionary sits in its raw bytes: name token plus
+/// value, whole (`/Contents <hex>`, `/ByteRange [ … ]`).
+///
+/// `pdf::items` cannot be used here. A signed signature dictionary contains a
+/// hole — the hex string in `/Contents` runs for tens of kilobytes and is
+/// full of ASCII letters — and a tokenizer that walks the bytes with no other
+/// idea of what is inside them can latch onto a `<` inside that hex, pair the
+/// `>` that closes it with a name that comes after, and report a perfectly
+/// ordinary dictionary as lying about where its own value sits. This scan
+/// cannot: names only occur outside strings, so each value is skipped whole
+/// by its own delimiter — strings by their markers, arrays to their `]`,
+/// nested dictionaries recursively — before the next key is looked for. A
+/// value that cannot be skipped whole stops the scan; whatever was found up
+/// to there is returned.
+pub(crate) fn key_spans(dict: &[u8]) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let mut out = Vec::new();
+    if !dict.starts_with(b"<<") {
+        return out;
+    }
+    let mut i = 2;
+    loop {
+        i = skip_ws(dict, i);
+        if i >= dict.len() || dict[i] == b'>' {
+            break; // the closing `>>`, or something that cannot be a key
+        }
+        if dict[i] != b'/' {
+            break;
+        }
+        let name = name_end(dict, i);
+        let value_start = skip_ws(dict, name);
+        if value_start >= dict.len() {
+            out.push((i..name, value_start..value_start));
+            break; // a key with no value: the dictionary ends here
+        }
+        let value_end = match (dict[value_start], dict.get(value_start + 1)) {
+            (b'<', Some(b'<')) => match nested_dict_end(dict, value_start) {
+                Some(end) => end,
+                None => break,
+            },
+            (b'<', _) => match hex_string_end(dict, value_start) {
+                Some(end) => end,
+                // not a hex string at all — a `<` in front of the next key,
+                // say. Treat it as one token and let the loop see what follows.
+                None => token_end(dict, value_start),
+            },
+            (b'(', _) => match literal_string_end(dict, value_start) {
+                Some(end) => end,
+                None => break,
+            },
+            (b'[', _) => match array_end(dict, value_start) {
+                Some(end) => end,
+                None => break,
+            },
+            _ => token_end(dict, value_start),
+        };
+        let mut v_end = value_end;
+        while v_end > value_start && is_ws(dict[v_end - 1]) {
+            v_end -= 1;
+        }
+        out.push((i..name, value_start..v_end));
+        i = value_end;
+    }
+    out
+}
+
+/// The span of the key named `key` — without the leading slash — or `None`.
+/// Matching is exact: `/Contents` is a prefix of `/ContentsSize`, and the two
+/// can never be told apart by looking at where a token starts.
+pub(crate) fn key_span(
+    dict: &[u8],
+    key: &str,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let wanted = format!("/{key}");
+    // The hole-aware scan below decides WHICH token is the key — a `/Contents`
+    // that only appears inside the CMS hex can never be the one returned. Its
+    // spans are then the ones every other reader of this crate measures them
+    // at (`pdf::items`): matching what the signer itself measured when it
+    // wrote the hole bounds, and refusing a shadow definition does not need a
+    // second tokenizer, only the same eyes on both sides of the comparison.
+    if !key_spans(dict)
+        .into_iter()
+        .any(|(name, _)| dict.get(name.clone()) == Some(wanted.as_bytes()))
+    {
+        return None;
+    }
+    let value = pdf::get_span(dict, &wanted)?;
+    // the name is the token immediately before the value, separated by at
+    // least one whitespace: walk back over the gap and take `/Name` whole
+    let mut start = value.start;
+    while start > 0 && matches!(dict[start - 1], b'\t' | b'\n' | 0x0c | b'\r' | b' ') {
+        start -= 1;
+    }
+    let name = start - key.len() - 1..start;
+    if dict.get(name.clone()) != Some(wanted.as_bytes()) {
+        return None;
+    }
+    Some((name, value))
+}
+
+/// End of whitespace between tokens. (Comments are not skipped: a `%` that
+/// would start one inside this scan is either hex, which cannot be one, or a
+/// token boundary, where stopping the scan is the honest answer.)
+fn skip_ws(data: &[u8], mut i: usize) -> usize {
+    while i < data.len() && is_ws(data[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// End of the `/Name` that starts at `i`, the slash included.
+fn name_end(data: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < data.len() && !is_ws(data[j]) && !is_delim(data[j]) {
+        j += 1;
+    }
+    j
+}
+
+/// End of a hex string that starts with `<` at `i`, or `None` when something
+/// that cannot be inside one turns up first. Real CMS tokens are strict
+/// lower-case hex, so their closing `>` is always found; a stray `<` in front
+/// of non-hex bytes is reported as not-a-string instead of swallowing the
+/// rest of the dictionary.
+fn hex_string_end(data: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < data.len() {
+        match data[j] {
+            b'>' => return Some(j + 1),
+            b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' | b'\t' | b'\n' | b'\r' | b' ' => j += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// End of a literal string `( … )` with balanced escapes and nesting.
+fn literal_string_end(data: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    let mut depth = 1usize;
+    while j < data.len() {
+        match data[j] {
+            b'\\' => j += 2,
+            b'(' => {
+                depth += 1;
+                j += 1;
+            }
+            b')' => {
+                depth -= 1;
+                j += 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// End of an array value `[ … ]`: strings are skipped whole (their bytes may
+/// look like a closing bracket) and the first `]` outside one closes it.
+fn array_end(data: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < data.len() {
+        match data[j] {
+            b']' => return Some(j + 1),
+            b'(' => j = literal_string_end(data, j)?,
+            b'<' if j + 1 < data.len() && data[j + 1] == b'<' => j += 2,
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// End of a nested dictionary that opens at `i`: one past its closing `>>`.
+/// Located by scanning the nested keys with the same rules; if the close does
+/// not follow cleanly, one past the last value understood.
+fn nested_dict_end(data: &[u8], open: usize) -> Option<usize> {
+    let inner = key_spans(&data[open..]);
+    let last = inner.last()?;
+    let i = skip_ws(data, open + last.1.end);
+    if data.get(i..i + 2) == Some(b">>") {
+        Some(i + 2)
+    } else {
+        Some(open + last.1.end)
+    }
+}
+
+/// End of a plain token — a number, a reference, a keyword: it runs until the
+/// next whitespace or delimiter.
+fn token_end(data: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while j < data.len() && !is_ws(data[j]) && !is_delim(data[j]) {
+        j += 1;
+    }
+    j
 }
 
 fn verify_one(
@@ -204,15 +478,86 @@ fn verify_one(
             pdf.len()
         )));
     }
-    let gap = &pdf[b..c];
-    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
-        return Err(Error::Verification(
-            "the hole between the /ByteRange segments is not the /Contents hex string".into(),
-        ));
+    // The appearance of the hole (a hex string between the two segments) and
+    // its ownership by THIS dictionary are checked together below, after the
+    // dictionary has been located: a hole shaped like /Contents that belongs
+    // to some other object is exactly what M-3 must refuse, so shape alone
+    // cannot decide anything here. What must be true before locating any-
+    // M-3, the binding between structure and bytes. The dictionary must be a
+    // direct object of the file (an ISO 32000 rule with a hard reason: inside
+    // an object stream there is no offset for its /Contents at all), and the
+    // hole must be THIS dictionary's /Contents — not merely something shaped
+    // like one. Checking only that `pdf[b..c]` starts with `<` and ends with
+    // `>` let any second definition of a signature object, sitting in an older
+    // still-reachable revision, claim someone else's bytes: the digest then
+    // covers whatever lies in between while the dictionary shown to readers
+    // says otherwise. What binds the claim is (a) being THE definition the
+    // final cross-reference resolves — a shadow copy elsewhere is never the
+    // one located here — and (b) this resolved dictionary carrying a /Contents
+    // whose hex string IS the hole. The value span is taken from the raw
+    // bytes with `pdf::get_span`, exactly as the signer measured it when it
+    // wrote [b, c): whether that reading trimmed a space after the `>`, or one
+    // token further in an unusual layout, is padding trivia both sides agree
+    // on; whether the dictionary even has its own /Contents at those bytes is
+    // the claim under test. The name span comes from the hole-aware scan
+    // below, so a "/Contents" that only appears inside tens of kilobytes of
+    // CMS hex can never be the key being checked.
+    let locations = pdf::object_locations(pdf, pdf::last_startxref(pdf)?)?;
+    let offset = match locations.get(&sig.object).copied() {
+        Some(pdf::Location::Direct(off)) => off,
+        _ => {
+            return Err(Error::Verification(format!(
+                "the signature dictionary ({} {}) is not a direct object of the file: its \
+                 bytes do not sit at any offset the /ByteRange can name",
+                sig.object.num, sig.object.generation
+            )));
+        }
+    };
+    // slice of the file this reader resolves object N to — exactly what
+    // `inspect` digested and what the signer patched, span for span
+    let body = pdf::object_body(pdf, offset)?;
+    let raw = &pdf[body.clone()];
+    let contents = key_span(raw, "Contents").ok_or_else(|| {
+        Error::Verification(format!(
+            "the signature dictionary ({} {}) carries no /Contents whose bytes the hole \
+             could be",
+            sig.object.num, sig.object.generation
+        ))
+    })?;
+    if body.start + contents.1.start != b || body.start + contents.1.end != c {
+        return Err(Error::Verification(format!(
+            "the /ByteRange hole [{b}, {c}) is not this dictionary's /Contents value, which \
+             sits at [{}, {}): what sits in the hole belongs to another object",
+            body.start + contents.1.start,
+            body.start + contents.1.end
+        )));
     }
-    if sig.cms.is_empty() {
+    if let Some((_, range)) = key_span(raw, "ByteRange") {
+        let (first, last) = (body.start + range.start, body.start + range.end);
+        if first >= c || last > b {
+            // every byte of the array must fall inside [0, b): the second
+            // segment resumes AT c, so a span reaching into or past the hole
+            // would claim to have digested its own declaration.
+            return Err(Error::Verification(format!(
+                "the /ByteRange array of dictionary {} {} sits at [{first}, {last}), outside \
+                 the bytes that signature covers",
+                sig.object.num, sig.object.generation
+            )));
+        }
+    }
+
+    // The hole and the bytes `inspect` decoded from it are now bound to this
+    // dictionary. Last carrier question: those bytes must BE a SignedData —
+    // a `/Contents` that decodes to some other DER value (a bare digest, an
+    // array) is not "the signature I could not verify", it is the wrong object
+    // entirely, and saying so beats failing on whichever unrelated check an
+    // honest parser happens to hit first.
+
+    if sig.cms.is_empty() || !openfirma_cades::verify::looks_like_signed_data(&sig.cms) {
         return Err(Error::Verification(
-            "no CMS could be read from /Contents".into(),
+            "the /Contents of this signature holds no SignedData: what fills the hole \
+             belongs to another object"
+                .into(),
         ));
     }
 
@@ -265,9 +610,20 @@ fn verify_dss(
         }
     }
 
-    // every OCSP response: a successful answer, read down to its CertIDs
+    // every OCSP response: verified as a revocation datum (signature, responder
+    // authority, interval), and a successful answer, read down to its CertIDs.
+    // An archived response is evidence years after signing with no network to
+    // re-ask, so an unverifiable one is refused, not counted (A4).
     let mut ocsp_ids: Vec<OcspCertId> = Vec::new();
     for (i, (_, der)) in dss.ocsps.iter().enumerate() {
+        let status = revocation::read_ocsp_response(der, &issuers, opts.validation_time);
+        if !status.verified() {
+            return Err(fail_dss(&format!(
+                "OCSP response {} archived under /OCSPs is not a revocation datum: {}",
+                i + 1,
+                status.problem.unwrap_or_else(|| "unverifiable".into())
+            )));
+        }
         match revocation::parse_ocsp_response(der) {
             Ok(ids) => ocsp_ids.extend(ids),
             Err(e) => {

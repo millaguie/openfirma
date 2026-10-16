@@ -27,6 +27,7 @@ pub mod appearance;
 pub mod inspect;
 pub mod ltv;
 pub mod pdf;
+pub mod revisions;
 pub mod sign;
 pub mod stream;
 pub mod update;
