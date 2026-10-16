@@ -233,7 +233,15 @@ fn ask(
     origin: Option<&str>,
     body: &[u8],
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    for _ in 0..5 {
+    // Twelve attempts a quarter-second apart, not five in a burst. On Windows
+    // an answer written into a socket whose peer just vanished dies with it —
+    // worst while handlers are still draining (a wave; slots freeing one
+    // thread at a time), and a retry loop with no pause re-enters exactly the
+    // window that swallowed the last attempt. Each attempt mints its own
+    // token, so patience costs nothing an operation cares about: discarded
+    // tokens never signed (a_quiet_half_header's "never burn without a full
+    // request" rule) and each fresh one is the only thing ask promises.
+    for attempt in 0..12 {
         let token = server.issue_token();
         let path = format!("/sign/{token}");
         let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
@@ -242,8 +250,11 @@ fn ask(
         if status != u16::MAX {
             return (status, headers, payload);
         }
+        if attempt + 1 < 12 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
     }
-    panic!("the endpoint discarded five consecutive answers unread");
+    panic!("the endpoint discarded twelve consecutive answers unread");
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
