@@ -782,7 +782,8 @@ fn a_truncated_request_refuses_without_burning_the_token() {
     stream.write_all(&body.as_bytes()[..24]).unwrap();
     stream.flush().unwrap();
     // Read with a bounded wait instead of read_to_end: the answer comes when
-    // the *body* deadline fires (up to CONNECTION_TIMEOUT), and read_to_end on
+    // the *body*'s silence deadline fires (HEAD_GRACE after the last byte),
+    // and read_to_end on
     // an open socket would sit past that. The endpoint closes after answering,
     // so EOF is the natural end.
     stream
@@ -829,17 +830,18 @@ fn a_truncated_request_refuses_without_burning_the_token() {
     );
 }
 
-/// The timeout of `CONNECTION_TIMEOUT` must actually fire: Linux reports an
-/// `SO_RCVTIMEO` expiry as `WouldBlock`, and an earlier accept loop continued
-/// on that error, so a connection that sent half a header and went quiet was
-/// waited on forever (the slowloris-by-idleness ADR-0005 promises against).
-/// The proof is the *timing of the answer while the peer says nothing*: this
-/// connection sends part of a head once and then stays silent for its whole
-/// life — if the endpoint still answers, it answered at the deadline, because
-/// no other event exists that could wake it. (The old code produced no answer
+/// The timeout must actually fire: Linux reports an `SO_RCVTIMEO` expiry as
+/// `WouldBlock`, and an earlier accept loop continued on that error, so a
+/// connection that sent half a header and went quiet was waited on forever
+/// (the slowloris-by-idleness ADR-0005 promises against). The proof is the
+/// *timing of the answer while the peer says nothing*: this connection sends
+/// part of a head once and then stays silent for its whole life — if the
+/// endpoint still answers, it answered at its inactivity deadline, because no
+/// other event exists that could wake it. (The old code produced no answer
 /// here at all, so an assertion about "served too early" was unwritable; the
-/// absence of any answer is exactly what the bug looked like.) Generous CI
-/// bounds around a 30 s server-side timeout.
+/// absence of any answer is exactly what the bug looked like.) The head's own
+/// grace window (`HEAD_GRACE`, five seconds) is what cuts this peer — bytes
+/// received renew it, silence does not. Generous CI bounds around it.
 #[test]
 fn a_silent_half_header_is_cut_at_the_deadline() {
     let Some(key) = p12() else {
@@ -877,9 +879,9 @@ fn a_silent_half_header_is_cut_at_the_deadline() {
         "the refusal names the timeout: {head}"
     );
     assert!(
-        elapsed >= std::time::Duration::from_secs(25)
-            && elapsed < std::time::Duration::from_secs(60),
-        "the deadline fired at its own moment ({elapsed:?}); anything later          than 60 s is a wait, not a deadline"
+        elapsed >= std::time::Duration::from_secs(4)
+            && elapsed < std::time::Duration::from_secs(30),
+        "the deadline fired at its own moment ({elapsed:?}); anything later          than 30 s is a wait, not a deadline"
     );
 }
 
@@ -888,11 +890,12 @@ fn a_silent_half_header_is_cut_at_the_deadline() {
 /// a blind `<img>` tag burst can do — permanently killed the port before the
 /// legitimate call arrived. What replaced it must not be the same wall in a
 /// different place: what consumes a slot is a *live* connection, and a live
-/// one dies at the connection deadline by itself, so an attacker who merely
-/// holds slots pays 30 s of threads per wave while the real flow signs every
-/// free instant between the waves. The test cycles exactly that schedule —
-/// saturate with stalled peers, see the named refusal at capacity, sign in
-/// the first gap once the oldest handler ages out — for two deadline waves.
+/// one dies at its silence deadline by itself, so an attacker who merely
+/// holds slots pays HEAD_GRACE of threads per wave while the real flow signs
+/// every free instant between the waves. The test cycles exactly that
+/// schedule — saturate with stalled peers, see the named refusal at capacity,
+/// sign in the first gap once the oldest handler ages out — for two deadline
+/// waves.
 #[test]
 fn stalled_connections_age_out_and_the_endpoint_never_shuts_down() {
     let Some(key) = p12() else {
@@ -929,7 +932,7 @@ fn stalled_connections_age_out_and_the_endpoint_never_shuts_down() {
         // The real caller cannot post into a saturated box either — what it
         // must never get again is the old *permanently dead* behaviour. Sign
         // in the first instant a stalled handler ages out (the deadline is
-        // 30 s, so well inside this test's own patience).
+        // five seconds of silence each, so well inside this test's patience).
         let signed = std::time::Instant::now();
         loop {
             let token = server.issue_token();
@@ -1010,8 +1013,8 @@ fn a_flood_of_live_connections_gets_503_not_a_dead_endpoint() {
         "the endpoint never answered 503 while every slot was held busy"
     );
 
-    // The stalled crowd ages out at the connection deadline (30 s); when a
-    // slot frees, the echo answers again — no state died with the flood.
+    // The stalled crowd ages out at its silence deadline (five seconds); when
+    // a slot frees, the echo answers again — no state died with the flood.
     let t0 = std::time::Instant::now();
     loop {
         let (status, _, _) = request(addr, "POST", "/echo", &host, None, b"");

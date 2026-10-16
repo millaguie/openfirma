@@ -103,9 +103,11 @@ loopback port. What stops an uninvited caller here:
   of *its* document.
 - Process limits: ≤16 concurrent connections (refused with 503 past that, and
   refused *while* at capacity — the endpoint never shuts itself down because a
-  crowd was knocking), 30 s per connection enforced as an absolute deadline
-  checked around every read (no slowloris-by-idleness: Linux reports a socket
-  read timeout as `WouldBlock`, so the limit cannot be delegated to the
+  crowd was knocking), an absolute request budget of 30 s per connection plus
+  a 5 s silence window per read — bytes received renew the silence window, so
+  the defence cuts peers that stop talking and never a caller whose bytes keep
+  arriving on a loaded machine (no slowloris-by-idleness: Linux reports a
+  socket read timeout as `WouldBlock`, so the limit cannot be delegated to the
   platform's error kind), bind refuses any non-loopback address. The token is
   consumed only when a complete request has arrived, so a client that dies
   mid-request costs the session a refusal, not its only signing opportunity.

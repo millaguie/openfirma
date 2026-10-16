@@ -91,7 +91,19 @@ pub const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 /// `ErrorKind::TimedOut`: on Linux an `SO_RCVTIMEO` expiry surfaces as
 /// `WouldBlock` and the earlier loop continued on it, re-arming the timeout
 /// forever (finding M-2: the 30 s promise of ADR-0005 was dead code there).
+/// While bytes are ARRIVING both read loops renew their inactivity window
+/// instead ([`HEAD_GRACE`]), so this number bounds total cost, and only a peer
+/// that keeps talking for half a minute ever reaches it.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a connection may stay SILENT mid-request — before its head, or
+/// between body parts. The full 30 s is the whole-request budget; counting an
+/// idle first second of that against a real caller punished exactly the client
+/// the defence exists to protect (a loaded CI runner schedules localhost worse
+/// never speak again ages out in this window and frees their slot for it. A
+/// peer whose bytes keep coming never sees it fire — the total-request bound is
+/// `CONNECTION_TIMEOUT`, enforced on every read loop that touches it.
+const HEAD_GRACE: Duration = Duration::from_secs(5);
 
 /// How many live connection threads may exist at once. A bare connection that
 /// never speaks is closed by the deadline, so this only bounds the threads of
@@ -319,12 +331,17 @@ fn handle_connection(
     tokens: &TokenStore,
     key: &SharedKey,
 ) -> std::io::Result<()> {
-    // The per-read socket timeouts stay (a hung `write` also has to end), but
-    // the real bound is this absolute deadline: see CONNECTION_TIMEOUT for why
-    // a platform error kind cannot be trusted for it.
-    stream.set_read_timeout(Some(CONNECTION_TIMEOUT)).ok();
+    // The deadline that ages an attacker's stalled connection out cannot also
+    // be the patience a real request asks of this machine: CI runners have
+    // been seen to sit between accept() and the first read for well over a
+    // second, and losing THAT socket's answer is what "slowloris defence"
+    // would never mean to do — the defence exists for connections that never
+    // send a request. The handshake therefore gets its own shorter window;
+    // the long CONNECTION_TIMEOUT still bounds every read once real bytes
+    // start arriving (M-2).
+    stream.set_read_timeout(Some(HEAD_GRACE)).ok();
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT)).ok();
-    let deadline = std::time::Instant::now() + CONNECTION_TIMEOUT;
+    let mut deadline = std::time::Instant::now() + HEAD_GRACE;
 
     // The header cap is what protects the read loop itself; a body is only
     // ever read after Content-Length passed its own (much smaller) cap.
@@ -338,6 +355,9 @@ fn handle_connection(
         }
     };
     let (request_line, headers, body_prefix) = split_request(&raw)?;
+    // A complete head means a client that is actually talking: from here the
+    // full connection budget applies to the rest of its request.
+    deadline = std::time::Instant::now() + CONNECTION_TIMEOUT;
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() != 3 || !parts[2].starts_with("HTTP/1.") {
@@ -566,7 +586,7 @@ fn handle_connection(
 fn read_request_head(
     stream: &mut TcpStream,
     cap: usize,
-    deadline: std::time::Instant,
+    mut deadline: std::time::Instant,
 ) -> Result<Vec<u8>, &'static str> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -585,6 +605,12 @@ fn read_request_head(
             }
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
+                // Headline rule: time counts against a peer that stops
+                // talking, not against a slow scheduler on our own machine.
+                // Bytes received reset the head's grace window — this is what
+                // keeps a real request alive on a loaded runner while an idle
+                // attacker still ages out in [HEAD_GRACE] of silence (M-2).
+                deadline = std::time::Instant::now() + HEAD_GRACE;
                 if buf.windows(4).any(|w| w == b"\r\n\r\n") || ends_with_double_lf(&buf) {
                     return Ok(buf);
                 }
@@ -655,22 +681,33 @@ fn split_request(raw: &[u8]) -> std::io::Result<RequestParts<'_>> {
 fn read_exact_timeout(
     stream: &mut TcpStream,
     buf: &mut [u8],
-    deadline: std::time::Instant,
+    absolute: std::time::Instant,
 ) -> std::io::Result<()> {
     let mut filled = 0;
+    // Body reads live in the body's own window: CONNECTION_TIMEOUT is the
+    // total-request bound, HEAD_GRACE what an arriving-then-silent peer may
+    // not exceed. The stricter of the two decides when to give up.
+    let mut silence_deadline = std::time::Instant::now()
+        + HEAD_GRACE.min(absolute.saturating_duration_since(std::time::Instant::now()));
     while filled < buf.len() {
         match stream.read(&mut buf[filled..]) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => filled += n,
+            Ok(n) => {
+                filled += n;
+                // Same silence rule as the head: dribbling bytes keep a peer's
+                // window alive, going quiet past HEAD_GRACE does not.
+                let left_total = absolute.saturating_duration_since(std::time::Instant::now());
+                silence_deadline = std::time::Instant::now() + HEAD_GRACE.min(left_total);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // Same deadline rule as the request head: a dribbling body is cut
-            // at CONNECTION_TIMEOUT total, not waited on forever (M-2). The
-            // caller reports it under its existing short-body refusal.
+            // A body that stops arriving is refused under the existing
+            // short-body sentence (M-2's other half: the deadline must fire on
+            // every platform's spelling of an expired read, not just the one).
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                let left = silence_deadline.saturating_duration_since(std::time::Instant::now());
                 if left.is_zero() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
