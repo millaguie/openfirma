@@ -57,7 +57,10 @@ impl Update {
     }
 
     pub fn push(&mut self, object: Object) {
-        self.size = self.size.max(object.r.num + 1);
+        // saturating rather than checked: /Size is written as a number and an
+        // object numbered u32::MAX simply leaves it at the top of the range.
+        // A wrapping add here would publish a /Size of 0.
+        self.size = self.size.max(object.r.num.saturating_add(1));
         self.objects.push(object);
     }
 

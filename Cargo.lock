@@ -520,6 +520,7 @@ dependencies = [
  "openfirma-pades",
  "openfirma-xades",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -542,6 +543,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]
@@ -563,8 +565,10 @@ dependencies = [
  "sha1",
  "sha2",
  "spki",
+ "subtle",
  "thiserror",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

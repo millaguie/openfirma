@@ -488,12 +488,28 @@ fn trailer_dict(data: &[u8], xref_at: usize) -> Result<Vec<u8>> {
                 .map_err(|_| Error::Pdf("subsection count is not a number".into()))?;
             let mut k = count_end;
             for _ in 0..count {
+                // the count is the file's claim, and the file may end first;
+                // without this an entry that reads no byte would spin the
+                // claimed number of times, which a hostile count makes
+                // unbounded
+                if k >= data.len() {
+                    return Err(Error::Pdf(format!(
+                        "the cross-reference table ends before the {count} entries its \
+                         subsection header claims"
+                    )));
+                }
+                let before = k;
                 k = skip_ws(data, k);
                 let a = token_end(data, k);
                 k = skip_ws(data, a);
                 let b = token_end(data, k);
                 k = skip_ws(data, b);
                 k = token_end(data, k); // n or f
+                if k == before {
+                    return Err(Error::Pdf(
+                        "malformed cross-reference table: an entry does not advance".into(),
+                    ));
+                }
             }
             j = k;
         }
@@ -585,6 +601,15 @@ fn read_xref_table(data: &[u8], i: usize) -> Result<(XrefEntries, Vec<u8>)> {
             .ok_or_else(|| Error::Pdf("subsection count is not a number".into()))?;
         let mut k = count_end;
         for n in 0..count {
+            // the entry count is the file's claim and the file may end first:
+            // an entry reads three tokens, and past the end all three are
+            // empty, which would spin the claimed number of times
+            if k >= data.len() {
+                return Err(Error::Pdf(format!(
+                    "the cross-reference table ends after {n} of the {count} entries its \
+                     subsection header claims"
+                )));
+            }
             k = skip_ws(data, k);
             let off_end = token_end(data, k);
             let gen_start = skip_ws(data, off_end);
@@ -593,9 +618,18 @@ fn read_xref_table(data: &[u8], i: usize) -> Result<(XrefEntries, Vec<u8>)> {
             let kind = at(data, type_start);
             let offset = parse_uint(&data[k..off_end]).unwrap_or(0) as usize;
             let generation = parse_uint(&data[gen_start..gen_end]).unwrap_or(0) as u16;
+            // the object number is the subsection start plus the entry index,
+            // and both come out of the file: a pair that does not fit in an
+            // object number is a broken table, not a wrapped one
+            let Some(num) = first.checked_add(n) else {
+                return Err(Error::Pdf(format!(
+                    "the cross-reference subsection starting at {first} runs past the \
+                     object number space at entry {n}"
+                )));
+            };
             // object 0 is always the head of the free list, never an object
-            if kind == b'n' && first + n > 0 {
-                entries.push((ObjRef::new(first + n, generation), Location::Direct(offset)));
+            if kind == b'n' && num > 0 {
+                entries.push((ObjRef::new(num, generation), Location::Direct(offset)));
             }
             k = type_start + 1;
         }
@@ -675,7 +709,11 @@ fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, Vec<u8>)
             };
             let (kind, second, third) = (field(0), field(1), field(2));
             pos += row;
-            let num = first + n;
+            let Some(num) = first.checked_add(n) else {
+                return Err(Error::Pdf(format!(
+                    "the /Index pair starting at {first} runs past the object number space"
+                )));
+            };
             if num == 0 {
                 continue; // the head of the free list
             }
@@ -749,7 +787,9 @@ pub fn object_body(data: &[u8], offset: usize) -> Result<Range<usize>> {
     if !data[i..].starts_with(b"obj") {
         return Err(Error::Pdf(format!(
             "expected 'obj' at offset {i}, found {:?}",
-            String::from_utf8_lossy(&data[i..i + 8])
+            // the preview is clamped: an object header that runs into the end
+            // of the file is exactly the case this error reports
+            String::from_utf8_lossy(&data[i..(i + 8).min(data.len())])
         )));
     }
     let body_start = skip_ws(data, i + 3);
@@ -783,7 +823,9 @@ pub fn stream_raw(data: &[u8], offset: usize) -> Result<Vec<u8>> {
 
     if let Some(n) = get(dict, "/Length").and_then(parse_uint) {
         let n = n as usize;
-        if i + n > data.len() {
+        // i is inside the file, checked on the way here, so the subtraction
+        // cannot wrap; the addition of a file-declared length could
+        if n > data.len() - i {
             return Err(Error::Pdf(format!(
                 "/Length {n} runs past the end of the file"
             )));
@@ -842,6 +884,15 @@ fn object_stream_contents(
             "/First points past the end of the object stream".into(),
         ));
     }
+    // /N is the file's claim, and every object needs at least two numbers in
+    // the header inside the first /First bytes, so a claim bigger than the
+    // stream is a lie: believed, it would allocate before reading anything
+    if count > decoded.len() {
+        return Err(Error::Pdf(format!(
+            "/N claims {count} objects but the decoded object stream is only {} bytes",
+            decoded.len()
+        )));
+    }
 
     // the header is 2N integers: object number, then offset relative to /First
     let mut header = Vec::with_capacity(count * 2);
@@ -867,11 +918,20 @@ fn object_stream_contents(
 
     let mut out = Vec::with_capacity(count);
     for n in 0..count {
-        let start = first + header[n * 2 + 1] as usize;
-        let end = if n + 1 < count {
-            first + header[n * 2 + 3] as usize
-        } else {
-            decoded.len()
+        // the header offsets are the file's claim: checked, because a sum
+        // that wraps would pass the range test below with a nonsense range
+        let (Some(start), Some(end)) = (
+            first.checked_add(header[n * 2 + 1] as usize),
+            if n + 1 < count {
+                first.checked_add(header[n * 2 + 3] as usize)
+            } else {
+                Some(decoded.len())
+            },
+        ) else {
+            return Err(Error::Pdf(format!(
+                "object number {} of the stream has an offset too large to represent",
+                header[n * 2]
+            )));
         };
         if start > end || end > decoded.len() {
             return Err(Error::Pdf(format!(
@@ -1036,6 +1096,67 @@ pub(crate) mod tests {
             get(&page, "/Annots").is_none(),
             "the unsigned fixture has none"
         );
+    }
+
+    #[test]
+    fn the_object_header_error_message_survives_the_end_of_the_file() {
+        // "obj" never arrives, and the eight byte preview of what did arrive
+        // used to slice past the end of the buffer inside the error message
+        let err = object_body(b"1 0 xy", 0).unwrap_err().to_string();
+        assert!(err.contains("expected 'obj'"), "{err}");
+        assert!(err.contains("found \"xy\""), "{err}");
+        // the same scan with nothing left at all
+        let err = object_body(b"1 0 ", 0).unwrap_err().to_string();
+        assert!(err.contains("expected 'obj'"), "{err}");
+    }
+
+    #[test]
+    fn an_object_stream_n_bigger_than_its_contents_is_refused() {
+        // /N sizes an allocation before a single header number is read, and a
+        // stream that claims more objects than it has bytes for is a lie:
+        // believed, a large enough claim allocates gigabytes from sixteen
+        // bytes of input. The refusal names the claim and the real size.
+        let packed = deflate(b"1 0 2 4 <</A 1>>");
+        let mut pdf = Vec::from(&b"%PDF-1.7\n"[..]);
+        let objstm_at = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "7 0 obj\n<< /Type /ObjStm /N 100 /First 8 /Length {} \
+                 /Filter /FlateDecode >>\nstream\n",
+                packed.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&packed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let mut locations = BTreeMap::new();
+        locations.insert(ObjRef::new(7, 0), Location::Direct(objstm_at));
+        locations.insert(
+            ObjRef::new(1, 0),
+            Location::InObjectStream {
+                stream: ObjRef::new(7, 0),
+                index: 0,
+            },
+        );
+        let err = resolve(&pdf, &locations, ObjRef::new(1, 0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/N claims 100 objects"), "{err}");
+        assert!(err.contains("only 16 bytes"), "{err}");
+    }
+
+    #[test]
+    fn next_object_number_survives_the_top_of_the_range() {
+        // /Size is the highest object number plus one; an object numbered
+        // u32::MAX used to wrap that sum to zero and publish a /Size no
+        // reader can use
+        let mut update = crate::update::Update::new(0, ObjRef::new(1, 0), None, 1);
+        update.push(crate::update::Object::new(
+            ObjRef::new(u32::MAX, 0),
+            b"<< >>".to_vec(),
+        ));
+        assert_eq!(update.next_object_number(), u32::MAX);
     }
 
     /// A document shaped the way iText writes one: the catalog and the page

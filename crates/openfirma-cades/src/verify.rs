@@ -717,7 +717,7 @@ fn ecdsa_digest(o: &ObjectIdentifier) -> Option<DigestAlg> {
     }
 }
 
-fn subject_key_identifier(cert: &CertificateHandle) -> Option<Vec<u8>> {
+pub(crate) fn subject_key_identifier(cert: &CertificateHandle) -> Option<Vec<u8>> {
     let extensions = cert.parsed().tbs_certificate().extensions()?;
     let ext = extensions
         .iter()

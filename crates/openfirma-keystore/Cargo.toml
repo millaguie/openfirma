@@ -23,6 +23,8 @@ cbc.workspace = true
 des.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

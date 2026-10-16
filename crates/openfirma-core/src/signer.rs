@@ -39,6 +39,17 @@ enum SoftwareKey {
     P256(p256::ecdsa::SigningKey),
 }
 
+/// A signer is the one object that must not leave the private key in freed
+/// memory for the next allocation to find. Both backends zeroize themselves
+/// on drop in their own crates (`ZeroizeOnDrop`), and this asserts the
+/// guarantee at compile time: an upgrade that ever swaps in a key type
+/// without it breaks the build instead of quietly dropping the zeroing.
+const _: fn() = || {
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<rsa::RsaPrivateKey>();
+    assert_zeroize_on_drop::<p256::ecdsa::SigningKey>();
+};
+
 enum KeyMaterial<'a> {
     Pem(&'a str),
     Der(&'a [u8]),

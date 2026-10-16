@@ -52,12 +52,45 @@ fn apply(name: &str, data: &[u8], parms: Option<&[u8]>) -> Result<Vec<u8>> {
     }
 }
 
+/// The most a single decoded stream may expand to.
+///
+/// The streams openfirma decodes carry document *structure*: a cross-reference
+/// table, an object stream. Kilobytes in every real document, even a huge one.
+/// A 40 KB compressed stream that unpacks to gigabytes is a decompression
+/// bomb, and reading it to the end before deciding is how a signing tool ends
+/// up an out of memory victim. The cap is generous enough that no legitimate
+/// document comes near it.
+pub(crate) const MAX_DECODED_STREAM: usize = 256 * 1024 * 1024;
+
+/// The most any one `/Colors`, `/BitsPerComponent` or `/Columns` predictor
+/// parameter may claim. These numbers multiply into an allocation, so they are
+/// bounded before anything is computed from them; 65536 columns of 65536
+/// colours is already a nonsense image, let alone a PDF structure stream.
+const MAX_PREDICTOR_PARM: i64 = 65_536;
+
 /// PDF's `FlateDecode` is zlib format, RFC 1950, not raw deflate.
 fn inflate(data: &[u8]) -> Result<Vec<u8>> {
+    inflate_capped(data, MAX_DECODED_STREAM)
+}
+
+/// Inflate with an explicit ceiling, so the refusal can be tested without
+/// materializing a real 256 MiB stream.
+fn inflate_capped(data: &[u8], cap: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
+    // one byte over the cap is read so "exactly at the cap" still succeeds and
+    // anything past it is provably past it, without draining a gigabyte bomb
     flate2::read::ZlibDecoder::new(data)
+        .take(cap as u64 + 1)
         .read_to_end(&mut out)
         .map_err(|e| Error::Pdf(format!("FlateDecode failed: {e}")))?;
+    if out.len() > cap {
+        return Err(Error::Pdf(format!(
+            "FlateDecode expands to more than {} bytes, the most openfirma decodes from \
+             one stream: a structural stream this large is a decompression bomb, not a \
+             document",
+            cap
+        )));
+    }
     Ok(out)
 }
 
@@ -133,23 +166,37 @@ fn int_parm(parms: Option<&[u8]>, key: &str) -> Option<i64> {
 /// Predictors 10 to 15 are the PNG filters, where every row carries a tag byte
 /// saying which filter that row uses, so a single stream can mix them.
 fn apply_predictor(data: &[u8], parms: Option<&[u8]>) -> Result<Vec<u8>> {
-    let predictor = int_parm(parms, "/Predictor").unwrap_or(1);
+    let predictor = bounded_parm(parms, "/Predictor", 1)?;
     match predictor {
         1 => Ok(data.to_vec()),
         2 => {
-            let colors = int_parm(parms, "/Colors").unwrap_or(1) as usize;
-            let bpc = int_parm(parms, "/BitsPerComponent").unwrap_or(8) as usize;
-            let columns = int_parm(parms, "/Columns").unwrap_or(1) as usize;
+            let colors = bounded_parm(parms, "/Colors", 1)?;
+            let bpc = bounded_parm(parms, "/BitsPerComponent", 8)?;
+            let columns = bounded_parm(parms, "/Columns", 1)?;
             tiff_predictor(data, colors, bpc, columns)
         }
         10..=15 => {
-            let colors = int_parm(parms, "/Colors").unwrap_or(1) as usize;
-            let bpc = int_parm(parms, "/BitsPerComponent").unwrap_or(8) as usize;
-            let columns = int_parm(parms, "/Columns").unwrap_or(1) as usize;
+            let colors = bounded_parm(parms, "/Colors", 1)?;
+            let bpc = bounded_parm(parms, "/BitsPerComponent", 8)?;
+            let columns = bounded_parm(parms, "/Columns", 1)?;
             png_predictor(data, colors, bpc, columns)
         }
         other => Err(Error::Pdf(format!("unknown predictor {other}"))),
     }
+}
+
+/// A `/DecodeParms` integer, bounded before it becomes a `usize`: the value is
+/// the document's claim, it is signed in the file, and an `as usize` of a
+/// negative or an absurd one turns into an allocation.
+fn bounded_parm(parms: Option<&[u8]>, key: &str, default: i64) -> Result<usize> {
+    let value = int_parm(parms, key).unwrap_or(default);
+    if !(1..=MAX_PREDICTOR_PARM).contains(&value) {
+        return Err(Error::Pdf(format!(
+            "{key} is {value}, outside the 1..={MAX_PREDICTOR_PARM} openfirma accepts: \
+             the predictor parameters size an allocation and are not trusted as written"
+        )));
+    }
+    Ok(value as usize)
 }
 
 fn tiff_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Result<Vec<u8>> {
@@ -163,7 +210,13 @@ fn tiff_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Res
             "the TIFF predictor needs non-zero /Colors and /Columns".into(),
         ));
     }
-    let row_bytes = colors * columns;
+    // both parameters are bounded by MAX_PREDICTOR_PARM, so this cannot
+    // actually fail; checked because the numbers came out of a file
+    let Some(row_bytes) = colors.checked_mul(columns) else {
+        return Err(Error::Pdf(
+            "the TIFF predictor's /Colors and /Columns multiply past any row size".into(),
+        ));
+    };
     let mut out = data.to_vec();
     for row in out.chunks_mut(row_bytes) {
         for i in colors..row.len() {
@@ -179,11 +232,31 @@ fn png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Resu
             "a PNG predictor needs non-zero /Colors, /BitsPerComponent and /Columns".into(),
         ));
     }
-    let row_bytes = (colors * bpc * columns).div_ceil(8);
+    // every factor is the file's claim, bounded by MAX_PREDICTOR_PARM and
+    // multiplied with checks: the product sizes the allocation below
+    let sample_bits = colors
+        .checked_mul(bpc)
+        .and_then(|x| x.checked_mul(columns))
+        .ok_or_else(|| {
+            Error::Pdf(
+                "the PNG predictor's /Colors, /BitsPerComponent and /Columns multiply past \
+                 any row size"
+                    .into(),
+            )
+        })?;
+    let row_bytes = sample_bits.div_ceil(8);
     // a "pixel" for the Sub and Paeth filters is one sample position, and it
     // cannot be narrower than a byte
-    let bpp = ((colors * bpc).div_ceil(8)).max(1);
-    let stride = row_bytes + 1;
+    let bpp = colors
+        .checked_mul(bpc)
+        .map(|x| x.div_ceil(8))
+        .unwrap_or(1)
+        .max(1);
+    let Some(stride) = row_bytes.checked_add(1) else {
+        return Err(Error::Pdf(
+            "the PNG predictor's row size does not fit in an offset".into(),
+        ));
+    };
     let rows = data.len() / stride;
     if rows == 0 {
         return Err(Error::Pdf(format!(
@@ -192,7 +265,15 @@ fn png_predictor(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Resu
         )));
     }
 
-    let mut out = vec![0u8; rows * row_bytes];
+    // rows * row_bytes is at most data.len(): every output row is paid for by
+    // a stride byte input row, so the allocation stays inside the (capped)
+    // decoded stream
+    let Some(total) = rows.checked_mul(row_bytes) else {
+        return Err(Error::Pdf(
+            "the PNG predictor's output does not fit in an allocation".into(),
+        ));
+    };
+    let mut out = vec![0u8; total];
     let mut prev = vec![0u8; row_bytes];
     for r in 0..rows {
         let row = &data[r * stride..(r + 1) * stride];
@@ -287,7 +368,9 @@ fn ascii85(data: &[u8]) -> Result<Vec<u8>> {
                 "ASCII85Decode found byte {b} outside the 33..117 range"
             )));
         }
-        group = group * 85 + u32::from(b - 33);
+        // checked: five 'u' characters (84) accumulate to 85^5 - 1, which is
+        // one past the largest value a group can hold, 0xffffffff ("s8W-!")
+        group = accumulate85(group, u32::from(b - 33))?;
         count += 1;
         if count == 5 {
             out.extend_from_slice(&group.to_be_bytes());
@@ -298,11 +381,26 @@ fn ascii85(data: &[u8]) -> Result<Vec<u8>> {
     if count > 0 {
         // a partial group is padded with 'u' (84) and the extra bytes dropped
         for _ in count..5 {
-            group = group * 85 + 84;
+            group = accumulate85(group, 84)?;
         }
         out.extend_from_slice(&group.to_be_bytes()[..count - 1]);
     }
     Ok(out)
+}
+
+/// One base 85 digit of an ASCII85 group, with the overflow the format itself
+/// forbids reported instead of wrapped around.
+fn accumulate85(group: u32, digit: u32) -> Result<u32> {
+    group
+        .checked_mul(85)
+        .and_then(|g| g.checked_add(digit))
+        .ok_or_else(|| {
+            Error::Pdf(
+                "ASCII85Decode: a group of five characters exceeds 32 bits; the largest \
+                 legal group is s8W-! (0xffffffff), so the stream is corrupt or hostile"
+                    .into(),
+            )
+        })
 }
 
 fn run_length(data: &[u8]) -> Result<Vec<u8>> {
@@ -469,6 +567,49 @@ mod tests {
             decode(b"<< /Filter /ASCII85Decode >>", b"9jqo^~>").unwrap(),
             b"Man "
         );
+    }
+
+    /// The largest group the format defines, s8W-! = 0xffffffff, decodes, and
+    /// one step past it is a typed error instead of a debug panic or, worse,
+    /// a silent wrap that invents four bytes of stream.
+    #[test]
+    fn ascii85_accepts_the_largest_legal_group_and_refuses_the_next() {
+        let dict = b"<< /Filter /ASCII85Decode >>";
+        assert_eq!(decode(dict, b"s8W-!~>").unwrap(), [0xff, 0xff, 0xff, 0xff]);
+        let err = decode(dict, b"uuuuu~>").unwrap_err().to_string();
+        assert!(err.contains("exceeds 32 bits"), "{err}");
+        // a partial group is padded with 'u', and "uuuu" padded reaches past
+        // 32 bits exactly like the full group does
+        let err = decode(dict, b"uuuu~>").unwrap_err().to_string();
+        assert!(err.contains("exceeds 32 bits"), "{err}");
+    }
+
+    #[test]
+    fn inflate_stops_at_the_cap_and_names_it() {
+        // 4 KiB of zeros compresses to nothing; the cap under test is small
+        // so the refusal is exercised without materializing a real bomb
+        let bomb = deflate(&vec![0u8; 4096]);
+        assert_eq!(inflate_capped(&bomb, 4096).unwrap().len(), 4096);
+        let err = inflate_capped(&bomb, 1024).unwrap_err().to_string();
+        assert!(err.contains("1024 bytes"), "{err}");
+        assert!(err.contains("decompression bomb"), "{err}");
+    }
+
+    /// The predictor parameters come out of the file and size an allocation,
+    /// so they are bounded before anything is computed from them. A negative
+    /// /Columns used to become a near-usize::MAX row width through an
+    /// `as usize`, and an absurd one an allocation attempt of the same size.
+    #[test]
+    fn predictor_parameters_outside_the_bounds_are_refused() {
+        let data = deflate(&[0u8; 64]);
+        for dict in [
+            b"<< /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns -1 >> >>".as_slice(),
+            b"<< /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 99999999 >> >>",
+            b"<< /Filter /FlateDecode /DecodeParms << /Predictor 2 /Colors -3 /Columns 4 >> >>",
+        ] {
+            let err = decode(dict, &data).unwrap_err().to_string();
+            assert!(err.contains("65536"), "the cap must be named: {err}");
+        }
     }
 
     #[test]

@@ -23,6 +23,7 @@ rand_core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

@@ -19,14 +19,21 @@
 //!   `friendlyName` / `localKeyID` attributes that tie a key to its chain.
 //!
 //! What it refuses, loudly: RC2 and RC4 PBE, which only files from two decades
-//! ago use, and indefinite lengths, which DER forbids anyway. The message says
-//! how to re-export the file with a modern openssl.
+//! ago use; indefinite lengths, which DER forbids anyway; and key derivation
+//! counts above ten million iterations, which no legitimate writer produces
+//! and which are a denial of service the moment they are believed. Every
+//! refusal message says how to re-export the file with a modern openssl.
+//!
+//! What it does not leave behind: the MAC comparison is constant time, and
+//! every decrypted buffer that could hold key material is zeroized on drop.
 
 use const_oid::ObjectIdentifier;
 use digest::{Digest, KeyInit, Mac};
 use hmac::Hmac;
 use openfirma_core::cert::CertificateHandle;
 use openfirma_core::{Error, Result};
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 const OID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
 const OID_ENCRYPTED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.6");
@@ -59,8 +66,10 @@ const OID_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.10
 const OID_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
 
 /// A key bag as it is found: `localKeyID`, `friendlyName`, and the decrypted
-/// PKCS#8 private key.
-type FoundKey = (Option<Vec<u8>>, Option<String>, Vec<u8>);
+/// PKCS#8 private key. The key is zeroized when this tuple drops, which is why
+/// it travels in a [`Zeroizing`] until it is copied into an [`Entry`], whose
+/// own `Drop` takes over from there.
+type FoundKey = (Option<Vec<u8>>, Option<String>, Zeroizing<Vec<u8>>);
 
 /// One private key and the certificates that travel with it.
 #[derive(Clone, Debug)]
@@ -73,6 +82,15 @@ pub struct Entry {
     pub key_pkcs8: Vec<u8>,
     /// Certificates, leaf first, then the chain up to whatever the file held.
     pub chain: Vec<Vec<u8>>,
+}
+
+impl Drop for Entry {
+    /// The decrypted private key is the one buffer in this crate that outlives
+    /// the load call, so it is the one that has to be zeroed on the way out
+    /// instead of left to the allocator's mercy.
+    fn drop(&mut self) {
+        self.key_pkcs8.zeroize();
+    }
 }
 
 /// Everything a PKCS#12 file held.
@@ -248,6 +266,28 @@ struct MacData {
     iterations: usize,
 }
 
+/// The most key derivation iterations openfirma will run from a file's claim.
+///
+/// Real files ask for 2048 (openssl's default), 10 000 or 100 000 (Java's);
+/// a paranoid re-export reaches a few million. Ten million is seconds of work
+/// and covers everything legitimate, and it is what stops a 4 KB file that
+/// claims a billion iterations from being an hour long denial of service.
+const MAX_ITERATIONS: usize = 10_000_000;
+
+/// Checks an iteration count the file declares, naming both the cause and the
+/// way out, which is always a re-export through a tool that uses sane counts.
+fn check_iterations(iterations: usize, what: &str) -> Result<()> {
+    if iterations > MAX_ITERATIONS {
+        return Err(Error::Keystore(format!(
+            "the PKCS#12 asks for {iterations} {what} iterations, more than the \
+             {MAX_ITERATIONS} openfirma accepts: the file is hostile or so old that \
+             nothing wrote it that a current tool reads. Re-export it with \
+             `openssl pkcs12 -in old.p12 -out new.p12`, which uses a sane count"
+        )));
+    }
+    Ok(())
+}
+
 pub fn load(bytes: &[u8], password: &str) -> Result<Pkcs12> {
     let mut outer = Cur::new(bytes).sequence()?;
     let version = outer.number()?;
@@ -265,10 +305,10 @@ pub fn load(bytes: &[u8], password: &str) -> Result<Pkcs12> {
             "the authenticated safe is not a plain data ContentInfo".into(),
         ));
     }
-    let auth_safe_bytes = {
+    let auth_safe_bytes = Zeroizing::new({
         let mut wrapped = Cur::new(auth_safe.explicit(0)?);
         wrapped.octets()?.to_vec()
-    };
+    });
 
     if !outer.is_done() {
         let mac = read_mac(&mut outer)?;
@@ -283,8 +323,10 @@ pub fn load(bytes: &[u8], password: &str) -> Result<Pkcs12> {
         let mut ci = safe.sequence()?;
         let content_type = ci.oid()?;
         let content = ci.explicit(0)?;
-        let safe_contents = if content_type == OID_DATA {
-            Cur::new(content).octets()?.to_vec()
+        // decrypted or not, a SafeContents can hold plain key bags, so it is
+        // zeroized like the key material it may contain
+        let safe_contents: Zeroizing<Vec<u8>> = if content_type == OID_DATA {
+            Zeroizing::new(Cur::new(content).octets()?.to_vec())
         } else if content_type == OID_ENCRYPTED_DATA {
             decrypt_content_info(content, password)?
         } else {
@@ -312,6 +354,7 @@ fn read_mac(cur: &mut Cur) -> Result<MacData> {
     let salt = mac.octets()?.to_vec();
     // iterations defaults to 1 when absent, per the specification
     let iterations = if mac.is_done() { 1 } else { mac.number()? };
+    check_iterations(iterations, "MAC")?;
     Ok(MacData {
         digest_oid,
         digest,
@@ -340,7 +383,11 @@ fn verify_mac(mac: &MacData, auth_safe: &[u8], password: &str) -> Result<()> {
             let mut m = <Hmac<$d> as KeyInit>::new_from_slice(&key)
                 .map_err(|e| Error::Keystore(format!("cannot build the MAC key: {e}")))?;
             m.update(auth_safe);
-            m.finalize().into_bytes().as_slice() == mac.digest.as_slice()
+            // constant time: the MAC is compared before the password is known
+            // to be right, so an early exit here would leak it digest byte by
+            // digest byte to anyone who can hand us files and watch the time
+            let computed = m.finalize().into_bytes();
+            bool::from(mac.digest.as_slice().ct_eq(computed.as_slice()))
         }};
     }
     let ok = match mac.digest_oid {
@@ -364,7 +411,7 @@ fn verify_mac(mac: &MacData, auth_safe: &[u8], password: &str) -> Result<()> {
     Ok(())
 }
 
-fn decrypt_content_info(content: &[u8], password: &str) -> Result<Vec<u8>> {
+fn decrypt_content_info(content: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>> {
     let mut ed = Cur::new(content).sequence()?;
     let _version = ed.number()?;
     let mut eci = ed.sequence()?;
@@ -415,7 +462,7 @@ fn read_bag(
             keys.push((local_key_id, alias, pkcs8));
         }
         OID_KEY_BAG => {
-            keys.push((local_key_id, alias, value.to_vec()));
+            keys.push((local_key_id, alias, Zeroizing::new(value.to_vec())));
         }
         OID_SAFE_CONTENTS_BAG => {
             let mut inner = Cur::new(value).sequence()?;
@@ -438,7 +485,7 @@ fn read_attributes(cur: &mut Cur) -> Result<(Option<String>, Option<Vec<u8>>)> {
         let id = attr.oid()?;
         let mut values = Cur::new(attr.expect(0x31)?);
         match id {
-            OID_FRIENDLY_NAME => alias = Some(bmp_string(values.expect(0x1e)?)),
+            OID_FRIENDLY_NAME => alias = Some(bmp_string(values.expect(0x1e)?)?),
             OID_LOCAL_KEY_ID => local_key_id = Some(values.octets()?.to_vec()),
             _ => {}
         }
@@ -447,27 +494,46 @@ fn read_attributes(cur: &mut Cur) -> Result<(Option<String>, Option<Vec<u8>>)> {
 }
 
 /// A BMPString is UTF-16BE, which is also how PKCS#12 encodes the password.
-fn bmp_string(bytes: &[u8]) -> String {
+///
+/// Decoded strictly: the lossy variant turns an unpaired surrogate into a
+/// replacement character, and an alias that silently differs from the one the
+/// file carries makes `--alias` fail with "no entry named" for an entry that
+/// is plainly there.
+fn bmp_string(bytes: &[u8]) -> Result<String> {
+    if bytes.len() % 2 != 0 {
+        return Err(Error::Keystore(format!(
+            "a BMPString with an odd number of bytes ({}) cannot be UTF-16",
+            bytes.len()
+        )));
+    }
     let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|c| u16::from_be_bytes([c[0], c[1]]))
         .collect();
-    String::from_utf16_lossy(&units)
+    String::from_utf16(&units).map_err(|_| {
+        Error::Keystore(
+            "the PKCS#12 carries a BMPString that is not valid UTF-16 (an unpaired \
+             surrogate): the alias, or the password on the tool that wrote the file, \
+             contains non-ASCII characters this reader cannot represent. Re-export the \
+             container with an ASCII alias: `openssl pkcs12 -in old.p12 -out new.p12`"
+                .into(),
+        )
+    })
 }
 
 /// The password as PKCS#12 wants it: UTF-16BE with a two byte zero terminator.
 /// An empty password is encoded as no bytes at all, which is what openssl and
 /// Java both expect.
-fn bmp_password(password: &str) -> Vec<u8> {
+fn bmp_password(password: &str) -> Zeroizing<Vec<u8>> {
     if password.is_empty() {
-        return Vec::new();
+        return Zeroizing::new(Vec::new());
     }
     let mut out = Vec::with_capacity(password.len() * 2 + 2);
     for unit in password.encode_utf16() {
         out.extend_from_slice(&unit.to_be_bytes());
     }
     out.extend_from_slice(&[0, 0]);
-    out
+    Zeroizing::new(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -487,7 +553,7 @@ fn pkcs12_kdf<D: Digest>(
     iterations: usize,
     out_len: usize,
     block_size: usize,
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     let v = block_size;
     let u = <D as Digest>::output_size();
     let d = vec![id; v];
@@ -498,10 +564,12 @@ fn pkcs12_kdf<D: Digest>(
         let n = v * src.len().div_ceil(v);
         (0..n).map(|i| src[i % src.len()]).collect()
     };
-    let mut i = repeat(salt);
+    // the folded I block holds the repeated password, so it is key material
+    // like the output and gets zeroed the same way
+    let mut i = Zeroizing::new(repeat(salt));
     i.extend_from_slice(&repeat(password));
 
-    let mut out = Vec::with_capacity(out_len + u);
+    let mut out = Zeroizing::new(Vec::with_capacity(out_len + u));
     for round in 0..out_len.div_ceil(u) {
         let mut h = D::new();
         h.update(&d);
@@ -515,7 +583,7 @@ fn pkcs12_kdf<D: Digest>(
         if round + 1 < out_len.div_ceil(u) {
             // fold A back into I: every v byte block of I becomes I + B + 1,
             // B being A repeated to v bytes, as a big endian addition
-            let b: Vec<u8> = (0..v).map(|j| a[j % u]).collect();
+            let mut b: Vec<u8> = (0..v).map(|j| a[j % u]).collect();
             for block in i.chunks_mut(v) {
                 let mut carry = 1u16;
                 for j in (0..v).rev() {
@@ -524,6 +592,7 @@ fn pkcs12_kdf<D: Digest>(
                     carry = sum >> 8;
                 }
             }
+            b.zeroize();
         }
         out.extend_from_slice(&a);
     }
@@ -549,13 +618,14 @@ fn decrypt_pbe(
     params: Vec<u8>,
     encrypted: &[u8],
     password: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
     match alg {
         OID_PBES2 => decrypt_pbes2(&params, encrypted, password),
         OID_PBE_SHA1_3DES => {
             let mut p = Cur::new(&params);
             let salt = p.octets()?.to_vec();
             let iterations = p.number()?;
+            check_iterations(iterations, "key derivation")?;
             let pw = bmp_password(password);
             let key = pkcs12_kdf::<sha1::Sha1>(1, &pw, &salt, iterations, 24, 64);
             let iv = pkcs12_kdf::<sha1::Sha1>(2, &pw, &salt, iterations, 8, 64);
@@ -574,8 +644,10 @@ fn decrypt_pbe(
 }
 
 /// PBKDF2 counts rounds in a u32. A file claiming more is not a file, it is a
-/// denial of service.
+/// denial of service, and so is one claiming millions of millions within what
+/// the format can express: both stop at [`MAX_ITERATIONS`].
 fn rounds(iterations: usize) -> Result<u32> {
+    check_iterations(iterations, "PBKDF2")?;
     u32::try_from(iterations).map_err(|_| {
         Error::Keystore(format!(
             "{iterations} PBKDF2 rounds is beyond what the format can express"
@@ -583,7 +655,7 @@ fn rounds(iterations: usize) -> Result<u32> {
     })
 }
 
-fn decrypt_pbes2(params: &[u8], encrypted: &[u8], password: &str) -> Result<Vec<u8>> {
+fn decrypt_pbes2(params: &[u8], encrypted: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>> {
     let mut p = Cur::new(params);
     let mut kdf_ai = p.sequence()?;
     let kdf_oid = kdf_ai.oid()?;
@@ -620,7 +692,7 @@ fn decrypt_pbes2(params: &[u8], encrypted: &[u8], password: &str) -> Result<Vec<
         }
     };
 
-    let mut key = vec![0u8; key_len];
+    let mut key = Zeroizing::new(vec![0u8; key_len]);
     match prf {
         OID_HMAC_SHA1 => pbkdf2::pbkdf2_hmac::<sha1::Sha1>(
             password.as_bytes(),
@@ -661,20 +733,24 @@ fn decrypt_pbes2(params: &[u8], encrypted: &[u8], password: &str) -> Result<Vec<
     }
 }
 
-fn cbc_decrypt<C>(key: &[u8], iv: &[u8], encrypted: &[u8]) -> Result<Vec<u8>>
+fn cbc_decrypt<C>(key: &[u8], iv: &[u8], encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>>
 where
     C: cbc::cipher::BlockCipherDecrypt + cbc::cipher::KeyInit,
 {
     use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
     let dec = <cbc::Decryptor<C> as KeyIvInit>::new_from_slices(key, iv)
         .map_err(|e| Error::Keystore(format!("bad key or IV length: {e}")))?;
-    dec.decrypt_padded_vec::<Pkcs7>(encrypted).map_err(|_| {
-        Error::Keystore(
-            "the decrypted block does not carry valid padding; wrong password or a \
-             truncated file"
-                .into(),
-        )
-    })
+    // the plaintext of a safe contents bag or a key bag is key material until
+    // the caller has looked at it, so it travels zeroized
+    dec.decrypt_padded_vec::<Pkcs7>(encrypted)
+        .map(Zeroizing::new)
+        .map_err(|_| {
+            Error::Keystore(
+                "the decrypted block does not carry valid padding; wrong password or a \
+                 truncated file"
+                    .into(),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -710,7 +786,9 @@ fn assemble(keys: Vec<FoundKey>, certs: Vec<(Option<Vec<u8>>, Vec<u8>)>) -> Resu
         entries.push(Entry {
             alias,
             local_key_id: key_id,
-            key_pkcs8,
+            // the copy is what the Entry's Drop zeroizes; the Zeroizing
+            // original goes out of scope here and zeroes itself
+            key_pkcs8: key_pkcs8.to_vec(),
             chain,
         });
     }
@@ -793,4 +871,97 @@ fn pkcs8_public_key(key_pkcs8: &[u8]) -> Result<Vec<u8>> {
     let mut content = tlv::tlv(alg_tag, alg_value);
     content.extend_from_slice(&tlv::tlv(bit_tag, bit_value));
     Ok(tlv::tlv(tlv::TAG_SEQUENCE, &content))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openfirma_core::tlv;
+
+    /// A DER INTEGER in minimal form, for the iteration counts below.
+    fn der_integer(v: usize) -> Vec<u8> {
+        let be = v.to_be_bytes();
+        let start = be.iter().position(|b| *b != 0).unwrap_or(be.len() - 1);
+        let mut content = be[start..].to_vec();
+        if content[0] & 0x80 != 0 {
+            content.insert(0, 0);
+        }
+        tlv::tlv(tlv::TAG_INTEGER, &content)
+    }
+
+    /// The smallest shape that is still a PFX: version 3, an empty plain
+    /// authenticated safe, and a MAC whose iteration count is the point of
+    /// the test. No certificate material anywhere, so it can live here.
+    fn pfx_with_mac_iterations(iterations: usize) -> Vec<u8> {
+        let digest_info = tlv::sequence(&[
+            tlv::sequence(&[tlv::oid(&OID_SHA1).unwrap(), tlv::null()]),
+            tlv::octet_string(&[0u8; 20]).unwrap(),
+        ]);
+        let mac_data = tlv::sequence(&[
+            digest_info,
+            tlv::octet_string(b"saltsalt").unwrap(),
+            der_integer(iterations),
+        ]);
+        let safe_contents = tlv::sequence(&[]);
+        let auth_safe = tlv::sequence(&[
+            tlv::oid(&OID_DATA).unwrap(),
+            tlv::explicit(0, &tlv::octet_string(&safe_contents).unwrap()),
+        ]);
+        tlv::sequence(&[tlv::integer_small(3), auth_safe, mac_data])
+    }
+
+    /// The MAC runs before anything is decrypted, so its iteration count is
+    /// the first denial of service a hostile file can ask for. Ten million is
+    /// the ceiling; past it the error names the cause and the re-export.
+    #[test]
+    fn mac_iterations_above_the_cap_are_refused_with_a_way_out() {
+        let pfx = pfx_with_mac_iterations(MAX_ITERATIONS + 1);
+        let err = load(&pfx, "whatever").unwrap_err().to_string();
+        assert!(err.contains("10000001 MAC iterations"), "{err}");
+        assert!(err.contains("hostile"), "{err}");
+        assert!(err.contains("openssl pkcs12"), "{err}");
+    }
+
+    #[test]
+    fn mac_iterations_at_the_cap_reach_the_mac_itself() {
+        // the digest is zeros, so the container is still refused — but as a
+        // failed integrity check, which is the stage the cap must not preempt
+        let pfx = pfx_with_mac_iterations(MAX_ITERATIONS);
+        let err = load(&pfx, "whatever").unwrap_err().to_string();
+        assert!(err.contains("integrity check failed"), "{err}");
+    }
+
+    #[test]
+    fn pbkdf2_rounds_are_capped_too() {
+        assert_eq!(rounds(2048).unwrap(), 2048);
+        assert_eq!(rounds(MAX_ITERATIONS).unwrap(), MAX_ITERATIONS as u32);
+        let err = rounds(MAX_ITERATIONS + 1).unwrap_err().to_string();
+        assert!(err.contains("PBKDF2"), "{err}");
+        assert!(err.contains("openssl pkcs12"), "{err}");
+    }
+
+    /// The lossy UTF-16 decode used to invent a replacement character for an
+    /// unpaired surrogate, so an alias could silently stop matching what the
+    /// user types into --alias. A strict decode says what is wrong instead,
+    /// including the possibility that the password is what will not decode.
+    #[test]
+    fn bmp_string_is_decoded_strictly() {
+        assert_eq!(bmp_string(b"\x00A\x00n\x00a").unwrap(), "Ana");
+        // an unpaired high surrogate
+        let err = bmp_string(&[0xD8, 0x00]).unwrap_err().to_string();
+        assert!(err.contains("not valid UTF-16"), "{err}");
+        assert!(err.contains("non-ASCII"), "{err}");
+        // an odd number of bytes cannot be UTF-16 at all
+        let err = bmp_string(b"\x00A\x00").unwrap_err().to_string();
+        assert!(err.contains("odd number of bytes"), "{err}");
+    }
+
+    #[test]
+    fn the_password_encoding_round_trips() {
+        // PKCS#12 wants UTF-16BE with a two byte terminator, and nothing for
+        // an empty password, which is what openssl and Java both expect
+        assert!(bmp_password("").is_empty());
+        assert_eq!(&*bmp_password("a"), b"\x00a\x00\x00");
+        assert_eq!(&*bmp_password("\u{e9}"), b"\x00\xe9\x00\x00");
+    }
 }

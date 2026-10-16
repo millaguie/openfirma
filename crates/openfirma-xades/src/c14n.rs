@@ -213,6 +213,11 @@ fn element(
     opts: &Options,
     out: &mut Vec<u8>,
 ) {
+    // Recurses one stack frame per nesting level, and so does the drop of the
+    // tree afterwards. That is safe without a cap of its own because every
+    // tree that reaches this module came out of xml::parse, which refuses
+    // documents nested deeper than xml::MAX_DEPTH; a tree deeper than the
+    // canonicalizer's stack therefore cannot exist.
     let axis = extend_axis(parent_axis, el);
     out.push(b'<');
     write_qname(&el.name, out);

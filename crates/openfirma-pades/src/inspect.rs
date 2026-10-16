@@ -85,6 +85,10 @@ fn byte_range_of(dict: &[u8], object: ObjRef) -> Result<[usize; 4]> {
 /// of the file: a signature added by an incremental update covers the
 /// document as it was when it was made, and later revisions are appended
 /// after it. Only the newest one reaches the end of the file.
+///
+/// Every number here comes out of the document, so every offset is clamped or
+/// checked instead of sliced with: a `/ByteRange` that names bytes the file
+/// does not have is a problem to report, not a panic.
 fn range_problems(pdf: &[u8], byte_range: [usize; 4]) -> Vec<String> {
     let [a, b, c, d] = byte_range;
     let mut problems = Vec::new();
@@ -92,33 +96,51 @@ fn range_problems(pdf: &[u8], byte_range: [usize; 4]) -> Vec<String> {
         problems.push(format!("the first range starts at {a}, not at 0"));
     }
     let ends = revision_ends(pdf);
-    if !ends.contains(&(c + d)) {
-        problems.push(format!(
-            "the ranges end at {}, which is not the end of any of the {} revisions",
-            c + d,
+    match c.checked_add(d) {
+        Some(end) if ends.contains(&end) => {}
+        Some(end) => problems.push(format!(
+            "the ranges end at {end}, which is not the end of any of the {} revisions",
             ends.len()
-        ));
+        )),
+        None => problems.push(format!(
+            "the second range is {c} + {d}, which overflows any file offset"
+        )),
     }
     if b >= c {
         problems.push("the two ranges overlap or are in the wrong order".into());
     }
-    let gap = &pdf[b..c.min(pdf.len())];
+    let gap = gap_slice(pdf, b, c);
     if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
         problems.push("the gap between the ranges is not exactly the /Contents string".into());
     }
     problems
 }
 
+/// The bytes between the two ranges, the `/Contents` string, clamped into the
+/// file. A `/ByteRange` whose numbers do not describe a slice of this file
+/// yields an empty gap, which every caller already reports as a problem.
+fn gap_slice(pdf: &[u8], b: usize, c: usize) -> &[u8] {
+    let end = c.min(pdf.len());
+    if b <= end { &pdf[b..end] } else { &[] }
+}
+
 /// The bytes a `/ByteRange` covers, tolerating ranges that run past the end
 /// of the file so a damaged document stays reportable.
 fn covered_bytes(pdf: &[u8], byte_range: [usize; 4]) -> Vec<u8> {
     let [a, b, c, d] = byte_range;
-    let mut covered = Vec::with_capacity(b.min(pdf.len()) + d);
-    if a + b.min(pdf.len()) <= pdf.len() {
-        covered.extend_from_slice(&pdf[a..a + b.min(pdf.len())]);
+    let mut covered = Vec::with_capacity(b.min(pdf.len()).saturating_add(d.min(pdf.len())));
+    // both ends are checked: a range may start past the file, end past it, or
+    // name a sum that does not fit in an offset at all, and the digest of the
+    // part that does exist still has to be computable for the report
+    if let Some(end) = a.checked_add(b.min(pdf.len())) {
+        if end <= pdf.len() {
+            covered.extend_from_slice(&pdf[a..end]);
+        }
     }
-    if c + d <= pdf.len() {
-        covered.extend_from_slice(&pdf[c..c + d]);
+    if let Some(end) = c.checked_add(d) {
+        if end <= pdf.len() {
+            covered.extend_from_slice(&pdf[c..end]);
+        }
     }
     covered
 }
@@ -128,7 +150,7 @@ fn read_signature(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<Signature> 
     let [b, c] = [byte_range[1], byte_range[2]];
     let mut problems = range_problems(pdf, byte_range);
 
-    let gap = &pdf[b..c.min(pdf.len())];
+    let gap = gap_slice(pdf, b, c);
     let cms = if gap.first() == Some(&b'<') && gap.last() == Some(&b'>') {
         contents_der(gap, &mut problems)
     } else {
@@ -213,7 +235,7 @@ fn read_document_timestamp(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<Do
     let mut problems = range_problems(pdf, byte_range);
     let mut digest = None;
 
-    let gap = &pdf[b..c.min(pdf.len())];
+    let gap = gap_slice(pdf, b, c);
     let token = if gap.first() == Some(&b'<') && gap.last() == Some(&b'>') {
         contents_der(gap, &mut problems)
     } else {
@@ -296,11 +318,36 @@ fn contents_der(gap: &[u8], problems: &mut Vec<String>) -> Vec<u8> {
     let total = if raw[1] & 0x80 == 0 {
         2 + n
     } else {
+        // the long form length octets have to actually be inside the value:
+        // both the count and the number they encode come out of the document
+        let Some(len_end) = 2usize.checked_add(n).filter(|e| *e <= raw.len()) else {
+            problems.push(format!(
+                "/Contents declares a {n} octet DER length but only holds {} bytes",
+                raw.len().saturating_sub(2)
+            ));
+            return Vec::new();
+        };
         let mut v = 0usize;
-        for b in &raw[2..2 + n] {
-            v = (v << 8) | *b as usize;
+        for b in &raw[2..len_end] {
+            let Some(next) = v.checked_shl(8).and_then(|x| x.checked_add(*b as usize)) else {
+                problems.push(format!(
+                    "/Contents declares a DER length too large to be a file offset \
+                     ({} length octets)",
+                    len_end - 2
+                ));
+                return Vec::new();
+            };
+            v = next;
         }
-        2 + n + v
+        let Some(total) = len_end.checked_add(v) else {
+            problems.push(format!(
+                "/Contents declares a DER length too large to be a file offset \
+                 ({} length octets)",
+                len_end - 2
+            ));
+            return Vec::new();
+        };
+        total
     };
     if total > raw.len() {
         problems.push(format!(
@@ -318,10 +365,13 @@ fn message_digest(der: &[u8]) -> Option<Vec<u8>> {
         0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04,
     ];
     let at = der.windows(oid.len()).position(|w| w == oid)?;
-    let rest = &der[at + oid.len()..];
+    let rest = der.get(at + oid.len()..)?;
     let i = rest.iter().position(|b| *b == 0x04)?;
-    let len = *rest.get(i + 1)? as usize;
-    Some(rest[i + 2..i + 2 + len].to_vec())
+    let len = usize::from(*rest.get(i + 1)?);
+    // the declared length is the document's claim, not a promise: slice with
+    // get() so a truncated attribute reads as absent instead of panicking
+    let start = i.checked_add(2)?;
+    rest.get(start..start.checked_add(len)?).map(|v| v.to_vec())
 }
 
 /// The dictionary, reduced to the keys that carry meaning, in a fixed order.

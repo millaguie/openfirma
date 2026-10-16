@@ -12,7 +12,10 @@
 //! dependency decision of its own, not something a signature format should
 //! smuggle in. Tests answer queries with `openssl ts -reply`, offline.
 
+use std::time::SystemTime;
+
 use openfirma_core::alg::DigestAlg;
+use openfirma_core::cert::CertificateHandle;
 use openfirma_core::{Error, Result, oid, tlv};
 
 /// `id-ct-TSTInfo`, the content type a time-stamp token carries.
@@ -121,6 +124,165 @@ pub fn token_from_attribute(attr: &[u8], digest: DigestAlg, message: &[u8]) -> R
     let token = &values[..end];
     check_token(token, digest, message)?;
     Ok(token.to_vec())
+}
+
+/// Verifies the TSA's own signature on `token` and the chain of its signing
+/// certificate up to one of `anchors`.
+///
+/// The imprint check in [`token_from_response`] proves the token covers this
+/// signature value; it says nothing about who made the token, and a token
+/// fetched over plain http can be planted by anyone on the path. This is the
+/// check that closes that gap. Callers should *warn* on failure rather than
+/// refuse: a token whose TSA signature cannot be checked here may still be
+/// perfectly good — this function only knows the anchors it was handed, and
+/// the full-shape verification (policy, ordering, revocation of the TSA) is a
+/// validator's job, `openssl ts -verify` offline.
+///
+/// Deliberately narrower than [`crate::verify`]: RFC 3161 tokens carry the v1
+/// `signingCertificate` attribute or none, not the `signingCertificateV2` a
+/// CAdES profile requires, so what is checked here is the signature value over
+/// the re-tagged signed attributes and the certificate chain, nothing more.
+pub fn verify_token_signature(
+    token: &[u8],
+    anchors: &[CertificateHandle],
+    at: SystemTime,
+) -> Result<()> {
+    if anchors.is_empty() {
+        return Err(Error::Other(
+            "no TSA trust anchor was supplied, so the TSA's own signature on the token \
+             cannot be verified"
+                .into(),
+        ));
+    }
+    let mut ci = Cur::new(token).sequence()?;
+    let content_type = ci.oid_string()?;
+    if content_type != oid::ID_SIGNED_DATA.to_string() {
+        return Err(Error::Other(format!(
+            "a time-stamp token must be a SignedData, this ContentInfo is {content_type}"
+        )));
+    }
+    let mut sd = Cur::new(ci.explicit(0)?).sequence()?;
+    let _version = sd.number()?;
+    let _digest_algs = sd.tlv()?;
+    let _eci = sd.tlv()?; // encapContentInfo; the imprint has its own check
+
+    let mut certs: Vec<CertificateHandle> = Vec::new();
+    let mut signer_infos: Vec<&[u8]> = Vec::new();
+    while !sd.is_done() {
+        let (tag, value) = sd.tlv()?;
+        match tag {
+            // [0] the certificate set, RFC 3161 asks the TSA to include its
+            // chain because the query set certReq
+            0xA0 => {
+                let mut set = Cur::new(value);
+                while !set.is_done() {
+                    let (_, whole, _) = set.tlv_whole()?;
+                    certs.push(CertificateHandle::from_der(whole).map_err(|e| {
+                        Error::Other(format!("the token carries an unreadable certificate: {e}"))
+                    })?);
+                }
+            }
+            0xA1 => {} // CRLs: revocation of the TSA is a validator's layer
+            tlv::TAG_SET => {
+                let mut set = Cur::new(value);
+                while !set.is_done() {
+                    let (t, content) = set.tlv()?;
+                    if t != tlv::TAG_SEQUENCE {
+                        return Err(Error::Other(
+                            "a SignerInfo in the token is not a SEQUENCE".into(),
+                        ));
+                    }
+                    signer_infos.push(content);
+                }
+            }
+            other => {
+                return Err(Error::Other(format!(
+                    "unexpected tag {other:#04x} in the token's SignedData"
+                )));
+            }
+        }
+    }
+    if signer_infos.len() != 1 {
+        return Err(Error::Other(format!(
+            "a time-stamp token carries exactly one SignerInfo, this has {}",
+            signer_infos.len()
+        )));
+    }
+
+    let mut f = Cur::new(signer_infos[0]);
+    let _version = f.number()?;
+    let (sid_tag, sid_value) = f.tlv()?;
+    let mut dai = f.sequence()?;
+    let digest_oid = parse_dotted_oid(&dai.oid_string()?)?;
+    let digest = DigestAlg::from_oid(&digest_oid).map_err(|_| {
+        Error::Other(format!(
+            "the token's SignerInfo digests under {digest_oid}, which this code does not know"
+        ))
+    })?;
+    if f.peek_tag() != Some(0xA0) {
+        return Err(Error::Other(
+            "the token's SignerInfo carries no signed attributes; RFC 3161 requires them".into(),
+        ));
+    }
+    let attrs_content = f.expect(0xA0)?;
+    let mut sai = f.sequence()?;
+    let _sig_alg = sai.oid_string()?;
+    let signature = f.octets()?.to_vec();
+
+    let mut pool = certs.iter().chain(anchors.iter());
+    let signer = match sid_tag {
+        tlv::TAG_SEQUENCE => {
+            use der::Encode as _;
+            let mut s = Cur::new(sid_value);
+            let (issuer_tag, issuer_whole, _) = s.tlv_whole()?;
+            if issuer_tag != tlv::TAG_SEQUENCE {
+                return Err(Error::Other(
+                    "the token's issuerAndSerialNumber names no Name".into(),
+                ));
+            }
+            let serial = s.expect(0x02)?;
+            pool.find(|c| {
+                c.issuer()
+                    .to_der()
+                    .map(|d| d == issuer_whole)
+                    .unwrap_or(false)
+                    && c.serial_number().as_bytes() == serial
+            })
+        }
+        0x80 => {
+            pool.find(|c| crate::verify::subject_key_identifier(c).as_deref() == Some(sid_value))
+        }
+        other => {
+            return Err(Error::Other(format!(
+                "the token's sid has tag {other:#04x}, expected issuerAndSerialNumber or [0]"
+            )));
+        }
+    }
+    .ok_or_else(|| {
+        Error::Other(
+            "the token's SignerInfo names a signing certificate the token does not carry".into(),
+        )
+    })?
+    .clone();
+
+    // the signature, over the signed attributes re-tagged as SET OF, exactly
+    // the RFC 5652 5.4 mirror the CAdES verifier implements
+    let retagged = tlv::tlv(tlv::TAG_SET, attrs_content);
+    let prehash = digest.digest(&retagged);
+    openfirma_core::signer::verify_prehash(&signer, digest, &prehash, &signature).map_err(|e| {
+        Error::Other(format!(
+            "the TSA's signature on the token does not verify: {e}"
+        ))
+    })?;
+
+    // and the TSA has to be who the caller says it is: the signing certificate
+    // must chain to one of the supplied anchors, every link verified
+    crate::verify::chain_certificates(&signer, &certs, anchors, at).map_err(|e| {
+        Error::Other(format!(
+            "the TSA's certificate does not chain to any supplied trust anchor: {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 /// The digest algorithm and hashed message that a token's
@@ -233,7 +395,21 @@ impl<'a> Cur<'a> {
         self.i >= self.b.len()
     }
 
+    /// The tag of the next value without consuming it.
+    fn peek_tag(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
     fn tlv(&mut self) -> Result<(u8, &'a [u8])> {
+        let (tag, _, value) = self.tlv_whole()?;
+        Ok((tag, value))
+    }
+
+    /// The next value as (tag, whole TLV bytes, content bytes). The whole TLV
+    /// is what a certificate has to be re-read from, because `from_der`
+    /// rejects trailing data and the content alone is not a certificate.
+    fn tlv_whole(&mut self) -> Result<(u8, &'a [u8], &'a [u8])> {
+        let start = self.i;
         let tag = *self
             .b
             .get(self.i)
@@ -241,15 +417,19 @@ impl<'a> Cur<'a> {
         self.i += 1;
         let (len, n) = read_len(&self.b[self.i..])?;
         self.i += n;
-        let end = self.i + len;
+        let end = self
+            .i
+            .checked_add(len)
+            .ok_or_else(|| Error::Other("an absurd length in the time-stamp DER".into()))?;
         if end > self.b.len() {
             return Err(Error::Other(
                 "a time-stamp value runs past its container".into(),
             ));
         }
         let v = &self.b[self.i..end];
+        let whole = &self.b[start..end];
         self.i = end;
-        Ok((tag, v))
+        Ok((tag, whole, v))
     }
 
     fn expect(&mut self, tag: u8) -> Result<&'a [u8]> {
@@ -351,5 +531,17 @@ mod tests {
                 .any(|w| { w == [0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09] }),
             "the attribute type must be the signatureTimeStamp OID"
         );
+    }
+
+    /// Without an anchor there is nothing the TSA's own signature could be
+    /// trusted up to, and the check has to say that instead of passing a
+    /// token nobody vouched for. The positive path runs against a real
+    /// openssl-issued token in tests/tsp_crosscheck.rs.
+    #[test]
+    fn token_signature_verification_needs_an_anchor() {
+        let err = verify_token_signature(b"\x30\x00", &[], SystemTime::now())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no TSA trust anchor"), "{err}");
     }
 }

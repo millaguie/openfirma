@@ -7,6 +7,7 @@ use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
 use openfirma_core::signer::{Signer, SoftwareSigner};
 use openfirma_pades::{Appearance, PadesOptions};
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -95,9 +96,19 @@ struct SignArgs {
     #[arg(long)]
     p12: Option<PathBuf>,
 
-    /// Password of the --p12 container
+    /// Password of the --p12 container. INSECURE: everything on the command
+    /// line is readable by every process on the machine (ps) and lands in the
+    /// shell history. Prefer --password-file or the OPENFIRMA_PASSWORD
+    /// environment variable, which this flag also reads when it is not given.
+    #[arg(long, env = "OPENFIRMA_PASSWORD", hide_env_values = true)]
+    password: Option<std::ffi::OsString>,
+
+    /// File whose first line is the password of the --p12 container, one
+    /// trailing newline ignored. The safe way to pass a password: chmod 600
+    /// the file and nothing on the command line or in the environment names
+    /// it. Wins over --password and OPENFIRMA_PASSWORD when both are given.
     #[arg(long)]
-    password: Option<String>,
+    password_file: Option<PathBuf>,
 
     /// friendlyName of the entry to use when the --p12 holds more than one key
     #[arg(long)]
@@ -164,7 +175,10 @@ struct SignArgs {
     /// URL of a TSA to raise the signature to B-T with a time-stamp token.
     /// Plain http only: HTTPS needs a TLS client, which is a dependency
     /// decision of its own, not something to slip in here. For an https TSA,
-    /// fetch the token by hand and pass --timestamp-token.
+    /// fetch the token by hand and pass --timestamp-token. The token's
+    /// imprint is always checked; its own signature is only verified when
+    /// the TSA's chain is supplied through --validation-cert, and a warning
+    /// on stderr says so when it was not.
     #[arg(long)]
     tsa: Option<String>,
 
@@ -246,9 +260,16 @@ impl From<Digest> for DigestAlg {
 }
 
 /// Builds the B-T timestamp provider, or None when neither flag is given.
+///
+/// `tsa_trust` is what the token's own signature is checked against: the TSA
+/// fetch is plain http (a TLS client is a separate dependency decision, its
+/// own ADR), so a token that cannot be verified against a supplied anchor is
+/// accepted on its imprint alone — with a warning saying exactly that, because
+/// anyone on the path could have planted it.
 fn timestamp_provider(
     tsa: Option<String>,
     token_file: Option<PathBuf>,
+    tsa_trust: Vec<CertificateHandle>,
 ) -> Result<Option<openfirma_cades::TimestampFn>> {
     use openfirma_cades::tsp;
     use std::sync::Arc;
@@ -273,14 +294,17 @@ fn timestamp_provider(
                 let response = http_post(&url, &query)
                     .map_err(|e| openfirma_core::Error::Other(e.to_string()))?;
                 let token = tsp::token_from_response(&response, digest, sig)?;
+                warn_if_token_unverified(&format!("the TSA at {url}"), &token, &tsa_trust);
                 Ok(vec![tsp::unsigned_attribute(&token)?])
             })))
         }
         (None, Some(path)) => {
             let response =
                 std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let source = format!("{}", path.display());
             Ok(Some(Arc::new(move |sig: &[u8], digest| {
                 let token = tsp::token_from_response(&response, digest, sig)?;
+                warn_if_token_unverified(&format!("the token file {source}"), &token, &tsa_trust);
                 Ok(vec![tsp::unsigned_attribute(&token)?])
             })))
         }
@@ -288,21 +312,78 @@ fn timestamp_provider(
     }
 }
 
+/// The token about to be embedded imprints the right bytes, but its own
+/// signature is only as trusted as the anchors supplied for it. When it
+/// cannot be verified, say so on stderr instead of letting the B-T level
+/// imply a trust nobody checked.
+fn warn_if_token_unverified(source: &str, token: &[u8], tsa_trust: &[CertificateHandle]) {
+    use openfirma_cades::tsp;
+    if let Err(e) = tsp::verify_token_signature(token, tsa_trust, std::time::SystemTime::now()) {
+        eprintln!(
+            "warning: the time-stamp token from {source} was accepted on its imprint alone: {e}.\n\
+             warning: the imprint proves what the token covers, not who made it, and a \
+             plain-http TSA answer can be planted by anyone on the path.\n\
+             warning: pass the TSA's certificate chain with --validation-cert (PAdES B-LT \
+             and B-LTA) to have it checked here, or check the TSA's answer against its CA \
+             yourself: openssl ts -verify -CAfile <tsa-ca.pem> -in <answer.tsr> -data <file>"
+        );
+    }
+}
+
+/// How long the TSA may take to answer, per read or write. A signing run must
+/// not hang on a black hole; 10 seconds is generous for a timestamp query.
+const TSA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The most a TSA answer may weigh. A `TimeStampResp` with a full chain is
+/// kilobytes; a megabyte is already nothing legitimate, and reading without a
+/// cap hands a hostile server an unbounded allocation.
+const TSA_MAX_RESPONSE: usize = 1024 * 1024;
+
 /// A minimal HTTP/1.1 POST, enough for a timestamp query and nothing more.
 /// std::net only: no dependency for a request that is two headers and a body.
 fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>> {
     use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
     let rest = url
         .strip_prefix("http://")
         .context("only http:// TSA urls are supported")?;
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let host = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{authority}:80")
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (
+            h,
+            p.parse::<u16>()
+                .with_context(|| format!("the TSA url port {p:?} is not a number"))?,
+        ),
+        None => (authority, 80),
     };
-    let mut stream = std::net::TcpStream::connect(&host)
-        .with_context(|| format!("cannot reach the TSA at {host}"))?;
+    let mut stream: Option<TcpStream> = None;
+    let mut last_error = None;
+    for addr in (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("the TSA host {host} does not resolve"))?
+    {
+        match TcpStream::connect_timeout(&addr, TSA_TIMEOUT) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    let mut stream = stream.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot reach the TSA at {host}:{port}: {}",
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no address to connect to".into())
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(TSA_TIMEOUT))
+        .context("cannot arm the TSA read timeout")?;
+    stream
+        .set_write_timeout(Some(TSA_TIMEOUT))
+        .context("cannot arm the TSA write timeout")?;
     stream
         .write_all(
             format!(
@@ -318,18 +399,37 @@ fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>> {
         .write_all(body)
         .context("cannot send the timestamp query")?;
     let mut raw = Vec::new();
-    stream
+    // one byte over the cap so an answer exactly at the cap still parses and
+    // anything past it is provably past it
+    (&mut stream)
+        .take(TSA_MAX_RESPONSE as u64 + 1)
         .read_to_end(&mut raw)
         .context("the TSA closed the connection without answering")?;
+    if raw.len() > TSA_MAX_RESPONSE {
+        anyhow::bail!(
+            "the TSA sent more than {TSA_MAX_RESPONSE} bytes without finishing; a \
+             timestamp answer is kilobytes, so this server is not a TSA"
+        );
+    }
+    split_http_response(&raw)
+}
 
+/// The body of an HTTP answer, with the status line read as a status line:
+/// version, then the three digit code as its own token. A substring match on
+/// " 200" also accepts "HTTP/1.1 2006 ...", and a hostile server gets to pick
+/// the reason phrase.
+fn split_http_response(raw: &[u8]) -> Result<Vec<u8>> {
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .context("the TSA answer has no header/body separator")?;
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
     let status = head.lines().next().unwrap_or_default();
-    if !status.contains(" 200") {
-        anyhow::bail!("the TSA answered {status:?}");
+    let mut parts = status.split_whitespace();
+    let version = parts.next().unwrap_or_default();
+    let code = parts.next().unwrap_or_default();
+    if !version.starts_with("HTTP/1.") || code != "200" {
+        anyhow::bail!("the TSA answered {status:?}, expected an HTTP/1.x 200");
     }
     let mut body_out = raw[split + 4..].to_vec();
     // honour Content-Length when present; otherwise the connection close was
@@ -392,6 +492,7 @@ fn main() -> Result<()> {
                 label,
                 p12,
                 password,
+                password_file,
                 alias,
                 tsa,
                 timestamp_token,
@@ -424,12 +525,19 @@ fn main() -> Result<()> {
 
             let content =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+            let password = p12_password(password, password_file)?;
             let signer = match (&p12, &password) {
                 (Some(container), Some(pw)) => load_p12(container, pw, alias.as_deref())?,
                 (Some(_), None) => {
-                    anyhow::bail!("--p12 needs --password with the container's password")
+                    anyhow::bail!(
+                        "--p12 needs the container's password: --password-file (the safe \
+                         input), the OPENFIRMA_PASSWORD environment variable, or --password \
+                         (insecure, visible in ps and in shell history)"
+                    )
                 }
-                (None, Some(_)) => anyhow::bail!("--password only makes sense together with --p12"),
+                (None, Some(_)) => {
+                    anyhow::bail!("a password only makes sense together with --p12")
+                }
                 (None, None) => {
                     let cert = cert.context("--cert is required unless --p12 is given")?;
                     let key = key.context("--key is required unless --p12 is given")?;
@@ -438,7 +546,19 @@ fn main() -> Result<()> {
             };
             let digest_alg: DigestAlg = digest.into();
 
-            let stamp = timestamp_provider(tsa, timestamp_token)?;
+            // The validation certificates double as the TSA's trust anchors:
+            // a B-LT signing run that archives the TSA's chain usually passes
+            // it here, and that is exactly what the embedded token's own
+            // signature gets checked against before it is accepted.
+            let mut validation_certs = Vec::with_capacity(validation_cert.len());
+            for c in &validation_cert {
+                let bytes = std::fs::read(c).with_context(|| format!("reading {}", c.display()))?;
+                validation_certs.push(parse_certificate(&bytes).with_context(|| {
+                    format!("{} is not a valid X.509 certificate", c.display())
+                })?);
+            }
+
+            let stamp = timestamp_provider(tsa, timestamp_token, validation_certs.clone())?;
             let mut opts = CadesOptions {
                 digest: digest_alg,
                 encapsulate_content: encapsulate,
@@ -460,14 +580,6 @@ fn main() -> Result<()> {
                 // B-LTA add revisions after the signature: the /DSS with the
                 // validation data, then the document time-stamp.
                 Format::Pades | Format::PadesLt | Format::PadesLta => {
-                    let mut validation_certs = Vec::with_capacity(validation_cert.len());
-                    for c in &validation_cert {
-                        let bytes =
-                            std::fs::read(c).with_context(|| format!("reading {}", c.display()))?;
-                        validation_certs.push(parse_certificate(&bytes).with_context(|| {
-                            format!("{} is not a valid X.509 certificate", c.display())
-                        })?);
-                    }
                     let mut revocation = Vec::with_capacity(crl.len() + ocsp.len());
                     for c in &crl {
                         revocation.push(openfirma_pades::RevocationBytes::Crl(read_der_blob(
@@ -696,10 +808,53 @@ fn load_p12(path: &PathBuf, password: &str, alias: Option<&str>) -> Result<Softw
     Ok(signer.with_chain(chain))
 }
 
+/// The password of the `--p12` container: `--password-file` first, then
+/// `--password` or the `OPENFIRMA_PASSWORD` environment variable clap feeds
+/// it from. The file is the safe input — argv is world readable through ps
+/// and lands in shell history — and wins so that an exported environment
+/// variable cannot quietly override what the user typed a path to.
+fn p12_password(
+    flag: Option<std::ffi::OsString>,
+    file: Option<PathBuf>,
+) -> Result<Option<Zeroizing<String>>> {
+    if let Some(path) = file {
+        let bytes = Zeroizing::new(
+            std::fs::read(&path)
+                .with_context(|| format!("reading the password file {}", path.display()))?,
+        );
+        // the first line, with one CRLF or LF ending ignored: `echo secret >
+        // file` must not sign with a newline in the password
+        let line = bytes.split(|b| *b == b'\n').next().unwrap_or(&[]);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let text = std::str::from_utf8(line).map_err(|_| non_utf8_secret_error())?;
+        return Ok(Some(Zeroizing::new(text.to_string())));
+    }
+    match flag {
+        Some(value) => Ok(Some(Zeroizing::new(
+            value.into_string().map_err(|_| non_utf8_secret_error())?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Why a password that is not UTF-8 cannot be used, and what to do about it.
+fn non_utf8_secret_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "the password is not valid UTF-8: it may contain non-ASCII characters in an \
+         encoding openfirma cannot represent. PKCS#12 encodes passwords as UTF-16 \
+         BMPStrings and openfirma re-encodes them from UTF-8; supply the password as \
+         UTF-8, or re-export the container with an ASCII password: \
+         `openssl pkcs12 -in old.p12 -out new.p12`"
+    )
+}
+
 /// Reads a certificate and a PKCS#8 key, accepting PEM or DER for both.
 fn load_signer(cert: &PathBuf, key: &PathBuf, chain: &[PathBuf]) -> Result<SoftwareSigner> {
     let cert_bytes = std::fs::read(cert).with_context(|| format!("reading {}", cert.display()))?;
-    let key_bytes = std::fs::read(key).with_context(|| format!("reading {}", key.display()))?;
+    // a key file on disk is secret material like a decrypted PKCS#12, and the
+    // buffer that held it is zeroed on the way out rather than freed as-is
+    let key_bytes =
+        Zeroizing::new(std::fs::read(key).with_context(|| format!("reading {}", key.display()))?);
 
     let handle = parse_certificate(&cert_bytes)
         .with_context(|| format!("{} is not a valid X.509 certificate", cert.display()))?;
@@ -1008,6 +1163,51 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
+    /// Temp file named after the running test, because cargo runs the tests
+    /// of one binary in parallel threads.
+    fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
+        let test = std::thread::current()
+            .name()
+            .unwrap_or("main")
+            .replace("::", "_");
+        let path =
+            std::env::temp_dir().join(format!("openfirma-{}-{test}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).expect("cannot write temp file");
+        path
+    }
+
+    /// A one answer TCP server, so `http_post` can be pointed at something
+    /// that behaves like a hostile TSA without leaving the machine.
+    fn fake_tsa(answer: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("cannot bind");
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the request until a short read timeout expires.
+                // Closing with unread bytes in the receive buffer makes the
+                // kernel send a RST, and the client's read_to_end then fails
+                // even though the answer arrived: the request is two writes
+                // and the first read races the second segment.
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                    .ok();
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(_) => break, // timeout or reset: nothing more is coming
+                    }
+                }
+                let _ = stream.write_all(&answer);
+                // the handler's drop closes the connection, which is what
+                // "Connection: close" promised the client
+            }
+        });
+        (addr, handle)
+    }
+
     fn epoch(t: SystemTime) -> u64 {
         t.duration_since(SystemTime::UNIX_EPOCH)
             .expect("before 1970")
@@ -1064,5 +1264,82 @@ mod tests {
             fmt_system_time(SystemTime::UNIX_EPOCH),
             "1970-01-01T00:00:00Z"
         );
+    }
+
+    /// --password-file is the safe input: the first line, one trailing LF or
+    /// CRLF ignored, and it wins over --password when both are given.
+    #[test]
+    fn the_password_file_is_read_and_one_newline_ignored() {
+        let path = write_tmp("pw.txt", b"secret\n");
+        let got = p12_password(None, Some(path.clone())).unwrap().unwrap();
+        assert_eq!(&*got, "secret");
+
+        let crlf = write_tmp("pw-crlf.txt", b"secret\r\n");
+        let got = p12_password(None, Some(crlf)).unwrap().unwrap();
+        assert_eq!(&*got, "secret");
+
+        // the file wins over the flag, and the flag works on its own
+        let got = p12_password(Some("flagvalue".into()), Some(path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*got, "secret");
+        let got = p12_password(Some("flagvalue".into()), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*got, "flagvalue");
+        assert!(p12_password(None, None).unwrap().is_none());
+    }
+
+    /// A password file that is not UTF-8 used to arrive as a clap error
+    /// about invalid UTF-8 and nothing else. PKCS#12 passwords are UTF-16
+    /// BMPStrings; the error has to say that the password may contain
+    /// non-ASCII characters this tool cannot represent, and what to run.
+    #[test]
+    fn a_password_that_is_not_utf8_says_what_might_be_wrong() {
+        let path = write_tmp("pw-latin1.txt", b"caf\xe9\n");
+        let err = p12_password(None, Some(path)).unwrap_err().to_string();
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert!(err.contains("non-ASCII"), "{err}");
+        assert!(err.contains("openssl pkcs12"), "{err}");
+    }
+
+    /// The status line is parsed as a status line: version token, then the
+    /// code token. Matching the substring " 200" anywhere in the line also
+    /// matched "HTTP/1.1 2006 ...", and the server picks the reason phrase.
+    #[test]
+    fn the_tsa_status_line_is_parsed_not_substring_matched() {
+        let (addr, srv) = fake_tsa(b"HTTP/1.1 2006 evil\r\nContent-Length: 2\r\n\r\nhi".to_vec());
+        let err = http_post(&format!("http://{addr}/tsa"), b"query")
+            .expect_err("2006 is not 200")
+            .to_string();
+        srv.join().unwrap();
+        assert!(err.contains("expected an HTTP/1.x 200"), "{err}");
+
+        let (addr, srv) = fake_tsa(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec());
+        let body = http_post(&format!("http://{addr}/tsa"), b"query")
+            .expect("a real 200 answer must be accepted");
+        srv.join().unwrap();
+        assert_eq!(body, b"hi");
+
+        let (addr, srv) = fake_tsa(b"HTTP/1.1 500 Internal Server Error\r\n\r\nx".to_vec());
+        let err = http_post(&format!("http://{addr}/tsa"), b"query")
+            .expect_err("a 500 is not a timestamp")
+            .to_string();
+        srv.join().unwrap();
+        assert!(err.contains("500"), "{err}");
+    }
+
+    /// A timestamp answer is kilobytes; a server that keeps sending is
+    /// refused at one megabyte instead of being read into memory.
+    #[test]
+    fn the_tsa_answer_is_capped() {
+        let mut answer = Vec::from(&b"HTTP/1.1 200 OK\r\n\r\n"[..]);
+        answer.resize(TSA_MAX_RESPONSE + 100, b'x');
+        let (addr, srv) = fake_tsa(answer);
+        let err = http_post(&format!("http://{addr}/tsa"), b"query")
+            .expect_err("a megabyte of x is not a TimeStampResp")
+            .to_string();
+        srv.join().unwrap();
+        assert!(err.contains("1048576 bytes"), "{err}");
     }
 }

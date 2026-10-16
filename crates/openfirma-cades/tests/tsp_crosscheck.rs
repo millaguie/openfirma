@@ -178,3 +178,83 @@ fn b_t_carries_a_token_that_openssl_accepts() {
         "a token must not be embeddable over a value it does not imprint"
     );
 }
+
+/// The imprint check proves *what* a token covers; this proves *who made
+/// it*. The CLI warns on stderr when this check fails for a live TSA answer,
+/// because the fetch is plain http and a token nobody vouched for could have
+/// been planted by anyone on the path. Here it runs against a real token from
+/// openssl's TSA, in both directions.
+#[test]
+fn the_token_signature_verifies_against_an_anchor_and_only_against_it() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    if !certs_dir().join("tsa.crt").exists() {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    }
+    let message = b"the signature value a B-T token imprints";
+    let query = tsp::request(DigestAlg::Sha256, message, 0x0102_0304).unwrap();
+    let q = write_tmp("token-sig.tsq", &query);
+    let r = write_tmp("token-sig.tsr", b"");
+    let dir = certs_dir();
+    let (ok, text) = run(&[
+        "ts",
+        "-reply",
+        "-queryfile",
+        q.to_str().unwrap(),
+        "-out",
+        r.to_str().unwrap(),
+        "-signer",
+        dir.join("tsa.crt").to_str().unwrap(),
+        "-inkey",
+        dir.join("tsa.key").to_str().unwrap(),
+        "-chain",
+        dir.join("chain.crt").to_str().unwrap(),
+    ]);
+    assert!(ok, "openssl ts -reply failed:\n{text}");
+    let response = std::fs::read(&r).expect("the TSA wrote no response");
+    let token = tsp::token_from_response(&response, DigestAlg::Sha256, message)
+        .expect("the answer must hold a token over the message");
+
+    let load = |name: &str| {
+        let pem = std::fs::read_to_string(dir.join(name))
+            .unwrap_or_else(|e| panic!("{name} cannot be read: {e}"));
+        CertificateHandle::from_pem(&pem).unwrap_or_else(|e| panic!("{name}: {e}"))
+    };
+    let now = std::time::SystemTime::now();
+
+    // the genuine token verifies: the TSA's own signature over its signed
+    // attributes checks out, and its certificate chains to the test CA
+    let ca = load("ca.crt");
+    tsp::verify_token_signature(&token, std::slice::from_ref(&ca), now)
+        .expect("a genuine token must verify against the CA that issued the TSA's chain");
+
+    // no anchor, no trust: the function says so rather than passing
+    let err = tsp::verify_token_signature(&token, &[], now)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no TSA trust anchor"), "{err}");
+
+    // an unrelated certificate is not an anchor for this TSA
+    let unrelated = load("signer-rsa.crt");
+    let err = tsp::verify_token_signature(&token, &[unrelated], now)
+        .expect_err("a signing certificate is no TSA anchor")
+        .to_string();
+    assert!(err.contains("trust anchor"), "{err}");
+
+    // and a token with one flipped byte in its signature value is refused.
+    // The signature value is the last field of the only SignerInfo, so a
+    // flip near the end of the DER lands inside it.
+    let mut tampered = token.clone();
+    let at = tampered.len() - 10;
+    tampered[at] ^= 0xff;
+    let err = tsp::verify_token_signature(&tampered, &[ca], now)
+        .expect_err("a planted token must not verify")
+        .to_string();
+    assert!(
+        err.contains("does not verify") || err.contains("does not chain"),
+        "{err}"
+    );
+}

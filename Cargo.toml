@@ -48,6 +48,11 @@ rand_core = "0.10"
 thiserror = "2"
 hex = "0.4"
 base64 = "0.23"
+# Constant time comparison for the PKCS#12 MAC, and zeroing of decrypted key
+# material on drop. Both are pure Rust and both are already in the dependency
+# tree through the RustCrypto crates; this only calls them by name.
+subtle = "2.6"
+zeroize = "1"
 # The XAdES Id attributes are UUIDv4 like AutoFirma's (java.util.UUID). Pure
 # Rust, and not a new library in the binary: getrandom 0.4 is already in the
 # dependency tree through rsa -> crypto-bigint, this only calls it by name.
@@ -57,7 +62,7 @@ getrandom = "0.4"
 # a future release cannot quietly swap in a C zlib.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tracing = "0.1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 
 # NOTE: no rcgen. It pulls ring or aws-lc-rs, which are C/asm, and that would

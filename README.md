@@ -100,6 +100,19 @@ cargo run -- verify -i doc.signed.pdf --trust testdata/certs/ca.crt
 cargo test                       # includes the OpenSSL crosschecks
 ```
 
+Signing with a real certificate means signing from its PKCS#12 container.
+The password goes in a file nobody but you can read, or in the environment —
+never in argv, where `ps` and the shell history can see it:
+
+```
+cargo run -- sign -i doc.pdf -o doc.signed.pdf --format pades-b-b \
+    --p12 certificado.p12 --password-file pw.txt     # chmod 600 pw.txt
+OPENFIRMA_PASSWORD=... cargo run -- sign ... --p12 certificado.p12
+```
+
+`--password` still exists and reads `OPENFIRMA_PASSWORD` when not given, but
+its help text says what it is: insecure.
+
 `tools/fetch-autofirma.sh` downloads the official AutoFirma so its output can
 be diffed against ours, see `docs/validation.md`.
 

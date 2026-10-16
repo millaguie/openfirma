@@ -132,6 +132,18 @@ pub struct Document {
     pub epilog: Vec<DocLevelNode>,
 }
 
+/// The deepest element nesting openfirma accepts.
+///
+/// The parser, the canonicalizer and the drop of a parsed tree each recurse
+/// once per level, so an uncapped document aborts the process with a stack
+/// overflow instead of failing to parse: 100 000 nested elements are enough.
+/// 512 is far deeper than any real administrative XML (FacturaE nests a
+/// handful of levels) and shallow enough that the three recursions stay well
+/// inside the 8 MiB stack of the main thread the CLI runs on, in debug
+/// builds included; a caller on a thread with a smaller stack should budget
+/// roughly 4 KiB per level in the worst case.
+pub const MAX_DEPTH: usize = 512;
+
 /// Parses a well formed UTF-8 XML document.
 pub fn parse(input: &[u8]) -> Result<Document> {
     let text = std::str::from_utf8(input).map_err(|e| {
@@ -209,7 +221,7 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 let start = self.pos;
-                let el = self.parse_element(&mut scope)?;
+                let el = self.parse_element(&mut scope, 1)?;
                 root_span = (start, self.pos);
                 root = Some(el);
                 continue;
@@ -251,7 +263,15 @@ impl<'a> Parser<'a> {
         Ok(Some((start, self.pos)))
     }
 
-    fn parse_element(&mut self, scope: &mut Scope) -> Result<Element> {
+    fn parse_element(&mut self, scope: &mut Scope, depth: usize) -> Result<Element> {
+        if depth > MAX_DEPTH {
+            return Err(Error::Xml(format!(
+                "the document nests elements more than {MAX_DEPTH} levels deep, which \
+                 openfirma refuses: the parser, the canonicalizer and the tree's own drop \
+                 recurse once per level and a deeper document would overflow the stack. \
+                 Flattening the document is the only way to sign it"
+            )));
+        }
         let open_start = self.pos;
         self.expect(b"<")?;
         let name = self.parse_qname()?;
@@ -400,7 +420,7 @@ impl<'a> Parser<'a> {
                 }
                 if self.src[self.pos] == b'<' {
                     let mut inner_scope = scope.clone();
-                    let el = self.parse_element(&mut inner_scope)?;
+                    let el = self.parse_element(&mut inner_scope, depth + 1)?;
                     children.push(Child::Element(Box::new(el)));
                     continue;
                 }
@@ -828,5 +848,42 @@ mod tests {
         let doc = parse(b"<a/>").unwrap();
         assert!(doc.root.self_closing);
         assert!(doc.root.content.is_none());
+    }
+
+    /// The parser, the canonicalizer and the drop of the tree each recurse
+    /// once per nesting level. Without the cap, a document nested 100 000
+    /// levels deep did not fail to parse — it aborted the process with a
+    /// stack overflow, which no caller can catch.
+    #[test]
+    fn nesting_past_the_cap_is_refused_instead_of_overflowing_the_stack() {
+        fn nested(depth: usize) -> String {
+            let mut s = "<a>".repeat(depth);
+            s.push('x');
+            s.push_str(&"</a>".repeat(depth));
+            s
+        }
+        // 512 frames of unoptimized parser recursion weigh more than the
+        // 2 MiB a cargo test thread gets, so the probing runs on a thread
+        // with a stack like the 8 MiB main thread the CLI parses on. A cap
+        // that fits no stack would protect nothing; this one fits that one.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                // the cap itself is accepted, one level past it is refused
+                let at_cap = parse(nested(MAX_DEPTH).as_bytes());
+                assert!(at_cap.is_ok(), "depth {MAX_DEPTH} must parse: {at_cap:?}");
+                drop(at_cap);
+                let err = parse(nested(MAX_DEPTH + 1).as_bytes())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains(&MAX_DEPTH.to_string()), "{err}");
+                // and the review's proof of concept: this used to abort the
+                // process instead of returning an error
+                let err = parse(nested(100_000).as_bytes()).unwrap_err().to_string();
+                assert!(err.contains(&MAX_DEPTH.to_string()), "{err}");
+            })
+            .expect("cannot spawn the probe thread")
+            .join()
+            .expect("deep nesting must be an error, not an abort");
     }
 }

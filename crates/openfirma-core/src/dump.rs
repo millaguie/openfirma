@@ -82,17 +82,22 @@ fn parse_tlv(input: &[u8]) -> Result<Tlv<'_>> {
         pos += n;
         value
     };
-    if pos + len > input.len() {
-        return Err(Error::other(format!(
-            "truncated DER, content claims {len} bytes but only {} are left",
-            input.len() - pos
-        )));
-    }
+    // checked: an eight octet length can claim up to usize::MAX bytes, and
+    // pos + len would wrap into a range that looks plausible
+    let end = match pos.checked_add(len) {
+        Some(end) if end <= input.len() => end,
+        _ => {
+            return Err(Error::other(format!(
+                "truncated DER, content claims {len} bytes but only {} are left",
+                input.len() - pos
+            )));
+        }
+    };
     Ok(Tlv {
         tag: input[0],
         header_len: pos,
-        content: &input[pos..pos + len],
-        rest: &input[pos + len..],
+        content: &input[pos..end],
+        rest: &input[end..],
     })
 }
 

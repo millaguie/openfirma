@@ -193,7 +193,12 @@ fn verify_one(
             "the first /ByteRange segment starts at {a}, not at 0"
         )));
     }
-    if b > c || c + d > pdf.len() {
+    // checked: the numbers come out of the document, and a pair whose sum
+    // does not fit in an offset describes no segment of any file
+    let inside = c
+        .checked_add(d)
+        .is_some_and(|end| end <= pdf.len() && b <= c);
+    if !inside {
         return Err(Error::Verification(format!(
             "/ByteRange [{a} {b} {c} {d}] does not describe two segments inside the {} byte file",
             pdf.len()
