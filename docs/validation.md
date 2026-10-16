@@ -121,6 +121,23 @@ written from the examples of the C14N 1.0 specification
 cross-checked against Apache Santuario and libxml2 while the crate was
 written.
 
+The browser endpoint's signing path gets the same independent treatment
+(`crates/openfirma-browser/tests/sede_crosscheck.rs`): a fake sede POSTs a
+recorded-style `afirma://sign?dat=…` URI to the real loopback server, and what
+comes back — AutoFirma's `base64(cert)|base64(signature)` wire shape — is
+split apart and verified by `openssl smime -verify -content` as a detached
+CAdES signature over exactly the document that went in. So the endpoint is not
+only shape-checked against the measured AutoFirma contract; its cryptographic
+output is judged by an independent implementation too.
+
+The protocol parsing itself (`crates/openfirma-browser/tests/uri_parse.rs`)
+works from recorded `afirma://` URIs with the AutoFirma source line each form
+comes from, and the attack surface has tests that assert refusal *by named
+reason*: cross-site Origin, rebound Host, GET-as-CSRF, token replay, chunked
+and oversized bodies (`crates/openfirma-browser/tests/fake_sede.rs`). The
+threat model and why the transport is plain HTTP on loopback rather than the
+self-signed wss AutoFirma uses is docs/adr/0005-browser-protocol.md.
+
 Gotcha found while setting this up: **`openssl cms -verify -content` is broken
 for detached signatures in 3.6.5**. It rejects detached CMS produced by openssl
 itself with `CMS_SignerInfo_verify_content: verification failure`, even though
@@ -256,6 +273,12 @@ and docs/adr/0004-system-keystores.md).
 The last step is the sedes electrónicas themselves: submit a real trámite with a
 document signed by openfirma. That is the only proof of protocol layer
 compatibility, and it is done by hand, tracked in `docs/validation-log.md`.
+For the browser path this step has an extra gap today: real sedes open a
+`wss://127.0.0.1:<port>` socket (docs/adr/0005-browser-protocol.md), and the
+openfirma endpoint speaks plain HTTP on loopback until a pure-Rust TLS stack
+exists, so an end-to-end trámite through a real sede's autoscript is not yet
+possible; what *is* proven is every layer under it — URI parsing from recorded
+URIs, dispatch, wire response shapes, and the endpoint's refusals.
 
 ## Test certificate material
 

@@ -6,6 +6,7 @@ members = [
     "crates/openfirma-pades",
     "crates/openfirma-xades",
     "crates/openfirma-keystore",
+    "crates/openfirma-browser",
     "crates/openfirma-cli",
 ]
 
@@ -80,6 +81,7 @@ openfirma-cades = { path = "crates/openfirma-cades", version = "0.1.0" }
 openfirma-pades = { path = "crates/openfirma-pades", version = "0.1.0" }
 openfirma-xades = { path = "crates/openfirma-xades", version = "0.1.0" }
 openfirma-keystore = { path = "crates/openfirma-keystore", version = "0.1.0" }
+openfirma-browser = { path = "crates/openfirma-browser", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 openfirma-core.workspace = true
+openfirma-browser.workspace = true
 openfirma-cades.workspace = true
 openfirma-pades.workspace = true
 openfirma-xades.workspace = true

@@ -39,6 +39,74 @@ enum Command {
         #[command(subcommand)]
         command: KeystoreCommand,
     },
+    /// Answer one browser invocation URI (`afirma://…`), headless. This is
+    /// what the OS scheme handler runs when a sede electronica's page hands
+    /// the browser an afirma:// URL; the result goes to --output (AutoFirma's
+    /// wire form, `base64(cert)|base64(signature)` — in the real flow the
+    /// page reads it from the loopback endpoint or the intermediate server,
+    /// never from the scheme hand-off itself, and this flag is how a test,
+    /// script, or human collects it).
+    AfirmaUri {
+        /// The full afirma://… URI as one argument (the OS hands the handler
+        /// exactly this in %u/%1). Omit it only with --register, which answers
+        /// no call and installs the scheme instead.
+        uri: Option<String>,
+
+        /// Where to write the result. Without it the payload goes to stdout,
+        /// which is what a human piping it wants; a sede flow has no stdout
+        /// reader and uses --serve instead.
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// PKCS#12 holding the signing key. The password rule of `sign`
+        /// applies: --password-file or OPENFIRMA_PASSWORD, never argv.
+        #[arg(long)]
+        p12: Option<PathBuf>,
+
+        /// Password file for --p12; first line, one newline ignored (see sign).
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+
+        /// Print where the `afirma://` scheme registration belongs on this OS
+        /// and write only those files — never a registry entry, never a
+        /// system path. Reads no key and needs no --p12; run it at install
+        /// time, not from a browser call.
+        #[arg(long)]
+        register: bool,
+    },
+    /// Serve the loopback endpoint a sede page calls, and run every URI that
+    /// arrives through it. The ephemeral port is printed at startup — like
+    /// AutoFirma's pages learn theirs, out of band — and each session token
+    /// is consumed by its first request. Ctrl-C stops it. See
+    /// docs/adr/0005-browser-protocol.md for the transport decision and its
+    /// exact limits.
+    AfirmaServe {
+        #[arg(long)]
+        p12: Option<PathBuf>,
+
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+
+        /// Address to bind. Only loopback addresses are accepted, and
+        /// 127.0.0.1:0 (the default) is the documented form: the port that
+        /// gets chosen is printed and belongs to whoever hands it to the page.
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: String,
+
+        /// Answer one liveness probe (`POST /echo` on a fresh token) and
+        /// exit 0 if the endpoint signs nothing but answers — the shape of a
+        /// smoke test CI can run without a browser. A token is issued and
+        /// consumed by this flag's own request; with no --serve, an external
+        /// fake sede drives the rest.
+        #[arg(long)]
+        issue_token: bool,
+
+        /// Issue a session token, print it, and exit. What a real launch
+        /// prints is the port (this prints both); scripts feed the pair to
+        /// their own client code.
+        #[arg(long, conflicts_with = "issue_token")]
+        token_only: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1241,8 +1309,208 @@ fn main() -> Result<()> {
                 anyhow::bail!("at least one keystore could not be listed");
             }
         }
+        Command::AfirmaUri {
+            uri,
+            output,
+            p12,
+            password_file,
+            register,
+        } => {
+            if register {
+                if uri.is_some() || output.is_some() {
+                    anyhow::bail!(
+                        "--register installs the scheme and signs nothing; a URI or --output \
+                         with it would be ambiguous about which one this invocation is"
+                    );
+                }
+                return register_scheme();
+            }
+            let uri = uri.context(
+                "afirma-uri needs the afirma://… URI the browser handed over (or --register \
+                 to install the scheme instead of answering a call)",
+            )?;
+            let container = p12.context(
+                "--p12 (and its password by --password-file or OPENFIRMA_PASSWORD) names \
+                 the key a browser call signs with: openfirma is headless and has no \
+                 AutoFirma-style certificate dialog to fall back on",
+            )?;
+            let password = p12_password(None, password_file)?.context(
+                "--p12 needs the container's password: --password-file (the safe \
+                 input) or OPENFIRMA_PASSWORD; argv is not an option for a secret",
+            )?;
+            let key = openfirma_browser::dispatch::KeySource::P12 {
+                path: &container,
+                password: &password,
+            };
+            let result = openfirma_browser::dispatch::handle_uri_text(&uri, &key)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            match output {
+                Some(path) => std::fs::write(&path, &result.payload)
+                    .with_context(|| format!("writing {}", path.display()))?,
+                None => {
+                    use std::io::Write;
+                    std::io::stdout()
+                        .write_all(&result.payload)
+                        .context("writing the result to stdout")?;
+                }
+            }
+            match &result.kind {
+                openfirma_browser::dispatch::ResultKind::Signature { format } => eprintln!(
+                    "signed a browser call as {format}, {} bytes of payload",
+                    result.payload.len()
+                ),
+                openfirma_browser::dispatch::ResultKind::CertificateSelected => eprintln!(
+                    "selected certificate, {} bytes of base64 DER",
+                    result.payload.len()
+                ),
+            }
+        }
+        Command::AfirmaServe {
+            p12,
+            password_file,
+            bind,
+            issue_token,
+            token_only,
+        } => {
+            let addr: std::net::SocketAddr = bind
+                .parse()
+                .with_context(|| format!("--bind {bind:?} is not an address like 127.0.0.1:0"))?;
+            let container = p12.context("--p12 names the key the endpoint signs with")?;
+            let password = p12_password(None, password_file)?
+                .context("--p12 needs its password: --password-file or OPENFIRMA_PASSWORD")?;
+            let server = openfirma_browser::serve::LoopbackServer::start(
+                addr,
+                openfirma_browser::serve::OwnedKeySource::P12 {
+                    path: container,
+                    password,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("listening on http://{}", server.addr());
+            if token_only {
+                let token = server.issue_token();
+                println!("token: {token}");
+                // The accept thread keeps the process alive past this return;
+                // for a print-the-token flag the caller is done with us, so
+                // end now like AutoFirma halts after its one operation.
+                std::process::exit(0);
+            }
+            let token = server.issue_token();
+            println!("token: {token}");
+            if issue_token {
+                // The probe doubles as the smoke test a fake client repeats:
+                // POST /echo with the exact Host/Origin this endpoint demands.
+                let body = probe_echo(server.addr())?;
+                println!("echo: {body}");
+                return Ok(());
+            }
+            eprintln!(
+                "serving until interrupted or after {} requests; see \
+                 docs/adr/0005-browser-protocol.md for the endpoint's rules",
+                openfirma_browser::serve::MAX_REQUESTS
+            );
+            // Park the main thread: connection threads own their sockets, and
+            // a Ctrl-C kills the process while the listener dies with it —
+            // the same life span AutoFirma's socket has (it halts after its
+            // one operation).
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
     }
     Ok(())
+}
+
+/// `afirma-uri --register`: generate exactly this platform's registration
+/// files, write only those, and print what still has to be run by hand (the
+/// update-desktop-database command, or opening a .reg through its own UAC
+/// prompt). Nothing here touches a system location or a registry: scheme
+/// registration is an install-time act the user performs, and docs/adr/0005
+/// keeps it that way on purpose.
+fn register_scheme() -> Result<()> {
+    let exe = std::env::current_exe().context(
+        "the registration must name openfirma's own absolute path (the OS starts this \
+         process from a path already, so this failure means the OS lied about argv0)",
+    )?;
+    #[cfg(target_os = "linux")]
+    {
+        let (path, reindex) = openfirma_browser::scheme::linux_install_paths();
+        std::fs::write(&path, openfirma_browser::scheme::linux_desktop_entry(&exe))
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+        println!("then run:  {reindex}");
+        println!(
+            "and make sure the Exec path exists for the desktop environment: \
+             currently it is {}",
+            exe.display()
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let path = std::env::current_dir()
+            .context("no current directory to write the registration file into")?
+            .join("openfirma-afirma.reg");
+        std::fs::write(
+            &path,
+            openfirma_browser::scheme::windows_registry_file(&exe),
+        )
+        .with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+        println!(
+            "then double-click it (or `regedit /I`) and accept the UAC prompt: \
+                  a signing client never edits HKCR by itself"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        println!(
+            "macOS launches an .app bundle, not a bare binary, for a URL scheme. \
+             Put this inside openfirma.app/Contents/Info.plist and re-register the \
+             bundle with lsregister:\n{}",
+            openfirma_browser::scheme::macos_plist_fragment()
+        );
+        println!(
+            "then: /System/Library/Frameworks/CoreServices.framework/Frameworks/\
+             LaunchServices.framework/Versions/A/Support/lsregister -f openfirma.app"
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        let _ = exe;
+        anyhow::bail!(
+            "this operating system has no scheme registration mechanism openfirma knows; \
+             point your browser's handler at `openfirma afirma-uri \"%u\"` by hand"
+        );
+    }
+    Ok(())
+}
+
+/// One `POST /echo` with the headers the endpoint demands, and the body it
+/// answers. The same tiny request a fake sede drives in the tests; keeping it
+/// here is what lets `--issue-token` smoke-test an actual build without any
+/// test harness.
+fn probe_echo(addr: std::net::SocketAddr) -> Result<String> {
+    use std::io::{Read, Write};
+    let request = format!(
+        "POST /echo HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n",
+        port = addr.port()
+    );
+    let mut stream = std::net::TcpStream::connect(addr)
+        .with_context(|| format!("connecting to the endpoint at {addr}"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.write_all(request.as_bytes())?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw)?;
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    if raw.starts_with("HTTP/1.1 200") && body.trim() == "OK" {
+        Ok(body.trim().to_string())
+    } else {
+        anyhow::bail!(
+            "the endpoint did not answer the liveness probe as promised: {}",
+            raw.lines().next().unwrap_or("<no status line>")
+        );
+    }
 }
 
 /// Reads a PKCS#12 and takes one entry from it: the key, the leaf certificate

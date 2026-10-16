@@ -61,7 +61,9 @@ Very early, phase 1. What works today:
   DER signature as a normalized tree for diffing), and `openfirma keystores
   list`, which lists what a PKCS#11 token or NSS database holds.
 
-Not started yet: the browser protocol, the GUI, and FacturaE.
+Not started yet: the GUI, and FacturaE. The browser protocol works on its own
+pages and test sedes; against a *real* sede it still lacks the TLS leg — see
+docs/adr/0005-browser-protocol.md and the table row below.
 
 | Component | Status |
 |---|---|
@@ -77,7 +79,7 @@ Not started yet: the browser protocol, the GUI, and FacturaE.
 | Keystores: Windows cert store, macOS keychain | Windows compiles on CI and is untested at runtime; macOS lists, refuses to sign until tested, see docs/adr/0004-system-keystores.md |
 | XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
 | XAdES B-T and above, FacturaE, enveloping/detached shapes | not started |
-| Browser integration (`afirma://`, wss:// localhost, AutoScript) | not started |
+| Browser integration (`afirma://` parsing, dispatch, loopback endpoint) | works end to end against a fake sede (openssl crosschecks the signature it produces); plain HTTP transport: real sedes need wss, refused rather than faked, see docs/adr/0005-browser-protocol.md |
 | GUI | not started |
 
 ## Quick start
@@ -127,6 +129,19 @@ cargo run -- sign -i doc.txt -o doc.csig \
 cargo run -- sign -i doc.txt -o doc.csig --store nss      # $HOME/.pki/nssdb
 ```
 
+A sede's browser call answers through the same signing code. The scheme and
+the loopback endpoint's rules are docs/adr/0005-browser-protocol.md; at install
+time you register the scheme once (it writes only your own files, never a
+system path), then pages hand URIs to the endpoint:
+
+```
+cargo run -- afirma-uri --register          # writes and explains the registration
+cargo run -- afirma-serve \
+    --p12 certificado.p12 --password-file pw.txt   # prints its port and one token
+cargo run -- afirma-uri "afirma://sign?op=sign&format=CAdES&algorithm=SHA256&dat=…" \
+    --p12 certificado.p12 --password-file pw.txt -o result.txt   # what the OS handler runs
+```
+
 `tools/fetch-autofirma.sh` downloads the official AutoFirma so its output can
 be diffed against ours, see `docs/validation.md`.
 
@@ -139,6 +154,7 @@ crates/
   openfirma-pades    PDF reading, incremental updates, PAdES
   openfirma-xades    XML reader, Canonical XML, XAdES-B-B
   openfirma-keystore PKCS#12 + system stores: PKCS#11/NSS FFI, Windows, macOS
+  openfirma-browser  browser protocol: afirma:// URIs, dispatch, loopback endpoint
   openfirma-cli      the `openfirma` binary
 docs/
   architecture.md    crate layering and data flow

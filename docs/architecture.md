@@ -5,7 +5,7 @@
 ```
         openfirma-cli        openfirma-gui (later)
                  \              /
-             openfirma-protocol      <- afirma:// verbs, wss://localhost, AutoScript compat
+             openfirma-browser       <- afirma:// verbs, loopback endpoint (docs/adr/0005)
                         |
         +---------------+----------------+
         |               |                |
@@ -26,8 +26,8 @@ format testable with a fixed software key, and it is what makes the hardware
 backends swappable.
 
 Rule: nothing above `openfirma-core` may depend on a platform. Platform access
-is confined to `openfirma-keystore`, `openfirma-protocol` (sockets, URL scheme
-registration) and the installers.
+is confined to `openfirma-keystore`, `openfirma-browser` (loopback sockets, URL
+scheme registration) and the installers.
 
 ## Crate responsibilities
 
@@ -63,8 +63,12 @@ registration) and the installers.
   `docs/xades.md`.
 - **openfirma-keystore**: enumeration and selection of certificates across
   stores, key operations through the platform or a token.
-- **openfirma-protocol**: the local service that browsers invoke. Wire
-  compatible with AutoScript so existing sedes electrónicas work unchanged.
+- **openfirma-browser**: the local service that browsers invoke: `afirma://`
+  URI parsing and dispatch onto the format crates, the loopback endpoint with
+  its one-time-token/Origin/Host rules, and the OS scheme registration files.
+  The wire shapes are measured off AutoFirma; its self-signed wss transport is
+  deliberately not reproduced — docs/adr/0005-browser-protocol.md records what
+  a real sede still needs before end-to-end AutoScript compatibility.
 - **openfirma-validate**: revocation, certificate policy, validation data and
   the report format VALIDe shows. The cryptographic verification of CAdES and
   PAdES already lives in the format crates, behind `openfirma verify`; PAdES
