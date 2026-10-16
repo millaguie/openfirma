@@ -10,3 +10,10 @@
              Sin /Info, sin fechas y sin cadena de productor: cualquier valor
              volatile acabaria en el golden y convertiria un diff estructural
              en ruido. Regeneralo con esa script si cambia.
+ xfa-form.pdf         PDF con formulario: /AcroForm inline con /NeedAppearances
+                      y /XFA. Entra en la regresion que comprueba que firmar
+                      conserva esas claves (se injerta en el diccionario, no
+                      se reconstruye).
+ indirect-annots.pdf  PDF cuyo /Annots de pagina es un objeto indirecto, la
+                      forma que escribe iText. Comprueba que sigue siendo
+                      indirecto despues de firmar.

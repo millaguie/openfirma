@@ -40,11 +40,14 @@ pub(crate) const BYTERANGE_WIDTH: usize = 10;
 /// How much space to reserve for `/Contents` when the caller does not say.
 ///
 /// The CMS is zero padded to fill it, so this is wasted space in the file, but
-/// too small a reservation is a hard failure. 16 KiB holds a chain of several
-/// certificates with room to spare and leaves space for the timestamp token
-/// that B-T will add later without changing the layout algorithm. AutoFirma,
-/// through iText, reserves 27000.
-pub const DEFAULT_CONTENTS_RESERVED: usize = 16384;
+/// too small a reservation is a hard failure, and the shapes that need the
+/// most room are the ones a signer cannot foresee: a long TSA chain in a B-T
+/// token, or a certificate chain with a post-quantum key in it. 27000 is what
+/// AutoFirma reserves through iText, so it is what openfirma reserves: a
+/// document that fits AutoFirma fits us, and the golden diff sees the same
+/// container on both sides. Raise it through [`PadesOptions::contents_reserved`]
+/// or `--contents-reserved` for a signature that still does not fit.
+pub const DEFAULT_CONTENTS_RESERVED: usize = 27000;
 
 pub struct PadesOptions {
     pub digest: DigestAlg,
@@ -163,11 +166,9 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
         .field_name
         .clone()
         .unwrap_or_else(|| next_field_name(&existing.names));
-    let mut fields = existing.refs;
-    fields.push(field);
+    let acroform = acroform_of(pdf, &offsets, &catalog);
 
     let sig_dict = build_sig_dict(signer, opts)?;
-    let acroform = build_acroform(&fields, helv, zadb);
 
     // Even an invisible signature needs an appearance entry, viewers look for
     // it, and a blank form XObject is how you say "draw nothing".
@@ -211,14 +212,55 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     // The catalog and the page keep their numbers, so every reference to them
     // from the older revisions now resolves to these new definitions and the
     // page tree does not have to be rewritten at all.
-    update.push(Object::new(
-        trailer.root,
-        pdf::set(&catalog, "/AcroForm", acroform.as_bytes())?,
-    ));
-    update.push(Object::new(
-        page_ref,
-        pdf::set(&page, "/Annots", &merged_annots(&page, field)?)?,
-    ));
+    //
+    // An /AcroForm that already exists is *spliced*, not rebuilt: /Fields
+    // gains our field and /SigFlags is added when absent, and every other
+    // byte of the dictionary survives — /NeedAppearances, /XFA (which the
+    // forms the Spanish administration publishes carry), the author's own
+    // /DR. Rebuilding it from the keys we know is exactly the silent
+    // document alteration docs/adr/0003 exists to prevent. An indirect
+    // /AcroForm stays indirect: only the object that changes is rewritten,
+    // and the catalog is left alone entirely.
+    match acroform {
+        Some((acro_ref, acro_bytes)) => {
+            let mut new_acro = match pdf::get(&acro_bytes, "/Fields") {
+                Some(v) => pdf::set(&acro_bytes, "/Fields", &merged_fields(v, field)?)?,
+                None => pdf::set(&acro_bytes, "/Fields", format!("[{field}]").as_bytes())?,
+            };
+            if pdf::get(&new_acro, "/SigFlags").is_none() {
+                new_acro = pdf::set(&new_acro, "/SigFlags", b"3")?;
+            }
+            match acro_ref {
+                Some(r) => update.push(Object::new(r, new_acro)),
+                None => update.push(Object::new(
+                    trailer.root,
+                    pdf::set(&catalog, "/AcroForm", &new_acro)?,
+                )),
+            }
+        }
+        None => {
+            // no form at all: write the dictionary iText writes, which is
+            // what the golden diff measures
+            let mut fields = existing.refs;
+            if !fields.contains(&field) {
+                fields.push(field);
+            }
+            let form = build_acroform(&fields, helv, zadb);
+            update.push(Object::new(
+                trailer.root,
+                pdf::set(&catalog, "/AcroForm", form.as_bytes())?,
+            ));
+        }
+    }
+    match merged_annots(pdf, &offsets, &page, field)? {
+        MergedAnnots::Inline(array) => {
+            update.push(Object::new(page_ref, pdf::set(&page, "/Annots", &array)?))
+        }
+        // the page keeps pointing at "N G R"; only the array object it names
+        // is rewritten, in the new revision, where the old one stays exactly
+        // where the earlier /ByteRanges say it is
+        MergedAnnots::Indirect(r, array) => update.push(Object::new(r, array)),
+    }
 
     // Recording that the document changed is what /ModDate is for.
     let date = pdf_string(&pdf_date(opts.sign_time)?);
@@ -333,20 +375,78 @@ pub(crate) fn build_field(
     d
 }
 
+/// Where a page's `/Annots` ends up after our field is added: spliced into
+/// the page dictionary itself, or written back under the number of the
+/// indirect object it already was — the shape iText writes, and the shape the
+/// page keeps pointing at. Turning an indirect array into an inline one would
+/// work for readers but rewrite the page for no reason; keeping the reference
+/// is the byte preservation of docs/adr/0003 at annotation level.
+pub(crate) enum MergedAnnots {
+    Inline(Vec<u8>),
+    Indirect(ObjRef, Vec<u8>),
+}
+
 /// The page's `/Annots` with our field added, keeping the ones already there.
-pub(crate) fn merged_annots(page: &[u8], field: ObjRef) -> Result<Vec<u8>> {
-    match pdf::get(page, "/Annots") {
-        Some(existing) => {
-            let mut v = pdf::trim_ws(existing).to_vec();
-            if !v.ends_with(b"]") {
-                return Err(Error::Pdf("the page /Annots is not an array".into()));
-            }
-            v.pop();
-            v.extend_from_slice(format!(" {field}]").as_bytes());
-            Ok(v)
+pub(crate) fn merged_annots(
+    pdf: &[u8],
+    offsets: &BTreeMap<ObjRef, Location>,
+    page: &[u8],
+    field: ObjRef,
+) -> Result<MergedAnnots> {
+    let Some(existing) = pdf::get(page, "/Annots") else {
+        return Ok(MergedAnnots::Inline(format!("[{field}]").into_bytes()));
+    };
+    if let Some(r) = pdf::parse_ref(existing) {
+        let resolved = pdf::resolve(pdf, offsets, r)?;
+        let array = pdf::trim_ws(&resolved);
+        if !array.starts_with(b"[") || !array.ends_with(b"]") {
+            return Err(Error::Pdf(format!(
+                "object {r}, the page's indirect /Annots, is not an array"
+            )));
         }
-        None => Ok(format!("[{field}]").into_bytes()),
+        return Ok(MergedAnnots::Indirect(r, append_to_array(array, field)?));
     }
+    let array = pdf::trim_ws(existing);
+    if !array.ends_with(b"]") {
+        return Err(Error::Pdf("the page /Annots is not an array".into()));
+    }
+    Ok(MergedAnnots::Inline(append_to_array(array, field)?))
+}
+
+/// An array value with one more reference before the closing bracket,
+/// keeping the author's bytes for everything already in it.
+fn append_to_array(array: &[u8], field: ObjRef) -> Result<Vec<u8>> {
+    let mut v = array.to_vec();
+    v.pop(); // the ']'
+    v.extend_from_slice(format!(" {field}]").as_bytes());
+    Ok(v)
+}
+
+/// An existing `/AcroForm /Fields` with our field appended and duplicates
+/// out. When the array holds neither a duplicate nor our field — the case
+/// every real document is in — the author's bytes are kept and the reference
+/// is inserted before the bracket. A rebuild from the parsed references only
+/// happens for an array that lists the same field twice, because that cannot
+/// be fixed by appending; it drops inline field dictionaries, which an array
+/// with duplicate references is not a document to be careful with anyway.
+pub(crate) fn merged_fields(existing: &[u8], field: ObjRef) -> Result<Vec<u8>> {
+    let array = pdf::trim_ws(existing);
+    if !array.starts_with(b"[") || !array.ends_with(b"]") {
+        return Err(Error::Pdf("the /AcroForm /Fields is not an array".into()));
+    }
+    let refs = pdf::array_refs(array)?;
+    let duplicated = refs.iter().enumerate().any(|(i, r)| refs[..i].contains(r));
+    if !duplicated && !refs.contains(&field) {
+        return append_to_array(array, field);
+    }
+    let mut out: Vec<ObjRef> = Vec::with_capacity(refs.len() + 1);
+    for r in refs.into_iter().chain(std::iter::once(field)) {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    let list: Vec<String> = out.iter().map(|r| r.to_string()).collect();
+    Ok(format!("[{}]", list.join(" ")).into_bytes())
 }
 
 /// Patches `/ByteRange`, then signs the two ranges it describes and fills
@@ -553,6 +653,27 @@ pub(crate) struct ExistingFields {
     pub names: Vec<String>,
 }
 
+/// The document's `/AcroForm` dictionary: its bytes, and the object it lives
+/// under when it is an indirect object, which is how iText writes it. Both
+/// halves matter to the caller: the bytes get spliced, and the number says
+/// which object the splice has to be written back as.
+pub(crate) fn acroform_of(
+    pdf: &[u8],
+    offsets: &BTreeMap<ObjRef, Location>,
+    catalog: &[u8],
+) -> Option<(Option<ObjRef>, Vec<u8>)> {
+    let value = pdf::get(catalog, "/AcroForm")?;
+    match pdf::parse_ref(value) {
+        // an indirect /AcroForm may live in an object stream, so the bytes
+        // are always owned here
+        Some(r) => match pdf::resolve(pdf, offsets, r) {
+            Ok(b) => Some((Some(r), b.into_owned())),
+            Err(_) => None,
+        },
+        None => Some((None, pdf::trim_ws(value).to_vec())),
+    }
+}
+
 pub(crate) fn existing_signature_fields(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
@@ -562,20 +683,10 @@ pub(crate) fn existing_signature_fields(
         refs: Vec::new(),
         names: Vec::new(),
     };
-    let Some(acro_bytes) = pdf::get(catalog, "/AcroForm") else {
+    let Some((_, acro)) = acroform_of(pdf, offsets, catalog) else {
         return empty;
     };
-    // /AcroForm may be written inline or as an indirect reference, and an
-    // indirect one may live in an object stream, so it is always owned here
-    let owned: Vec<u8> = match pdf::parse_ref(acro_bytes) {
-        Some(r) => match pdf::resolve(pdf, offsets, r) {
-            Ok(b) => b.into_owned(),
-            Err(_) => return empty,
-        },
-        None => acro_bytes.to_vec(),
-    };
-    let acro: &[u8] = &owned;
-    let Some(fields_bytes) = pdf::get(acro, "/Fields") else {
+    let Some(fields_bytes) = pdf::get(&acro, "/Fields") else {
         return empty;
     };
     let Ok(refs) = pdf::array_refs(fields_bytes) else {
@@ -898,5 +1009,208 @@ mod tests {
             next_field_name(&["Signature1".into(), "Signature2".into()]),
             "Signature3"
         );
+    }
+
+    /// The default reservation is iText's, which is what AutoFirma leaves in
+    /// every document it signs: a signature that fits AutoFirma has to fit
+    /// us, and a B-T token with a long TSA chain is the shape that used to
+    /// not fit in 16384.
+    #[test]
+    fn the_default_reservation_matches_itext_and_lands_in_the_file() {
+        assert_eq!(DEFAULT_CONTENTS_RESERVED, 27_000);
+        assert_eq!(PadesOptions::default().contents_reserved, 27_000);
+        let Some(signer) = test_signer() else {
+            eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let signed = sign(FIXTURE, &signer, &PadesOptions::default()).expect("signing failed");
+        let sig = &crate::inspect::signatures(&signed).expect("readable")[0];
+        let [_, b, c, _] = sig.byte_range;
+        assert_eq!(
+            c - b,
+            DEFAULT_CONTENTS_RESERVED * 2 + 2,
+            "the hole is the reservation in hex, brackets included"
+        );
+    }
+
+    /// An `/AcroForm` the document already has is spliced, not rebuilt:
+    /// every key its author wrote survives into the new revision. The
+    /// casualties of a rebuild are `/NeedAppearances` and `/XFA`, and XFA
+    /// forms are what the Spanish administration publishes; dropping either
+    /// changes how the document renders or what it says, which is exactly
+    /// what docs/adr/0003 forbids.
+    #[test]
+    fn an_existing_acroform_keeps_its_other_keys() {
+        const XFA_FORM: &[u8] = include_bytes!("../../../testdata/inputs/xfa-form.pdf");
+        let Some(signer) = test_signer() else {
+            eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let signed =
+            sign(XFA_FORM, &signer, &PadesOptions::default()).expect("signing a form PDF failed");
+        assert!(
+            signed.starts_with(XFA_FORM),
+            "the original revision must survive untouched"
+        );
+
+        let at = pdf::last_startxref(&signed).unwrap();
+        let tr = pdf::trailer(&signed, at).unwrap();
+        let locs = pdf::object_locations(&signed, at).unwrap();
+        let catalog = pdf::resolve(&signed, &locs, tr.root).unwrap();
+        let acro = pdf::get(&catalog, "/AcroForm").expect("the catalog lost its /AcroForm");
+        for key in ["/NeedAppearances true", "/XFA 4 0 R"] {
+            assert!(
+                acro.windows(key.len()).any(|w| w == key.as_bytes()),
+                "{key} must survive the splice, /AcroForm is now {:?}",
+                String::from_utf8_lossy(acro)
+            );
+        }
+        assert!(
+            pdf::get(acro, "/SigFlags").is_some_and(|v| pdf::trim_ws(v) == b"3"),
+            "/SigFlags 3 is added when absent"
+        );
+        // and the field list gained exactly our signature field
+        let refs = pdf::array_refs(pdf::get(acro, "/Fields").unwrap()).unwrap();
+        assert_eq!(refs.len(), 1, "the empty /Fields gains our field only");
+        let field = pdf::resolve(&signed, &locs, refs[0]).unwrap();
+        assert_eq!(
+            pdf::get(&field, "/FT").map(pdf::trim_ws),
+            Some(b"/Sig".as_slice())
+        );
+    }
+
+    /// `/SigFlags` the author already wrote is kept: the splice adds it only
+    /// when it is absent, it does not insist on its own value.
+    #[test]
+    fn an_existing_sigflags_value_is_kept() {
+        let Some(signer) = test_signer() else {
+            eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let doc = mini_pdf(
+            "<< /Type /Catalog /Pages 2 0 R \
+             /AcroForm << /Fields [] /NeedAppearances true /SigFlags 1 >> >>",
+        );
+        let signed = sign(&doc, &signer, &PadesOptions::default()).expect("signing failed");
+
+        let at = pdf::last_startxref(&signed).unwrap();
+        let tr = pdf::trailer(&signed, at).unwrap();
+        let locs = pdf::object_locations(&signed, at).unwrap();
+        let catalog = pdf::resolve(&signed, &locs, tr.root).unwrap();
+        let acro = pdf::get(&catalog, "/AcroForm").expect("the catalog lost its /AcroForm");
+        let text = String::from_utf8_lossy(acro);
+        assert!(text.contains("/SigFlags 1"), "kept: {text}");
+        assert!(!text.contains("/SigFlags 3"), "not overwritten: {text}");
+        assert!(text.contains("/NeedAppearances true"), "{text}");
+    }
+
+    /// A minimal one page PDF with the catalog given verbatim, behind a
+    /// correct classic cross-reference table.
+    fn mini_pdf(catalog: &str) -> Vec<u8> {
+        let bodies: [&str; 3] = [
+            catalog,
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>",
+        ];
+        let mut out = Vec::from(&b"%PDF-1.4\n"[..]);
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref_at = out.len();
+        out.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n");
+        out.extend_from_slice(format!("{xref_at}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    /// The array splice itself: the author's bytes are kept and the field
+    /// appended, and only an array that lists a reference twice — which
+    /// appending cannot fix — is rebuilt from its deduplicated references.
+    #[test]
+    fn merged_fields_keeps_the_authors_bytes_and_dedupes() {
+        let field = ObjRef::new(9, 0);
+        assert_eq!(
+            merged_fields(b"[1 0 R 2 0 R]", field).unwrap(),
+            b"[1 0 R 2 0 R 9 0 R]"
+        );
+        assert_eq!(
+            merged_fields(b"[1 0 R 2 0 R 1 0 R]", field).unwrap(),
+            b"[1 0 R 2 0 R 9 0 R]"
+        );
+        // our field already listed: no second copy of it
+        assert_eq!(merged_fields(b"[9 0 R]", field).unwrap(), b"[9 0 R]");
+        // an empty array gains exactly the field
+        assert_eq!(merged_fields(b"[]", field).unwrap(), b"[ 9 0 R]");
+        // and something that is not an array is refused
+        assert!(merged_fields(b"9 0 R", field).is_err());
+    }
+
+    /// An indirect `/Annots` — the shape iText writes, so the shape every
+    /// document AutoFirma signed has — is resolved, merged and written back
+    /// under its own number: the page keeps its reference, the old array
+    /// stays where the earlier revisions' `/ByteRange`s say it is, and the
+    /// annotation it held survives next to our field.
+    #[test]
+    fn an_indirect_annots_array_stays_indirect() {
+        const DOC: &[u8] = include_bytes!("../../../testdata/inputs/indirect-annots.pdf");
+        let Some(signer) = test_signer() else {
+            eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        // before the fix this failed outright: "the page /Annots is not an
+        // array", because the value was the reference, not the array
+        let signed = sign(DOC, &signer, &PadesOptions::default())
+            .expect("signing a document with an indirect /Annots failed");
+        assert!(
+            signed.starts_with(DOC),
+            "the original revision must survive"
+        );
+
+        let at = pdf::last_startxref(&signed).unwrap();
+        let locs = pdf::object_locations(&signed, at).unwrap();
+
+        // the page still points at 4 0 R, it was not inlined
+        let page = pdf::resolve(&signed, &locs, ObjRef::new(3, 0)).unwrap();
+        assert_eq!(
+            pdf::get(&page, "/Annots").map(pdf::trim_ws),
+            Some(b"4 0 R".as_slice()),
+            "the indirect form must be kept in the new revision"
+        );
+
+        // object 4, redefined in the new revision, holds both annotations
+        let annots = pdf::resolve(&signed, &locs, ObjRef::new(4, 0)).unwrap();
+        let refs = pdf::array_refs(&annots).unwrap();
+        assert_eq!(refs.len(), 2, "the original annotation plus our field");
+        // the annotation that was there is itself indirect, so the array
+        // holds its reference and the /Subtype lives in its own object
+        let link = pdf::resolve(&signed, &locs, refs[0]).unwrap();
+        assert_eq!(
+            pdf::get(&link, "/Subtype").map(pdf::trim_ws),
+            Some(b"/Link".as_slice()),
+            "the annotation that was there must survive: {:?}",
+            String::from_utf8_lossy(&link)
+        );
+        let field = pdf::resolve(&signed, &locs, refs[1]).unwrap();
+        assert_eq!(
+            pdf::get(&field, "/FT").map(pdf::trim_ws),
+            Some(b"/Sig".as_slice())
+        );
+
+        // and the whole document still verifies
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs");
+        let ca = openfirma_core::cert::CertificateHandle::from_pem(
+            &std::fs::read_to_string(dir.join("ca.crt")).expect("the test PKI has a ca.crt"),
+        )
+        .expect("ca.crt is a certificate");
+        crate::verify::verify(
+            &signed,
+            &openfirma_cades::verify::VerifyOptions::new(vec![ca]),
+        )
+        .expect("the signed document must verify");
     }
 }

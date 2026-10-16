@@ -42,8 +42,8 @@ use crate::appearance;
 use crate::inspect;
 use crate::pdf::{self, Location, ObjRef};
 use crate::sign::{
-    BYTERANGE_WIDTH, build_field, existing_signature_fields, fill_hole, merged_annots, next_name,
-    page_at,
+    BYTERANGE_WIDTH, MergedAnnots, acroform_of, build_field, existing_signature_fields, fill_hole,
+    merged_annots, merged_fields, next_name, page_at,
 };
 use crate::update::{Object, Update};
 
@@ -497,25 +497,15 @@ pub fn add_document_timestamp(
     // /AcroForm keeps every byte it has except /Fields, which gains the new
     // field; it may sit inline in the catalog or be an indirect object, and
     // only the definition that actually changes is rewritten
-    let Some(acro_value) = pdf::get(&catalog, "/AcroForm") else {
+    let Some((acro_ref, acro_bytes)) = acroform_of(pdf, &offsets, &catalog) else {
         return Err(Error::Pdf(
             "the catalog has no /AcroForm to append the time-stamp field to".into(),
         ));
     };
-    let (acro_ref, acro_bytes) = match pdf::parse_ref(acro_value) {
-        Some(r) => (Some(r), pdf::resolve(pdf, &offsets, r)?.into_owned()),
-        None => (None, pdf::trim_ws(acro_value).to_vec()),
-    };
     let Some(fields_value) = pdf::get(&acro_bytes, "/Fields") else {
         return Err(Error::Pdf("the /AcroForm has no /Fields".into()));
     };
-    let mut fields = pdf::trim_ws(fields_value).to_vec();
-    if !fields.ends_with(b"]") {
-        return Err(Error::Pdf("the /AcroForm /Fields is not an array".into()));
-    }
-    fields.pop();
-    fields.extend_from_slice(format!(" {field}]").as_bytes());
-    let new_acro = pdf::set(&acro_bytes, "/Fields", &fields)?;
+    let new_acro = pdf::set(&acro_bytes, "/Fields", &merged_fields(fields_value, field)?)?;
     match acro_ref {
         Some(r) => update.push(Object::new(r, new_acro)),
         None => update.push(Object::new(
@@ -523,10 +513,12 @@ pub fn add_document_timestamp(
             pdf::set(&catalog, "/AcroForm", &new_acro)?,
         )),
     }
-    update.push(Object::new(
-        page_ref,
-        pdf::set(&page, "/Annots", &merged_annots(&page, field)?)?,
-    ));
+    match merged_annots(pdf, &offsets, &page, field)? {
+        MergedAnnots::Inline(array) => {
+            update.push(Object::new(page_ref, pdf::set(&page, "/Annots", &array)?))
+        }
+        MergedAnnots::Indirect(r, array) => update.push(Object::new(r, array)),
+    }
 
     let rendered = update.render(pdf.len())?;
     let dts_at = rendered.offsets[&dts];

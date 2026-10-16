@@ -87,7 +87,8 @@ run_case simple "$INPUTS/simple.txt" signer-rsa
 #   revisions  AutoFirma rewrites the document through iText, we append an
 #              incremental update. docs/adr/0003-incremental-update.md
 #   container  how much of /Contents is reserved for the CMS and zero padded.
-#              AutoFirma reserves 27000 bytes, we size it from the chain.
+#              Both sides reserve 27000 by default, but ours is a flag
+#              (--contents-reserved), so the container is normalized away.
 #              The length of the CMS itself is compared and must match.
 normalize_pades() {
   grep -vE '^(source|revisions):' | sed -E 's/container [0-9]+ bytes/container <reserved>/'

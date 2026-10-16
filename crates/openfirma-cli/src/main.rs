@@ -207,6 +207,20 @@ struct SignArgs {
     /// Obtained by the caller, like the CRLs. PAdES B-LT and B-LTA only.
     #[arg(long)]
     ocsp: Vec<PathBuf>,
+
+    /// Bytes reserved for the /Contents hole of a PAdES signature or
+    /// document time-stamp, which the value is zero padded to fill. The
+    /// default is what AutoFirma reserves through iText; raise it for a
+    /// signature that does not fit (a long TSA chain, an unusual
+    /// certificate), because too small a reservation is a hard failure.
+    #[arg(long, default_value_t = openfirma_pades::DEFAULT_CONTENTS_RESERVED)]
+    contents_reserved: usize,
+
+    /// Allow the output to be the input file itself. Without it,
+    /// `sign -i f.pdf -o f.pdf` is refused: replacing the document being
+    /// signed is one typo away and never the common case.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -444,6 +458,40 @@ fn split_http_response(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(body_out)
 }
 
+/// Refuses `sign -i f -o f` unless `--force` says the overwrite is meant.
+///
+/// Both paths are compared before any reading happens, and twice: the plain
+/// absolute spelling catches `-o ./f` and `-o dir/../f`, and the canonical
+/// one catches an output that is a symlink or a hard link to the input. The
+/// input is read whole before the output is written, so nothing is lost
+/// mechanically — what is refused is the silent case, where one typo turns a
+/// signature into a replacement of the only copy of a document.
+fn check_not_in_place(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    force: bool,
+) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    let absolute_same = match (std::path::absolute(input), std::path::absolute(output)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let canonical_same = match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if absolute_same || canonical_same {
+        anyhow::bail!(
+            "{} is both the input and the output: signing would replace the document \
+             itself. Choose a different -o, or pass --force to overwrite it anyway",
+            input.display()
+        );
+    }
+    Ok(())
+}
+
 /// Parses `llx,lly,urx,ury`, accepting commas or spaces as separators.
 fn parse_rect(text: &str) -> std::result::Result<[f64; 4], String> {
     let parts: Vec<&str> = text
@@ -499,7 +547,10 @@ fn main() -> Result<()> {
                 validation_cert,
                 crl,
                 ocsp,
+                contents_reserved,
+                force,
             } = *args;
+            check_not_in_place(&input, &output, force)?;
             let ltv = matches!(format, Format::PadesLt | Format::PadesLta);
             if !ltv && (!validation_cert.is_empty() || !crl.is_empty() || !ocsp.is_empty()) {
                 anyhow::bail!(
@@ -601,6 +652,7 @@ fn main() -> Result<()> {
                             location,
                             contact_info,
                             field_name,
+                            contents_reserved,
                             visible: rect.map(|r| Appearance {
                                 page,
                                 rect: r,
@@ -660,6 +712,13 @@ fn main() -> Result<()> {
                 trust,
                 at,
             } = args;
+            // the flags are judged before any file is read: a --at that is
+            // not a time is the user's first mistake, not the certificate's
+            let validation_time = match &at {
+                Some(text) => parse_rfc3339(text)
+                    .map_err(|e| anyhow::anyhow!("--at {text:?} is not an RFC 3339 time: {e}"))?,
+                None => std::time::SystemTime::now(),
+            };
             let bytes =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
 
@@ -671,11 +730,6 @@ fn main() -> Result<()> {
                     format!("{} is not a valid X.509 certificate", t.display())
                 })?);
             }
-            let validation_time = match &at {
-                Some(text) => parse_rfc3339(text)
-                    .map_err(|e| anyhow::anyhow!("--at {text:?} is not an RFC 3339 time: {e}"))?,
-                None => std::time::SystemTime::now(),
-            };
             let opts = openfirma_cades::VerifyOptions {
                 trust_anchors: anchors,
                 validation_time,
@@ -1061,10 +1115,30 @@ fn parse_date(s: &str) -> std::result::Result<(i64, u32, u32), String> {
     let d: u32 = s[8..10]
         .parse()
         .map_err(|_| "the day is not a number".to_string())?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return Err(format!("month {m} or day {d} is out of range"));
+    if !(1..=12).contains(&m) {
+        return Err(format!("month {m} is out of range"));
+    }
+    // a validation time of 2026-02-31 is not a time at all: the day has to
+    // exist in its month, leap years included, or the caller typoed and the
+    // certificate dates get judged against an instant that never happens
+    let days_in_month = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => u32::from(is_leap_year(y)) + 28,
+        _ => unreachable!("the month was range checked above"),
+    };
+    if d < 1 || d > days_in_month {
+        return Err(format!(
+            "{s:?} is not a calendar date: month {m} of year {y} has {days_in_month} days"
+        ));
     }
     Ok((y, m, d))
+}
+
+/// The proleptic Gregorian leap year rule, the same calendar
+/// `days_from_civil` below converts through.
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 fn parse_time(s: &str) -> std::result::Result<(u32, u32, u32), String> {
@@ -1252,6 +1326,95 @@ mod tests {
         ] {
             assert!(parse_rfc3339(bad).is_err(), "{bad:?} was accepted");
         }
+    }
+
+    /// --at is the instant certificate validity is judged at, so a date that
+    /// never existed must not quietly become one that does: 2026-02-31 used
+    /// to be accepted and normalized to March 3.
+    #[test]
+    fn calendar_impossible_dates_are_refused() {
+        for bad in [
+            "2026-02-31",
+            "2026-02-30",
+            "2026-02-29", // 2026 is not a leap year
+            "1900-02-29", // divisible by 100, not by 400: not a leap year
+            "2026-04-31",
+            "2026-00-10",
+            "2026-01-00",
+            "2026-02-31T12:00:00Z",
+        ] {
+            assert!(parse_rfc3339(bad).is_err(), "{bad:?} was accepted");
+        }
+        // and the day-in-month refusals say they are calendar refusals
+        for bad in ["2026-02-31", "2026-02-29", "2026-04-31", "2026-01-00"] {
+            let err = parse_rfc3339(bad).err().unwrap();
+            assert!(err.contains("not a calendar date"), "{bad}: {err}");
+        }
+        // the leap years that are real stay usable
+        assert!(parse_rfc3339("2024-02-29").is_ok());
+        assert!(parse_rfc3339("2000-02-29").is_ok());
+        assert!(parse_rfc3339("2026-02-28").is_ok());
+    }
+
+    /// Signing a document onto itself replaces the only copy the user named;
+    /// it takes an explicit --force to mean that.
+    #[test]
+    fn signing_a_file_onto_itself_needs_force() {
+        let input = write_tmp("in-place.pdf", b"%PDF-1.4\n");
+        check_not_in_place(&input, &input, true).expect("--force is the explicit yes");
+        let err = check_not_in_place(&input, &input, false)
+            .expect_err("the same file twice is the accident --force exists for")
+            .to_string();
+        assert!(err.contains("--force"), "{err}");
+
+        // the same file spelled differently is still the same file
+        let dotted = input
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(input.file_name().unwrap());
+        assert!(check_not_in_place(&input, &dotted, false).is_err());
+
+        // a different output is the normal case
+        let other = write_tmp("in-place-out.pdf", b"");
+        check_not_in_place(&input, &other, false).expect("different files are fine");
+        std::fs::remove_file(&other).ok();
+
+        // and an output that does not exist yet cannot be the input
+        let missing = input.with_file_name("definitely-not-the-input.pdf");
+        check_not_in_place(&input, &missing, false).expect("a new file is fine");
+    }
+
+    #[test]
+    fn the_contents_reservation_is_a_flag_with_the_itext_default() {
+        let cli = Cli::try_parse_from(["openfirma", "sign", "-i", "a.pdf", "-o", "b.pdf"]).unwrap();
+        let Command::Sign(args) = cli.command else {
+            panic!("sign");
+        };
+        assert_eq!(args.contents_reserved, 27_000);
+        assert_eq!(
+            args.contents_reserved,
+            openfirma_pades::DEFAULT_CONTENTS_RESERVED
+        );
+        assert!(!args.force);
+
+        let cli = Cli::try_parse_from([
+            "openfirma",
+            "sign",
+            "-i",
+            "a.pdf",
+            "-o",
+            "b.pdf",
+            "--contents-reserved",
+            "40000",
+            "--force",
+        ])
+        .unwrap();
+        let Command::Sign(args) = cli.command else {
+            panic!("sign");
+        };
+        assert_eq!(args.contents_reserved, 40_000);
+        assert!(args.force);
     }
 
     #[test]

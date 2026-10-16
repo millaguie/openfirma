@@ -142,3 +142,28 @@ fn a_truncated_xref_table_is_an_error_not_a_walk_past_the_end() {
     assert!(text.contains("cross-reference table ends"), "{text}");
     assert!(text.contains("3 entries"), "{text}");
 }
+
+/// A `/ByteRange` number that is not a number used to be read as a silent 0,
+/// which turned a corrupt range into one that merely disagrees with the file:
+/// a much worse thing to tell the user. Now the report names the token.
+#[test]
+fn an_unparseable_byterange_number_is_named_in_the_problems() {
+    let pdf = pdf_with_sig_dict("<< /Type /Sig /ByteRange [0 xyz 100 5] /Contents <00> >>");
+    let report = inspect::render(&pdf).expect("a corrupt number must stay reportable");
+    assert!(
+        report.contains("\"xyz\" that is not an unsigned integer"),
+        "the problem must quote the offending token: {report}"
+    );
+
+    // a number too large for any offset is unparseable in the same sense:
+    // it is reported rather than wrapped or silently zeroed
+    let pdf = pdf_with_sig_dict(&format!(
+        "<< /Type /Sig /ByteRange [0 {} 100 5] /Contents <00> >>",
+        u128::from(u64::MAX) * 3
+    ));
+    let report = inspect::render(&pdf).expect("an oversized number must stay reportable");
+    assert!(
+        report.contains("that is not an unsigned integer"),
+        "the problem must name the oversized token: {report}"
+    );
+}

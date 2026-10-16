@@ -37,6 +37,9 @@ use x509_cert::name::Name;
 
 /// Name of the check that the `sid` resolves to an embedded certificate.
 pub const CHECK_SIGNER_CERTIFICATE: &str = "signerCertificate";
+/// Name of the check that the `contentType` signed attribute matches
+/// `encapContentInfo.eContentType`, RFC 5652 11.1.
+pub const CHECK_CONTENT_TYPE: &str = "contentType";
 /// Name of the check that `messageDigest` equals the content's digest.
 pub const CHECK_MESSAGE_DIGEST: &str = "messageDigest";
 /// Name of the check that `signatureValue` verifies over the signed attrs.
@@ -194,6 +197,24 @@ fn verify_signer_info(
         )
     })?;
     let attrs = parse_attributes(attrs_content)?;
+
+    // the contentType attribute, when present, has to name the same type as
+    // encapContentInfo: RFC 5652 11.1, repeated as a verification rule in
+    // 5.6. A mismatch means the signed attributes describe a different
+    // content than the one the messageDigest below is taken over.
+    if let Some(claimed) = attrs.content_type {
+        if claimed != sd.econtent_type {
+            return Err(fail(
+                CHECK_CONTENT_TYPE,
+                format!(
+                    "the signed attribute is {claimed} but encapContentInfo.eContentType \
+                     is {}, and RFC 5652 11.1 requires the two to match",
+                    sd.econtent_type
+                ),
+            ));
+        }
+        passed.push(CHECK_CONTENT_TYPE);
+    }
 
     // (a) messageDigest equals the digest of the content
     let claimed = attrs.message_digest.ok_or_else(|| {
@@ -760,6 +781,9 @@ fn trailing(where_: &str) -> Error {
 // parsing
 
 struct SignedData<'a> {
+    /// `encapContentInfo.eContentType`, what the `contentType` signed
+    /// attribute has to match, RFC 5652 11.1.
+    econtent_type: ObjectIdentifier,
     /// The content inside `encapContentInfo`, when the signature encapsulates.
     econtent: Option<&'a [u8]>,
     certificates: Vec<CertificateHandle>,
@@ -824,7 +848,7 @@ fn parse_signed_data(der: &[u8]) -> Result<SignedData<'_>> {
         f.expect(tlv::TAG_SEQUENCE, "SignedData.encapContentInfo")?
             .content,
     );
-    let _econtent_type = eci.oid("encapContentInfo.eContentType")?;
+    let econtent_type = eci.oid("encapContentInfo.eContentType")?;
     let mut econtent = None;
     if !eci.done() {
         let wrapper = eci.expect(0xA0, "encapContentInfo.eContent")?;
@@ -878,6 +902,7 @@ fn parse_signed_data(der: &[u8]) -> Result<SignedData<'_>> {
         }
     }
     Ok(SignedData {
+        econtent_type,
         econtent,
         certificates,
         signer_infos,

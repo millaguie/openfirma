@@ -15,8 +15,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use openfirma_cades::verify::{
-    CHECK_CERTIFICATE_CHAIN, CHECK_MESSAGE_DIGEST, CHECK_SIGNATURE_VALUE, CHECK_SIGNER_CERTIFICATE,
-    CHECK_SIGNING_CERTIFICATE_V2, CHECK_VALIDITY_DATES, VerifyOptions, verify,
+    CHECK_CERTIFICATE_CHAIN, CHECK_CONTENT_TYPE, CHECK_MESSAGE_DIGEST, CHECK_SIGNATURE_VALUE,
+    CHECK_SIGNER_CERTIFICATE, CHECK_SIGNING_CERTIFICATE_V2, CHECK_VALIDITY_DATES, VerifyOptions,
+    verify,
 };
 use openfirma_cades::{CadesOptions, attributes, sign};
 use openfirma_core::alg::DigestAlg;
@@ -204,6 +205,7 @@ fn encapsulated_cades_verifies_and_the_report_is_complete() {
         r.passed,
         vec![
             CHECK_SIGNER_CERTIFICATE,
+            CHECK_CONTENT_TYPE,
             CHECK_MESSAGE_DIGEST,
             CHECK_SIGNATURE_VALUE,
             CHECK_SIGNING_CERTIFICATE_V2,
@@ -220,6 +222,50 @@ fn encapsulated_cades_verifies_and_the_report_is_complete() {
     assert_eq!(r.attributes.content_hint.as_deref(), Some("Texto plano"));
     assert!(!r.attributes.signature_time_stamp_token);
     assert!(r.attributes.unsigned_attributes.is_empty());
+}
+
+/// RFC 5652 11.1: the `contentType` signed attribute must match
+/// `encapContentInfo.eContentType`. Nothing else in the signature breaks when
+/// the two disagree — the digest is still over the same bytes and the
+/// signature still verifies — which is exactly why the comparison has to be
+/// a check of its own.
+#[test]
+fn a_content_type_that_disagrees_with_econtenttype_fails() {
+    let Some(signer) =
+        load_signer_with_chain("signer-rsa.crt", "signer-rsa.key", &["intermediate.crt"])
+    else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let opts = CadesOptions {
+        encapsulate_content: true,
+        ..default_opts()
+    };
+    let signature = sign(CONTENT, &signer, &opts).expect("signing failed");
+
+    // the first id-data OID in the DER is encapContentInfo.eContentType;
+    // one byte turns it into id-signedData while the signed attribute, which
+    // the signature value covers, still says id-data
+    let id_data: [u8; 11] = [
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01,
+    ];
+    let mut patched = signature.clone();
+    let at = patched
+        .windows(11)
+        .position(|w| w == id_data)
+        .expect("an encapsulated id-data signature carries eContentType");
+    patched[at + 10] = 0x02;
+
+    let err = verify(&patched, None, &VerifyOptions::new(anchors(&["ca.crt"])))
+        .expect_err("a contentType that disagrees with eContentType must not verify")
+        .to_string();
+    assert!(err.contains("contentType check failed"), "{err}");
+    assert!(err.contains("RFC 5652 11.1"), "{err}");
+
+    // the untouched signature passes the check, and says so
+    let reports = verify(&signature, None, &VerifyOptions::new(anchors(&["ca.crt"])))
+        .expect("the untouched signature must still verify");
+    assert!(reports[0].passed.contains(&CHECK_CONTENT_TYPE));
 }
 
 #[test]

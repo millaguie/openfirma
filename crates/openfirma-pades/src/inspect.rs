@@ -58,23 +58,43 @@ pub fn signatures(pdf: &[u8]) -> Result<Vec<Signature>> {
     Ok(out)
 }
 
-/// The `/ByteRange` of a signature or document time-stamp dictionary.
-fn byte_range_of(dict: &[u8], object: ObjRef) -> Result<[usize; 4]> {
+/// The `/ByteRange` of a signature or document time-stamp dictionary, and the
+/// problems its numbers gave while being read. A number that is not a number
+/// is read as 0 *and reported*: silently zeroing it used to turn a corrupt
+/// range into a range that merely disagrees with the file, which is a much
+/// worse thing to tell the user.
+fn byte_range_of(dict: &[u8], object: ObjRef) -> Result<([usize; 4], Vec<String>)> {
     let Some(range_bytes) = pdf::get(dict, "/ByteRange") else {
         return Err(Error::Pdf(format!("signature {object} has no /ByteRange")));
     };
-    let nums: Vec<usize> = String::from_utf8_lossy(range_bytes)
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.parse().unwrap_or(0))
-        .collect();
+    let trimmed = pdf::trim_ws(range_bytes);
+    let Some(inner) = trimmed.strip_prefix(b"[") else {
+        return Err(Error::Pdf(format!(
+            "signature {object} has a /ByteRange that is not an array"
+        )));
+    };
+    let inner = inner.strip_suffix(b"]").unwrap_or(inner);
+    let mut nums: Vec<usize> = Vec::with_capacity(4);
+    let mut problems = Vec::new();
+    for token in String::from_utf8_lossy(inner).split_whitespace() {
+        match token.parse::<usize>() {
+            Ok(n) => nums.push(n),
+            Err(_) => {
+                problems.push(format!(
+                    "signature {object} has a /ByteRange number {token:?} that is not an \
+                     unsigned integer; it is read as 0"
+                ));
+                nums.push(0);
+            }
+        }
+    }
     if nums.len() != 4 {
         return Err(Error::Pdf(format!(
             "signature {object} has a /ByteRange with {} numbers, expected 4",
             nums.len()
         )));
     }
-    Ok([nums[0], nums[1], nums[2], nums[3]])
+    Ok(([nums[0], nums[1], nums[2], nums[3]], problems))
 }
 
 /// The structural claims of a `/ByteRange`, shared by signatures and document
@@ -146,9 +166,9 @@ fn covered_bytes(pdf: &[u8], byte_range: [usize; 4]) -> Vec<u8> {
 }
 
 fn read_signature(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<Signature> {
-    let byte_range = byte_range_of(dict, object)?;
+    let (byte_range, mut problems) = byte_range_of(dict, object)?;
     let [b, c] = [byte_range[1], byte_range[2]];
-    let mut problems = range_problems(pdf, byte_range);
+    problems.extend(range_problems(pdf, byte_range));
 
     let gap = gap_slice(pdf, b, c);
     let cms = if gap.first() == Some(&b'<') && gap.last() == Some(&b'>') {
@@ -230,9 +250,9 @@ pub fn document_timestamps(pdf: &[u8]) -> Result<Vec<DocTimeStamp>> {
 }
 
 fn read_document_timestamp(pdf: &[u8], object: ObjRef, dict: &[u8]) -> Result<DocTimeStamp> {
-    let byte_range = byte_range_of(dict, object)?;
+    let (byte_range, mut problems) = byte_range_of(dict, object)?;
     let [b, c] = [byte_range[1], byte_range[2]];
-    let mut problems = range_problems(pdf, byte_range);
+    problems.extend(range_problems(pdf, byte_range));
     let mut digest = None;
 
     let gap = gap_slice(pdf, b, c);

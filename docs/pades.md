@@ -87,6 +87,16 @@ page     /Annots [ <field> ] added
 AutoFirma's default when no position is given. `/Helv` and `/ZaDb` are two of
 the standard 14 fonts, referenced but not embedded.
 
+That is the shape written when the document has no form yet. When it already
+has an `/AcroForm`, the dictionary is spliced, not rewritten: `/Fields` gains
+our field (deduplicated), `/SigFlags 3` is added only when absent, and every
+other byte survives — `/NeedAppearances`, the `/XFA` of the forms the Spanish
+administration publishes, the author's own `/DR`. It is the ADR-0003 rule at
+dictionary level. An indirect `/AcroForm` stays indirect and only the object
+that really changes is rewritten; the page's `/Annots`, when it is an
+indirect array (the shape iText writes), stays an indirect array with our
+field merged into the new revision under its own number.
+
 ## What we deliberately do differently
 
 Recorded here so a future diff is read as a decision and not as a bug. See
@@ -98,11 +108,11 @@ Recorded here so a future diff is read as a decision and not as a bug. See
   classic xref table. Two `%%EOF` instead of one.
 - **`/ITEXT (2.1.7)`.** iText's producer watermark. We do not write it, because
   it would claim a library we do not use wrote the file.
-- **`/Contents` reservation.** AutoFirma reserves 27000 bytes and leaves 23400
-  of zero padding. We size the reservation from the actual certificate chain
-  plus headroom, so our file is smaller. The reserved size is not comparable
-  and the normalizer reports the DER length separately from the container
-  length.
+- **`/Contents` reservation.** Both reserve 27000 bytes: AutoFirma through
+  iText's default, openfirma through `DEFAULT_CONTENTS_RESERVED`, which
+  `--contents-reserved` can raise. The normalizer still reduces the container
+  to a placeholder, because the flag makes ours movable; the DER length of
+  the CMS itself is compared and must match.
 
 The golden comparison runs both sides through `qpdf --qdf
 --object-streams=disable`, which collapses revisions and decompresses object
