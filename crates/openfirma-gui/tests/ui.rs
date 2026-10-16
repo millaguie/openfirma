@@ -105,7 +105,7 @@ fn a_p12_picked_through_the_fixture_signs_with_its_password() {
     // files are checked afterwards by `verify_after_gui_sign` below; what
     // this test owns is that the *window* gets there in three clicks.
     let p12 = testdata().join("certs/signer-rsa.p12");
-    let pdf_dir = temp_doc();
+    let pdf_dir = temp_doc("p12-sign");
     let doc = pdf_dir.join("contrato.pdf");
     if require(
         p12.is_file() && testdata().join("inputs/simple.pdf").is_file(),
@@ -179,7 +179,7 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     // *document itself* (not an exported .csig) gets verdicts. Built end to
     // end: sign once through the library seam, drop the result, read lines.
     let p12 = testdata().join("certs/signer-rsa.p12");
-    let dir = temp_doc();
+    let dir = temp_doc("verify-drop");
     let doc = dir.join("doc.pdf");
     if require(
         p12.is_file() && testdata().join("inputs/simple.pdf").is_file(),
@@ -344,7 +344,7 @@ fn a_store_row_signs_without_any_password_field() {
     // session is already logged in). The fixture source builds a software
     // KeySource from the test .p12; for the window these are one and the same.
     let p12 = testdata().join("certs/signer-rsa.p12");
-    let dir = temp_doc();
+    let dir = temp_doc("store-row");
     let doc = dir.join("firmable.pdf");
     if require(
         p12.is_file() && testdata().join("inputs/simple.pdf").is_file(),
@@ -401,20 +401,25 @@ fn a_store_row_signs_without_any_password_field() {
 
 // ------------------------------------------------------------------ helpers
 
-fn temp_doc() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "openfirma-gui-test-{}-{}",
-        std::process::id(),
-        counter()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn counter() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    N.fetch_add(1, Ordering::Relaxed)
+fn temp_doc(tag: &str) -> PathBuf {
+    // One directory per (process, test): cargo runs tests as threads in one
+    // process, so the pid alone cannot tell two tests apart — and a shared
+    // name means one test's `remove_dir_all` pulls the tree out from under
+    // another's write (observed on Windows as "Access is denied" while a
+    // sibling test cleaned up mid-sign). Each caller names itself, and
+    // `create_dir` refuses to share — only our own crashed leftovers get
+    // replaced.
+    let dir = std::env::temp_dir().join(format!("openfirma-gui-test-{}-{tag}", std::process::id()));
+    match std::fs::create_dir(&dir) {
+        Ok(()) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Only a crashed earlier run of THIS test can own this name.
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir(&dir).unwrap();
+            dir
+        }
+        Err(e) => panic!("cannot create {}: {e}", dir.display()),
+    }
 }
 
 /// Sign once through the GUI's own code path (`openfirma_gui::signing` over
