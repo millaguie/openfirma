@@ -74,6 +74,12 @@ pub struct SignRequest<'a> {
     /// the flags the citizen actually has: the window offers none of the LTV
     /// material and points at the terminal instead.
     pub from_window: bool,
+    /// Sign a document certified with `/Perms /DocMDP` `/P 1` anyway (the
+    /// terminal's `--allow-certified`, AutoFirma's `allowSigningCertifiedPdfs`).
+    /// The window never sets it: overriding an author's certification is the
+    /// deliberate decision of whoever runs the command, not a default either
+    /// frontend can take for them.
+    pub allow_signing_certified: bool,
 }
 
 impl<'a> SignRequest<'a> {
@@ -102,6 +108,7 @@ impl<'a> SignRequest<'a> {
             revocation: Vec::new(),
             document_timestamp: None,
             from_window: false,
+            allow_signing_certified: false,
         }
     }
 
@@ -261,6 +268,7 @@ fn dispatch(req: &mut SignRequest<'_>, content: &[u8], signer: &dyn Signer) -> R
                     validation_certs: std::mem::take(&mut req.validation_certs),
                     revocation: std::mem::take(&mut req.revocation),
                     document_timestamp: req.document_timestamp.clone(),
+                    allow_signing_certified: req.allow_signing_certified,
                     ..PadesOptions::default()
                 },
             )

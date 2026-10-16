@@ -380,6 +380,14 @@ struct SignArgs {
     /// signed is one typo away and never the common case.
     #[arg(long)]
     force: bool,
+
+    /// Sign a PDF that is certified with /Perms /DocMDP /P 1 — "no changes to
+    /// the document are permitted" — anyway. Without it such a document is
+    /// refused: the new revision breaks the certification in every reader that
+    /// honours it, and only whoever owns the document may override its author's
+    /// rule (AutoFirma asks for the same permission). PAdES only.
+    #[arg(long)]
+    allow_certified: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -834,6 +842,7 @@ fn main() -> Result<()> {
                 ocsp,
                 contents_reserved,
                 force,
+                allow_certified,
             } = *args;
             check_not_in_place(&input, &output, force)?;
             let ltv = matches!(format, Format::PadesLt | Format::PadesLta);
@@ -993,6 +1002,7 @@ fn main() -> Result<()> {
             }
             request.validation_certs = validation_certs;
             request.revocation = revocation;
+            request.allow_signing_certified = allow_certified;
             // B-LTA is B-LT is B-T: the same TSA stamps the signature value
             // and then the document (docs/pades.md). The gate above already
             // refuses pades-b-lta without --tsa, so only a live TSA arrives.
