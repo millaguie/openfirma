@@ -950,20 +950,22 @@ fn a_silent_half_header_is_cut_at_the_deadline() {
     );
 }
 
-/// Finding M-2, first half: the head and body timeouts used to be pure
-/// inactivity windows that every byte renewed, so a peer that dribbled one
-/// byte per window stayed alive forever. The fix is an absolute budget fixed
-/// when the connection is accepted (`CONNECTION_TIMEOUT` from then on, no
-/// matter what arrives); bytes may move the deadline earlier but never past
-/// it. This peer dribbles a request head that never finishes — one byte every
-/// 1.15 s, each gap shorter than HEAD_GRACE so every trickle genuinely renews
-/// the head's grace window (under the reviewed code this rhythm lived
-/// forever; nothing capped the renewals) — and keeps dribbling past twice the
-/// connection budget. Two assertions together pin the fix: no answer may
-/// arrive while the budget is still maturing (renewals do not extend life, but
-/// neither does an idle clock cut a talking peer early), and once the budget
-/// has matured the endpoint ends the connection within one read window with
-/// the named head timeout.
+/// Finding M-2, both halves closed (round-3 re-check): the connection's total
+/// budget is an absolute instant fixed at accept (`CONNECTION_TIMEOUT`), and
+/// — the half this test exists to pin — it is evaluated on the *success* path
+/// of every read, not only where a read would block. A peer that dribbles one
+/// byte every 1.15 s never blocks long enough for the socket timeout to fire,
+/// so under the previous code its trickle constantly (re)armed the grace
+/// window and the budget was never consulted: an idle clock cut nothing, and
+/// the ceiling existed only in prose. The dribble here is INDEFINITE — one
+/// byte per interval until the endpoint itself ends the connection — never a
+/// fixed finite burst: with a finite trickle the last byte hands the cut to
+/// the silence rule and the test passes even with the budget removed entirely
+/// (the exact non-bite the round-3 review demonstrated). Two assertions pin
+/// both directions: no answer and no close before `accept + 30 s` — an
+/// idle-clock rule that cut a still-talking peer is the wrong fix this test
+/// rejects — and the endpoint ends the connection within one trickle interval
+/// after the budget matures, with the named head timeout.
 #[test]
 fn a_dribbling_peer_dies_at_the_absolute_budget_not_at_its_own_trickle() {
     let Some(key) = p12() else {
@@ -982,25 +984,80 @@ fn a_dribbling_peer_dies_at_the_absolute_budget_not_at_its_own_trickle() {
         .unwrap();
     let mut request = b"POST /echo HTTP/1.1\r\nHost: ".to_vec();
     request.extend_from_slice(host.as_bytes());
+    // The budget fixed by the server at accept, plus the dribble's own worst
+    // lateness (one interval) before its next byte lets the Ok-path notice.
+    let budget = std::time::Duration::from_secs(30);
+    let trickle = std::time::Duration::from_millis(1150);
+    // The budget is fixed at the SERVER's accept; `started` is this thread's
+    // connect, slightly earlier, and every measured instant below inherits
+    // that offset. Allow it explicitly so a correct implementation is never
+    // punished for microseconds of scheduling: no honest cut lands 50 ms on
+    // the early side of its own deadline.
+    let slack = std::time::Duration::from_millis(50);
     let started = std::time::Instant::now();
     let mut buf = [0u8; 4096];
-    for (i, b) in request.iter().enumerate() {
-        stream.write_all(&[*b]).unwrap();
-        stream.flush().unwrap();
-        eprintln!("t={:5.2} write byte {i}", started.elapsed().as_secs_f64());
-        let next = std::time::Instant::now() + std::time::Duration::from_millis(1150);
-        while std::time::Instant::now() < next {
+    let mut i = 0usize;
+    let (answer, elapsed) = 'dribble: loop {
+        if i >= request.len() {
+            // The head is still incomplete and the peer has said everything
+            // it will: keep polling until the endpoint ends this by itself.
+            // Nothing else can ever wake either side — pure budget clock.
             match stream.read(&mut buf) {
-                Ok(0) => panic!(
-                    "the endpoint closed the dribbler early ({:?}) without an answer",
-                    started.elapsed()
-                ),
+                Ok(0) => break 'dribble (String::new(), started.elapsed()),
                 Ok(n) => {
-                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                    panic!(
-                        "the dribbler was answered at {:?}, long before its \
-                         absolute budget could mature: {head}",
+                    break 'dribble (
+                        String::from_utf8_lossy(&buf[..n]).to_string(),
+                        started.elapsed(),
+                    );
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    assert!(
+                        started.elapsed() < budget + trickle + std::time::Duration::from_secs(10),
+                        "the endpoint never ended an ever-talking dribbler on its own \
+                         budget ({:?}): the ceiling is invisible to a peer that never blocks",
                         started.elapsed()
+                    );
+                }
+                Err(e) => panic!("the dribbler's socket failed: {e}"),
+            }
+        } else {
+            stream.write_all(&[request[i]]).unwrap();
+            stream.flush().unwrap();
+            i += 1;
+        }
+        let next = std::time::Instant::now() + trickle;
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    // A close BEFORE the budget (plus accept-offset slack) is
+                    // the wrong fix; at or after it, this is the cut.
+                    if started.elapsed() + slack < budget {
+                        panic!(
+                            "the endpoint closed a talking dribbler before its budget \
+                     matured ({:?}): the grace must not cut a peer that is still \
+                     speaking",
+                            started.elapsed()
+                        );
+                    }
+                    break 'dribble (String::new(), started.elapsed());
+                }
+                Ok(n) => {
+                    // Same slack on an answer: at or after budget+slack this
+                    // is the refusal the budget owes us, not a premature one.
+                    if started.elapsed() + slack < budget {
+                        panic!(
+                            "the dribbler was answered before its absolute budget could \
+                     mature ({:?}): {:?}",
+                            started.elapsed(),
+                            String::from_utf8_lossy(&buf[..n])
+                        );
+                    }
+                    break 'dribble (
+                        String::from_utf8_lossy(&buf[..n]).to_string(),
+                        started.elapsed(),
                     );
                 }
                 Err(e)
@@ -1008,30 +1065,20 @@ fn a_dribbling_peer_dies_at_the_absolute_budget_not_at_its_own_trickle() {
                         || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => panic!("the dribbler's socket failed: {e}"),
             }
-        }
-    }
-    // Head still unfinished at ~46 s — past accept + CONNECTION_TIMEOUT: from
-    // here the endpoint has one read window to end the connection by itself.
-    let answer = loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break String::new(),
-            Ok(n) => break String::from_utf8_lossy(&buf[..n]).to_string(),
-            Err(e)
-                if (e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut)
-                    && started.elapsed() < std::time::Duration::from_secs(60) => {}
-            Err(e) => panic!("the dribbler never got an answer at all: {e}"),
+            if std::time::Instant::now() >= next {
+                break;
+            }
         }
     };
-    let elapsed = started.elapsed();
     assert!(
-        elapsed >= std::time::Duration::from_secs(45),
-        "an idle-clock rule cut a talking peer before its budget matured \
-         ({elapsed:?})"
+        elapsed + slack >= budget,
+        "an idle-clock rule cut a talking peer before its absolute budget \
+         matured ({elapsed:?})"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(60),
-        "the endpoint never ended the connection on its own budget ({elapsed:?})"
+        elapsed < budget + trickle + std::time::Duration::from_secs(5),
+        "the endpoint did not end the dribbler promptly at its budget — it \
+         kept waiting on a peer whose bytes never block the read ({elapsed:?})"
     );
     if !answer.is_empty() {
         // A refusal (rather than a bare close) must name the head timeout —
@@ -1045,6 +1092,219 @@ fn a_dribbling_peer_dies_at_the_absolute_budget_not_at_its_own_trickle() {
             "the trickle was cut by the head deadline, not a malformed head: {answer}"
         );
     }
+}
+
+/// Finding M-2, the capacity half the round-3 review measured end to end:
+/// `MAX_CONCURRENT_CONNECTIONS` ever-talking dribblers used to hold every
+/// slot for as long as they liked — their trickle never let the budget be
+/// consulted, so a legitimate caller with a fresh valid token starved on 503
+/// indefinitely (the review watched fourteen attempts over 40 s, all 503).
+/// With the budget enforced on every successful read, the first wave dies at
+/// accept + 30 s whatever its rhythm, and the caller's own retries — one
+/// fresh token per attempt — land in the freed slots. The bound this
+/// test asserts is patience any signing flow tolerates (60 s: the budget,
+/// plus a few trickle intervals of tolerance for the scheduling race between
+/// the wave dying and a retry catching the freed slot), not a claim that no
+/// 503 is ever possible: while every slot is honestly occupied by a peer
+/// still inside its budget, 503 is the answer, and what the two ceilings
+/// guarantee is that the state is bounded. The dribblers are never dropped:
+/// each of the server's cuts must come from the server, not from this harness
+/// handing back a slot, and every loop in here is wall-clock bounded so the
+/// unfixed code fails red (measured) instead of hanging the suite.
+#[test]
+fn dribbling_peers_never_starve_a_tokened_caller() {
+    let Some(key) = p12() else {
+        require_or_skip("testdata/certs/signer-rsa.p12 is absent");
+        return;
+    };
+    let server = server_on(&key);
+    let addr = server.addr();
+    let host = format!("127.0.0.1:{}", addr.port());
+
+    // Saturate every slot with an ever-talking dribbler: one byte of a head,
+    // then one byte every 2 s — always inside HEAD_GRACE, never blocking long
+    // enough for the grace's WouldBlock path to speak for the budget.
+    let n = openfirma_browser::serve::MAX_CONCURRENT_CONNECTIONS;
+    // The caller's wall-clock bound: the budget plus slack for the wave to
+    // die and a retry to catch the freed slot. Crowd threads get it plus a
+    // final trickle round, so whichever assert fires, it is this test failing
+    // red with an honest message — never the suite hanging (this laptop has
+    // frozen once on an unbounded timing test; none may exist here).
+    let patience = std::time::Duration::from_secs(60);
+    // How many crowd threads the endpoint has ACCEPTED as handlers, as opposed
+    // to refused at capacity. Main waits on this before timing the caller, so
+    // the caller races nobody for a slot: without the barrier the caller's own
+    // first connect could take the slot a crowd thread was about to claim, the
+    // endpoint refuses that thread at capacity in microseconds, and the check
+    // below would report a "death" that was never a budget cut at all — the
+    // 244µs failure this barrier exists to make impossible.
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let crowd: Vec<_> = (0..n)
+        .map(|_| {
+            let accepted = accepted.clone();
+            std::thread::spawn(move || {
+                // One connection is accepted and then dribbles until the budget
+                // cuts it; a connection refused at capacity answers within
+                // milliseconds, so it is retried instead of being counted.
+                // Silence is the acceptance signal — an accepted handler says
+                // nothing until its cut, a refused one has already spoken.
+                let (mut stream, started) = loop {
+                    let started = std::time::Instant::now();
+                    let mut stream = TcpStream::connect(addr).unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                        .unwrap();
+                    stream.write_all(b"P").unwrap();
+                    stream.flush().unwrap();
+                    match stream.read(&mut [0u8; 64]) {
+                        // Bytes this early are the capacity refusal: drop this
+                        // connection and try again rather than die for a slot
+                        // the caller (or a sister thread) took first.
+                        Ok(_) => continue,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            break (stream, started);
+                        }
+                        Err(e) => panic!("dribbler probe error {e:?} at {:?}", started.elapsed()),
+                    }
+                };
+                accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The server only ever answers this peer when it cuts it, so
+                // any readable byte IS the 599 refusal at the budget. Linux
+                // keeps bytes received before the peer's close readable, and
+                // a write into a socket whose FIN already arrived still
+                // succeeds — draining the refusal must therefore be its own
+                // observable step (read until empty after seeing one byte),
+                // never something inferred from a failed write. The whole
+                // loop is wall-clock bounded so no protocol surprise here can
+                // hang the suite; an over-budget exit fails loudly below.
+                let deadline = started + patience + std::time::Duration::from_secs(5);
+                loop {
+                    if std::time::Instant::now() >= deadline {
+                        // End this peer's loop honestly; the join bound below
+                        // turns it into a failed assertion with a clear cause.
+                        return started.elapsed();
+                    }
+                    let wrote = stream.write_all(b"O").is_ok();
+                    let next = started.elapsed() + std::time::Duration::from_secs(2);
+                    match stream.read(&mut [0u8; 64]) {
+                        // The budget's refusal (or its EOF after the answer
+                        // drained): a cut at or after the budget is exactly
+                        // what this peer must die of.
+                        Ok(_) => return started.elapsed(),
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            // Nothing back yet (there is nothing to send us
+                            // until the budget cuts). A write that failed on
+                            // a closed socket means the cut's bytes died
+                            // unread — a race between this poll loop and the
+                            // endpoint's drain-and-close, not an early cut;
+                            // report it at the join bound.
+                            if !wrote {
+                                return started.elapsed();
+                            }
+                            // Wait out the trickle interval — under HEAD_GRACE,
+                            // so the grace never fires and only the absolute
+                            // budget can end this.
+                            while started.elapsed() < next {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                        }
+                        Err(e) => panic!("dribbler read error {e:?} at {:?}", started.elapsed()),
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // The legitimate caller: the exact shape of a real signing call, a fresh
+    // one-shot token per attempt (never re-presented — `request_on` in one
+    // shot). Starvation past this bound is the finding; 503 attempts before
+    // it are legal and expected while every dribbler is still inside its
+    // budget. This must NOT be `ask`: under a crowd that holds capacity for
+    // as long as it likes (exactly what unfixed code does), ask's twelve-at-
+    // a-quarter-second rounds would burn every token in the whole saturation
+    // window and its own panic would replace the honest timing assertion.
+    // Wait for every crowd thread to be accepted before timing the caller.
+    // Bounded by wall clock so a crowd that can never saturate (a bug in this
+    // harness, or an endpoint that stopped accepting) fails loudly instead of
+    // hanging the suite; on unfixed code the crowd still saturates — that was
+    // never the broken half — so this bound only ever trips on a harness bug.
+    {
+        let saturate_by = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while accepted.load(std::sync::atomic::Ordering::Relaxed) < n {
+            assert!(
+                std::time::Instant::now() < saturate_by,
+                "the crowd never filled every slot ({}/{} accepted): the harness \
+                 could not reach the saturation this test measures",
+                accepted.load(std::sync::atomic::Ordering::Relaxed),
+                n
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    loop {
+        let token = server.issue_token();
+        let path = format!("/sign/{token}");
+        let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
+        let body = uri_body(b"la firma legitima entre dribblers");
+        let (status, _, payload) =
+            request_on(stream, addr, "POST", &path, &host, None, body.as_bytes());
+        if status == 200 {
+            assert!(
+                String::from_utf8_lossy(&payload).contains('|'),
+                "a served caller gets the signature payload"
+            );
+            break;
+        }
+        // A connection whose answer died unread in the socket layer (the
+        // harness's u16::MAX sentinel) is not a sign of health: on unfixed
+        // code 503s pile up and some answers die undelivered. Retrying that
+        // attempt without claiming anything keeps the honest failure the
+        // timing bound below, not a discarded-read technicality — this test
+        // has already demonstrated it fails red before the fix for the right
+        // reason (starvation at t=60 s).
+        assert!(
+            status == 503 || status == u16::MAX,
+            "at capacity the endpoint refuses by name instead of dying: {status}"
+        );
+        assert!(
+            t0.elapsed() < patience,
+            "the legitimate caller starved while {n} dribblers held every \
+             slot: never served within {patience:?} ({:?}) — the absolute \
+             budget is invisible to a peer that never blocks",
+            t0.elapsed()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    // Every dribbler must have died at the server's hands, not ours: none of
+    // these streams was ever dropped or closed from this side. The peer kept
+    // talking, so the silence rule (5 s) cannot explain a cut and only the
+    // absolute budget (30 s) can; 29 s is well clear of any honest early cut
+    // on the early side. On unfixed code the caller starves at the patience
+    // bound above — this loop never runs, as measured (red at t=60.1 s).
+    for handle in crowd {
+        let died = handle.join().expect("a dribble thread ran to its cut");
+        assert!(
+            died >= std::time::Duration::from_secs(29),
+            "a dribbler died before its budget could mature: {died:?}"
+        );
+        assert!(
+            died < patience + std::time::Duration::from_secs(10),
+            "the endpoint never ended a dribbler on its own budget (it lived to \
+             {:?}): the absolute budget is invisible to a peer that never blocks",
+            died
+        );
+    }
+    // The caller got its signature and every dribbler met the server's cut;
+    // there is nothing left holding slots.
 }
 
 /// Finding M-2, second half: the request bound used to count *accepted

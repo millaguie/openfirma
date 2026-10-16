@@ -113,10 +113,15 @@ loopback port. What stops an uninvited caller here:
   refused *while* at capacity — the endpoint never shuts itself down because a
   crowd was knocking), an absolute request budget of 30 s per connection plus
   a 5 s silence window per read — bytes received renew the silence window, so
-  the defence cuts peers that stop talking and never a caller whose bytes keep
-  arriving on a loaded machine (no slowloris-by-idleness: Linux reports a
-  socket read timeout as `WouldBlock`, so the limit cannot be delegated to the
-  platform's error kind), bind refuses any non-loopback address. The token is
+  the defence never cuts a caller whose bytes keep arriving on a loaded
+  machine *inside* the budget; and the 30 s budget itself is evaluated on
+  every read's success path, not only where a read would block, so a peer
+  that keeps dribbling without ever falling silent dies at accept + 30 s
+  whatever its rhythm (no slowloris-by-idleness: Linux reports a socket read
+  timeout as `WouldBlock`, so the limit cannot be delegated to the platform's
+  error kind; and no slowloris-by-trickle: budget checks reachable only from
+  an expired — blocking — read are unreachable to a peer whose bytes always
+  arrive in time), bind refuses any non-loopback address. The token is
   consumed only when a complete request has arrived, so a client that dies
   mid-request costs the session a refusal, not its only signing opportunity.
   *(Amended 2026-10-16 after the adversarial review, finding M-2: the previous
@@ -125,7 +130,22 @@ loopback port. What stops an uninvited caller here:
   died at 17 bare connections. The ADR always stated the intended promise;
   the code now enforces it, and the shutdown-by-request-count is replaced by
   the concurrency refusal because killing a launch's endpoint from unauthenticated
-  empty connects served no threat model this ADR has.)*
+  empty connects served no threat model this ADR has. Second amendment, same
+  day (round-3 re-check of M-2): "the code now enforces it" was ahead of the
+  code again — the budget was consulted only when a read would block, so an
+  ever-talking dribbler never met it and lived indefinitely; both read loops
+  now compare against the fixed budget after every successful read. On
+  capacity: what frees a slot is a handler dying, so the two ceilings above
+  are also what bounds a 503 window — silent peers for ≤5 s per wave,
+  ever-talking dribblers for ≤30 s plus one trickle interval per connection;
+  an attacker who reconnects to keep all 16 slots busy pays one dead
+  connection per reconnect in refused work (measured: a tokened caller is
+  served within the budget plus scheduling slack of the first dribble wave
+  dying, bounded at 60 s by `dribbling_peers_never_starve_a_tokened_caller`).
+  The residual nuance, stated precisely: while all slots are honestly held by
+  peers still inside their budgets, a new caller *is* refused — survivable
+  and bounded, not a dead port; there is no slot class reserved for tokened
+  callers.)*
 - Two recorded deviations from AutoFirma's URI handling, both in `uri.rs`'s
   `dat` decoding, both toward refusing rather than signing the wrong bytes:
   (1) there is **no literal-text fallback** — where AutoFirma signs a

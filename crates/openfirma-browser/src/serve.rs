@@ -64,7 +64,11 @@
 //!   wrong `Content-Length`, chunked encoding, and connections past
 //!   `MAX_CONCURRENT_CONNECTIONS` are refused with a status that says which;
 //!   the token is consumed only by a complete request (see B-4's note at the
-//!   take), and each connection runs under an absolute deadline.
+//!   take), and each connection runs under an absolute deadline fixed at
+//!   accept: silence cuts after 5 s and a peer that never falls silent — one
+//!   byte every two seconds, say — still dies at the 30 s budget, because
+//!   both read loops compare against it on every read, not only where a read
+//!   would block.
 //! - The response body of a successful sign is AutoFirma's wire form
 //!   (`base64(cert)|base64(signature)`, dispatch.rs). There is no CORS header
 //!   in the answer: a *same-origin* page (one served from this very port, the
@@ -92,13 +96,18 @@ pub const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 /// `WouldBlock` and the earlier loop continued on it, re-arming the timeout
 /// forever (finding M-2: the 30 s promise of ADR-0005 was dead code there).
 /// While bytes are ARRIVING both read loops renew their inactivity window
-/// ([`HEAD_GRACE`]) — but never past this absolute budget: the deadline is set
-/// once, at accept, to `now + CONNECTION_TIMEOUT`, and no renewal may push it
-/// later. Renewals without a ceiling were finding M-2's other half: a peer
-/// dribbling one byte every few seconds kept re-arming the timer and lived
-/// forever, so the 30 s was dead code again. Total cost stays bounded by this
-/// number whatever the peer's rhythm; what the grace protects — a real caller
-/// whose bytes keep coming on a loaded machine — is protected inside it.
+/// ([`HEAD_GRACE`]) — but never past this absolute budget, and, since the
+/// round-3 re-check of M-2, the budget is also evaluated on the *success*
+/// path of every read, not only where a read would have blocked: a ceiling
+/// that only silences can reach is invisible to a peer dribbling one byte
+/// every two seconds, which never blocks and therefore never met it. The
+/// deadline is set once, at accept, to `now + CONNECTION_TIMEOUT`; no renewal
+/// may push it later and no arriving byte excuses skipping the check. Total
+/// cost stays bounded by this number whatever the peer's rhythm; what the
+/// grace protects — a real caller whose bytes keep coming on a loaded machine
+/// — is protected inside it: a request that finishes before the budget is
+/// answered normally, the check fires only when the budget has actually run
+/// out.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a connection may stay SILENT mid-request — before its head, or
@@ -116,7 +125,11 @@ const HEAD_GRACE: Duration = Duration::from_secs(5);
 /// The deadline one more arriving byte buys a connection: [`HEAD_GRACE`] from
 /// now, but never later than the connection's absolute budget (M-2 — renewals
 /// that could cross the total made that total a lie). Every read loop re-arms
-/// through exactly this function so no path can forget the ceiling.
+/// through exactly this function so no path can forget the ceiling. The
+/// ceiling is only half of it: both loops ALSO compare against `absolute`
+/// directly after every successful read (round-3 M-2), because a capped
+/// renewal silently stops moving once the budget is reached and the grace
+/// alone would keep waiting on a peer that is slowly dribbling, not silent.
 fn head_deadline(absolute: std::time::Instant) -> std::time::Instant {
     let now = std::time::Instant::now();
     (now + HEAD_GRACE).min(absolute)
@@ -265,8 +278,14 @@ impl LoopbackServer {
 /// real call could arrive (finding M-2). Liveness is worth more than a crude
 /// anti-flood switch an advertiser could press: what the loop bounds instead
 /// is *concurrency*, answering 503 while `MAX_CONCURRENT_CONNECTIONS` handlers
-/// are all mid-request, which a stalled crowd cannot reach because stalled
-/// connections die at the deadline.
+/// are all mid-request. Two ceilings keep that refusal transient for a real
+/// caller: stalled peers die after HEAD_GRACE of silence, and since the
+/// round-3 re-check of M-2 so do ever-talking dribblers, at the absolute
+/// budget every handler's Ok-path enforces. The steady-state slot cost of a
+/// dribble flood is therefore bounded by the crowd's own reconnect rate (one
+/// dead connection per reconnect it pays), not by how long each connection
+/// lives; `dribbling_peers_never_starve_a_tokened_caller` measures that a
+/// tokened caller is served within seconds of the first wave dying.
 fn accept_loop(listener: TcpListener, tokens: Arc<TokenStore>, key: SharedKey) {
     // Live handler threads, counted with an Arc counter each handler holds for
     // exactly its own lifetime: no leak is possible when a thread panics, and
@@ -628,10 +647,25 @@ fn read_request_head(
                 buf.extend_from_slice(&chunk[..n]);
                 // Headline rule: time counts against a peer that stops
                 // talking, not against a slow scheduler on our own machine —
-                // arriving bytes re-arm the head's grace window. The renewal
-                // is CAPPED by the connection's absolute budget (M-2): as far
-                // as grace reaches and no further, so a dribbling peer dies at
-                // `accept + CONNECTION_TIMEOUT` whatever its rhythm.
+                // arriving bytes re-arm the head's grace window. But the
+                // absolute budget is NOT delegated to the silence path: once
+                // renewals pin the deadline at `absolute`, only an expired
+                // read would ever notice it — and a peer dribbling one byte
+                // every two seconds never blocks, so it never met that check
+                // (round-3 M-2: the budget was consulted only in the
+                // WouldBlock branches and lived 90 s+). Every successful read
+                // compares against the budget too; a request that finishes
+                // before it is answered normally — the fast path pays one
+                // clock comparison. A budget-expired head is refused even if
+                // this very read completed it: completing at t≥budget is the
+                // signature of the dribble, and answering it would reward the
+                // exact rhythm the budget exists to cut; a legitimately slow
+                // machine completes inside the budget.
+                if std::time::Instant::now() >= absolute {
+                    return Err(
+                        "the connection exceeded its total budget before its request head finished",
+                    );
+                }
                 deadline = head_deadline(absolute);
                 if buf.windows(4).any(|w| w == b"\r\n\r\n") || ends_with_double_lf(&buf) {
                     return Ok(buf);
@@ -719,8 +753,18 @@ fn read_exact_timeout(
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => {
                 filled += n;
-                // Same capped rule as the head: arriving bytes re-arm the
-                // grace, the absolute budget ends the argument either way.
+                // Same rule as the head, same reason (round-3 M-2): arriving
+                // bytes re-arm the grace capped by `absolute`, and because a
+                // dribbling body never blocks, the budget is compared here on
+                // every successful read — not only where a read would have
+                // waited. A body delivered inside the budget never pays more
+                // than a clock comparison per read.
+                if std::time::Instant::now() >= absolute {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the connection exceeded its total budget before the body arrived",
+                    ));
+                }
                 deadline = head_deadline(absolute);
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
