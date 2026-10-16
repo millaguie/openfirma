@@ -551,11 +551,16 @@ mod tests {
         assert_eq!(browser_config_path_in(None, None), None);
 
         // and the live function is this rule on the live environment — checked
-        // only for the shape both branches share (one file, under a directory
-        // called openfirma), because what the variables hold here is the
-        // developer's machine.
-        let live = browser_config_path().expect("this process has HOME or XDG_CONFIG_HOME");
-        assert_eq!(live.file_name().unwrap(), "browser.toml");
-        assert_eq!(live.parent().unwrap().file_name().unwrap(), "openfirma");
+        // only when one of its two inputs actually exists here (Windows CI
+        // exports neither HOME nor XDG_CONFIG_HOME; the process that needs the
+        // file fails at startup, so the CLI refuses with a named reason rather
+        // than inventing a location). Where an input does exist, check only
+        // the shape both branches share, because what the variables hold is
+        // the developer's machine.
+        let live = browser_config_path();
+        if let Some(live) = live {
+            assert_eq!(live.file_name().unwrap(), "browser.toml");
+            assert_eq!(live.parent().unwrap().file_name().unwrap(), "openfirma");
+        }
     }
 }
