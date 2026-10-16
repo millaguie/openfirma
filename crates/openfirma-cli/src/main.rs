@@ -584,7 +584,7 @@ fn split_http_response(raw: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// One `--store` / `keystores list --store` descriptor, parsed. The type and
-/// its parser live in `openfirma_core::workflow` (docs/adr-0006): the GUI's
+/// its parser live in `openfirma_core::workflow` (docs/adr/0006-gui-toolkit.md): the GUI's
 /// add-a-keystore field and this flag are ONE parser over ONE spelling, so a
 /// descriptor accepted by `openfirma sign --store` is accepted by the window
 /// and vice versa — the drift both frontends' tests would never catch. The

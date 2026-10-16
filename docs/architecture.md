@@ -3,7 +3,7 @@
 ## Layering
 
 ```
-        openfirma-cli        openfirma-gui (later)
+        openfirma-cli        openfirma-gui
                  \              /
              openfirma-browser       <- afirma:// verbs, loopback endpoint (docs/adr/0005)
                         |

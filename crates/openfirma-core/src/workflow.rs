@@ -3,7 +3,7 @@
 //! asked to sign with, where an output path goes.
 //!
 //! This is the shared layer behind `openfirma sign`/`verify` on the command
-//! line and `openfirma-gui` on the screen (docs/adr-0006 records why the GUI
+//! line and `openfirma-gui` on the screen (docs/adr/0006-gui-toolkit.md records why the GUI
 //! must not duplicate these rules). Nothing here knows about argv or widgets:
 //! it takes paths, bytes and certificates and answers questions. The formats
 //! themselves stay in their crates; what lives here is the choosing around
@@ -63,7 +63,7 @@ impl Format {
     /// `.csig` instead of AutoFirma's ambiguous `.signature`: a file named
     /// `contrato.signature` says nothing about its shape to the next reader,
     /// and the GUI writes next to the original without asking (the deliberate
-    /// deviation from AutoFirma's save-dialog-every-time is docs/adr-0006).
+    /// deviation from AutoFirma's save-dialog-every-time is docs/adr/0006-gui-toolkit.md).
     pub fn default_output(self, input: &Path) -> PathBuf {
         let base = input.with_extension("");
         let ext = match self {

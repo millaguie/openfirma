@@ -2,7 +2,7 @@
 //! type so it is testable headlessly (`egui_kittest` drives the rendering;
 //! this module is tested as plain logic — and both assert the same rules).
 //!
-//! One principle from docs/adr-0006 governs everything below: never a silent
+//! One principle from docs/adr/0006-gui-toolkit.md governs everything below: never a silent
 //! success, never a lost result. The `Done` state keeps every byte of the
 //! signature in memory until the user has seen where it was written *and* an
 //! explicit save (or an explicit discard confirmed twice) releases it; the
@@ -197,7 +197,7 @@ impl Screen {
     /// certificate dialog too), while the document bytes, path, format and
     /// advanced choices stay exactly where they were. A Done screen clones in
     /// full: its signature bytes *are* the result, and losing them would be
-    /// the silent-loss failure this project bans (ADR-0006).
+    /// the silent-loss failure this project bans (docs/adr/0006-gui-toolkit.md).
     pub fn restore(&self) -> Screen {
         match self {
             Screen::Idle | Screen::Signing => Screen::Idle,
@@ -256,7 +256,7 @@ impl Screen {
 /// result is held and not saved. The GUI has no "Save" button on the done
 /// screen: it writes immediately to a default path *and* keeps the bytes, so
 /// closing can only ever discard a result nobody confirmed — hence the two
-/// explicit answers (docs/adr-0006, "never a silent success").
+/// explicit answers (docs/adr/0006-gui-toolkit.md, "never a silent success").
 #[derive(Debug, PartialEq, Eq)]
 pub enum CloseDecision {
     /// Nothing is unsaved; close.

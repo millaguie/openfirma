@@ -6,7 +6,7 @@
 //! `openfirma_pades::pades_verify` for PDFs. What lives here is only how its
 //! result is shown: one line per signature, plain language first, the
 //! technical strings (chain subjects, byte ranges, check names) reachable
-//! behind a details control and never in front of the verdict (docs/adr-0006:
+//! behind a details control and never in front of the verdict (docs/adr/0006-gui-toolkit.md:
 //! this is the screen where openfirma is allowed to be better than AutoFirma,
 //! whose validation viewer shows a certificate tree instead of an answer).
 

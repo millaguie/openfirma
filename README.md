@@ -61,7 +61,11 @@ Very early, phase 1. What works today:
   DER signature as a normalized tree for diffing), and `openfirma keystores
   list`, which lists what a PKCS#11 token or NSS database holds.
 
-Not started yet: the GUI, and FacturaE. The browser protocol works on its own
+The window (`openfirma-gui`) signs and verifies through the same library
+calls this CLI makes — everything it does is also possible from here, and the
+decisions (detection, output naming, descriptor parsing, trust anchors) are
+one implementation both frontends call, not two that can drift. Not started
+yet: FacturaE. The browser protocol works on its own
 pages and test sedes; against a *real* sede it still lacks the TLS leg — see
 docs/adr/0005-browser-protocol.md and the table row below.
 
@@ -80,7 +84,7 @@ docs/adr/0005-browser-protocol.md and the table row below.
 | XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
 | XAdES B-T and above, FacturaE, enveloping/detached shapes | not started |
 | Browser integration (`afirma://` parsing, dispatch, loopback endpoint) | works end to end against a fake sede (openssl crosschecks the signature it produces); plain HTTP transport: real sedes need wss, refused rather than faked, see docs/adr/0005-browser-protocol.md |
-| GUI | not started |
+| GUI (`openfirma-gui`, egui/eframe): sign, verify, keystores, .p12 | works: the same library calls as the CLI (docs/adr/0006-gui-toolkit.md); windowless kittest tests drive the real App, including an end-to-end sign-then-verify; real-display checks live in docs/validation.md's manual checklist |
 
 ## Quick start
 
@@ -101,7 +105,15 @@ cargo run -- sign -i doc.pdf -o doc.lt.pdf --format pades-b-lt \
 cargo run -- verify -i doc.csig --content doc.txt --trust testdata/certs/ca.crt
 cargo run -- verify -i doc.signed.pdf --trust testdata/certs/ca.crt
 cargo test                       # includes the OpenSSL crosschecks
+cargo run -p openfirma-gui       # the window (Spanish UI; docs/adr/0006-gui-toolkit.md)
 ```
+
+The GUI needs no flags: drop the document, pick the certificate, sign — the
+result lands next to the original (`documento.signed.pdf`). Verifying is
+dropping a signed file and reading the verdicts; without trust anchors it
+asks for one certificate to trust (`$OPENFIRMA_TRUST` answers for both
+frontends). Everything the window does has the CLI spelling above; the
+window never adds a capability the terminal lacks.
 
 Signing with a real certificate means signing from its PKCS#12 container.
 The password goes in a file nobody but you can read, or in the environment —

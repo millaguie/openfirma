@@ -6,12 +6,12 @@
 //! frontends call it).
 //!
 //! The verify path is a deliberate deviation from AutoFirma recorded in
-//! docs/adr-0006: its validation tab wants a *second*, signature-only file an
+//! docs/adr/0006-gui-toolkit.md: its validation tab wants a *second*, signature-only file an
 //! ordinary citizen never has (an exported `.csig`), so verifying one's own
 //! document means exporting something first. openfirma verifies the document
 //! itself — drop it, read the verdicts. A PDF that already holds signatures
 /// therefore opens as a verification task, and co-signing is deliberately not
-/// offered in v1 (docs/adr-0006 omissions): adding one's signature next to
+/// offered in v1 (docs/adr/0006-gui-toolkit.md omissions): adding one's signature next to
 /// one nobody has read is how bad paperwork starts.
 use std::path::{Path, PathBuf};
 
@@ -182,7 +182,7 @@ impl App {
     fn verify_file(&mut self, path: PathBuf, bytes: Vec<u8>) {
         let anchors = openfirma_core::workflow::default_trust_anchors();
         if anchors.is_empty() {
-            // The ask-the-user step (ADR-0006): "who do you trust?" is one
+            // The ask-the-user step (docs/adr/0006-gui-toolkit.md): "who do you trust?" is one
             // file picker, nothing more clever, and the reason shows on the
             // drop screen while it waits for the pick. Declining leaves the
             // zone where it was — a half-finished verify is not an error.
@@ -423,7 +423,7 @@ impl App {
 
         // The certificate picker is the heart of this screen: format and
         // digest have detected defaults and hide under an expander; choosing
-        // *who signs* is what a citizen must not get wrong (ADR-0006).
+        // *who signs* is what a citizen must not get wrong (docs/adr/0006-gui-toolkit.md).
         ui.label(RichText::new(tr.choose_certificate.clone()).strong());
         for e in catalog.errors.iter() {
             let e = e.clone();
@@ -505,7 +505,7 @@ impl App {
         // Spanish sentence. The PAdES long-term levels are *not* silently
         // offered: B-LT/B-LTA archive CRL/OCSP data a window must not omit
         // without saying so, and `signing::execute` refuses half a level with
-        // the CLI's honest pointer to the terminal (ADR-0006).
+        // the CLI's honest pointer to the terminal (docs/adr/0006-gui-toolkit.md).
         ui.add_space(6.0);
         let adv_open = *advanced;
         egui::CollapsingHeader::new(if *advanced {

@@ -1,6 +1,6 @@
 //! One sentence per failure. A signing client's errors *are* its product: the
 //! user must read what went wrong and what to do next, never a raw DER or CMS
-//! trace (docs/adr-0006; the library's own refusal texts — the PKCS#12 RC2
+//! trace (docs/adr/0006-gui-toolkit.md; the library's own refusal texts — the PKCS#12 RC2
 //! refusal, the browser-protocol refusals — are the standard this aims at).
 //!
 //! The rules: a message that already contains a fix instruction ("run `openssl pkcs12 …`",

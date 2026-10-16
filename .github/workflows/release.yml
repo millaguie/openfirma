@@ -18,9 +18,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux, glibc, the two architectures AutoFirma ships plus arm64
+          # Linux, glibc, the two architectures AutoFirma ships plus arm64.
+          # `gui` marks where the window binary (openfirma-gui) builds: it is
+          # the runner's native target, so eframe links the system's own X11/
+          # Wayland client libraries (installed below). Non-native targets stay
+          # CLI-only and say so in the release notes.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            gui: true
+            setup_gui: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
           # Static Linux binary, no glibc version constraint, works as a
@@ -31,6 +37,7 @@ jobs:
           # Windows 64 and 32 bit. AutoFirma still ships a 32 bit installer
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            gui: true
           - target: i686-pc-windows-msvc
             os: windows-latest
           - target: aarch64-pc-windows-msvc
@@ -41,8 +48,10 @@ jobs:
           # is universal, so Intel builds from the arm64 runner
           - target: x86_64-apple-darwin
             os: macos-latest
+            gui: true
           - target: aarch64-apple-darwin
             os: macos-latest
+            gui: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -57,8 +66,34 @@ jobs:
         if: matrix.setup
         run: ${{ matrix.setup }}
 
-      - name: build
+      # eframe's Linux sys crates resolve the X11/Wayland client libraries at
+      # link time; only the native-glibc job ships the GUI and installs them.
+      - name: GUI build packages
+        if: matrix.setup_gui
+        run: ${{ matrix.setup_gui }}
+
+      # Any target that could not link a windowing system still builds with
+      # `--no-default-features`, which drops the `gui` feature (eframe, egui,
+      # rfd) — this is what makes the GUI an opt-out workspace member rather
+      # than a hard dependency of the CLI: no bin other than openfirma-gui
+      # ever needs it, and openfirma-gui's own bin has required-features.
+      - name: build every member without the GUI (non-GUI targets)
+        if: ${{ !matrix.gui }}
+        run: cargo build --release --workspace --exclude openfirma-gui --target ${{ matrix.target }}
+
+      - name: build CLI
         run: cargo build --release --target ${{ matrix.target }} --bin openfirma
+
+      # The window ships where its toolkit builds (gui: true above): the
+      # runner's native targets. The cross compilations — x86_64 binaries
+      # built from an arm64 macOS image, and any target whose matrix entry
+      # omits `gui` — carry no openfirma-gui: a cross sysroot has no
+      # windowing system to link against, and shipping a CLI-only binary
+      # beats shipping nothing. The release notes say exactly which
+      # artifacts hold the GUI.
+      - name: build GUI
+        if: matrix.gui
+        run: cargo build --release --target ${{ matrix.target }} -p openfirma-gui --bin openfirma-gui
 
       # Every artifact carries the license texts and the attribution notice,
       # because that is a condition of the GPL/EUPL distribution, not a nicety
@@ -70,6 +105,9 @@ jobs:
           name="openfirma-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "$name/LICENSES"
           cp "target/${{ matrix.target }}/release/openfirma" "$name/"
+          if [ "${{ matrix.gui }}" = "true" ]; then
+            cp "target/${{ matrix.target }}/release/openfirma-gui" "$name/"
+          fi
           cp README.md NOTICE.md "$name/"
           cp LICENSES/* "$name/LICENSES/"
           tar -czf "$name.tar.gz" "$name"
@@ -82,6 +120,9 @@ jobs:
           $name = "openfirma-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "$name/LICENSES" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/openfirma.exe" "$name/"
+          if ("${{ matrix.gui }}" -eq "true") {
+            Copy-Item "target/${{ matrix.target }}/release/openfirma-gui.exe" "$name/"
+          }
           Copy-Item README.md,NOTICE.md "$name/"
           Copy-Item LICENSES/* "$name/LICENSES/"
           Compress-Archive -Path "$name" -DestinationPath "$name.zip"
@@ -109,6 +150,22 @@ jobs:
 
       - name: list what we are publishing
         run: ls -lh dist
+
+      - name: state what the window ships on
+        # The GUI binary rides every `gui: true` artifact (x86_64 Linux,
+        # both Windows 64-bit families where MSVC builds it, both macOS);
+        # i686 Windows, musl and aarch64-linux-from-cross carry the CLI only.
+        run: |
+          {
+            echo ""
+            echo "### openfirma-gui (the window)"
+            echo ""
+            echo "Ships inside the artifacts for \`x86_64-unknown-linux-gnu\`,"
+            echo "\`x86_64-pc-windows-msvc\`, \`aarch64-pc-windows-msvc\`,"
+            echo "\`x86_64-apple-darwin\` and \`aarch64-apple-darwin\`."
+            echo "The other artifacts (i686 Windows, musl, aarch64 Linux via cross)"
+            echo "carry the CLI only: their toolchain has no windowing system to link."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: softprops/action-gh-release@v2
         with:

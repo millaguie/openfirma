@@ -145,6 +145,15 @@ the `messageDigest` attribute matches the file exactly. `openssl smime -verify
 -content` does the same job and works, so the detached tests go through
 `smime`. Encapsulated signatures verify fine with `cms -verify`.
 
+The GUI is tested at the same standard as far as a headless suite reaches:
+`crates/openfirma-gui/tests/ui.rs` drives the *real* `App` under egui_kittest
+(no display, AccessKit widget tree), and its end-to-end test signs through
+the GUI's own code path and verifies the written file with
+`openfirma_cades::verify`/`openfirma_pades::pades_verify` — the CLI's own
+verifiers. What a headless suite cannot reach is the OS furniture (a real
+file picker, drag-and-drop from a real desktop, closing a real window, the
+glow renderer itself); those are the manual checklist of section 5 below.
+
 For B-T, `crates/openfirma-cades/tests/tsp_crosscheck.rs` answers the RFC 3161
 query with `openssl ts -reply` and a synthetic TSA certificate, so the token
 embedded in our signature is one a real responder produced; openssl then
@@ -279,6 +288,39 @@ openfirma endpoint speaks plain HTTP on loopback until a pure-Rust TLS stack
 exists, so an end-to-end trámite through a real sede's autoscript is not yet
 possible; what *is* proven is every layer under it — URI parsing from recorded
 URIs, dispatch, wire response shapes, and the endpoint's refusals.
+
+## 5. GUI manual checklist (what kittest cannot reach)
+
+The window's logic — screens, routing, verdicts, error wording, the close
+guard, sign-then-verify through the same files — is asserted windowless by
+`crates/openfirma-gui/tests/ui.rs`. The items below need a real display and a
+real desktop; they are run once per release on each platform, in a scratch
+directory with the test PKI (`tools/gen-testcert.sh`) or, for full trust
+wording, a real certificate that never enters the repository.
+
+- [ ] `cargo run -p openfirma-gui` opens (glow renders; X11 and Wayland
+      sessions both), title «openfirma», Spanish throughout.
+- [ ] drag a PDF from the file manager onto the window → it detects and names
+      the format; dropping over the *Done* screen does not disturb the result.
+- [ ] "Examinar…" opens the real OS picker (rfd) on all three platforms, and
+      cancels cleanly (drop zone stays where it was).
+- [ ] ".p12" button → picker → password field → Firmar; a wrong password is
+      one plain sentence plus details, never a dialog storm; the right one
+      writes `documento.signed.pdf` next to the original before ✓ appears.
+- [ ] keystores: open a DNIe/OpenSC token by descriptor + PIN (or SoftHSM via
+      `pkcs11:/usr/lib/softhsm/libsofthsm2.so:openfirma test`, PIN 12345678);
+      its row needs no password to sign; a wrong PIN says so on the picker.
+- [ ] verify: drop a signed PDF → verdict lines with who/when; the details
+      toggle shows chain and byte ranges; with no `$OPENFIRMA_TRUST` the
+      window asks for an anchor and finishes from one picked file.
+- [ ] close (window ✗ / Alt-F4) over an unsaved result opens the guard; "Seguir
+      trabajando" keeps everything, "Cerrar sin guardar" ends the run and
+      leaves written files exactly where their screen said.
+- [ ] Save As writes to a second location and the path on screen follows it.
+- [ ] "Abrir carpeta" opens the folder (never a document); if no opener
+      exists, the failure is a red sentence on the screen.
+- [ ] CLI parity spot-check: every action above reproduces with the
+      equivalent `openfirma sign/verify` line from the README.
 
 ## Test certificate material
 
