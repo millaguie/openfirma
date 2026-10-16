@@ -102,6 +102,15 @@ pub struct PadesOptions {
     /// Requires validation data in the same call or already in the document,
     /// because B-LTA is B-LT plus the document time-stamp.
     pub document_timestamp: Option<openfirma_cades::TimestampFn>,
+
+    /// Sign a document certified with `/Perms /DocMDP` `/P 1` ("no changes to
+    /// the document are permitted"). Without this, openfirma refuses: the new
+    /// revision breaks the certification in every reader that honours it, and
+    /// AutoFirma asks for the same explicit permission before doing it (its
+    /// `allowSigningCertifiedPdfs` extraParam). With the flag set, the sign
+    /// goes ahead and the broken certification is the author's decision, not
+    /// ours. See docs/pades.md.
+    pub allow_signing_certified: bool,
 }
 
 impl Default for PadesOptions {
@@ -119,8 +128,106 @@ impl Default for PadesOptions {
             validation_certs: Vec::new(),
             revocation: Vec::new(),
             document_timestamp: None,
+            allow_signing_certified: false,
         }
     }
+}
+
+/// What `/Perms /DocMDP` of a document permits (finding A-2). ISO 32000-1
+/// 12.8.4.3; the certification dictionary sits under `/Reference`, whose value
+/// may be one dictionary or an array of them when a document is certified and
+/// then co-signed.
+#[derive(Clone, Copy, Debug)]
+pub struct DocMdp {
+    /// The `/P` permission bit of the strictest (`/P 1`) certification found —
+    /// ISO calls the whole thing out by the most restrictive entry.
+    pub lowest_p: i64,
+}
+
+/// Reads `/Perms /DocMDP /Reference /TransformParams /P` from the catalog. A
+/// catalog that has no `/Perms`, or one whose shape this cannot read, answers
+/// `Ok(None)`: nothing is certified and signing is allowed. A value found and
+/// refused to parse is an error — a certification openfirma cannot read is not
+/// a licence to overwrite it (AutoFirma likewise fails closed).
+pub fn docmdp_of(perms: &[u8]) -> Result<Option<DocMdp>> {
+    let perms = pdf::trim_ws(perms);
+    if !perms.starts_with(b"<<") {
+        return Err(Error::Pdf(
+            "the catalog's /Perms is not a dictionary".into(),
+        ));
+    }
+    let Some(docmdp) = pdf::get(perms, "/DocMDP") else {
+        return Ok(None);
+    };
+    let docmdp = pdf::trim_ws(docmdp);
+    if !docmdp.starts_with(b"<<") {
+        return Err(Error::Pdf(
+            "the catalog's /Perms /DocMDP is not a dictionary".to_string(),
+        ));
+    }
+    let Some(reference) = pdf::get(docmdp, "/Reference") else {
+        // A certification with no /Reference has no TransformParams and no /P
+        // to honour; ISO requires the pair, and AutoFirma treats the bare
+        // /DocMDP as a P=1 certification. Fail closed the same way.
+        return Ok(Some(DocMdp { lowest_p: 1 }));
+    };
+    let reference = pdf::trim_ws(reference);
+    // one dictionary, or an array of them (certified then co-signed)
+    let dicts: Vec<&[u8]> = if reference.starts_with(b"[") {
+        let mut out = Vec::new();
+        let mut i = 1;
+        let end = pdf::trim_ws(reference).len().saturating_sub(1);
+        while i < end {
+            let j = pdf::skip_ws(reference, i);
+            if j >= end || reference[j] == b']' {
+                break;
+            }
+            if !reference[j..].starts_with(b"<<") {
+                return Err(Error::Pdf(
+                    "a /DocMDP /Reference array holds something that is not a dictionary"
+                        .to_string(),
+                ));
+            }
+            let stop = pdf::dict_end(reference, j)?;
+            out.push(&reference[j..stop]);
+            i = stop;
+        }
+        out
+    } else if reference.starts_with(b"<<") {
+        vec![reference]
+    } else {
+        return Err(Error::Pdf(
+            "the /DocMDP /Reference is neither a dictionary nor an array of dictionaries"
+                .to_string(),
+        ));
+    };
+    let mut lowest: Option<i64> = None;
+    for d in dicts {
+        let Some(params) = pdf::get(d, "/TransformParams") else {
+            // no TransformParams: nothing declares a permission, and every
+            // conforming certification carries one. Fail closed as for an
+            // absent /Reference.
+            lowest = Some(1);
+            continue;
+        };
+        let params = pdf::trim_ws(params);
+        if !params.starts_with(b"<<") {
+            return Err(Error::Pdf(
+                "a /DocMDP /TransformParams is not a dictionary".to_string(),
+            ));
+        }
+        let p = pdf::get(params, "/P")
+            .and_then(|v| {
+                std::str::from_utf8(pdf::trim_ws(v))
+                    .ok()?
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+            })
+            .unwrap_or(1);
+        lowest = Some(lowest.map_or(p, |cur: i64| cur.min(p)));
+    }
+    Ok(lowest.map(|lowest_p| DocMdp { lowest_p }))
 }
 
 /// Adds a PAdES-B-B signature to `pdf` and returns the whole signed document.
@@ -130,6 +237,9 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     }
 
     let xref_at = pdf::last_startxref(pdf)?;
+    // The trailer is read FIRST and refused there: C-2's whole point is that
+    // an encrypted document must not get as far as being parsed further,
+    // because every later step would slice streams that are ciphertext.
     let trailer = pdf::trailer(pdf, xref_at)?;
     let offsets = pdf::object_locations(pdf, xref_at)?;
     // One object-stream decode memo for the whole signing walk (finding A-1):
@@ -138,7 +248,7 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     // documents CPU-quadratic.
     let mut cache = pdf::ObjectStreamCache::new();
 
-    let catalog = pdf::resolve(pdf, &offsets, Some(&mut cache), trailer.root)?.to_vec();
+    let mut catalog = pdf::resolve(pdf, &offsets, Some(&mut cache), trailer.root)?.to_vec();
     if !catalog.starts_with(b"<<") {
         return Err(Error::Pdf("the catalog is not a dictionary".into()));
     }
@@ -151,20 +261,127 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     if !page.starts_with(b"<<") {
         return Err(Error::Pdf(format!("page {page_ref} is not a dictionary")));
     }
+    // `/Info` may be indirect, and an incremental update must not rewrite it:
+    // its old bytes are already covered by earlier revisions' /ByteRanges, so
+    // the copy below is what gets spliced into the fresh definition.
     let info = match trailer.info {
         Some(r) => Some(pdf::resolve(pdf, &offsets, Some(&mut cache), r)?.to_vec()),
         None => None,
     };
 
-    let mut update = Update::new(xref_at, trailer.root, trailer.info, trailer.size);
-    // existing objects are rewritten under their own number, new ones start here
-    let first_new = update.next_object_number();
+    // A-2: a document certified with /Perms /DocMDP P=1 forbids every change,
+    // this signature included; signing it breaks the certification in each
+    // reader that honours it. AutoFirma asks for the same permission (its
+    // allowSigningCertifiedPdfs) before touching one. /Perms may be indirect.
+    if let Some(perms_value) = pdf::get(&catalog, "/Perms") {
+        let perms_owned;
+        let perms = match pdf::parse_ref(perms_value) {
+            Some(r) => {
+                perms_owned = pdf::resolve(pdf, &offsets, Some(&mut cache), r)?.into_owned();
+                &perms_owned[..]
+            }
+            None => pdf::trim_ws(perms_value),
+        };
+        if let Some(mdp) = docmdp_of(perms)? {
+            if mdp.lowest_p <= 1 && !opts.allow_signing_certified {
+                return Err(Error::Pdf(format!(
+                    "this document is certified with /Perms /DocMDP /P {} (no changes are \
+                     permitted), and signing it would break that certification in every \
+                     reader that honours it. If the author's rule must be overridden, pass \
+                     allow_signing_certified (--allow-certified on the command line).",
+                    mdp.lowest_p
+                )));
+            }
+        }
+    }
+
+    // M-2: a PDF/A document (ISO 19005-1) requires xmp:ModifyDate in the
+    // /Metadata XMP packet to equal /Info /ModDate, and openfirma does not
+    // rewrite the XMP stream — AutoFirma likewise changes behaviour for PDF/A
+    // sources. The simplest conforming choice (docs/pades.md): when a PDF/A
+    // identity declaration exists, write no new /ModDate at all and leave the
+    // /Info object exactly where it is — its bytes are already covered by the
+    // earlier revisions' /ByteRanges. Detecting on the declaration rather than
+    // trusting every /Metadata keeps every ordinary document (a plain XMP
+    // stream, an OpenMetadata package) stamping dates as before.
+    let metadata_ref = pdf::get(&catalog, "/Metadata").and_then(pdf::parse_ref);
+    let pdfa = match metadata_ref {
+        Some(m) => {
+            let dict = pdf::resolve(pdf, &offsets, Some(&mut cache), m)?;
+            // The key spells itself pdfaid:part in ISO 32000-2 and every
+            // PDF/A packet; compared case-insensitively without its leading
+            // slash because namespace prefixes are the XMP's business.
+            pdf::items(&dict)
+                .map(|items| {
+                    items.iter().any(|(k, _)| {
+                        let key = &dict[k.clone()];
+                        key.len() > 1
+                            && String::from_utf8_lossy(&key[1..]).to_ascii_lowercase()
+                                == "pdfaid:part"
+                    })
+                })
+                .unwrap_or(false)
+        }
+        None => false,
+    };
+
+    // A-1: the new trailer is a copy of the previous one — /ID included, which
+    // ISO 32000-1 7.5.6 requires carried over and PDF/A and PDF 2.0 demand —
+    // with this revision's /Size, /Root, /Info and /Prev written on top by
+    // render().
+    let previous_trailer = pdf::trailer_dict(pdf, xref_at)?;
+
+    let (root, _, size) = trailer.mandatory()?;
+    // Existing objects are rewritten under their own number and new ones start
+    // here. B-1: /Size alone is not enough — a lying trailer whose /Size sits
+    // below the real numbers would make every new object overwrite an existing
+    // one (pages, fonts), so the highest number the cross-reference knows
+    // bounds it too.
+    let first_new = size.max(
+        offsets
+            .keys()
+            .map(|r| r.num)
+            .max()
+            .map(|m| m.saturating_add(1))
+            .unwrap_or(0),
+    );
+    // M-1: when the original has no /Info, this is the object number the fresh
+    // dictionary gets and the trailer references — the old code wrote the
+    // dictionary and left it orphaned. The numbering block below allocates from
+    // first_new up to first_new + 5 (the five signature objects, plus the
+    // catalog when an inline /AcroForm or a usage-rights rewrite forces it to
+    // be written), so first_new + 6 is the number this revision really writes
+    // — never one another object already took.
+    let info_ref = trailer.info_for_revision(ObjRef::new(first_new + 6, 0));
+    let mut update =
+        Update::new_with_trailer(xref_at, root, Some(info_ref), size, &previous_trailer)?;
     let appearance = ObjRef::new(first_new, 0);
     let helv = ObjRef::new(first_new + 1, 0);
     let zadb = ObjRef::new(first_new + 2, 0);
     let sig = ObjRef::new(first_new + 3, 0);
     let field = ObjRef::new(first_new + 4, 0);
-    let info_ref = trailer.info.unwrap_or(ObjRef::new(first_new + 5, 0));
+
+    // M-4: AutoFirma removes usage rights (pdfReader.removeUsageRights) before
+    // signing: Adobe flags a signed document that still carries /Perms /UR3,
+    // because the usage rights were granted to a state of the document this
+    // new revision no longer is. The rest of /Perms (/DocMDP above, an older
+    // /SigStamp) survives byte for byte — pdf::set replaces one key and touches
+    // nothing else — and only when there is a /Perms to rewrite at all (the
+    // catalog keeps its number, so an untouched catalog stays untouched).
+    if let Some(perms_value) = pdf::get(&catalog, "/Perms") {
+        let perms_ref = pdf::parse_ref(perms_value);
+        let perms_owned = match perms_ref {
+            Some(r) => pdf::resolve(pdf, &offsets, Some(&mut cache), r)?.into_owned(),
+            None => pdf::trim_ws(perms_value).to_vec(),
+        };
+        if pdf::get(&perms_owned, "/UR3").is_some() || pdf::get(&perms_owned, "/UR").is_some() {
+            let stripped = pdf::set(&pdf::set(&perms_owned, "/UR3", b"null")?, "/UR", b"null")?;
+            match perms_ref {
+                Some(r) => update.push(Object::new(r, stripped)),
+                None => catalog = pdf::set(&catalog, "/Perms", &stripped)?,
+            }
+        }
+    }
 
     let existing = existing_signature_fields(pdf, &offsets, Some(&mut cache), &catalog);
     let field_name = opts
@@ -267,18 +484,33 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
         MergedAnnots::Indirect(r, array) => update.push(Object::new(r, array)),
     }
 
-    // Recording that the document changed is what /ModDate is for.
-    let date = pdf_string(&pdf_date(opts.sign_time)?);
-    let info_dict = match info {
-        Some(old) if old.starts_with(b"<<") => pdf::set(&old, "/ModDate", &date)?,
-        _ => {
-            let mut d = Vec::from(&b"<< /ModDate "[..]);
-            d.extend_from_slice(&date);
-            d.extend_from_slice(b" >>");
-            d
-        }
-    };
-    update.push(Object::new(info_ref, info_dict));
+    // Recording that the document changed is what /ModDate is for — except
+    // under PDF/A (M-2, see above), where the XMP copy of the date would be
+    // left behind: no /Info dictionary is written at all then, and the trailer
+    // keeps naming the one the original had. With M-1 fixed the alternative —
+    // rewrite /Info without a new date — cannot be used for the case that
+    // needs it most: a document with no /Info at all gets its first dictionary
+    // in this revision, and an empty one would only add an orphan-looking key.
+    let fresh_info = !pdfa;
+    if fresh_info {
+        let date = pdf_string(&pdf_date(opts.sign_time)?);
+        let info_dict = match info {
+            Some(old) if old.starts_with(b"<<") => pdf::set(&old, "/ModDate", &date)?,
+            _ => {
+                let mut d = Vec::from(&b"<< /ModDate "[..]);
+                d.extend_from_slice(&date);
+                d.extend_from_slice(b" >>");
+                d
+            }
+        };
+        update.push(Object::new(info_ref, info_dict));
+    } else if trailer.info.is_none() {
+        // A PDF/A document with no /Info: there is nothing to keep in sync, so
+        // stamping a fresh dictionary would be the only date the XMP does not
+        // carry. The trailer carries no /Info, which is exactly what the
+        // original said.
+        update.clear_info();
+    }
 
     let rendered = update.render(pdf.len())?;
     let sig_at = rendered.offsets[&sig];
@@ -563,7 +795,7 @@ fn cades_options(opts: &PadesOptions) -> CadesOptions {
 pub(crate) fn page_at(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
-    cache: Option<&mut pdf::ObjectStreamCache>,
+    mut cache: Option<&mut pdf::ObjectStreamCache>,
     catalog: &[u8],
     index: usize,
 ) -> Result<ObjRef> {
@@ -572,52 +804,116 @@ pub(crate) fn page_at(
             "pages are counted from 1, there is no page 0".into(),
         ));
     }
+    // M-5: the walk stops at the requested page — a visible signature on page
+    // 1 of a million-page book must not enumerate a million references first —
+    // and it remembers what it has seen, so a /Kids list that names the same
+    // node twice cannot replay its whole subtree. The root's declared /Count
+    // bounds the leaves an honest tree can hold; MAX_PAGES_WALKED bounds the
+    // lie.
     let pages_ref = pdf::parse_ref(
         pdf::get(catalog, "/Pages")
             .ok_or_else(|| Error::Pdf("the catalog has no /Pages".into()))?,
     )
     .ok_or_else(|| Error::Pdf("/Pages is not an indirect reference".into()))?;
-
-    let mut pages = Vec::new();
-    collect_pages(pdf, offsets, cache, pages_ref, &mut pages, 0)?;
+    let declared = {
+        let body = pdf::resolve(pdf, offsets, cache.as_deref_mut(), pages_ref)?;
+        pdf::get(&body, "/Count")
+            .and_then(|v| std::str::from_utf8(pdf::trim_ws(v)).ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+    };
+    let limit = declared.map_or(MAX_PAGES_WALKED, |c| c.min(MAX_PAGES_WALKED));
+    let mut walker = PageWalker::new(pdf, offsets, cache);
+    let pages = walker.collect(pages_ref, index, limit)?;
     pages.get(index - 1).copied().ok_or_else(|| {
+        // a truncated walk (it stopped at `index` leaves) can only miss when
+        // the tree holds fewer leaves than asked, and then /Count is the
+        // number of pages a viewer shows
+        let shown = declared.unwrap_or(pages.len());
         Error::Pdf(format!(
-            "the document has {} pages, so it has no page {index}",
-            pages.len()
+            "the document has {shown} pages, so it has no page {index}"
         ))
     })
 }
 
-/// Walks the page tree in document order, which is the order viewers number
-/// pages in and therefore the order a caller means by "page 3".
-fn collect_pages(
-    pdf: &[u8],
-    offsets: &BTreeMap<ObjRef, Location>,
-    mut cache: Option<&mut pdf::ObjectStreamCache>,
-    node: ObjRef,
-    out: &mut Vec<ObjRef>,
-    depth: u32,
-) -> Result<()> {
-    if depth > 64 {
-        return Err(Error::Pdf(
-            "the page tree is deeper than 64 levels, /Kids is probably a loop".into(),
-        ));
+/// How many page leaves one walk may collect before the tree is refused. A
+/// PDF object number space ends at u32::MAX and every leaf must be reachable
+/// through a `/Kids` entry the file contains (at least three bytes each), so
+/// this bounds memory by something a real document of readable size never
+/// approaches while refusing the exponential-blowup shape outright.
+const MAX_PAGES_WALKED: usize = 1 << 20;
+
+/// The page-tree walk, with its visited set and its budget (finding M-5).
+struct PageWalker<'a> {
+    pdf: &'a [u8],
+    offsets: &'a BTreeMap<ObjRef, Location>,
+    cache: Option<&'a mut pdf::ObjectStreamCache>,
+    visited: std::collections::HashSet<ObjRef>,
+}
+
+impl<'a> PageWalker<'a> {
+    fn new(
+        pdf: &'a [u8],
+        offsets: &'a BTreeMap<ObjRef, Location>,
+        cache: Option<&'a mut pdf::ObjectStreamCache>,
+    ) -> Self {
+        Self {
+            pdf,
+            offsets,
+            cache,
+            visited: std::collections::HashSet::new(),
+        }
     }
-    let body = pdf::resolve(pdf, offsets, cache.as_deref_mut(), node)?;
-    let typed = pdf::get(&body, "/Type").map(|t| pdf::trim_ws(t) == b"/Page");
-    if typed == Some(true) || (pdf::get(&body, "/MediaBox").is_some() && typed.is_none()) {
-        out.push(node);
-        return Ok(());
+
+    /// Leaves in document order, at most `stop` of them. A node already
+    /// visited — `/Kids [N 0 R N 0 R]` listing the same child twice, a cycle
+    /// dressed as a tree — is refused: iText's PageRefs marks nodes for
+    /// exactly this reason, and replaying a repeated node is what turned a few
+    /// KB of PDF into 2^depth references. `limit` bounds leaves by the root's
+    /// declared `/Count` (capped at [`MAX_PAGES_WALKED`]).
+    fn collect(&mut self, root: ObjRef, stop: usize, limit: usize) -> Result<Vec<ObjRef>> {
+        let mut out = Vec::new();
+        self.walk(root, &mut out, stop.min(limit), 0)?;
+        Ok(out)
     }
-    let Some(kids) = pdf::get(&body, "/Kids") else {
-        return Err(Error::Pdf(format!(
-            "node {node} is neither a page nor has /Kids"
-        )));
-    };
-    for kid in pdf::array_refs(kids)? {
-        collect_pages(pdf, offsets, cache.as_deref_mut(), kid, out, depth + 1)?;
+
+    fn walk(&mut self, node: ObjRef, out: &mut Vec<ObjRef>, stop: usize, depth: u32) -> Result<()> {
+        if out.len() >= stop {
+            return Ok(());
+        }
+        if depth > 64 {
+            return Err(Error::Pdf(
+                "the page tree is deeper than 64 levels, /Kids is probably a loop".into(),
+            ));
+        }
+        if !self.visited.insert(node) {
+            return Err(Error::Pdf(format!(
+                "the page tree reaches node {node} twice: /Kids repeats a child, and openfirma \
+                 refuses to replay it — the pages a viewer shows cannot be derived from a tree \
+                 that lists its own nodes more than once"
+            )));
+        }
+        let body = pdf::resolve(self.pdf, self.offsets, self.cache.as_deref_mut(), node)?;
+        let typed = pdf::get(&body, "/Type").map(|t| pdf::trim_ws(t) == b"/Page");
+        if typed == Some(true) || (pdf::get(&body, "/MediaBox").is_some() && typed.is_none()) {
+            out.push(node);
+            return Ok(());
+        }
+        let Some(kids) = pdf::get(&body, "/Kids") else {
+            return Err(Error::Pdf(format!(
+                "node {node} is neither a page nor has /Kids"
+            )));
+        };
+        for kid in pdf::array_refs(kids)? {
+            // checked before descending: stopping only after the subtree was
+            // walked would still materialise 2^depth visits for a doubled
+            // /Kids tree even when page 1 is wanted
+            if out.len() >= stop {
+                return Ok(());
+            }
+            self.walk(kid, out, stop, depth + 1)?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// The lines the visible appearance draws: an optional label, who signed, and
@@ -854,8 +1150,9 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    pub use crate::testkit::{mini_pdf, test_signer};
 
     #[test]
     fn dates_are_utc_and_zero_padded() {
@@ -886,31 +1183,6 @@ mod tests {
         for s in ["Signature1", "Firma (uno)", "JOSÉ ÁNGEL"] {
             assert_eq!(unquote(&pdf_string(s)), s, "{s} did not round trip");
         }
-    }
-
-    /// The RSA signer from the throwaway PKI, or None when it has not been
-    /// generated. Present but unloadable material panics rather than skipping,
-    /// because a silent skip once hid that every ECDSA test was passing
-    /// without signing anything.
-    fn test_signer() -> Option<openfirma_core::signer::SoftwareSigner> {
-        use openfirma_core::cert::CertificateHandle;
-        use openfirma_core::signer::SoftwareSigner;
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs");
-        let read = |name: &str| std::fs::read_to_string(dir.join(name));
-        let (Ok(cert), Ok(key)) = (read("signer-rsa.crt"), read("signer-rsa.key")) else {
-            return None;
-        };
-        let signer = SoftwareSigner::from_pkcs8_pem(&cert, &key).unwrap_or_else(|e| {
-            panic!("the test PKI is present but unusable: {e}. Rerun tools/gen-testcert.sh")
-        });
-        let chain = ["intermediate.crt", "ca.crt"]
-            .iter()
-            .map(|c| {
-                CertificateHandle::from_pem(&read(c).expect("the test PKI is incomplete"))
-                    .expect("not a certificate")
-            })
-            .collect();
-        Some(signer.with_chain(chain))
     }
 
     /// The fixture, so the visible appearance can be checked against a real
@@ -1161,28 +1433,6 @@ mod tests {
 
     /// A minimal one page PDF with the catalog given verbatim, behind a
     /// correct classic cross-reference table.
-    fn mini_pdf(catalog: &str) -> Vec<u8> {
-        let bodies: [&str; 3] = [
-            catalog,
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>",
-        ];
-        let mut out = Vec::from(&b"%PDF-1.4\n"[..]);
-        let mut offsets = Vec::new();
-        for (i, body) in bodies.iter().enumerate() {
-            offsets.push(out.len());
-            out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
-        }
-        let xref_at = out.len();
-        out.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
-        for off in &offsets {
-            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        out.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n");
-        out.extend_from_slice(format!("{xref_at}\n%%EOF\n").as_bytes());
-        out
-    }
-
     /// The array splice itself: the author's bytes are kept and the field
     /// appended, and only an array that lists a reference twice — which
     /// appending cannot fix — is rebuilt from its deduplicated references.
