@@ -197,12 +197,26 @@ fn nss_env() -> Option<(PathBuf, String)> {
     if !Path::new(db.strip_prefix("sql:").unwrap_or(&db)).exists() {
         return None;
     }
-    let module =
-        std::env::var("OPENFIRMA_NSS_MODULE").unwrap_or_else(|_| "/usr/lib/libsoftokn3.so".into());
-    let module = PathBuf::from(module);
-    if !module.is_file() {
-        return None;
+    // OPENFIRMA_NSS_MODULE wins; otherwise probe. The library is *not* where
+    // every package installs it: Debian's libnss3 ships it under the multiarch
+    // dir (/usr/lib/x86_64-linux-gnu), which does not even exist on Arch (and
+    // differs by triplet between x86_64 and aarch64 runners). Trusting one
+    // path silently skipped the NSS suite in CI while the SoftHSM one ran.
+    if let Ok(explicit) = std::env::var("OPENFIRMA_NSS_MODULE") {
+        let module = PathBuf::from(explicit);
+        return module.is_file().then_some((module, db));
     }
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from("/usr/lib/libsoftokn3.so")];
+    if let Ok(triplet) = std::process::Command::new("dpkg-architecture")
+        .args(["-q", "DEB_HOST_MULTIARCH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    {
+        if !triplet.is_empty() {
+            candidates.push(PathBuf::from(format!("/usr/lib/{triplet}/libsoftokn3.so")));
+        }
+    }
+    let module = candidates.into_iter().find(|p| p.is_file())?;
     Some((module, db))
 }
 

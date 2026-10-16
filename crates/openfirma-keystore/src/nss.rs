@@ -88,6 +88,18 @@ fn find_softokn() -> Result<PathBuf> {
             PathBuf::from("/usr/local/lib"),
             PathBuf::from("/usr/lib64"),
         ]);
+        // Debian's libnss3 installs into the multiarch directory, which no
+        // fixed spelling covers — and it differs between x86_64 and aarch64.
+        // Ask the packaging system what triplet this machine uses.
+        if let Ok(out) = std::process::Command::new("dpkg-architecture")
+            .args(["-q", "DEB_HOST_MULTIARCH"])
+            .output()
+        {
+            let triplet = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !triplet.is_empty() {
+                dirs.push(PathBuf::from(format!("/usr/lib/{triplet}")));
+            }
+        }
         if let Ok(extra) = std::env::var("LD_LIBRARY_PATH") {
             dirs.extend(std::env::split_paths(&extra));
         }
