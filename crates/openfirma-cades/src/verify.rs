@@ -309,7 +309,21 @@ pub fn verify(
     content: Option<&[u8]>,
     opts: &VerifyOptions,
 ) -> Result<Vec<VerifyReport>> {
-    let signed_data = parse_signed_data(der)?;
+    let signed_data = match parse_signed_data(der) {
+        Ok(sd) => sd,
+        // the caller handed bytes that are not a CMS at all (the cursor's
+        // codec complaints arrive as `Other`): say so as a verification
+        // verdict — a verifier refusing its input — rather than letting the
+        // UI explain a raw codec message on its own. A shape mismatch with a
+        // readable contentType already arrives as `Verification` and passes
+        // through untouched.
+        Err(e @ Error::Other(_)) => {
+            return Err(Error::Verification(format!(
+                "these bytes are not a CMS signature: {e}"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
     if signed_data.signer_infos.is_empty() {
         return Err(Error::Verification(
             "the SignedData carries no SignerInfo, so there is nothing to verify".into(),

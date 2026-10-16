@@ -113,3 +113,35 @@ fn every_truncation_and_length_mutation_of_a_token_is_an_error() {
         let _ = revocation::verify_crl(input, &[], now);
     }
 }
+
+/// Bytes that are not a CMS at all must come back as a verification verdict,
+/// never as a raw codec error: the GUI's verify screen forwards whatever it
+/// hears, and `b"not a signature"` — ASCII text whose first byte happens to
+/// be a tag (`0x6e`) with a length past the end — once surfaced as an opaque
+/// `Other("a value with tag 0x6e claims 111 bytes but only 13 are left")`.
+#[test]
+fn verify_refuses_non_cms_bytes_as_a_verification_error() {
+    let opts = verify_opts();
+    for bytes in [
+        b"not a signature".as_slice(),
+        &[0x6e_u8, 0x6f, 0x74][..],
+        &[0x30, 0x84, 0x00][..],
+        &[][..],
+    ] {
+        let err = openfirma_cades::verify::verify(bytes, None, &opts)
+            .expect_err("garbage is never a verified signature");
+        assert!(
+            matches!(err, openfirma_core::Error::Verification(_)),
+            "expected a verification verdict for {bytes:?}, got {err:?}"
+        );
+    }
+}
+
+fn verify_opts() -> openfirma_cades::verify::VerifyOptions {
+    // the anchors never see light: every input here fails at the parser.
+    openfirma_cades::verify::VerifyOptions {
+        trust_anchors: Vec::new(),
+        validation_time: std::time::SystemTime::now(),
+        ts_mode: false,
+    }
+}

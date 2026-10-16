@@ -43,6 +43,149 @@ pub const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 /// what the "emit `xmlns=""`" rule below keys off.
 pub type Axis = Vec<(Option<String>, String)>;
 
+/// The walking scope: a shadowing stack of every namespace declaration on
+/// the path to the current element (innermost last) plus a side stack
+/// marking which of them are still visible — an entry is hidden when a later
+/// one declares the same prefix. Descending pushes one element's
+/// declarations, leaving truncates both stacks: that is all it ever costs to
+/// move down or up the tree, and `live` walks only what is visible instead
+/// of re-compacting thousands of shadowed declarations at every subtree
+/// root. Building an [`Axis`] per node — what this whole design replaced —
+/// made canonicalization quadratic in the number of declarations times the
+/// number of elements (review 03, M-2): a document with thousands of
+/// prefixes on the root and thousands of untouched children took minutes.
+#[derive(Debug, Default)]
+struct Scope {
+    stack: Vec<(Option<String>, String)>,
+    /// one flag per entry of `stack`: false once a deeper entry shadows it.
+    visible: Vec<bool>,
+    /// for each prefix in scope, its innermost still-visible entry.
+    innermost: std::collections::HashMap<Option<String>, usize>,
+    undo: Vec<(Option<String>, Option<usize>)>,
+}
+
+impl Scope {
+    /// Enter an element: push its declarations, return the mark `ascend`
+    /// truncates back to. Nothing else is touched — no clone of any table.
+    fn push_element(&mut self, el: &Element) -> usize {
+        self.push_decls(&el.ns_decls)
+    }
+
+    /// Enter an element by declaration only — for callers (the subtree-root
+    /// seed below) that must replay a namespace context without re-pushing
+    /// the element itself.
+    fn push_decls(&mut self, decls: &[(Option<String>, String)]) -> usize {
+        let mark = self.stack.len();
+        for (prefix, uri) in decls {
+            // shadow the innermost outer binding of this prefix; `live` and
+            // `innermost_default` skip entries marked invisible. A duplicate
+            // within the same element (an xml parser rejects those, but a
+            // hand-built tree could carry them) shadows the earlier one too.
+            if let Some(&at) = self.innermost.get(prefix) {
+                self.visible[at] = false;
+            }
+            self.undo.push((
+                prefix.clone(),
+                self.innermost.insert(prefix.clone(), self.stack.len()),
+            ));
+            self.stack.push((prefix.clone(), uri.to_string()));
+            self.visible.push(true);
+        }
+        mark
+    }
+
+    fn ascend(&mut self, mark: usize) {
+        // undo in reverse push order and truncate the stack; one record per
+        // declaration pushed below the mark.
+        let mut n = self.stack.len();
+        while n > mark {
+            let (prefix, outer) = self.undo.pop().expect("one undo per pushed decl");
+            match outer {
+                Some(at) => self.visible[at] = true,
+                None => {
+                    self.innermost.remove(&prefix);
+                }
+            }
+            n -= 1;
+        }
+        self.stack.truncate(mark);
+        self.visible.truncate(mark);
+    }
+
+    /// The live axis of the current path: every prefix's innermost binding,
+    /// sorted by prefix for §2.3's print order, with `xmlns=""` removing the
+    /// default instead of adding an empty binding (the XPath data model).
+    /// Only an element that declared something ever pays to build it — the
+    /// render path calls it once per declaring element and at subtree roots,
+    /// so paths through thousands of *prefixed* declarations stay linear
+    /// (review 03, M-2). Cost: one probe per distinct prefix in scope.
+    fn live(&self) -> Axis {
+        let mut axis: Axis = self
+            .innermost
+            .iter()
+            .filter_map(|(prefix, at)| {
+                let (p, uri) = &self.stack[*at];
+                if p.is_none() && uri.is_empty() {
+                    return None; // an undeclaration is not a binding
+                }
+                Some((prefix.clone(), uri.clone()))
+            })
+            .collect();
+        axis.sort_by(|a, b| a.0.cmp(&b.0));
+        axis
+    }
+
+    /// The innermost declaration of the default namespace on the path:
+    /// `Some("")` for an explicit `xmlns=""`, `Some(uri)` for a default in
+    /// scope, `None` when no default was ever declared above. This is the
+    /// only question about the axis that an element without declarations can
+    /// ask (§2.3's undeclaration rule), and it is a single map probe now —
+    /// paths through thousands of prefixed declarations pay nothing for it.
+    fn innermost_default(&self) -> Option<&str> {
+        self.innermost
+            .get(&None)
+            .map(|at| self.stack[*at].1.as_str())
+    }
+
+    /// Whether a non-empty default is in scope on the path.
+    fn has_default(&self) -> bool {
+        matches!(self.innermost_default(), Some(u) if !u.is_empty())
+    }
+}
+
+/// What an element's children compare their bindings against: the axis that
+/// element rendered (§2.3 renders the full in-scope set at a root and the
+/// live set below one — they agree, because every ancestor binding stays in
+/// scope), plus whether that rendering had a default namespace: §2.3 makes a
+/// descendant without one print `xmlns=""`. The axis is reference-counted so
+/// handing it down the tree costs nothing (review 03, M-2): an element that
+/// declared nothing reuses its parent's exactly, and children pay only for
+/// their own declarations against it.
+#[derive(Debug)]
+struct Rendered {
+    axis: std::rc::Rc<Axis>,
+    had_default: bool,
+}
+
+impl Clone for Rendered {
+    fn clone(&self) -> Rendered {
+        Rendered {
+            axis: std::rc::Rc::clone(&self.axis),
+            had_default: self.had_default,
+        }
+    }
+}
+
+impl Rendered {
+    fn of(axis: Axis) -> Rendered {
+        let had_default = axis.iter().any(|(p, u)| p.is_none() && !u.is_empty());
+        Rendered {
+            axis: std::rc::Rc::new(axis),
+            had_default,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     /// Canonical XML with comments. AutoFirma signs without.
@@ -65,7 +208,14 @@ pub fn document(doc: &Document, opts: &Options) -> Vec<u8> {
             out.push(b'\n');
         }
     }
-    element(&doc.root, &Axis::new(), true, &[], opts, &mut out);
+    // `render_decls` with a `None` parent prints the live axis — exactly
+    // what the spec's §3.3 example (`e6`: an `xmlns=""` cancelling nothing
+    // prints nothing) requires at a whole-document root, where there is no
+    // rendering ancestor to owe an undeclaration to. Children get the root's
+    // live axis as their parent view below.
+    let mut scope = Scope::default();
+    let mark = scope.push_element(&doc.root);
+    element_with_context(&doc.root, &mut scope, mark, None, &[], opts, &mut out);
     for node in &doc.epilog {
         // the leading newline separates the node from whatever came before,
         // even when that was a comment this mode drops
@@ -88,7 +238,22 @@ pub fn subtree(
     opts: &Options,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    element(el, inherited, true, xml_attrs, opts, &mut out);
+    // A subtree root prints its whole context: what ancestors outside the
+    // output declared (`inherited`, already including this element's own
+    // declarations when a walk computed it from its scope) overridden by the
+    // element's own. Re-declared prefixes must not be shadowed against the
+    // identical inherited value — that would hide it — so they are dropped
+    // from `inherited` first; an `xmlns=""` on the root shadows nothing and
+    // prints as §2.3's undeclaration owed to the ancestors' default.
+    let mut scope = Scope::default();
+    let mut context: Axis = Vec::new();
+    for (prefix, uri) in inherited {
+        if !el.ns_decls.iter().any(|(p, u)| p == prefix && u == uri) {
+            context.push((prefix.clone(), uri.clone()));
+        }
+    }
+    let mark = scope.push_decls(&context);
+    element_with_context(el, &mut scope, mark, None, xml_attrs, opts, &mut out);
     out
 }
 
@@ -102,56 +267,80 @@ pub fn subtree_from<F: Fn(&Element) -> bool>(
     pred: F,
     opts: &Options,
 ) -> Option<Vec<u8>> {
+    // Descending pushes/pops the Scope alone — no axis per level, nothing
+    // proportional to the declarations already in scope (review 03, M-2).
+    // When the predicate matches, the path's live axis is exactly what §2.3
+    // makes the subtree root re-render, and `subtree` prints it in full.
     fn walk<F: Fn(&Element) -> bool>(
         el: &Element,
-        axis: &Axis,
+        scope: &mut Scope,
         xml_attrs: &[xml::Attribute],
         pred: &F,
         opts: &Options,
     ) -> Option<Vec<u8>> {
+        let mark = scope.push_element(el);
         if pred(el) {
-            return Some(subtree(el, axis, xml_attrs, opts));
+            let inherited = scope.live();
+            scope.ascend(mark);
+            return Some(subtree_with_inherited(el, &inherited, xml_attrs, opts));
         }
-        let child_axis = extend_axis(axis, el);
         let child_xml = extend_xml_attrs(xml_attrs, el);
-        for child in &el.children {
+        let found = el.children.iter().find_map(|child| {
             if let Child::Element(inner) = child {
-                if let Some(out) = walk(inner, &child_axis, &child_xml, pred, opts) {
-                    return Some(out);
-                }
+                walk(inner, scope, &child_xml, pred, opts)
+            } else {
+                None
             }
-        }
-        None
+        });
+        scope.ascend(mark);
+        found
     }
+
+    let mut scope = Scope::default();
     if pred(root) {
-        return Some(subtree(root, &Axis::new(), &[], opts));
+        // the root's context is its own declarations; `subtree`'s fresh
+        // scope re-pushes them, so pass an empty inherited axis and let the
+        // subtree-root rule print them in full.
+        return Some(subtree(
+            root,
+            &Axis::new(),
+            &extend_xml_attrs(&[], root),
+            opts,
+        ));
     }
-    let axis = extend_axis(&Axis::new(), root);
+    let mark = scope.push_element(root);
     let xml_attrs = extend_xml_attrs(&[], root);
-    for child in &root.children {
+    let found = root.children.iter().find_map(|child| {
         if let Child::Element(inner) = child {
-            if let Some(out) = walk(inner, &axis, &xml_attrs, &pred, opts) {
-                return Some(out);
-            }
+            walk(inner, &mut scope, &xml_attrs, &pred, opts)
+        } else {
+            None
         }
-    }
-    None
+    });
+    scope.ascend(mark);
+    found
 }
 
-fn extend_axis(parent: &Axis, el: &Element) -> Axis {
-    if el.ns_decls.is_empty() {
-        return parent.clone();
-    }
-    let mut axis = parent.clone();
-    for (prefix, uri) in &el.ns_decls {
-        axis.retain(|(p, _)| p != prefix);
-        if !uri.is_empty() || prefix.is_some() {
-            // xmlns="" removes the default binding instead of adding an
-            // empty one, per the XPath data model
-            axis.push((prefix.clone(), uri.clone()));
-        }
-    }
-    axis
+/// Like [`subtree`], but `inherited` came from a walk's scope and already
+/// includes the element's own declarations; seeding them into a fresh scope
+/// (minus exact duplicates of what it re-declares) gives exactly the context
+/// a subtree root prints.
+fn subtree_with_inherited(
+    el: &Element,
+    inherited: &Axis,
+    xml_attrs: &[xml::Attribute],
+    opts: &Options,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut scope = Scope::default();
+    let context: Axis = inherited
+        .iter()
+        .filter(|(p, u)| !el.ns_decls.iter().any(|(q, v)| q == p && v == u))
+        .cloned()
+        .collect();
+    let mark = scope.push_decls(&context);
+    element_with_context(el, &mut scope, mark, None, xml_attrs, opts, &mut out);
+    out
 }
 
 fn extend_xml_attrs(parent: &[xml::Attribute], el: &Element) -> Vec<xml::Attribute> {
@@ -172,43 +361,81 @@ fn extend_xml_attrs(parent: &[xml::Attribute], el: &Element) -> Vec<xml::Attribu
     out
 }
 
-/// The axis rule of §2.3: which bindings does this element render?
+/// The axis rule of §2.3: which bindings does this element render? At a root
+/// (a whole document or a subtree) that is its full context — every binding
+/// in scope, inherited ones included, which is why canonical
+/// `xades:SignedProperties` starts with an `xmlns:ds` declared on its parent.
+/// Below one, only the bindings that differ from what the nearest rendering
+/// ancestor rendered (`parent`), plus the default undeclaration owed when
+/// that rendering had a default and this element's scope has none — the one
+/// thing an element without declarations can still print. `parent.axis` is
+/// sorted and prefix-unique, so the diff scans in linear time of two sorted
+/// lists; an element that declared nothing pays one cheap default scan and
+/// builds no axis at all (review 03, M-2).
 fn render_decls(
-    axis: &Axis,
-    parent_axis: &Axis,
-    subtree_root: bool,
+    scope: &Scope,
+    el: &Element,
+    parent: Option<&Rendered>,
 ) -> Vec<(Option<String>, String)> {
-    let mut decls: Vec<(Option<String>, String)> = Vec::new();
-    for (prefix, uri) in axis {
-        if prefix.as_deref() == Some("xml") && uri == XML_NS {
-            continue;
+    let mut decls: Axis = match parent {
+        // at a root every binding of the context prints.
+        None => scope.live(),
+        Some(_) if el.ns_decls.is_empty() => {
+            // an element that declared nothing changed no binding; it builds
+            // no axis (review 03, M-2). The one thing it can still print —
+            // the owed `xmlns=""` — needs only the default probe below.
+            Vec::new()
         }
-        if !subtree_root && parent_axis.iter().any(|(p, u)| p == prefix && u == uri) {
-            continue;
+        Some(view) => {
+            // Below a root only own declarations can differ from what the
+            // nearest rendering ancestor rendered, so the candidates are its
+            // own prefixes and nothing else: each live binding costs one map
+            // probe and one binary search in `view.axis`. A re-declaration of
+            // the exact in-scope uri suppresses; a shadowing of the same
+            // prefix to a different uri prints the new binding; a prefix that
+            // shadowed nothing below the ancestor (identical pair) drops out.
+            let mut decls = Axis::new();
+            for (prefix, _) in &el.ns_decls {
+                let Some(at) = scope.innermost.get(prefix) else {
+                    continue;
+                };
+                let uri = scope.stack[*at].1.clone();
+                // An `xmlns=""` is a namespace node only while it cancels a
+                // default that was in scope; cancelling nothing prints
+                // nothing (the spec's own §3.3 example, element `e6`).
+                if prefix.is_none() && uri.is_empty() {
+                    continue;
+                }
+                match view.axis.binary_search_by(|(q, _)| q.cmp(prefix)) {
+                    Ok(v) if view.axis[v].1 == uri => {}
+                    _ => decls.push((prefix.clone(), uri)),
+                }
+            }
+            decls.sort_by(|a, b| a.0.cmp(&b.0));
+            decls
         }
-        decls.push((prefix.clone(), uri.clone()));
-    }
-    if !subtree_root
-        && !axis.iter().any(|(p, _)| p.is_none())
-        && parent_axis.iter().any(|(p, _)| p.is_none())
-    {
+    };
+    if parent.is_some_and(|view| view.had_default) && !scope.has_default() {
         // the nearest rendered ancestor has a default namespace and this
-        // element has none: the undeclaration has to be printed
-        decls.push((None, String::new()));
+        // element's scope has none: the undeclaration has to be printed (an
+        // own `xmlns=""` shows up as the missing binding here, not above).
+        if !decls.iter().any(|(p, u)| p.is_none() && u.is_empty()) {
+            decls.insert(0, (None, String::new()));
+        }
     }
-    decls.sort_by(|a, b| match (&a.0, &b.0) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(x), Some(y)) => x.cmp(y),
-    });
+    decls.retain(|(p, u)| !(p.as_deref() == Some("xml") && u == XML_NS));
     decls
 }
 
-fn element(
+/// Renders one element with its path already pushed onto `scope` up to and
+/// including itself (`mark` is the push to undo on the way out). `parent` is
+/// what the nearest rendering ancestor rendered, or `None` at a root, where
+/// the whole context lives in the scope's live axis.
+fn element_with_context(
     el: &Element,
-    parent_axis: &Axis,
-    subtree_root: bool,
+    scope: &mut Scope,
+    mark: usize,
+    parent: Option<&Rendered>,
     xml_attrs: &[xml::Attribute],
     opts: &Options,
     out: &mut Vec<u8>,
@@ -218,12 +445,11 @@ fn element(
     // tree that reaches this module came out of xml::parse, which refuses
     // documents nested deeper than xml::MAX_DEPTH; a tree deeper than the
     // canonicalizer's stack therefore cannot exist.
-    let axis = extend_axis(parent_axis, el);
     out.push(b'<');
     write_qname(&el.name, out);
 
-    for (prefix, uri) in render_decls(&axis, parent_axis, subtree_root) {
-        match &prefix {
+    for (prefix, uri) in render_decls(scope, el, parent) {
+        match prefix {
             Some(p) => {
                 out.extend_from_slice(b" xmlns:");
                 out.extend_from_slice(p.as_bytes());
@@ -258,6 +484,44 @@ fn element(
     }
     out.push(b'>');
 
+    // what this element hands its children. At a root (no parent) it printed
+    // its whole live axis and hands that down. Below one, the rule to keep is
+    // "children compare against what the nearest rendering ancestor
+    // rendered", and two shapes are possible. An element that declared
+    // something renders a superset of its parent's set (the superset rule),
+    // so it hands down its live axis — the pairs it printed included, the
+    // cancelled default removed by the data model, which is exactly what
+    // turns `had_default` off for descendants. An element that declared
+    // nothing changes no binding at all and hands the parent's record down
+    // untouched; below it children compare against the same axis in O(own
+    // size), never re-cloning or rebuilding a table of thousands of prefixes
+    // (review 03, M-2 — that per-child rebuild was the quadratic cost). The
+    // one fact such an element can still change is whether a rendered default
+    // remains in scope below it: an `xmlns=""` on an *ancestor between here
+    // and the parent* cannot exist without having changed `parent.had_default`
+    // itself, so within a no-declaration stretch nothing touches the flag.
+    let child_context: Rendered = match parent {
+        None => Rendered::of(scope.live()),
+        Some(view) if el.ns_decls.is_empty() => view.clone(),
+        Some(view) => {
+            // the printed set below this element is its parent's pairs with
+            // every own prefix replaced by the live binding (an undeclared
+            // default removes it): same superset rule, linear in own size.
+            let mut axis: Axis = (*view.axis).clone();
+            for (prefix, _) in &el.ns_decls {
+                axis.retain(|(q, _)| q != prefix);
+                if let Some(at) = scope.innermost.get(prefix) {
+                    let uri = scope.stack[*at].1.clone();
+                    match axis.binary_search_by(|(q, _)| q.cmp(prefix)) {
+                        Ok(v) => axis[v].1 = uri,
+                        Err(v) => axis.insert(v, (prefix.clone(), uri)),
+                    }
+                }
+            }
+            Rendered::of(axis)
+        }
+    };
+
     let omit = opts
         .omit
         .as_ref()
@@ -279,11 +543,14 @@ fn element(
                         continue;
                     }
                 }
-                element(inner, &axis, false, &[], opts, out);
+                let mark = scope.push_element(inner);
+                element_with_context(inner, scope, mark, Some(&child_context), &[], opts, out);
+                scope.ascend(mark);
             }
         }
     }
 
+    scope.ascend(mark);
     out.extend_from_slice(b"</");
     write_qname(&el.name, out);
     out.push(b'>');
@@ -476,8 +743,10 @@ mod tests {
             omit: Some(("urn:sig".into(), "Signature".into())),
             ..Default::default()
         };
-        let mut out = Vec::new();
-        crate::c14n::element(&doc.root, &Axis::new(), true, &[], &opts, &mut out);
-        assert_eq!(String::from_utf8(out).unwrap(), "<d>xy</d>");
+        assert_eq!(doc_c14n_with(&doc, &opts), "<d>xy</d>");
+    }
+
+    fn doc_c14n_with(doc: &Document, opts: &Options) -> String {
+        String::from_utf8(document(doc, opts)).expect("c14n is utf-8")
     }
 }
