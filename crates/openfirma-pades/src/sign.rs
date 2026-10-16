@@ -132,22 +132,27 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     let xref_at = pdf::last_startxref(pdf)?;
     let trailer = pdf::trailer(pdf, xref_at)?;
     let offsets = pdf::object_locations(pdf, xref_at)?;
+    // One object-stream decode memo for the whole signing walk (finding A-1):
+    // catalog, page tree, AcroForm and fields may all live in compressed
+    // streams, and re-inflating one per object is what made reading hostile
+    // documents CPU-quadratic.
+    let mut cache = pdf::ObjectStreamCache::new();
 
-    let catalog = pdf::resolve(pdf, &offsets, trailer.root)?.to_vec();
+    let catalog = pdf::resolve(pdf, &offsets, Some(&mut cache), trailer.root)?.to_vec();
     if !catalog.starts_with(b"<<") {
         return Err(Error::Pdf("the catalog is not a dictionary".into()));
     }
 
     let page_ref = match &opts.visible {
-        Some(a) => page_at(pdf, &offsets, &catalog, a.page)?,
-        None => page_at(pdf, &offsets, &catalog, 1)?,
+        Some(a) => page_at(pdf, &offsets, Some(&mut cache), &catalog, a.page)?,
+        None => page_at(pdf, &offsets, Some(&mut cache), &catalog, 1)?,
     };
-    let page = pdf::resolve(pdf, &offsets, page_ref)?.to_vec();
+    let page = pdf::resolve(pdf, &offsets, Some(&mut cache), page_ref)?.to_vec();
     if !page.starts_with(b"<<") {
         return Err(Error::Pdf(format!("page {page_ref} is not a dictionary")));
     }
     let info = match trailer.info {
-        Some(r) => Some(pdf::resolve(pdf, &offsets, r)?.to_vec()),
+        Some(r) => Some(pdf::resolve(pdf, &offsets, Some(&mut cache), r)?.to_vec()),
         None => None,
     };
 
@@ -161,12 +166,12 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     let field = ObjRef::new(first_new + 4, 0);
     let info_ref = trailer.info.unwrap_or(ObjRef::new(first_new + 5, 0));
 
-    let existing = existing_signature_fields(pdf, &offsets, &catalog);
+    let existing = existing_signature_fields(pdf, &offsets, Some(&mut cache), &catalog);
     let field_name = opts
         .field_name
         .clone()
         .unwrap_or_else(|| next_field_name(&existing.names));
-    let acroform = acroform_of(pdf, &offsets, &catalog);
+    let acroform = acroform_of(pdf, &offsets, Some(&mut cache), &catalog)?;
 
     let sig_dict = build_sig_dict(signer, opts)?;
 
@@ -252,7 +257,7 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
             ));
         }
     }
-    match merged_annots(pdf, &offsets, &page, field)? {
+    match merged_annots(pdf, &offsets, Some(&mut cache), &page, field)? {
         MergedAnnots::Inline(array) => {
             update.push(Object::new(page_ref, pdf::set(&page, "/Annots", &array)?))
         }
@@ -390,6 +395,7 @@ pub(crate) enum MergedAnnots {
 pub(crate) fn merged_annots(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
+    cache: Option<&mut pdf::ObjectStreamCache>,
     page: &[u8],
     field: ObjRef,
 ) -> Result<MergedAnnots> {
@@ -397,7 +403,7 @@ pub(crate) fn merged_annots(
         return Ok(MergedAnnots::Inline(format!("[{field}]").into_bytes()));
     };
     if let Some(r) = pdf::parse_ref(existing) {
-        let resolved = pdf::resolve(pdf, offsets, r)?;
+        let resolved = pdf::resolve(pdf, offsets, cache, r)?;
         let array = pdf::trim_ws(&resolved);
         if !array.starts_with(b"[") || !array.ends_with(b"]") {
             return Err(Error::Pdf(format!(
@@ -557,6 +563,7 @@ fn cades_options(opts: &PadesOptions) -> CadesOptions {
 pub(crate) fn page_at(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
+    cache: Option<&mut pdf::ObjectStreamCache>,
     catalog: &[u8],
     index: usize,
 ) -> Result<ObjRef> {
@@ -572,7 +579,7 @@ pub(crate) fn page_at(
     .ok_or_else(|| Error::Pdf("/Pages is not an indirect reference".into()))?;
 
     let mut pages = Vec::new();
-    collect_pages(pdf, offsets, pages_ref, &mut pages, 0)?;
+    collect_pages(pdf, offsets, cache, pages_ref, &mut pages, 0)?;
     pages.get(index - 1).copied().ok_or_else(|| {
         Error::Pdf(format!(
             "the document has {} pages, so it has no page {index}",
@@ -586,6 +593,7 @@ pub(crate) fn page_at(
 fn collect_pages(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
+    mut cache: Option<&mut pdf::ObjectStreamCache>,
     node: ObjRef,
     out: &mut Vec<ObjRef>,
     depth: u32,
@@ -595,7 +603,7 @@ fn collect_pages(
             "the page tree is deeper than 64 levels, /Kids is probably a loop".into(),
         ));
     }
-    let body = pdf::resolve(pdf, offsets, node)?;
+    let body = pdf::resolve(pdf, offsets, cache.as_deref_mut(), node)?;
     let typed = pdf::get(&body, "/Type").map(|t| pdf::trim_ws(t) == b"/Page");
     if typed == Some(true) || (pdf::get(&body, "/MediaBox").is_some() && typed.is_none()) {
         out.push(node);
@@ -607,7 +615,7 @@ fn collect_pages(
         )));
     };
     for kid in pdf::array_refs(kids)? {
-        collect_pages(pdf, offsets, kid, out, depth + 1)?;
+        collect_pages(pdf, offsets, cache.as_deref_mut(), kid, out, depth + 1)?;
     }
     Ok(())
 }
@@ -657,33 +665,56 @@ pub(crate) struct ExistingFields {
 /// under when it is an indirect object, which is how iText writes it. Both
 /// halves matter to the caller: the bytes get spliced, and the number says
 /// which object the splice has to be written back as.
+/// The document's `/AcroForm` dictionary: its bytes, and the object it lives
+/// under when it is an indirect object, which is how iText writes it. Both
+/// halves matter to the caller: the bytes get spliced, and the number says
+/// which object the splice has to be written back as. `Ok(None)` means the
+/// document has no form at all, which lets the caller write a fresh one.
+///
+/// An indirect `/AcroForm` whose object cannot be resolved is an **error**,
+/// not a `None` (finding B-5): `None` reads as "no AcroForm" and every caller
+/// then replaces the catalog's whole `/AcroForm` — silently dropping `/XFA`
+/// and everything else a damaged but real form held, which is precisely the
+/// silent document alteration docs/adr/0003 forbids. Only a catalog without
+/// the key at all may produce `None`.
 pub(crate) fn acroform_of(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
+    cache: Option<&mut pdf::ObjectStreamCache>,
     catalog: &[u8],
-) -> Option<(Option<ObjRef>, Vec<u8>)> {
-    let value = pdf::get(catalog, "/AcroForm")?;
+) -> Result<Option<(Option<ObjRef>, Vec<u8>)>> {
+    let value = match pdf::get(catalog, "/AcroForm") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
     match pdf::parse_ref(value) {
         // an indirect /AcroForm may live in an object stream, so the bytes
         // are always owned here
-        Some(r) => match pdf::resolve(pdf, offsets, r) {
-            Ok(b) => Some((Some(r), b.into_owned())),
-            Err(_) => None,
-        },
-        None => Some((None, pdf::trim_ws(value).to_vec())),
+        Some(r) => pdf::resolve(pdf, offsets, cache, r)
+            .map(|b| Some((Some(r), b.into_owned())))
+            .map_err(|e| {
+                Error::Pdf(format!(
+                    "the document's /AcroForm points at object {r}, which does not resolve                      ({e}); signing anyway would replace the whole form dictionary and lose                      what it held, so this is refused instead of guessed around"
+                ))
+            }),
+        None => Ok(Some((None, pdf::trim_ws(value).to_vec()))),
     }
 }
 
 pub(crate) fn existing_signature_fields(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
+    mut cache: Option<&mut pdf::ObjectStreamCache>,
     catalog: &[u8],
 ) -> ExistingFields {
     let empty = ExistingFields {
         refs: Vec::new(),
         names: Vec::new(),
     };
-    let Some((_, acro)) = acroform_of(pdf, offsets, catalog) else {
+    // A dangling indirect /AcroForm is refused by `acroform_of` itself (B-5);
+    // here only the "no form at all" reading may fall through to an empty
+    // list, and it always has.
+    let Ok(Some((_, acro))) = acroform_of(pdf, offsets, cache.as_deref_mut(), catalog) else {
         return empty;
     };
     let Some(fields_bytes) = pdf::get(&acro, "/Fields") else {
@@ -694,7 +725,7 @@ pub(crate) fn existing_signature_fields(
     };
     let mut names = Vec::new();
     for r in &refs {
-        if let Ok(f) = pdf::resolve(pdf, offsets, *r) {
+        if let Ok(f) = pdf::resolve(pdf, offsets, cache.as_deref_mut(), *r) {
             if let Some(t) = pdf::get(&f, "/T") {
                 names.push(unquote(t));
             }
@@ -941,6 +972,28 @@ mod tests {
         assert!(err.contains("no page 7"), "{err}");
     }
 
+    /// The unreadable-path half of the AcroForm rule (finding B-5): an
+    /// indirect `/AcroForm` whose object does not resolve must refuse the
+    /// signature with its reason, never fall through to "no form" and replace
+    /// a dictionary that may be holding `/XFA`. The catalog names object 9 as
+    /// its AcroForm; object 9 is nowhere in the cross-reference.
+    #[test]
+    fn a_dangling_indirect_acroform_refuses_the_signing_instead_of_replacing_it() {
+        let Some(signer) = test_signer() else {
+            eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let pdf = mini_pdf("<< /Type /Catalog /Pages 2 0 R /AcroForm 9 0 R >>");
+        let err = sign(&pdf, &signer, &PadesOptions::default())
+            .expect_err("a dangling /AcroForm reference must stop the signing");
+        let text = err.to_string();
+        assert!(text.contains("/AcroForm"), "{text}");
+        assert!(
+            text.contains("9 0 R") || text.contains("does not resolve"),
+            "the refusal must name the object: {text}"
+        );
+    }
+
     #[test]
     fn a_rectangle_with_no_area_is_refused() {
         let Some(signer) = test_signer() else {
@@ -986,7 +1039,7 @@ mod tests {
             "our revision must chain to the previous one"
         );
         let locs = pdf::object_locations(&signed, at).unwrap();
-        let catalog = pdf::resolve(&signed, &locs, tr.root).unwrap();
+        let catalog = pdf::resolve(&signed, &locs, None, tr.root).unwrap();
         assert!(
             pdf::get(&catalog, "/AcroForm").is_some(),
             "the rewritten catalog must carry the signature field"
@@ -995,7 +1048,7 @@ mod tests {
         let old_at = tr.prev.unwrap();
         let old_tr = pdf::trailer(&signed, old_at).unwrap();
         let old_locs = pdf::object_locations(&signed, old_at).unwrap();
-        let old_catalog = pdf::resolve(&signed, &old_locs, old_tr.root).unwrap();
+        let old_catalog = pdf::resolve(&signed, &old_locs, None, old_tr.root).unwrap();
         assert!(
             pdf::get(&old_catalog, "/AcroForm").is_none(),
             "the revision we appended to had no signature in it"
@@ -1056,7 +1109,7 @@ mod tests {
         let at = pdf::last_startxref(&signed).unwrap();
         let tr = pdf::trailer(&signed, at).unwrap();
         let locs = pdf::object_locations(&signed, at).unwrap();
-        let catalog = pdf::resolve(&signed, &locs, tr.root).unwrap();
+        let catalog = pdf::resolve(&signed, &locs, None, tr.root).unwrap();
         let acro = pdf::get(&catalog, "/AcroForm").expect("the catalog lost its /AcroForm");
         for key in ["/NeedAppearances true", "/XFA 4 0 R"] {
             assert!(
@@ -1072,7 +1125,7 @@ mod tests {
         // and the field list gained exactly our signature field
         let refs = pdf::array_refs(pdf::get(acro, "/Fields").unwrap()).unwrap();
         assert_eq!(refs.len(), 1, "the empty /Fields gains our field only");
-        let field = pdf::resolve(&signed, &locs, refs[0]).unwrap();
+        let field = pdf::resolve(&signed, &locs, None, refs[0]).unwrap();
         assert_eq!(
             pdf::get(&field, "/FT").map(pdf::trim_ws),
             Some(b"/Sig".as_slice())
@@ -1096,7 +1149,7 @@ mod tests {
         let at = pdf::last_startxref(&signed).unwrap();
         let tr = pdf::trailer(&signed, at).unwrap();
         let locs = pdf::object_locations(&signed, at).unwrap();
-        let catalog = pdf::resolve(&signed, &locs, tr.root).unwrap();
+        let catalog = pdf::resolve(&signed, &locs, None, tr.root).unwrap();
         let acro = pdf::get(&catalog, "/AcroForm").expect("the catalog lost its /AcroForm");
         let text = String::from_utf8_lossy(acro);
         assert!(text.contains("/SigFlags 1"), "kept: {text}");
@@ -1175,7 +1228,7 @@ mod tests {
         let locs = pdf::object_locations(&signed, at).unwrap();
 
         // the page still points at 4 0 R, it was not inlined
-        let page = pdf::resolve(&signed, &locs, ObjRef::new(3, 0)).unwrap();
+        let page = pdf::resolve(&signed, &locs, None, ObjRef::new(3, 0)).unwrap();
         assert_eq!(
             pdf::get(&page, "/Annots").map(pdf::trim_ws),
             Some(b"4 0 R".as_slice()),
@@ -1183,19 +1236,19 @@ mod tests {
         );
 
         // object 4, redefined in the new revision, holds both annotations
-        let annots = pdf::resolve(&signed, &locs, ObjRef::new(4, 0)).unwrap();
+        let annots = pdf::resolve(&signed, &locs, None, ObjRef::new(4, 0)).unwrap();
         let refs = pdf::array_refs(&annots).unwrap();
         assert_eq!(refs.len(), 2, "the original annotation plus our field");
         // the annotation that was there is itself indirect, so the array
         // holds its reference and the /Subtype lives in its own object
-        let link = pdf::resolve(&signed, &locs, refs[0]).unwrap();
+        let link = pdf::resolve(&signed, &locs, None, refs[0]).unwrap();
         assert_eq!(
             pdf::get(&link, "/Subtype").map(pdf::trim_ws),
             Some(b"/Link".as_slice()),
             "the annotation that was there must survive: {:?}",
             String::from_utf8_lossy(&link)
         );
-        let field = pdf::resolve(&signed, &locs, refs[1]).unwrap();
+        let field = pdf::resolve(&signed, &locs, None, refs[1]).unwrap();
         assert_eq!(
             pdf::get(&field, "/FT").map(pdf::trim_ws),
             Some(b"/Sig".as_slice())

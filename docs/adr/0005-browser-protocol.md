@@ -101,8 +101,21 @@ loopback port. What stops an uninvited caller here:
   `X-Openfirma-Reason` header — the same split a healthy AutoFirma socket
   makes, so no page can be tricked into reading a refusal as a signing error
   of *its* document.
-- Process limits: ≤16 concurrent connections, 30 s per connection (no
-  slowloris-by-idleness), bind refuses any non-loopback address.
+- Process limits: ≤16 concurrent connections (refused with 503 past that, and
+  refused *while* at capacity — the endpoint never shuts itself down because a
+  crowd was knocking), 30 s per connection enforced as an absolute deadline
+  checked around every read (no slowloris-by-idleness: Linux reports a socket
+  read timeout as `WouldBlock`, so the limit cannot be delegated to the
+  platform's error kind), bind refuses any non-loopback address. The token is
+  consumed only when a complete request has arrived, so a client that dies
+  mid-request costs the session a refusal, not its only signing opportunity.
+  *(Amended 2026-10-16 after the adversarial review, finding M-2: the previous
+  text's "30 s per connection" and an implied request-count shutdown were not
+  what the code did — the timeout never fired on Linux and the accept loop
+  died at 17 bare connections. The ADR always stated the intended promise;
+  the code now enforces it, and the shutdown-by-request-count is replaced by
+  the concurrency refusal because killing a launch's endpoint from unauthenticated
+  empty connects served no threat model this ADR has.)*
 
 ## Reasons
 

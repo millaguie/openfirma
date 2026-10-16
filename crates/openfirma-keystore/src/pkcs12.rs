@@ -72,7 +72,13 @@ const OID_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.10
 type FoundKey = (Option<Vec<u8>>, Option<String>, Zeroizing<Vec<u8>>);
 
 /// One private key and the certificates that travel with it.
-#[derive(Clone, Debug)]
+///
+/// The `Debug` implementation prints the alias, the localKeyID and the chain
+/// but never `key_pkcs8`: an `{entry:?}` in a log or a panic would otherwise
+/// publish the decrypted private key next to it (finding B-3). Keeping the
+/// trait (rather than dropping the derive outright) is what keeps `.unwrap()`
+/// usable on `Result<Entry, _>`; printing the key is what it refuses to do.
+#[derive(Clone)]
 pub struct Entry {
     /// `friendlyName`, the human readable alias, when the file carries one.
     pub alias: Option<String>,
@@ -93,10 +99,37 @@ impl Drop for Entry {
     }
 }
 
-/// Everything a PKCS#12 file held.
-#[derive(Clone, Debug, Default)]
+impl std::fmt::Debug for Entry {
+    /// The manual form of the key-hiding rule stated at `Entry`: every field
+    /// except the private key prints normally (test failures need to see the
+    /// alias and chain), and the key is named but never shown. A future
+    /// `#[derive(Debug)]` here would silently undo it — this impl's existence
+    /// makes that a compile-visible choice, not an invisible one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("alias", &self.alias)
+            .field("local_key_id", &self.local_key_id)
+            .field("key_pkcs8", &"[hidden]")
+            .field("chain", &self.chain.len())
+            .finish()
+    }
+}
+
+/// Everything a PKCS#12 file held. `Debug` is the manual, key-hiding one of
+/// [`Entry`] applied to every entry; nothing here ever formats a key.
+#[derive(Clone, Default)]
 pub struct Pkcs12 {
     pub entries: Vec<Entry>,
+}
+
+impl std::fmt::Debug for Pkcs12 {
+    /// Delegates to `Entry`'s key-hiding Debug, so the container inherits the
+    /// rule instead of needing its own.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pkcs12")
+            .field("entries", &self.entries)
+            .finish()
+    }
 }
 
 impl Pkcs12 {

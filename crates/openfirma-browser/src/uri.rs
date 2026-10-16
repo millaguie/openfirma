@@ -256,10 +256,13 @@ fn percent_decode_str(text: &str) -> Result<String, UriError> {
 /// `DataDownloader.downloadData`, which (in order) treats an `http(s)://` or
 /// `ftp://` prefix as a URL to fetch, and otherwise decodes base64 — falling
 /// back to the literal bytes when not base64 at all. The gzip flag decompresses
-/// the decoded result. We implement the base64 + gzip paths and refuse the URL
-/// ones: fetching remote documents from inside the browser protocol is what
+/// the decoded result. We implement the base64 + gzip paths, refuse the URL
+/// ones (fetching remote documents from inside the browser protocol is what
 /// ADR-0005 rules out; a URI that needs it belongs to the intermediate-server
-/// flow, not to this client.
+/// flow, not to this client), and — the one deliberate deviation from AutoFirma
+/// here — refuse instead of falling back when the payload does not decode: see
+/// the comment at the decode call for why signing literal text is worse than
+/// refusing the call.
 fn decode_dat_text(value: &str, gzipped: bool) -> Result<Vec<u8>, UriError> {
     let trimmed = value.trim();
     if trimmed.starts_with("http://")
@@ -284,7 +287,28 @@ fn decode_dat_text(value: &str, gzipped: bool) -> Result<Vec<u8>, UriError> {
     // taken as literal bytes by AutoFirma; here it still has to look like
     // base64, because the sedes always send base64 and anything else means a
     // broken URI more often than a raw text document.
-    let b64 = trimmed.replace('_', "/").replace('-', "+");
+    //
+    // ASCII whitespace is dropped before decoding, which is what AutoFirma's
+    // decoder does too: its alphabet (`Base64.java:623`) contains \t, \n and
+    // \r, so the iharder decoder it calls skips that whitespace *inside* the
+    // stream. A sede whose server wraps the base64 into MIME lines of 76
+    // (`Base64.encode(x, DO_BREAK_LINES)`, a normal practice) therefore signs
+    // the document in AutoFirma; an implementation that rejected the newlines
+    // instead — or fell back to signing the literal text when strict decoding
+    // failed — would sign the base64 *text* with no warning, a detached
+    // signature over bytes nobody asked to sign (RFC 4648 §3.3: whitespace is
+    // ignored in the data). Only `\t \n \f \r space` are stripped; other
+    // Unicode blanks are not part of AutoFirma's alphabet and must refuse.
+    let mut b64 = String::with_capacity(trimmed.len());
+    for c in trimmed.chars() {
+        if !c.is_ascii_whitespace() {
+            b64.push(match c {
+                '_' => '/',
+                '-' => '+',
+                other => other,
+            });
+        }
+    }
     // The cap applies to what the decoder will produce, which a byte count of
     // valid base64 bounds exactly (every 4 characters decode to at most 3
     // bytes). Checking before decoding is the whole point: an oversized
@@ -301,20 +325,23 @@ fn decode_dat_text(value: &str, gzipped: bool) -> Result<Vec<u8>, UriError> {
         )));
     }
     let engine = base64::engine::general_purpose::STANDARD;
-    let bytes = match engine.decode(b64.as_bytes()) {
-        Ok(bytes) => bytes,
-        // AutoFirma's fallback for a non-base64 `dat` is the text itself. It
-        // keeps that shape only when gzip was not requested (gzip requires
-        // base64 first); we keep it too — rejecting it would break the
-        // recorded plain-text calls and cost nothing.
-        Err(_) if !gzipped => trimmed.as_bytes().to_vec(),
-        Err(e) => {
-            return Err(UriError::new(format!(
-                "the dat parameter is neither base64 ({e}) nor, with gzip set, anything we \
-                 can decompress"
-            )));
-        }
-    };
+    // There is deliberately no literal-text fallback here, where AutoFirma
+    // has one (`DataDownloader.java:127-137` signs the raw bytes when its
+    // `isBase64` check fails). The fallback's only effect in openfirma was
+    // that a payload which failed to decode — historically a *wrapped*
+    // base64, whose interior newlines the strict decoder rejected — was
+    // signed as the base64 text instead of the document: a valid-looking
+    // signature over bytes the sede never sent. Signing the wrong bytes in
+    // silence is exactly what this client must never do; a `dat` that does
+    // not decode is refused with the parameter named, and the caller fixes
+    // the URI or uses `openfirma sign` with the real file.
+    let bytes = engine.decode(b64.as_bytes()).map_err(|e| {
+        UriError::new(format!(
+            "the dat parameter is not valid base64 ({e}): openfirma signs the decoded \
+             document bytes and never falls back to signing the text verbatim, because a \
+             signature over the wrong bytes would still look valid to a sede"
+        ))
+    })?;
     if bytes.len() > MAX_DATA_BYTES {
         return Err(UriError::new(format!(
             "a dat payload of {} bytes exceeds the {} byte limit openfirma accepts for one \

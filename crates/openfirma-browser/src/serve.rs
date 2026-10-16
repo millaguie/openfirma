@@ -61,8 +61,10 @@
 //! - The path must carry a live session token, or be `/echo`, the pure
 //!   liveness probe AutoFirma's pages use (`echo=` → `OK`): it signs nothing
 //!   and burns nothing. Bodies larger than `MAX_BODY_BYTES`, non-finite or
-//!   wrong `Content-Length`, chunked encoding, and requests past
-//!   `MAX_REQUESTS_PER_SESSION` are refused with a status that says which.
+//!   wrong `Content-Length`, chunked encoding, and connections past
+//!   `MAX_CONCURRENT_CONNECTIONS` are refused with a status that says which;
+//!   the token is consumed only by a complete request (see B-4's note at the
+//!   take), and each connection runs under an absolute deadline.
 //! - The response body of a successful sign is AutoFirma's wire form
 //!   (`base64(cert)|base64(signature)`, dispatch.rs). There is no CORS header
 //!   in the answer: a *same-origin* page (one served from this very port, the
@@ -84,14 +86,19 @@ pub const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How long one connection may take, total. The endpoint signs locally with
 /// software or token keys, so anything slower than half a minute means a peer
-/// that is not our caller (slowloris-style dribbling counts).
+/// that is not our caller (slowloris-style dribbling counts). Enforced as an
+/// absolute `Instant` deadline checked around every read — NOT by trusting
+/// `ErrorKind::TimedOut`: on Linux an `SO_RCVTIMEO` expiry surfaces as
+/// `WouldBlock` and the earlier loop continued on it, re-arming the timeout
+/// forever (finding M-2: the 30 s promise of ADR-0005 was dead code there).
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum number of requests the listener will answer before shutting down.
-/// A real flow asks once per launch; a bound port that answers hundreds of
-/// operations is being probed, and closing it is cheaper than reasoning about
-/// why. (AutoFirma's sockets die with the app after one operation by design.)
-pub const MAX_REQUESTS: usize = 16;
+/// How many live connection threads may exist at once. A bare connection that
+/// never speaks is closed by the deadline, so this only bounds the threads of
+/// peers mid-request; a port past it answers 503 rather than dying (see
+/// `accept_loop`: refusing a caller is survivable, shutting down the endpoint
+/// for the one legitimate signing call is not).
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
 /// The running endpoint. Dropping it leaves the accept loop and any live
 /// connection to finish their current operation; a short-lived CLI process
@@ -217,43 +224,91 @@ impl LoopbackServer {
 }
 
 /// Runs the accept loop on the owned listener. One thread per connection, but
-/// accepting is strictly sequential and every connection dies on its own
-/// timeout or after its one exchange, so there is never more than a handful of
-/// live handlers.
+/// accepting is strictly sequential; every connection dies on its own absolute
+/// deadline or after its one exchange, so a bare connection (opened and never
+/// speaking — `nc`, a probing `<img>` tag) occupies a thread only for the
+/// length of that deadline and nothing else.
+///
+/// The loop never shuts the endpoint down: an earlier revision counted
+/// *accepted connections* against a cap of 16 and returned when past it, so
+/// seventeen silent `nc` connects — no request, no token, nothing a browser
+/// page cannot do with image tags — permanently killed the port before the
+/// real call could arrive (finding M-2). Liveness is worth more than a crude
+/// anti-flood switch an advertiser could press: what the loop bounds instead
+/// is *concurrency*, answering 503 while `MAX_CONCURRENT_CONNECTIONS` handlers
+/// are all mid-request, which a stalled crowd cannot reach because stalled
+/// connections die at the deadline.
 fn accept_loop(listener: TcpListener, tokens: Arc<TokenStore>, key: SharedKey) {
-    let mut served = 0usize;
+    // Live handler threads, counted with an Arc counter each handler holds for
+    // exactly its own lifetime: no leak is possible when a thread panics, and
+    // no state to reset on any exit path.
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                served += 1;
-                if served > MAX_REQUESTS {
-                    // The port has answered more than a real flow ever would.
-                    // Stop before this becomes a service.
-                    eprintln!(
-                        "openfirma: the loopback endpoint answered {MAX_REQUESTS} requests and \
-                         is closing; a signing call needs one per launch"
-                    );
-                    return;
-                }
-                let tokens = tokens.clone();
-                let key = key.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, &tokens, &key) {
-                        // A refusal the client walked away from before reading
-                        // is not an incident; a real failure still prints.
-                        eprintln!("openfirma: loopback connection ended: {e}");
-                    }
-                });
-            }
-            Err(e) => {
-                // The listener is only ever closed when the process ends; a
-                // transient per-connection accept error must not kill it, so
-                // every error that got here just skips this connection.
-                let _ = e;
-                continue;
+        let Ok(stream) = stream else {
+            // The listener is only ever closed when the process ends; a
+            // transient per-connection accept error must not kill it, so
+            // every error that got here just skips this connection.
+            continue;
+        };
+        if live.load(std::sync::atomic::Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
+            // Every slot busy means callers are mid-request at once — far
+            // past what one signing flow ever looks like. Say so and close;
+            // the next connection is still welcome.
+            eprintln!(
+                "openfirma: the loopback endpoint has {MAX_CONCURRENT_CONNECTIONS} requests \
+                 in flight and answered a new connection with 503"
+            );
+            let mut stream = stream;
+            let _ = write_refusal(
+                &mut stream,
+                503,
+                "every request slot of the endpoint is busy; retry once the signing call \
+                 that occupies them has finished",
+                "too-many-in-flight",
+            );
+            continue;
+        }
+        let tokens = tokens.clone();
+        let key = key.clone();
+        let live = live.clone();
+        live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        struct Guard(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        std::thread::spawn(move || {
+            let _guard = Guard(live);
+            if let Err(e) = handle_connection(stream, &tokens, &key) {
+                // A refusal the client walked away from before reading
+                // is not an incident; a real failure still prints.
+                eprintln!("openfirma: loopback connection ended: {e}");
+            }
+        });
     }
+}
+
+/// A stalled read is retried only until the connection deadline, then refused
+/// with a distinct name (`request-head-timeout`): an idle peer must be cut at
+/// the deadline, not waited on (M-2). Every other malformed head keeps the
+/// generic 400 it has always answered.
+fn write_head_refusal(stream: &mut TcpStream, error: &'static str) -> std::io::Result<()> {
+    if error.starts_with("the request head did not finish") {
+        return write_refusal(
+            stream,
+            599,
+            "the request head never finished: the connection timeout expired while it was \
+             incomplete, which is the shape of a slowloris stall",
+            "request-head-timeout",
+        );
+    }
+    write_refusal(
+        stream,
+        400,
+        "the request head is malformed or oversized",
+        error,
+    )
 }
 
 /// Reads exactly one HTTP/1.x request and answers it. Connection threads are
@@ -264,20 +319,21 @@ fn handle_connection(
     tokens: &TokenStore,
     key: &SharedKey,
 ) -> std::io::Result<()> {
+    // The per-read socket timeouts stay (a hung `write` also has to end), but
+    // the real bound is this absolute deadline: see CONNECTION_TIMEOUT for why
+    // a platform error kind cannot be trusted for it.
     stream.set_read_timeout(Some(CONNECTION_TIMEOUT)).ok();
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT)).ok();
+    let deadline = std::time::Instant::now() + CONNECTION_TIMEOUT;
 
     // The header cap is what protects the read loop itself; a body is only
     // ever read after Content-Length passed its own (much smaller) cap.
-    let raw = match read_request_head(&mut stream, 64 * 1024) {
+    let raw = match read_request_head(&mut stream, 64 * 1024, deadline) {
         Ok(raw) => raw,
         Err(e) => {
-            write_refusal(
-                &mut stream,
-                400,
-                "the request head is malformed or oversized",
-                e,
-            )?;
+            // A timeout gets its own named refusal (M-2's test asserts it);
+            // anything else keeps the malformed-head answer.
+            write_head_refusal(&mut stream, e)?;
             return Ok(());
         }
     };
@@ -424,20 +480,6 @@ fn handle_connection(
         }
     }
 
-    // The token check before any document is read off the wire: an unauthenticated
-    // connection must cost as close to nothing as this design can manage.
-    if let Some(t) = token {
-        if !tokens.take(t) {
-            return write_refusal(
-                &mut stream,
-                403,
-                "the session token in the path is unknown or already used: openfirma's endpoint \
-                 gives each launch one token and consumes it on its first request",
-                "bad-token",
-            );
-        }
-    }
-
     // Drain the rest of the declared body (already capped above). A POST to
     // /sign with no Content-Length was refused; an echo carries no meaningful
     // body but may still send a small one (AutoFirma's pages post their probe
@@ -457,7 +499,7 @@ fn handle_connection(
     if have < want {
         let remaining = want - have;
         let mut rest = vec![0u8; remaining];
-        match read_exact_timeout(&mut stream, &mut rest) {
+        match read_exact_timeout(&mut stream, &mut rest, deadline) {
             Ok(()) => body.extend_from_slice(&rest),
             Err(e) => {
                 return write_refusal(
@@ -467,6 +509,26 @@ fn handle_connection(
                     "short-body",
                 );
             }
+        }
+    }
+
+    // The token is consumed here — after the head *and* the body have fully
+    // arrived (finding B-4). `take` burns the one token of the launch, so
+    // consuming it before reading meant a client that dropped mid-request (or
+    // a proxy that truncated the body) destroyed the session: no signature, no
+    // retry, a relaunched endpoint. Everything before this point is a named
+    // refusal of bytes the caller chose to send, so an attacker without the
+    // token still costs nothing beyond their own bandwidth; the first thing a
+    // request can destroy is now only reached with a complete request.
+    if let Some(t) = token {
+        if !tokens.take(t) {
+            return write_refusal(
+                &mut stream,
+                403,
+                "the session token in the path is unknown or already used: openfirma's endpoint \
+                 gives each launch one token and consumes it once a complete request presents it",
+                "bad-token",
+            );
         }
     }
 
@@ -495,9 +557,17 @@ fn handle_connection(
     )
 }
 
-/// Reads until the end of headers (one blank line), capped. Returns the whole
-/// raw request so far: head plus whatever body bytes already arrived.
-fn read_request_head(stream: &mut TcpStream, cap: usize) -> Result<Vec<u8>, &'static str> {
+/// Reads until the end of headers (one blank line), capped, under a hard
+/// connection deadline. `deadline` is checked every iteration and every read
+/// interruption: on Linux `SO_RCVTIMEO` reports its expiry as `WouldBlock`, so
+/// an error-kind check for `TimedOut` — the old rule — never fired there and
+/// a stalled peer could stall forever (`continue` re-armed the socket timeout
+/// each pass). A WouldBlock past the deadline is the refusal.
+fn read_request_head(
+    stream: &mut TcpStream,
+    cap: usize,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, &'static str> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -519,7 +589,17 @@ fn read_request_head(stream: &mut TcpStream, cap: usize) -> Result<Vec<u8>, &'st
                     return Ok(buf);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // The read timeout expired (Linux's spelling): the connection
+                // deadline, not the socket option, decides what happens next.
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err("the request head did not finish within the connection timeout");
+                }
+                // A spurious non-blocking wakeup inside the window is retried,
+                // with the socket option re-armed to whatever time remains.
+                let _ = stream.set_read_timeout(Some(left.max(Duration::from_millis(50))));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 return Err("the request head did not finish within the connection timeout");
             }
@@ -572,13 +652,33 @@ fn split_request(raw: &[u8]) -> std::io::Result<RequestParts<'_>> {
     Ok((request_line, headers, &raw[head_len + sep_len..]))
 }
 
-fn read_exact_timeout(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
+fn read_exact_timeout(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
         match stream.read(&mut buf[filled..]) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Same deadline rule as the request head: a dribbling body is cut
+            // at CONNECTION_TIMEOUT total, not waited on forever (M-2). The
+            // caller reports it under its existing short-body refusal.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the body did not arrive within the connection timeout",
+                    ));
+                }
+                let _ = stream.set_read_timeout(Some(left.max(Duration::from_millis(50))));
+            }
             Err(e) => return Err(e),
         }
     }
@@ -635,6 +735,12 @@ fn write_bytes(
         405 => "Method Not Allowed",
         411 => "Length Required",
         413 => "Content Too Large",
+        // A stalled read answers before the request has a method to refuse,
+        // so no verb is pending at that point: 599 is our own status for it.
+        // (408 is not usable from this code path — with no method parsed yet,
+        // every refusal would answer 599 and lose the distinction; the ADR's
+        // process-limits entry records the same choice.)
+        599 => "Request Timeout",
         _ => "Error",
     };
     let mut head = format!(

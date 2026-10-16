@@ -846,15 +846,16 @@ pub fn stream_raw(data: &[u8], offset: usize) -> Result<Vec<u8>> {
     )))
 }
 
-/// The objects packed inside an object stream, as number and value bytes.
-///
-/// An object stream holds the values only, with no `N G obj` wrapper, because
-/// their numbers are in the header instead.
-fn object_stream_contents(
+/// The decoded bytes of one object stream: dictionary included, because the
+/// header offsets inside it (`/First`) are relative to the object's start.
+/// This is the *inflate* — a hostile document can make it expensive, so every
+/// caller goes through the per-document cache of [`resolve_with_cache`] and a
+/// given stream is decoded at most once (finding A-1).
+fn decoded_object_stream(
     data: &[u8],
     locations: &BTreeMap<ObjRef, Location>,
     stream: ObjRef,
-) -> Result<Vec<(u32, Vec<u8>)>> {
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let Some(Location::Direct(off)) = locations.get(&stream).copied() else {
         return Err(Error::Pdf(format!(
             "object stream {stream} is missing from the cross-reference, or is itself \
@@ -865,11 +866,22 @@ fn object_stream_contents(
     let dict = data[dict_span].to_vec();
     let raw = stream_raw(data, off)?;
     let decoded = crate::stream::decode(&dict, &raw)?;
+    Ok((dict, decoded))
+}
 
-    let count = get(&dict, "/N")
+/// The header of an object stream: `(count, first)` and the 2N integers that
+/// follow (`objnum offset` pairs). Validated exactly as far as it is trusted:
+/// `/N` may not exceed the decoded length (a claim larger than the stream is
+/// a lie that would allocate before reading anything), the numbers must all
+/// be there, and nothing else is believed here — entry ranges are re-checked
+/// per object by [`entry_range`] so a cached header never smuggles nonsense.
+fn object_stream_header(dict: &[u8], decoded: Vec<u8>, stream: ObjRef) -> Result<ObjStmEntry> {
+    // /N and /First belong to the dictionary, which the decode step did not
+    // touch; `decoded` carries only the stream content, header numbers first.
+    let count = get(dict, "/N")
         .and_then(parse_uint)
-        .ok_or_else(|| Error::Pdf("the object stream has no /N".into()))? as usize;
-    let first = get(&dict, "/First")
+        .ok_or_else(|| Error::Pdf(format!("object stream {stream} has no /N")))?;
+    let first = get(dict, "/First")
         .and_then(parse_uint)
         .ok_or_else(|| Error::Pdf("the object stream has no /First".into()))?
         as usize;
@@ -880,13 +892,14 @@ fn object_stream_contents(
     }
     // /N is the file's claim, and every object needs at least two numbers in
     // the header inside the first /First bytes, so a claim bigger than the
-    // stream is a lie: believed, it would allocate before reading anything
-    if count > decoded.len() {
+    // stream is a lie: believed, it would allocate before reading anything.
+    if count > decoded.len() as u32 {
         return Err(Error::Pdf(format!(
             "/N claims {count} objects but the decoded object stream is only {} bytes",
             decoded.len()
         )));
     }
+    let count = count as usize;
 
     // the header is 2N integers: object number, then offset relative to /First
     let mut header = Vec::with_capacity(count * 2);
@@ -909,40 +922,94 @@ fn object_stream_contents(
             count * 2
         )));
     }
+    Ok(ObjStmEntry {
+        decoded,
+        first,
+        header,
+    })
+}
 
-    let mut out = Vec::with_capacity(count);
-    for n in 0..count {
-        // the header offsets are the file's claim: checked, because a sum
-        // that wraps would pass the range test below with a nonsense range
-        let (Some(start), Some(end)) = (
-            first.checked_add(header[n * 2 + 1] as usize),
-            if n + 1 < count {
-                first.checked_add(header[n * 2 + 3] as usize)
-            } else {
-                Some(decoded.len())
-            },
-        ) else {
-            return Err(Error::Pdf(format!(
-                "object number {} of the stream has an offset too large to represent",
-                header[n * 2]
-            )));
-        };
-        if start > end || end > decoded.len() {
-            return Err(Error::Pdf(format!(
-                "object number {} of the stream has an impossible range {start}..{end}",
-                header[n * 2]
-            )));
-        }
-        out.push((header[n * 2], trim_ws(&decoded[start..end]).to_vec()));
+/// One object's byte range inside the stream, checked on every access — cached
+/// or not. Offsets are the file's claim, so a sum that wraps is refused rather
+/// than wrapped into a passing range test, and the `start > end` shape a lie
+/// takes is refused too. Returns `(number, span)` of entry `index`.
+fn entry_range(entry: &ObjStmEntry, index: usize) -> Result<(u32, std::ops::Range<usize>)> {
+    let count = entry.header.len() / 2;
+    let first = entry.first;
+    let (Some(start), Some(end)) = (
+        first.checked_add(entry.header[index * 2 + 1] as usize),
+        if index + 1 < count {
+            first.checked_add(entry.header[index * 2 + 3] as usize)
+        } else {
+            Some(entry.decoded.len())
+        },
+    ) else {
+        return Err(Error::Pdf(format!(
+            "object number {} of the stream has an offset too large to represent",
+            entry.header[index * 2]
+        )));
+    };
+    if start > end || end > entry.decoded.len() {
+        return Err(Error::Pdf(format!(
+            "object number {} of the stream has an impossible range {start}..{end}",
+            entry.header[index * 2]
+        )));
     }
-    Ok(out)
+    Ok((entry.header[index * 2], start..end))
+}
+
+/// What one object stream costs to read: its decoded bytes (needed for every
+/// range check, and the dictionary `/N`//`/First` live at their start) plus
+/// the header's 2N integers. An entire ObjStm entry is a few MB at worst; a
+/// document's streams together are bounded by the same caps a single read of
+/// the document pays anyway. The fields stay private and the struct itself is
+/// only named through [`ObjectStreamCache`] — callers create one with `new`
+/// and never look inside.
+pub(crate) struct ObjStmEntry {
+    decoded: Vec<u8>,
+    /// /First, kept because entry ranges are re-validated per access and the
+    /// dictionary is not at hand any more then.
+    first: usize,
+    header: Vec<u32>,
+}
+
+/// The decoded contents of every object stream one read has touched, keyed by
+/// the stream's object number. A document is immutable while it is parsed —
+/// nothing here writes to `data` — so a computed entry is valid for the whole
+/// operation and there is no invalidation to get wrong; keeping decodes past
+/// one parse would be a memory policy, not a correctness need, which is why
+/// the cache travels with the caller's stack instead of globally. The entry
+/// type stays private: an outside caller only ever passes this around.
+pub struct ObjectStreamCache(std::collections::HashMap<ObjRef, std::sync::Arc<ObjStmEntry>>);
+
+impl ObjectStreamCache {
+    /// An empty cache for one document walk.
+    pub fn new() -> Self {
+        Self(std::collections::HashMap::new())
+    }
+}
+
+impl Default for ObjectStreamCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Resolves a reference to the bytes of its value, whether it sits in the file
 /// directly or compressed inside an object stream.
+///
+/// `cache` memoises the decode of each object stream (finding A-1): passing
+/// one makes every ObjStm inflate **once per document walk instead of once
+/// per object it holds** — without it, a 40 KB PDF with 2.000 objects behind
+/// one ~24 MB stream costs 24,5 s of a single core, and /N up to 65.000
+/// scales that to hours. `None` keeps the old uncached behaviour for one-shot
+/// resolves (the entry checks run identically either way; only the inflate is
+/// memoised, never a validation). Multi-object callers — `signatures()`, the
+/// page-tree walk, the signer — create one cache per operation.
 pub fn resolve<'a>(
     data: &'a [u8],
     locations: &BTreeMap<ObjRef, Location>,
+    mut cache: Option<&mut ObjectStreamCache>,
     r: ObjRef,
 ) -> Result<Cow<'a, [u8]>> {
     let Some(loc) = locations.get(&r).copied() else {
@@ -956,19 +1023,34 @@ pub fn resolve<'a>(
             Ok(Cow::Borrowed(&data[span]))
         }
         Location::InObjectStream { stream, index } => {
-            let contents = object_stream_contents(data, locations, stream)?;
-            let Some((num, bytes)) = contents.get(index as usize) else {
+            // One *inflate* per (document, object stream): the first object
+            // that needs the stream pays it, every later one clones the Arc
+            // and runs its own range checks against the same caps the uncached
+            // path applies — memoising means never skipping a check.
+            let entry = match cache.as_mut().and_then(|c| c.0.get(&stream)) {
+                Some(entry) => entry.clone(),
+                None => {
+                    let (dict, decoded) = decoded_object_stream(data, locations, stream)?;
+                    let entry = std::sync::Arc::new(object_stream_header(&dict, decoded, stream)?);
+                    if let Some(c) = cache.as_mut() {
+                        c.0.insert(stream, entry.clone());
+                    }
+                    entry
+                }
+            };
+            let count = entry.header.len() / 2;
+            let Some(index_us) = usize::try_from(index).ok().filter(|i| *i < count) else {
                 return Err(Error::Pdf(format!(
-                    "object {r} is entry {index} of object stream {stream}, which only holds {}",
-                    contents.len()
+                    "object {r} is entry {index} of object stream {stream}, which only holds {count}"
                 )));
             };
-            if *num != r.num {
+            let (num, range) = entry_range(&entry, index_us)?;
+            if num != r.num {
                 return Err(Error::Pdf(format!(
                     "object stream {stream} holds object {num} where {r} was expected"
                 )));
             }
-            Ok(Cow::Owned(bytes.clone()))
+            Ok(Cow::Owned(trim_ws(&entry.decoded[range]).to_vec()))
         }
     }
 }
@@ -976,6 +1058,27 @@ pub fn resolve<'a>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The objects packed inside an object stream, as number and value bytes —
+    /// the whole stream at once. An object stream holds the values only, with
+    /// no `N G obj` wrapper, because their numbers are in the header instead.
+    /// This is the one-shot reading every test cross-checks against: it walks
+    /// [`object_stream_header`] + [`entry_range`] exactly like the cached
+    /// resolve path does, so "cached agrees with fresh" is checkable by
+    /// construction (finding A-1).
+    pub(crate) fn object_stream_objects(
+        dict: &[u8],
+        decoded: &[u8],
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        let entry = object_stream_header(dict, decoded.to_vec(), ObjRef::new(0, 0))?;
+        let count = entry.header.len() / 2;
+        let mut out = Vec::with_capacity(count);
+        for n in 0..count {
+            let (num, range) = entry_range(&entry, n)?;
+            out.push((num, trim_ws(&entry.decoded[range]).to_vec()));
+        }
+        Ok(out)
+    }
 
     fn keys(dict: &[u8]) -> Vec<String> {
         items(dict)
@@ -1077,14 +1180,14 @@ pub(crate) mod tests {
             "objects 1..5, object 0 is the free list head"
         );
 
-        let catalog = resolve(pdf, &offs, tr.root).unwrap();
+        let catalog = resolve(pdf, &offs, None, tr.root).unwrap();
         assert_eq!(get(&catalog, "/Type"), Some(b"/Catalog".as_slice()));
         let pages = parse_ref(get(&catalog, "/Pages").unwrap()).unwrap();
-        let pages_body = resolve(pdf, &offs, pages).unwrap();
+        let pages_body = resolve(pdf, &offs, None, pages).unwrap();
         let kids = array_refs(get(&pages_body, "/Kids").unwrap()).unwrap();
         assert_eq!(kids, [ObjRef::new(3, 0)]);
 
-        let page = resolve(pdf, &offs, kids[0]).unwrap();
+        let page = resolve(pdf, &offs, None, kids[0]).unwrap();
         assert_eq!(get(&page, "/MediaBox"), Some(b"[0 0 595 842]".as_slice()));
         assert!(
             get(&page, "/Annots").is_none(),
@@ -1133,9 +1236,14 @@ pub(crate) mod tests {
                 index: 0,
             },
         );
-        let err = resolve(&pdf, &locations, ObjRef::new(1, 0))
-            .unwrap_err()
-            .to_string();
+        let err = resolve(
+            &pdf,
+            &locations,
+            Some(&mut ObjectStreamCache::new()),
+            ObjRef::new(1, 0),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("/N claims 100 objects"), "{err}");
         assert!(err.contains("only 16 bytes"), "{err}");
     }
@@ -1236,6 +1344,34 @@ pub(crate) mod tests {
         enc.finish().unwrap()
     }
 
+    /// The memo must answer exactly what the fresh decode answers: same
+    /// bytes, and the same refusals. A cache that hides a validation is worse
+    /// than no cache at all (finding A-1's design rule), and this test is the
+    /// standing proof for `itext_style_document` end to end.
+    #[test]
+    fn the_object_stream_memo_answers_what_a_fresh_decode_answers() {
+        let pdf = itext_style_document();
+        let at = last_startxref(&pdf).unwrap();
+        let locs = object_locations(&pdf, at).unwrap();
+        let mut cache = ObjectStreamCache::new();
+        for r in locs.keys() {
+            let fresh = resolve(&pdf, &locs, None, *r).unwrap();
+            let memoised = resolve(&pdf, &locs, Some(&mut cache), *r).unwrap();
+            assert_eq!(fresh, memoised, "object {r} reads differently cached");
+        }
+        // and the whole-stream reading agrees object by object with it
+        let (dict, decoded) = decoded_object_stream(&pdf, &locs, ObjRef::new(4, 0)).unwrap();
+        let all = object_stream_objects(&dict, &decoded).unwrap();
+        for (num, bytes) in &all {
+            let r = ObjRef::new(*num, 0);
+            assert_eq!(
+                bytes,
+                &resolve(&pdf, &locs, Some(&mut cache), r).unwrap()[..]
+            );
+        }
+        assert_eq!(all.len(), 3);
+    }
+
     #[test]
     fn a_document_written_with_object_streams_is_readable() {
         let pdf = itext_style_document();
@@ -1256,14 +1392,14 @@ pub(crate) mod tests {
         );
         assert!(matches!(locs[&ObjRef::new(4, 0)], Location::Direct(_)));
 
-        let catalog = resolve(&pdf, &locs, tr.root).unwrap();
+        let catalog = resolve(&pdf, &locs, None, tr.root).unwrap();
         assert_eq!(get(&catalog, "/Type"), Some(b"/Catalog".as_slice()));
         let pages = parse_ref(get(&catalog, "/Pages").unwrap()).unwrap();
-        let pages_body = resolve(&pdf, &locs, pages).unwrap();
+        let pages_body = resolve(&pdf, &locs, None, pages).unwrap();
         assert_eq!(get(&pages_body, "/Count"), Some(b"1".as_slice()));
         let kids = array_refs(get(&pages_body, "/Kids").unwrap()).unwrap();
         assert_eq!(kids, [ObjRef::new(3, 0)]);
-        let page = resolve(&pdf, &locs, kids[0]).unwrap();
+        let page = resolve(&pdf, &locs, None, kids[0]).unwrap();
         assert_eq!(
             get(&page, "/MediaBox"),
             Some(b"[0 0 595 842]".as_slice()),

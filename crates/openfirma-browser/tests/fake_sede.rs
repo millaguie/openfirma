@@ -675,3 +675,285 @@ fn a_json_message_body_signs_and_a_json_without_one_is_refused_by_name() {
         "names what is missing: {text}"
     );
 }
+
+/// A truncated request: headers complete, Content-Length honest, and then the
+/// client dies before the body arrives. The refusal is `short-body` — and,
+/// after finding B-4, the session token must still be alive afterwards: one
+/// dropped connection may not destroy the launch's only signing attempt.
+#[test]
+fn a_truncated_request_refuses_without_burning_the_token() {
+    let Some(key) = p12() else {
+        require_or_skip("testdata/certs/signer-rsa.p12 is absent");
+        return;
+    };
+    let server = server_on(&key);
+    let addr = server.addr();
+    let host = format!("127.0.0.1:{}", addr.port());
+    let token = server.issue_token();
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let body = uri_body(b"el documento completo nunca llega a la sede");
+    stream
+        .write_all(
+            format!(
+                "POST /sign/{token} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n",
+                body.len() + 4096
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    // Only part of what was declared — like a browser tab that died or a
+    // proxy cut in half — and then *wait*: the endpoint notices on its own
+    // connection timeout and answers short-body. Closing here instead would
+    // RST the queued refusal away (the exact race write_bytes documents), so
+    // reading stays open until the answer arrives.
+    stream.write_all(&body.as_bytes()[..24]).unwrap();
+    stream.flush().unwrap();
+    // Read with a bounded wait instead of read_to_end: the answer comes when
+    // the *body* deadline fires (up to CONNECTION_TIMEOUT), and read_to_end on
+    // an open socket would sit past that. The endpoint closes after answering,
+    // so EOF is the natural end.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(e) => panic!("reading the short-body refusal failed: {e}"),
+        }
+    }
+    let (status, headers, _) = parse_response(&raw);
+    assert_eq!(status, 400, "an incomplete body is refused: {status}");
+    assert_eq!(
+        header(&headers, "x-openfirma-reason"),
+        Some("short-body"),
+        "the refusal names the truncation"
+    );
+
+    // The same token must still sign now that a complete request follows it.
+    let (status, _, payload) = request(
+        addr,
+        "POST",
+        &format!("/sign/{token}"),
+        &host,
+        None,
+        uri_body(b"el documento real, reintentado").as_bytes(),
+    );
+    assert_eq!(
+        status, 200,
+        "a request that died mid-body must not consume the one token of the launch"
+    );
+    assert!(
+        String::from_utf8_lossy(&payload).contains('|'),
+        "the retry produced a signature"
+    );
+}
+
+/// The timeout of `CONNECTION_TIMEOUT` must actually fire: Linux reports an
+/// `SO_RCVTIMEO` expiry as `WouldBlock`, and an earlier accept loop continued
+/// on that error, so a connection that sent half a header and went quiet was
+/// waited on forever (the slowloris-by-idleness ADR-0005 promises against).
+/// The proof is the *timing of the answer while the peer says nothing*: this
+/// connection sends part of a head once and then stays silent for its whole
+/// life — if the endpoint still answers, it answered at the deadline, because
+/// no other event exists that could wake it. (The old code produced no answer
+/// here at all, so an assertion about "served too early" was unwritable; the
+/// absence of any answer is exactly what the bug looked like.) Generous CI
+/// bounds around a 30 s server-side timeout.
+#[test]
+fn a_silent_half_header_is_cut_at_the_deadline() {
+    let Some(key) = p12() else {
+        require_or_skip("testdata/certs/signer-rsa.p12 is absent");
+        return;
+    };
+    let server = server_on(&key);
+    let addr = server.addr();
+    let host = format!("127.0.0.1:{}", addr.port());
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(90)))
+        .unwrap();
+    // Part of a request line, then silence forever. No header terminator ever
+    // arrives: the only thing that can answer is the deadline itself.
+    stream
+        .write_all(format!("POST /echo HTTP/1.1\r\nHost: {host}\r\nX-Pa").as_bytes())
+        .unwrap();
+    stream.flush().unwrap();
+
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 4096];
+    let n = stream
+        .read(&mut buf)
+        .expect("the endpoint must cut the stall");
+    let elapsed = started.elapsed();
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(
+        head.starts_with("HTTP/1.1 599"),
+        "a stalled request head is refused with the timeout status: {head}"
+    );
+    assert!(
+        head.contains("request-head-timeout"),
+        "the refusal names the timeout: {head}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(25)
+            && elapsed < std::time::Duration::from_secs(60),
+        "the deadline fired at its own moment ({elapsed:?}); anything later          than 60 s is a wait, not a deadline"
+    );
+}
+
+/// Finding M-2, second half: the request bound used to count *accepted
+/// connections*, so seventeen bare connects — no request, no token, anything
+/// a blind `<img>` tag burst can do — permanently killed the port before the
+/// legitimate call arrived. What replaced it must not be the same wall in a
+/// different place: what consumes a slot is a *live* connection, and a live
+/// one dies at the connection deadline by itself, so an attacker who merely
+/// holds slots pays 30 s of threads per wave while the real flow signs every
+/// free instant between the waves. The test cycles exactly that schedule —
+/// saturate with stalled peers, see the named refusal at capacity, sign in
+/// the first gap once the oldest handler ages out — for two deadline waves.
+#[test]
+fn stalled_connections_age_out_and_the_endpoint_never_shuts_down() {
+    let Some(key) = p12() else {
+        require_or_skip("testdata/certs/signer-rsa.p12 is absent");
+        return;
+    };
+    let server = server_on(&key);
+    let addr = server.addr();
+    let host = format!("127.0.0.1:{}", addr.port());
+
+    // Two deadline waves: fill every slot, then sign in the first gap. The
+    // attacker's slots age out; ours always finds one.
+    for wave in 0..2 {
+        let mut crowd = Vec::new();
+        for _ in 0..openfirma_browser::serve::MAX_CONCURRENT_CONNECTIONS {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            // one byte of a head: accepted, handler busy, deadline ticking.
+            stream.write_all(b"P").unwrap();
+            stream.flush().unwrap();
+            crowd.push(stream);
+        }
+        // With the cap reached, the overflow refusal is what a new connection
+        // gets — named, survivable, not the old silent death of the port.
+        let (status, headers, _) = request(addr, "POST", "/echo", &host, None, b"");
+        assert_eq!(
+            status, 503,
+            "wave {wave}: at capacity the endpoint refuses, it does not die"
+        );
+        assert_eq!(
+            header(&headers, "x-openfirma-reason"),
+            Some("too-many-in-flight")
+        );
+
+        // The real caller cannot post into a saturated box either — what it
+        // must never get again is the old *permanently dead* behaviour. Sign
+        // in the first instant a stalled handler ages out (the deadline is
+        // 30 s, so well inside this test's own patience).
+        let signed = std::time::Instant::now();
+        loop {
+            let token = server.issue_token();
+            let (status, _, payload) = request(
+                addr,
+                "POST",
+                &format!("/sign/{token}"),
+                &host,
+                None,
+                uri_body(b"la sede firma entre olas de conexiones").as_bytes(),
+            );
+            if status == 200 {
+                assert!(String::from_utf8_lossy(&payload).contains('|'));
+                break;
+            }
+            assert_eq!(status, 503, "an available slot answers or refuses by name");
+            assert!(
+                signed.elapsed() < std::time::Duration::from_secs(90),
+                "wave {wave}: the endpoint stayed past capacity forever — stalled \
+                 connections never age out ({signed:?} waited)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        // The crowd is irrelevant now: drop it and everything still works.
+        drop(crowd);
+    }
+    let token = server.issue_token();
+    let (status, _, _) = request(
+        addr,
+        "POST",
+        &format!("/sign/{token}"),
+        &host,
+        None,
+        uri_body(b"la ultima firma despues de todo el acoso").as_bytes(),
+    );
+    assert_eq!(status, 200, "the endpoint outlived every wave");
+}
+
+/// Past `MAX_CONCURRENT_CONNECTIONS` *live* connections, the overflow gets a
+/// named 503 while the port keeps answering: refusing one caller in a flood is
+/// survivable, closing the port for the real call is not. The stalled peers
+/// hold their slots by never finishing a request head; after they age out at
+/// the deadline, an echo proves no state died with them.
+#[test]
+fn a_flood_of_live_connections_gets_503_not_a_dead_endpoint() {
+    let Some(key) = p12() else {
+        require_or_skip("testdata/certs/signer-rsa.p12 is absent");
+        return;
+    };
+    let server = server_on(&key);
+    let addr = server.addr();
+    let host = format!("127.0.0.1:{}", addr.port());
+
+    let mut stalled = Vec::new();
+    let mut got_503 = false;
+    for _ in 0..(openfirma_browser::serve::MAX_CONCURRENT_CONNECTIONS + 8) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // one byte of a head: accepted, handler blocked waiting for the rest.
+        stream.write_all(b"P").unwrap();
+        stream.flush().unwrap();
+        stalled.push(stream);
+
+        // Probe with a complete request; any answer at all proves the loop is
+        // alive (200 while slots were still free), 503 ends the fill.
+        let (status, headers, _) = request(addr, "POST", "/echo", &host, None, b"");
+        if status == 503 {
+            assert_eq!(
+                header(&headers, "x-openfirma-reason"),
+                Some("too-many-in-flight"),
+                "the refusal names itself"
+            );
+            got_503 = true;
+            break;
+        }
+    }
+    assert!(
+        got_503,
+        "the endpoint never answered 503 while every slot was held busy"
+    );
+
+    // The stalled crowd ages out at the connection deadline (30 s); when a
+    // slot frees, the echo answers again — no state died with the flood.
+    let t0 = std::time::Instant::now();
+    loop {
+        let (status, _, _) = request(addr, "POST", "/echo", &host, None, b"");
+        if status == 200 {
+            break;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(90),
+            "held slots never freed: the timeout still does not fire ({t0:?})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    drop(stalled);
+}

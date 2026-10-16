@@ -130,6 +130,109 @@ fn a_startxref_at_the_end_of_the_file_is_an_error_not_a_panic() {
     );
 }
 
+/// A-1: a document whose body lives entirely inside Compressed Object Streams
+/// used to be quadratic — every `resolve` by number freshly inflated and
+/// zlib-decompressed the stream that was already in hand, so inspection cost
+/// hundreds of megabytes of decompression for 2000 objects. With the per-op
+/// ObjStm cache the walk is linear: measured live, the sample below inspects
+/// in well under a second where the uncached path took over fourteen. If a
+/// refactor drops the cache again, this fails on timing.
+#[test]
+fn inspecting_a_document_of_two_thousand_compressed_objects_is_linear() {
+    use std::time::Instant;
+
+    let data = objstm_document(2000);
+    // Cheap sanity: the fixture is what it claims to be.
+    let text = String::from_utf8_lossy(&data);
+    assert_eq!(text.matches("/Type /ObjStm").count(), 1);
+    assert!(
+        data.windows(4).any(|w| w == b"/N 2"),
+        "fixture should pack a four digit object count"
+    );
+
+    let started = Instant::now();
+    let sigs = inspect::signatures(&data)
+        .unwrap_or_else(|e| panic!("las dos mil estructuras comprimidas no se inspeccionan: {e}"));
+    assert!(sigs.is_empty());
+    let inspected = started.elapsed();
+    // Generous on purpose — the point is the asymptotics, not microseconds.
+    assert!(
+        inspected < std::time::Duration::from_secs(5),
+        "la inspección de 2000 objetos en streams comprimidos tardó {inspected:?}: \
+         el caché de ObjStm se ha perdido",
+    );
+
+    // And the page walk (which resolves every kid of /Pages through the
+    // cache) is linear for the same reason: collect_pages shares one entry.
+    let started = Instant::now();
+    let timestamps = inspect::document_timestamps(&data);
+    let walked = started.elapsed();
+    assert!(
+        walked < std::time::Duration::from_secs(5),
+        "el recorrido de 2000 objetos comprimidos tardó {walked:?}: \
+         el caché de ObjStm se ha perdido",
+    );
+    let _ = timestamps;
+}
+
+/// A document whose entire body lives in one Compressed Object Stream, laid
+/// out the way the three PDF engines write them: the stream payload is the
+/// header of (number, offset) pairs followed by the objects themselves, all
+/// zlib-deflated, `/First` marking where the objects begin.
+fn objstm_document(count: usize) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
+
+    // Build the packed payload while remembering where each object begins.
+    let mut payload = Vec::new();
+    let mut pairs = Vec::with_capacity(count);
+    for i in 0..count {
+        pairs.push(format!("{i} {}", payload.len()));
+        payload
+            .extend(format!("<< /Type /Page /MediaBox [0 0 595 {}] >>", 841 - (i % 50)).as_bytes());
+    }
+    let header = pairs.join(" ");
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(header.as_bytes()).unwrap();
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut out = Vec::new();
+    out.extend(b"%PDF-1.6\n");
+    let mut offsets = [0u32; 4];
+    offsets[1] = out.len() as u32;
+    out.extend(
+        format!(
+            "1 0 obj\n<< /Type /ObjStm /N {count} /First {} /Length {} /Filter \
+             /FlateDecode >>\nstream\n",
+            header.len(),
+            compressed.len(),
+        )
+        .as_bytes(),
+    );
+    out.extend(&compressed);
+    out.extend(b"\nendstream\nendobj\n");
+
+    offsets[2] = out.len() as u32;
+    out.extend(
+        format!("2 0 obj\n<< /Type /Pages /Kids [1 0 R] /Count {count} >>\nendobj\n").as_bytes(),
+    );
+    offsets[3] = out.len() as u32;
+    out.extend(b"3 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let xref_pos = out.len();
+    out.extend(b"xref\n0 4\n0000000000 65535 f \n");
+    for off in &offsets[1..] {
+        out.extend(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend(
+        format!("trailer\n<< /Size 4 /Root 3 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
 /// A cross-reference table whose subsection header claims entries the file
 /// does not hold. Walking them used to run past the end of the buffer, and a
 /// large enough claim spun for the claimed number of iterations first.

@@ -66,7 +66,7 @@ pub struct App {
 /// shape: `render_*` moved `self.screen` into UI closures, so a `&mut self`
 /// keystore call cannot nest inside them).
 enum Deferred {
-    OpenStore(String, Option<String>),
+    OpenStore(String, Option<Zeroizing<String>>),
     /// Ask the OS for the trust-anchor file of the verify path; its answer
     /// finishes the load that started it.
     AskAnchor(PathBuf),
@@ -689,9 +689,13 @@ impl App {
         if open_it {
             let d = std::mem::take(&mut self.descriptor_input);
             let p = std::mem::take(&mut self.pin_input);
+            // The PIN the user typed leaves the widget exactly once and into a
+            // Zeroizing: from here every copy zeroes on drop, like every other
+            // secret this crate handles (finding B-2). The plain String stays
+            // in the dialog's fields only between frames of the dialog itself.
+            let p = (!p.is_empty()).then(|| Zeroizing::new(p));
             self.show_add_store = false;
-            self.deferred
-                .push(Deferred::OpenStore(d, (!p.is_empty()).then_some(p)));
+            self.deferred.push(Deferred::OpenStore(d, p));
         }
         if cancel {
             self.show_add_store = false;
@@ -974,7 +978,7 @@ impl App {
     /// Open a keystore descriptor and merge its signable certificates into
     /// the catalog (the CLI's `keystores list` rule: one store failing never
     /// hides another's listing, and it never aborts what is already open).
-    fn open_descriptor(&mut self, descriptor: &str, pin: Option<String>) {
+    fn open_descriptor(&mut self, descriptor: &str, pin: Option<Zeroizing<String>>) {
         let outcome = (|| -> openfirma_core::Result<Vec<keystore_io::StoreEntry>> {
             let spec = StoreSpec::parse(descriptor).map_err(openfirma_core::Error::Keystore)?;
             let store = keystore_io::open_store(&spec, pin)?;

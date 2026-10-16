@@ -24,6 +24,7 @@ use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
 use openfirma_core::error::Error;
 use openfirma_core::tlv::{sequence, tlv};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::store::{KeyHandle, StoreCertificate, SystemStore};
 use types::*;
@@ -133,7 +134,7 @@ pub struct Pkcs11Store {
     module: Arc<Module>,
     slot: CkSlotId,
     token_label: String,
-    pin: Option<String>,
+    pin: Option<Zeroizing<String>>,
 }
 
 impl Pkcs11Store {
@@ -151,7 +152,14 @@ impl Pkcs11Store {
         Self::open_with(
             module_path,
             token,
-            pin,
+            // The PIN is a secret of the same order as a PKCS#12 password and
+            // lives as long as the store does (a token may sign long after
+            // listing), so it enters Zeroizing at the door: from here every
+            // copy zeroes when dropped. The plain Option<String> signature
+            // stays because that is what `--pin-env` hands us, and the last
+            // unprotected moment should be the variable's own buffer, not a
+            // store field.
+            pin.map(Zeroizing::new),
             InitShape::Generic,
             None,
             with_login,
@@ -170,6 +178,7 @@ impl Pkcs11Store {
         token: Option<&str>,
         pin: Option<String>,
     ) -> Result<Self> {
+        let pin = pin.map(Zeroizing::new);
         // Two defaults have to be overridden for the private-key database, so
         // an unqualified `--store nss` does the right thing (AutoFirma's NSS
         // helper works this way too — it points SunPKCS11 at the cert DB):
@@ -211,7 +220,7 @@ impl Pkcs11Store {
     fn open_with(
         module_path: &Path,
         token: Option<&str>,
-        pin: Option<String>,
+        pin: Option<Zeroizing<String>>,
         init: InitShape,
         library_parameters: Option<&str>,
         login_up_front: bool,
@@ -266,6 +275,11 @@ impl Pkcs11Store {
     }
 
     fn login(&self, session: &Session) -> Result<()> {
+        // The CString is a second copy of the secret (C_Login wants a C
+        // string), so its bytes are zeroed by hand after the call: zeroize's
+        // Zeroizing only covers types that implement DefaultIsZeroes, which
+        // CString does not, and `as_bytes_mut` is exactly what makes the
+        // buffer writable again for that purpose.
         let pin = match &self.pin {
             Some(p) => CString::new(p.as_str())
                 .map_err(|_| Error::Keystore("the PIN contains a NUL byte".into()))?,
@@ -282,6 +296,9 @@ impl Pkcs11Store {
             pin.as_ptr() as *mut u8,
             pin.as_bytes().len(),
         );
+        // Zero the FFI copy on every path out of the call, success included;
+        // into_bytes takes the buffer out so nothing can read it afterwards.
+        pin.into_bytes().zeroize();
         if rv == CKR_OK || rv == CKR_USER_ALREADY_LOGGED_IN {
             return Ok(());
         }
@@ -438,7 +455,8 @@ fn process_module(
         // C_Initialize already decided how this library was configured.
         if *shape != init {
             return Err(Error::Keystore(format!(
-                "{} is already initialized in this process as {} and cannot be                  reopened as {}",
+                "{} is already initialized in this process as {} and cannot be \
+                 reopened as {}",
                 path.display(),
                 shape.name(),
                 init.name()
@@ -805,7 +823,8 @@ fn list_in_session(session: &Session) -> Result<Vec<StoreCertificate>> {
         let Some(id) = session.attribute(object, CKA_ID)? else {
             tracing::warn!(
                 subject = %cert.subject(),
-                "a certificate on the token has no CKA_ID and cannot be paired                  with a private key; report this to the token vendor"
+                "a certificate on the token has no CKA_ID and cannot be paired \
+                 with a private key; report this to the token vendor"
             );
             continue;
         };

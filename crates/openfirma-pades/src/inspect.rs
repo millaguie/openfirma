@@ -44,9 +44,14 @@ pub fn signatures(pdf: &[u8]) -> Result<Vec<Signature>> {
     let xref_at = pdf::last_startxref(pdf)?;
     let locations = pdf::object_locations(pdf, xref_at)?;
 
+    // One decode memo for the whole scan: this loop resolves *every* object in
+    // the cross-reference, so an unmemoised resolve would inflate each object
+    // stream once per object it holds — quadratic CPU from 40 KB of input
+    // (finding A-1). The document is read-only here, so no invalidation.
+    let mut cache = pdf::ObjectStreamCache::new();
     let mut out = Vec::new();
     for object in locations.keys() {
-        let Ok(body) = pdf::resolve(pdf, &locations, *object) else {
+        let Ok(body) = pdf::resolve(pdf, &locations, Some(&mut cache), *object) else {
             continue;
         };
         if pdf::get(&body, "/Type").map(|t| pdf::trim_ws(t) == b"/Sig") != Some(true) {
@@ -235,9 +240,11 @@ pub fn document_timestamps(pdf: &[u8]) -> Result<Vec<DocTimeStamp>> {
     let xref_at = pdf::last_startxref(pdf)?;
     let locations = pdf::object_locations(pdf, xref_at)?;
 
+    // one ObjStm decode for the whole scan, not one per object (finding A-1)
+    let mut cache = pdf::ObjectStreamCache::new();
     let mut out = Vec::new();
     for object in locations.keys() {
-        let Ok(body) = pdf::resolve(pdf, &locations, *object) else {
+        let Ok(body) = pdf::resolve(pdf, &locations, Some(&mut cache), *object) else {
             continue;
         };
         if pdf::get(&body, "/Type").map(|t| pdf::trim_ws(t) == b"/DocTimeStamp") != Some(true) {

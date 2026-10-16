@@ -90,14 +90,16 @@ pub fn read_dss(pdf: &[u8]) -> Result<Option<Dss>> {
     let xref_at = pdf::last_startxref(pdf)?;
     let trailer = pdf::trailer(pdf, xref_at)?;
     let offsets = pdf::object_locations(pdf, xref_at)?;
-    let catalog = pdf::resolve(pdf, &offsets, trailer.root)?.to_vec();
+    // One decode memo for this read (finding A-1); see pdf::resolve.
+    let mut cache = pdf::ObjectStreamCache::new();
+    let catalog = pdf::resolve(pdf, &offsets, Some(&mut cache), trailer.root)?.to_vec();
     let Some(dss_bytes) = pdf::get(&catalog, "/DSS") else {
         return Ok(None);
     };
     let owned;
     let dict: &[u8] = match pdf::parse_ref(dss_bytes) {
         Some(r) => {
-            owned = pdf::resolve(pdf, &offsets, r)?.into_owned();
+            owned = pdf::resolve(pdf, &offsets, Some(&mut cache), r)?.into_owned();
             &owned
         }
         None => dss_bytes,
@@ -111,7 +113,7 @@ pub fn read_dss(pdf: &[u8]) -> Result<Option<Dss>> {
         ocsps: stream_array(pdf, &offsets, dict, "/OCSPs")?,
         vri: match pdf::get(dict, "/VRI") {
             Some(v) => Some(match pdf::parse_ref(v) {
-                Some(r) => pdf::resolve(pdf, &offsets, r)?.into_owned(),
+                Some(r) => pdf::resolve(pdf, &offsets, Some(&mut cache), r)?.into_owned(),
                 None => pdf::trim_ws(v).to_vec(),
             }),
             None => None,
@@ -182,7 +184,9 @@ pub fn add_validation_data(
     let xref_at = pdf::last_startxref(pdf)?;
     let trailer = pdf::trailer(pdf, xref_at)?;
     let offsets = pdf::object_locations(pdf, xref_at)?;
-    let catalog = pdf::resolve(pdf, &offsets, trailer.root)?.to_vec();
+    // One decode memo for this revision's whole walk (finding A-1).
+    let mut cache = pdf::ObjectStreamCache::new();
+    let catalog = pdf::resolve(pdf, &offsets, Some(&mut cache), trailer.root)?.to_vec();
     if !catalog.starts_with(b"<<") {
         return Err(Error::Pdf("the catalog is not a dictionary".into()));
     }
@@ -452,7 +456,9 @@ pub fn add_document_timestamp(
     let xref_at = pdf::last_startxref(pdf)?;
     let trailer = pdf::trailer(pdf, xref_at)?;
     let offsets = pdf::object_locations(pdf, xref_at)?;
-    let catalog = pdf::resolve(pdf, &offsets, trailer.root)?.to_vec();
+    // One decode memo for this revision's whole walk (finding A-1).
+    let mut cache = pdf::ObjectStreamCache::new();
+    let catalog = pdf::resolve(pdf, &offsets, Some(&mut cache), trailer.root)?.to_vec();
     if !catalog.starts_with(b"<<") {
         return Err(Error::Pdf("the catalog is not a dictionary".into()));
     }
@@ -465,7 +471,7 @@ pub fn add_document_timestamp(
                 .into(),
         ));
     }
-    let existing = existing_signature_fields(pdf, &offsets, &catalog);
+    let existing = existing_signature_fields(pdf, &offsets, Some(&mut cache), &catalog);
     if existing.refs.is_empty() {
         return Err(Error::Pdf(
             "the document time-stamp is added as a new signature field, and this document's \
@@ -481,8 +487,8 @@ pub fn add_document_timestamp(
     let field = ObjRef::new(first_new + 2, 0);
 
     let field_name = next_name("Timestamp", &existing.names);
-    let page_ref = page_at(pdf, &offsets, &catalog, 1)?;
-    let page = pdf::resolve(pdf, &offsets, page_ref)?.to_vec();
+    let page_ref = page_at(pdf, &offsets, Some(&mut cache), &catalog, 1)?;
+    let page = pdf::resolve(pdf, &offsets, Some(&mut cache), page_ref)?.to_vec();
     if !page.starts_with(b"<<") {
         return Err(Error::Pdf(format!("page {page_ref} is not a dictionary")));
     }
@@ -497,7 +503,8 @@ pub fn add_document_timestamp(
     // /AcroForm keeps every byte it has except /Fields, which gains the new
     // field; it may sit inline in the catalog or be an indirect object, and
     // only the definition that actually changes is rewritten
-    let Some((acro_ref, acro_bytes)) = acroform_of(pdf, &offsets, &catalog) else {
+    let Some((acro_ref, acro_bytes)) = acroform_of(pdf, &offsets, Some(&mut cache), &catalog)?
+    else {
         return Err(Error::Pdf(
             "the catalog has no /AcroForm to append the time-stamp field to".into(),
         ));
@@ -513,7 +520,7 @@ pub fn add_document_timestamp(
             pdf::set(&catalog, "/AcroForm", &new_acro)?,
         )),
     }
-    match merged_annots(pdf, &offsets, &page, field)? {
+    match merged_annots(pdf, &offsets, Some(&mut cache), &page, field)? {
         MergedAnnots::Inline(array) => {
             update.push(Object::new(page_ref, pdf::set(&page, "/Annots", &array)?))
         }

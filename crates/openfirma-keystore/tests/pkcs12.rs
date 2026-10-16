@@ -64,3 +64,29 @@ fn the_test_container_loads_and_the_mac_guards_it() {
         .to_string();
     assert!(err.contains("integrity check failed"), "{err}");
 }
+
+/// The Debug of a decrypted entry and its container must not print the key:
+/// one `tracing::debug!("{entry:?}")` in a future commit would otherwise be
+/// enough to publish a private key into the logs (finding B-3).
+#[test]
+fn debug_never_prints_the_decrypted_private_key() {
+    let bytes = match std::fs::read(certs_dir().join("signer-rsa.p12")) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("skipped: testdata/certs/signer-rsa.p12 absent");
+            return;
+        }
+    };
+    let p12 = Pkcs12::load(&bytes, "openfirma").expect("the synthetic container loads");
+    let entry = p12.entry(None).expect("one entry");
+    let key_head = hex::encode(&entry.key_pkcs8[..16.min(entry.key_pkcs8.len())]);
+    let shown = format!("{entry:?} {p12:?}");
+    assert!(
+        shown.contains("[hidden]"),
+        "the key field must announce itself hidden: {shown}"
+    );
+    assert!(
+        !shown.contains(&key_head),
+        "the first bytes of the decrypted key leaked into its Debug output"
+    );
+}
