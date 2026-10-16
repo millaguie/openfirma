@@ -1110,12 +1110,30 @@ fn stalled_connections_age_out_and_the_endpoint_never_shuts_down() {
         }
         // The crowd is irrelevant now: drop it and everything still works.
         drop(crowd);
-        // Between waves, give the OS time to deliver every FIN of the dropped
-        // crowd. On Windows a closed socket's handler can finish its answer
-        // just after the peer stopped reading — ask's own header documents the
-        // race inside one wave; this is the same race across the boundary, and
-        // six seconds (a head grace plus margin) empties the slot pool before
-        // wave two fills it again.
+        // Between waves, drain the endpoint fully — a second of pure silence
+        // past what the signature needed. On Windows a closed socket's answer
+        // can die in flight (ask's own header documents that race *inside* a
+        // wave; this is the same race across the boundary): every handler that
+        // refused or answered the moment a slot freed must have finished its
+        // write, and the slot pool must stand empty before wave two fills it.
+        let drained = std::time::Instant::now();
+        while ask(
+            &server,
+            addr,
+            "POST",
+            &host,
+            None,
+            uri_body(b"el drenaje entre olas").as_bytes(),
+        )
+        .0 != 200
+        {
+            assert!(
+                drained.elapsed() < std::time::Duration::from_secs(30),
+                "wave {wave}: the endpoint stopped answering between waves"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
     }
     let token = server.issue_token();
     let (status, _, _) = request(

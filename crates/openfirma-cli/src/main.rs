@@ -1987,6 +1987,12 @@ mod tests {
         path
     }
 
+    /// The two register tests below share the process's HOME (the platform
+    /// block resolves its .desktop through it, and set_var is visible to every
+    /// thread), so they take turns on this lock — cargo runs them as sibling
+    /// threads of one binary. Each still restores HOME for whoever comes next.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Give the platform block a home directory for the duration of `run`.
     /// Windows CI exports no HOME at all (register_scheme's linux block never
     /// compiles there, so it never notices; these tests must not notice either),
@@ -2049,6 +2055,7 @@ mod tests {
 
     #[test]
     fn register_without_any_key_source_names_the_refusal_it_cannot_sign_with() {
+        let _home_guard = HOME_LOCK.lock().unwrap();
         // The refusal a fresh `--register` (no --p12 anywhere) must print:
         // naming the fix, not just the missing flag — the whole point of the
         // round-two finding was an install step that "succeeded" into a
@@ -2097,6 +2104,7 @@ mod tests {
 
     #[test]
     fn register_writes_a_config_the_handler_reads_back() {
+        let _home_guard = HOME_LOCK.lock().unwrap();
         // The round trip that closes M-3b: what `--register` writes must be
         // exactly what `afirma-uri` reads with no flags but the URI — spaces
         // and all, because installs under `/home/Ana María/` are real.
