@@ -72,7 +72,8 @@ fn request(
         }
     }
     panic!(
-        "the endpoint's answer on {path:?} was discarded unread{}: a test that presents a          real token and must survive this race uses `ask`, which mints one per attempt",
+        "the endpoint's answer on {path:?} was discarded unread{}: a test that presents a \
+         real token and must survive this race uses `ask`, which mints one per attempt",
         if may_reask { " five times" } else { "" }
     )
 }
@@ -933,8 +934,106 @@ fn a_silent_half_header_is_cut_at_the_deadline() {
     assert!(
         elapsed >= std::time::Duration::from_secs(4)
             && elapsed < std::time::Duration::from_secs(30),
-        "the deadline fired at its own moment ({elapsed:?}); anything later          than 30 s is a wait, not a deadline"
+        "the deadline fired at its own moment ({elapsed:?}); anything later \
+         than 30 s is a wait, not a deadline"
     );
+}
+
+/// Finding M-2, first half: the head and body timeouts used to be pure
+/// inactivity windows that every byte renewed, so a peer that dribbled one
+/// byte per window stayed alive forever. The fix is an absolute budget fixed
+/// when the connection is accepted (`CONNECTION_TIMEOUT` from then on, no
+/// matter what arrives); bytes may move the deadline earlier but never past
+/// it. This peer dribbles a request head that never finishes — one byte every
+/// 1.15 s, each gap shorter than HEAD_GRACE so every trickle genuinely renews
+/// the head's grace window (under the reviewed code this rhythm lived
+/// forever; nothing capped the renewals) — and keeps dribbling past twice the
+/// connection budget. Two assertions together pin the fix: no answer may
+/// arrive while the budget is still maturing (renewals do not extend life, but
+/// neither does an idle clock cut a talking peer early), and once the budget
+/// has matured the endpoint ends the connection within one read window with
+/// the named head timeout.
+#[test]
+fn a_dribbling_peer_dies_at_the_absolute_budget_not_at_its_own_trickle() {
+    let Some(key) = p12() else {
+        require_or_skip("testdata/certs/signer-rsa.p12 is absent");
+        return;
+    };
+    let server = server_on(&key);
+    let addr = server.addr();
+    let host = format!("127.0.0.1:{}", addr.port());
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    // Poll with a short socket timeout so every event is visible; the trickle
+    // cadence and the budget are what this test is about, not the poll window.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+        .unwrap();
+    let mut request = b"POST /echo HTTP/1.1\r\nHost: ".to_vec();
+    request.extend_from_slice(host.as_bytes());
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 4096];
+    for (i, b) in request.iter().enumerate() {
+        stream.write_all(&[*b]).unwrap();
+        stream.flush().unwrap();
+        eprintln!("t={:5.2} write byte {i}", started.elapsed().as_secs_f64());
+        let next = std::time::Instant::now() + std::time::Duration::from_millis(1150);
+        while std::time::Instant::now() < next {
+            match stream.read(&mut buf) {
+                Ok(0) => panic!(
+                    "the endpoint closed the dribbler early ({:?}) without an answer",
+                    started.elapsed()
+                ),
+                Ok(n) => {
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    panic!(
+                        "the dribbler was answered at {:?}, long before its \
+                         absolute budget could mature: {head}",
+                        started.elapsed()
+                    );
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("the dribbler's socket failed: {e}"),
+            }
+        }
+    }
+    // Head still unfinished at ~46 s — past accept + CONNECTION_TIMEOUT: from
+    // here the endpoint has one read window to end the connection by itself.
+    let answer = loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break String::new(),
+            Ok(n) => break String::from_utf8_lossy(&buf[..n]).to_string(),
+            Err(e)
+                if (e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut)
+                    && started.elapsed() < std::time::Duration::from_secs(60) => {}
+            Err(e) => panic!("the dribbler never got an answer at all: {e}"),
+        }
+    };
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_secs(45),
+        "an idle-clock rule cut a talking peer before its budget matured \
+         ({elapsed:?})"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "the endpoint never ended the connection on its own budget ({elapsed:?})"
+    );
+    if !answer.is_empty() {
+        // A refusal (rather than a bare close) must name the head timeout —
+        // not a malformed-head 400: the trickle was legal, only slow.
+        assert!(
+            answer.starts_with("HTTP/1.1 599"),
+            "the budget answers with the timeout status: {answer}"
+        );
+        assert!(
+            answer.contains("request-head-timeout"),
+            "the trickle was cut by the head deadline, not a malformed head: {answer}"
+        );
+    }
 }
 
 /// Finding M-2, second half: the request bound used to count *accepted

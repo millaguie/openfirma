@@ -61,7 +61,15 @@ same reading no vendored TLS stack pretending to be one. rustls depends on
 3. Scheme registration ships as **generated fragments plus instructions**
    (`scheme.rs`: a `.desktop` file + `xdg-mime` command on Linux, a `.reg`
    file on Windows, a `.plist` fragment + `swiftdefault`/manual import on
-   macOS); openfirma never edits a system registration by itself.
+   macOS); openfirma never edits a system registration by itself. Because the
+   installed Exec carries no flags but the URI (`… afirma-uri "%u"`), the key
+   it signs with needs a home outside argv: `--register` also writes a
+   per-user browser config — `$XDG_CONFIG_HOME/openfirma/browser.toml`, two
+   keys only (`p12`, `password_file`: paths, never a password) — and both
+   browser commands resolve it when `--p12` was not given (an explicit
+   `--p12` always wins). *(Recorded 2026-10-16, finding M-3b: the first
+   revision of this decision shipped a registered handler that could never
+   sign; the config file is what closes that half.)*
 4. TLS is revisited **when** either (a) a pure-Rust TLS stack without native
    crypto lands (e.g. rustls on a pure-Rust feature, or `fussel`-class
    stacks mature enough to trust), or (b) the deployment requires answering a
@@ -118,6 +126,23 @@ loopback port. What stops an uninvited caller here:
   the code now enforces it, and the shutdown-by-request-count is replaced by
   the concurrency refusal because killing a launch's endpoint from unauthenticated
   empty connects served no threat model this ADR has.)*
+- Two recorded deviations from AutoFirma's URI handling, both in `uri.rs`'s
+  `dat` decoding, both toward refusing rather than signing the wrong bytes:
+  (1) there is **no literal-text fallback** — where AutoFirma signs a
+  non-decoding payload verbatim (`DataDownloader.java:127-137`), openfirma
+  refuses and names the parameter, because a valid-looking signature over
+  bytes nobody sent is worse than a failed call; (2) the whitespace stripped
+  before base64 decoding is **slightly wider than AutoFirma's alphabet**: its
+  iharder decoder skips `\t \n \r` (and space and `\f`, which it only reaches
+  through `trim()`, never inside the stream), while openfirma also drops a
+  space or form feed found *inside* the payload. The direction of that
+  difference is the safe one — where AutoFirma would hand a malformed payload
+  to its literal fallback and sign text, openfirma decodes what reads as
+  base64 and signs the document — but it is a divergence all the same: for a
+  `dat` with interior spaces openfirma signs the decoded bytes where AutoFirma
+  would sign the literal text. Recorded here rather than only in a code
+  comment (round-2 finding A-2's residual); a future parity claim must cite
+  this section, not the other way round.
 
 ## Reasons
 
