@@ -30,6 +30,10 @@ pub mod pdf;
 pub mod revisions;
 pub mod sign;
 pub mod stream;
+// Builders shared by the unit tests and the `tests/common` shim: cfg(test)
+// keeps them out of the library ships to users.
+#[cfg(test)]
+pub mod testkit;
 pub mod update;
 pub mod verify;
 

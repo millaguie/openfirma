@@ -97,6 +97,54 @@ that really changes is rewritten; the page's `/Annots`, when it is an
 indirect array (the shape iText writes), stays an indirect array with our
 field merged into the new revision under its own number.
 
+The trailer of the appended revision carries over everything the previous one
+said (`/ID`, a custom key like a DSS tool's `/Enforce`, and yes an older
+`/Encrypt`, which the check above has already refused). The writer owns
+`/Size`, `/Root`, `/Prev` and its own `/Info`; every other key is copied byte
+for byte. Dropping `/ID` used to happen, and qpdf reported "File does not
+start with a '%PDF-' header" on the result for documents whose only identity
+was that key; a document whose revisions stop sharing an `/ID` is no longer
+one document. And the trailer always names the `/Info` the signature pass
+actually wrote — the dictionary it stamped with `/ModDate` is the one readers
+find, never an orphan two objects over.
+
+## What the document must be before we sign it
+
+Measured against the reviewer's PoCs (`/tmp/review/02-pades.md`, wave 2), these
+refusals are part of the contract. Each is a test in
+`crates/openfirma-pades/tests/wave2.rs`.
+
+- **An encrypted PDF is never signed.** A trailer naming `/Encrypt` — at the
+  newest revision or at any older one the `/Prev` chain reaches (ISO 32000-1
+  7.5.6 forbids a new trailer from changing `/Encrypt`) — is refused with the
+  way out in the message: `qpdf --input-password=<pass> --decrypt in.pdf
+  out.pdf`. Signing an encrypted file used to produce an *unencrypted* document
+  whose streams were still ciphertext; readers called it broken. openfirma does
+  not decrypt, this round or any other: a signature library holding passwords
+  is a different kind of program.
+- **A `/Perms /DocMDP /P 1` certification stops signing.** No changes after a
+  P=1 certification are permitted, so signing one is the change the document
+  forbids; AutoFirma rejects these files (`PdfModel.checkModifyDocument`). The
+  refusal names the certification and points at `--allow-certified`, which
+  signs anyway for callers who know what they hold (the CLI flag only; the
+  browser protocol never sets it). `openfirma verify` grew the matching half: a
+  final catalog certifying P=1 whose certifying signature lives in an older
+  revision is reported as broken — revisions after a certification are what
+  every reader with certification support shows.
+- **Usage rights are withdrawn before signing.** `/Perms /UR3` (and the older
+  `/UR`) are set to null in the rewritten `/Perms`; every other key of the
+  dictionary survives byte for byte. AutoFirma's `removeUsageRights` does the
+  same: a signature over a state that silently revoked Adobe's extended-
+  features promise is worse than no signature. Detecting signatures whose
+  `/V` names no real signature dictionary (AutoFirma's unregistered-signature
+  check) is not implemented.
+- **PDF/A identity is not broken by our metadata.** AutoFirma refreshes the XMP
+  packet when it stamps `/ModDate`, and openfirma does not touch XMP; so a
+  document whose `/Metadata` stream declares `pdfaid:part` gets no `/Info`
+  rewrite at all — a stale `/ModDate` is one old date, while a fresh `/Info`
+  next to an XMP that says otherwise is two answers. Documents without the
+  declaration keep the `/ModDate` stamp.
+
 ## What we deliberately do differently
 
 Recorded here so a future diff is read as a decision and not as a bug. See

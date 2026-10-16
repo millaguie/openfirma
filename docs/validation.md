@@ -218,6 +218,24 @@ which is one more reason the independent readers above stay in the suite: a
 bug in how openfirma reads ASN.1 could otherwise hide on both sides of the
 verification.
 
+On top of the cryptographic checks, `openfirma verify` refuses the shapes the
+adversarial review produced against it (the two hardening waves, tests under
+`crates/openfirma-pades/tests/`). The revisions gate classifies every object a
+revision after a signature redefines against the whitelist of what an archive
+may append (ETSI EN 319 142-1): new signature dictionaries, document
+time-stamps, `/DSS` validation data, signature field plumbing — anything else,
+a rewritten page or content stream included, is the incremental saving attack
+and fails the document. The certification gate reports a final catalog
+carrying `/Perms /DocMDP /P 1` whose certifying signature sits in an older
+revision: revisions after a P=1 certification break it, and AutoFirma's own
+validator says so over those same files. Signing refuses what verification
+would refuse to sign: encrypted inputs (the refusal names `qpdf --decrypt` as
+the way out), a P=1 certification (unless told otherwise with
+`--allow-certified`), and page trees that repeat a `/Kids` child. Hostile
+offsets — a `startxref` or `/Prev` past the end of the file, xref widths that
+overflow, a lying `/Size`, a truncated table — are errors with the bad number
+named in the sentence, never panics and never silent overwrites.
+
 ## 3. ETSI reference validator, local
 
 The reference implementation for ETSI EN 319 102-2 and 142 is the European
