@@ -87,10 +87,16 @@ fn request_on(
     if let Some(o) = origin {
         text.push_str(&format!("Origin: {o}\r\n"));
     }
-    text.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    ));
+    // The endpoint closes after its answer either way (it never keep-alives,
+    // and the read below stops at the response's Content-Length boundary
+    // rather than waiting for an EOF). What this client must NOT do is echo
+    // "Connection: close": on Windows a client that says close then keeps the
+    // socket open until drop asks its own stack to RST the connection on
+    // teardown — and an RST queued before the answer was drained discards it
+    // unread (the 10054-on-first-read this harness kept meeting). Silence
+    // about keep-alive leaves the FIN the endpoint sends as the only close,
+    // and reads finish at their own boundary regardless.
+    text.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
     // Writing may fail, and that is part of the contract: when the endpoint
     // refuses a request it answers and closes while a large body may still be
     // in flight, and whether the write then succeeds is OS timing (macOS RSTs,
