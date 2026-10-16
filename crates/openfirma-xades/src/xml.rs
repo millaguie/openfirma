@@ -307,7 +307,7 @@ impl<'a> Parser<'a> {
             // attribute value normalization first, entity expansion second:
             // a literal tab or newline becomes a space, but &#x9; stays a
             // tab, which canonicalization then prints as a reference again
-            let expanded = self.expand_entities(&collapse_space(&value), true)?;
+            let expanded = self.expand_entities(&collapse_space(&value))?;
             if attr_name.prefix.is_none() && attr_name.local == "xmlns" {
                 ns_decls.push((None, expanded));
             } else if attr_name.prefix.as_deref() == Some("xmlns") {
@@ -518,7 +518,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         let raw = &self.text[start..self.pos];
-        self.expand_entities(&normalize_line_ends(raw), false)
+        self.expand_entities(&normalize_line_ends(raw))
     }
 
     fn parse_cdata(&mut self) -> Result<String> {
@@ -574,9 +574,8 @@ impl<'a> Parser<'a> {
 
     /// Expands the five predefined entities and character references. Any
     /// other entity reference is an error: resolving it would need a DTD, and
-    /// DTDs are refused. `in_attr` only matters for the error message.
-    fn expand_entities(&self, raw: &str, in_attr: bool) -> Result<String> {
-        let _ = in_attr;
+    /// DTDs are refused.
+    fn expand_entities(&self, raw: &str) -> Result<String> {
         let mut out = String::with_capacity(raw.len());
         let mut rest = raw;
         while let Some(amp) = rest.find('&') {
@@ -720,6 +719,15 @@ fn is_ncname(name: &str) -> bool {
     is_qname_parts(None, name)
 }
 
+/// Whether `id` can serve as an XML `Id` attribute value — a spec-conformant
+/// ID must be an NCName, and `ds:Reference URI="#…"`, which is a *URI*, can
+/// only resolve it back when nothing in it needs percent-encoding. The
+/// signing code refuses anything else before producing a signature nobody
+/// but us could resolve.
+pub fn is_valid_id(id: &str) -> bool {
+    is_ncname(id)
+}
+
 /// Name start and name characters, ASCII plus "any non ASCII byte", which is
 /// the pragmatic subset of the enormous NameChar production of the XML
 /// specification: real documents use letters, and the exotic ranges would
@@ -749,7 +757,8 @@ fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || !c.is_ascii()
 }
 
-/// Finds an element by its namespace and local name, breadth first.
+/// Finds an element by its namespace and local name, depth first: the first
+/// match in document order wins.
 pub fn find_element<'e>(root: &'e Element, ns: &str, local: &str) -> Option<&'e Element> {
     if root.namespace.as_deref() == Some(ns) && root.name.local == local {
         return Some(root);

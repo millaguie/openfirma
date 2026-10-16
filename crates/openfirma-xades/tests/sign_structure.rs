@@ -586,3 +586,90 @@ fn two_runs_differ_only_in_the_volatile_values() {
     let digest_b = text_of(child(refs_b[0], DS, "DigestValue"));
     assert_eq!(digest_a, digest_b, "the data digest is stable");
 }
+
+// ---- the Id that URI="#…" points at (review 03, B-1..B-3) ----
+
+/// `Id=""` on the root is no identifier: AutoFirma checks the string is not
+/// empty before building `#{id}`, and a URI="#" resolves to nothing any
+/// xmlsec1-based validator accepts. The signature must fall back to URI="".
+#[test]
+fn an_empty_root_id_signs_the_whole_document() {
+    let Some(signer) = load_signer("signer-rsa.crt", "signer-rsa.key", &[]) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let input = b"<documento Id=\"\"><a>x</a></documento>";
+    let signed = sign_input(&signer, input);
+    let doc = parse(&signed).expect("output parses");
+    let sig = child(&doc.root, DS, "Signature");
+    let refs = children(child(sig, DS, "SignedInfo"), DS, "Reference");
+    assert_eq!(
+        attr(refs[0], "URI"),
+        Some(""),
+        "Id=\"\" must not become URI=\"#\""
+    );
+}
+
+/// An Id containing a space serializes as `URI="#a b"`, which no validator
+/// resolves (xmlsec1 reports an error on exactly this input); an NCName is
+/// what an XML Id attribute and a same-document URI fragment can carry, so
+/// signing refuses the document instead of producing a signature nobody but
+/// our own reader could check. Same for the other characters a fragment
+/// cannot percentlessly carry.
+#[test]
+fn a_root_id_that_is_not_an_ncname_refuses_to_sign() {
+    let Some(signer) = load_signer("signer-rsa.crt", "signer-rsa.key", &[]) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    for bad in [
+        "<d Id=\"a b\"><x/></d>",
+        "<d Id=\"1starts-with-a-digit\"><x/></d>",
+        "<d Id=\"with:colon\"><x/></d>",
+        // a literal `<` cannot even reach the check — the parser is right to
+        // refuse it first, and NCName covers what an escaped `&lt;` carries
+        "<d Id=\"a&amp;b\"><x/></d>",
+        "<d Id=\"con#alfa\"><x/></d>",
+    ] {
+        let err = xades_sign(bad.as_bytes(), &signer, &XadesOptions::default())
+            .expect_err("{bad} must not produce a signature");
+        assert!(
+            err.to_string().contains("NCName"),
+            "expected the NCName refusal for {bad}, got {err}"
+        );
+    }
+}
+
+/// Two elements answering the same Id is the XML signature wrapping shape:
+/// URI="#r" resolves to one node while a different validator's resolver may
+/// take the other, so digests and bytes stop belonging together. The
+/// document is refused before any signing happens (DSS rejects duplicated
+/// IDs the same way).
+#[test]
+fn a_document_with_a_repeated_id_refuses_to_sign() {
+    let Some(signer) = load_signer("signer-rsa.crt", "signer-rsa.key", &[]) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    // hidden in the middle of the tree, with different namespaces around it
+    let input = br#"<doc Id="r"><section><p xmlns:o="urn:o" o:note="keep">x</p></section><deep><child Id="r">evil</child></deep></doc>"#;
+    let err = xades_sign(input, &signer, &XadesOptions::default())
+        .expect_err("two elements with Id=\"r\" must not be signable");
+    assert!(err.to_string().contains("more than one element"), "{err}");
+
+    // and the root's own Id colliding with any other attribute named Id —
+    // whatever namespace logic a validator's resolver uses, ours refuses it
+    let input = br#"<doc Id="a"><b Id="c"/><c Id="a"/></doc>"#;
+    xades_sign(input, &signer, &XadesOptions::default())
+        .expect_err("the root's Id repeated deeper must not be signable");
+
+    // two different duplicates anywhere are refused too: an ambiguous name
+    // space is an invitation for exactly this class of attack
+    let input = br#"<doc Id="a"><b Id="c"/><c Id="c"/></doc>"#;
+    xades_sign(input, &signer, &XadesOptions::default())
+        .expect_err("two elements sharing any Id must not be signable");
+
+    // a document whose Ids are unique still signs — the guard is exact
+    let input = br#"<doc Id="a"><b Id="c"/><c/></doc>"#;
+    xades_sign(input, &signer, &XadesOptions::default()).expect("unique Ids must sign");
+}

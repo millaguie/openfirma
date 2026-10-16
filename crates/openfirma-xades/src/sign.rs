@@ -13,7 +13,7 @@ use openfirma_core::signer::Signer;
 use openfirma_core::{Error, Result};
 
 use crate::c14n;
-use crate::xml::{self, Child};
+use crate::xml;
 
 pub const DS_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 pub const XADES_NS: &str = "http://uri.etsi.org/01903/v1.3.2#";
@@ -93,8 +93,30 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
 
     // AutoFirma references the root by its Id attribute when it has one and
     // signs the whole document (URI="") when it does not; the signature is
-    // appended to the root either way
-    let root_id = doc.root.attr("Id");
+    // appended to the root either way. An empty Id is no identifier — the
+    // Java signer checks `!ident.isEmpty()` before building `#{id}`, and a
+    // URI="#" resolves nowhere an xmlsec1-based validator accepts.
+    let root_id = doc.root.attr("Id").filter(|id| !id.is_empty());
+    if let Some(id) = root_id {
+        // `URI="#…"` is a same-document URI reference: an Id that is not an
+        // NCName (a space, a `<`, a colon — the parser keeps attribute
+        // values verbatim from any producer) would serialize an unencodable
+        // fragment other validators resolve to no node at all. Refuse it as
+        // clearly as AutoFirma's DOM layer would have.
+        if !xml::is_valid_id(id) {
+            return Err(Error::Xml(format!(
+                "the root element's Id=\"{id}\" is not an NCName, so \
+                 URI=\"#{id}\" could not resolve anywhere it is checked"
+            )));
+        }
+        // A repeated Id is the classic XML signature wrapping pattern: two
+        // elements answer `#id`, and a validator that resolves by any other
+        // route than ours can end up checking one node's bytes against
+        // another's digest. Refuse the document, the way DSS refuses
+        // duplicated IDs.
+        let mut seen = std::collections::HashSet::new();
+        reject_duplicate_id(&doc.root, id, &mut seen)?;
+    }
     let data_uri = match root_id {
         Some(id) => format!("#{id}"),
         None => String::new(),
@@ -108,15 +130,11 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
         omit: Some((DS_NS.to_string(), "Signature".to_string())),
         ..Default::default()
     };
-    let target = match root_id {
-        Some(id) => find_by_id(&doc.root, id).ok_or_else(|| {
-            Error::Xml(format!(
-                "the root element declares Id=\"{id}\" but no element in the \
-                 document carries it"
-            ))
-        })?,
-        None => &doc.root,
-    };
+    // The root carries the Id we just validated, so URI="#id" resolves to it
+    // — and nothing else in the document may carry it (the duplicate check
+    // above guarantees that). Without an Id the reference is URI="", which is
+    // the whole document too. Either way the target is the root.
+    let target = &doc.root;
     let data_c14n = c14n::subtree(target, &c14n::Axis::new(), &[], &data_opts);
     let data_digest = opts.reference_digest.digest(&data_c14n);
 
@@ -350,18 +368,31 @@ fn looks_like_xml(input: &[u8]) -> bool {
     first == Some(&b'<')
 }
 
-fn find_by_id<'e>(root: &'e xml::Element, id: &str) -> Option<&'e xml::Element> {
-    if root.attr("Id") == Some(id) {
-        return Some(root);
-    }
+/// Refuse a document in which any element below `root` re-declares the Id
+/// that `URI="#id"` resolves to. The walk sees every element, at every depth
+/// and in every namespace — an attribute named exactly `Id` is what XML
+/// digital signatures look up — because the wrapping attack hides the second
+/// one wherever the resolver for the other validator happens not to look.
+fn reject_duplicate_id(
+    root: &xml::Element,
+    id: &str,
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<()> {
     for child in &root.children {
-        if let Child::Element(el) = child {
-            if let Some(found) = find_by_id(el, id) {
-                return Some(found);
+        let xml::Child::Element(el) = child else {
+            continue;
+        };
+        if let Some(other) = el.attr("Id") {
+            if other == id || !seen.insert(other.to_string()) {
+                return Err(Error::Xml(format!(
+                    "the document carries Id=\"{other}\" on more than one element, \
+                     so a reference to it has no single target"
+                )));
             }
         }
+        reject_duplicate_id(el, id, seen)?;
     }
-    None
+    Ok(())
 }
 
 /// The `ds:SignatureMethod` URI for a key and a digest, AutoFirma's table.
@@ -511,6 +542,9 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// Escapes a string for an XML attribute value. Same rules as the
+/// canonicalizer's byte-level `escape_attr` (`c14n.rs`), on Strings because
+/// signing builds template text, not canonical output.
 fn escape_attr(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
@@ -524,6 +558,8 @@ fn escape_attr(value: &str) -> String {
     out
 }
 
+/// Escapes a string for XML character data: `>` as well as the two others,
+/// because text is not attribute values.
 fn escape_text(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
