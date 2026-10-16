@@ -1711,13 +1711,9 @@ mod tests {
             StoreSpec::Nss { db } => assert_eq!(db, "sql:/home/u/.pki/nssdb"),
             other => panic!("expected an nss spec, got {other:?}"),
         }
-        // The bare forms: nss defaults to the shared-database location under
-        // $HOME; windows/macos take no argument and name no store elsewhere.
-        unsafe { std::env::set_var("HOME", "/home/u") };
-        match parse_store_spec("nss").unwrap() {
-            StoreSpec::Nss { db } => assert_eq!(db, "sql:/home/u/.pki/nssdb"),
-            other => panic!("expected an nss spec, got {other:?}"),
-        }
+        // The bare forms: windows/macos take no argument and name no store
+        // elsewhere; the HOME-default of `nss` reads the environment and gets
+        // its own test below, away from any other env mutation.
         assert!(matches!(
             parse_store_spec("windows").unwrap(),
             StoreSpec::Windows
@@ -1742,23 +1738,45 @@ mod tests {
     }
 
     #[test]
+    fn bare_nss_store_names_home_shared_database() {
+        // Mutating HOME is unsafe in Rust 2024 precisely because sibling test
+        // threads see it: the value is one no machine uses, and it goes back
+        // to what it was before this test returns.
+        let home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", "/home/openfirma-spec-test") };
+        let got = match parse_store_spec("nss").unwrap() {
+            StoreSpec::Nss { db } => db,
+            other => panic!("expected an nss spec, got {other:?}"),
+        };
+        unsafe {
+            match home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(got, "sql:/home/openfirma-spec-test/.pki/nssdb");
+    }
+
+    #[test]
     fn store_pin_reads_the_named_variable_and_treats_absence_as_empty() {
-        unsafe { std::env::set_var("OPENFIRMA_TEST_PIN_VAR", "1234") };
-        assert_eq!(
-            store_pin(Some(&"OPENFIRMA_TEST_PIN_VAR".into()))
-                .unwrap()
-                .as_deref(),
-            Some("1234")
+        // Same thread-safety rule as the HOME test: the variable name carries
+        // this test's name, so no concurrent test can collide with it.
+        let var = format!(
+            "OPENFIRMA_TEST_PIN_{}",
+            std::thread::current().name().unwrap_or("main")
         );
+        unsafe { std::env::set_var(&var, "1234") };
+        assert_eq!(store_pin(Some(&var)).unwrap().as_deref(), Some("1234"));
         // An unset variable is an empty PIN: that is how an NSS database with
         // no password travels, and it must not be a hard error here.
         assert_eq!(
-            store_pin(Some(&"OPENFIRMA_TEST_PIN_ABSENT".into()))
+            store_pin(Some(&format!("{var}-absent")))
                 .unwrap()
                 .as_deref(),
             Some("")
         );
         assert_eq!(store_pin(None).unwrap(), None);
+        unsafe { std::env::remove_var(&var) };
     }
 
     /// A one answer TCP server, so `http_post` can be pointed at something

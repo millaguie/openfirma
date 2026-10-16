@@ -94,26 +94,34 @@ jobs:
       # generic token and NSS's libsoftokn3 for the shared-DB path. Linux only
       # — macOS and Windows have no packaged softhsm, and their keystore tests
       # skip by design (the platform stores cannot be provisioned either).
+      # Installed before the PKI step so its failure is visible on its own.
+      # The aarch64 job builds with --target for the same arch the runner has,
+      # so test binaries execute here and the keystore tests run too; that
+      # needs the real modules: SoftHSM as a generic token and NSS's
+      # libsoftokn3 for the shared-DB path. macOS and Windows have no packaged
+      # softhsm and their stores cannot be provisioned, so there those tests
+      # skip by design.
       - name: install PKCS#11 test modules (linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc libnss3
+
+      # The material the PKCS#11 tests load, built only where it can be
+      # *found* at test time: step env does not reach a later `cargo test`
+      # (only GITHUB_ENV does), so this is a sibling step that exports it.
+      - name: build PKCS#11 test keystores (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          ./tools/setup-test-keystores.sh | tee /tmp/keystore-setup.log
+          grep '^SOFTHSM2_CONF=' /tmp/keystore-setup.log >> "$GITHUB_ENV" || true
+          echo "OPENFIRMA_TEST_PKCS11_MODULE=/usr/lib/softhsm/libsofthsm2.so" >> "$GITHUB_ENV"
+          echo 'OPENFIRMA_TEST_NSS_DB=sql:/tmp/opencode/keystores/nssdb' >> "$GITHUB_ENV"
 
       - name: build
         run: cargo build --all-targets --target ${{ matrix.target }}
 
       - name: test
-        env:
-          OPENFIRMA_TEST_PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
-          OPENFIRMA_TEST_NSS_DB: sql:/tmp/opencode/keystores/nssdb
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            # Rebuilds the token and NSS DB under /tmp/opencode/keystores and
-            # prints SOFTHSM2_CONF=..., which is how the SoftHSM module finds
-            # its token directory from here on.
-            ./tools/setup-test-keystores.sh | tee /tmp/keystore-setup.log
-            grep '^SOFTHSM2_CONF=' /tmp/keystore-setup.log >> "$GITHUB_ENV" || true
-          fi
-          cargo test --target ${{ matrix.target }}
+        run: cargo test --target ${{ matrix.target }}
 
   no-real-certs:
     runs-on: ubuntu-latest

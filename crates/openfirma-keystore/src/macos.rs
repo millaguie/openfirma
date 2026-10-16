@@ -110,7 +110,7 @@ impl SystemStore for MacStore {
 fn algorithm_for(digest: DigestAlg) -> Result<*const c_void> {
     // The names below are the public constant symbols (Security/SecKey.h); we
     // take their addresses as CFStringRef values.
-    extern "C" {
+    unsafe extern "C" {
         #[link(name = "Security", kind = "framework")]
         static kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA1: c_void;
         #[link(name = "Security", kind = "framework")]
