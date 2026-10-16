@@ -263,47 +263,25 @@ fn inspecting_a_document_of_two_thousand_compressed_objects_is_linear() {
 /// five digits still fits its fields), not a classic table that only knows the
 /// stream itself: an xref that does not index the objects hides them from
 /// anything that walks locations, which is exactly how the A-1 regression
-/// test lost its teeth once (see the test above).
+/// test lost its teeth once (see the test above). The cross-reference stream
+/// also indexes itself, as every real writer's does.
 fn objstm_document(count: usize) -> Vec<u8> {
-    objstm_document_at(count, 0)
-}
-
-/// `objstm_document` with every declared offset still the document's own and
-/// every byte positioned `shift` past where it says — what a self-extracting
-/// prepender really ships: the document is appended whole behind a binary,
-/// untouched, exactly as a zip self-extractor appends its archive. A reader
-/// that trusts the file's offsets to index the container reads the program for
-/// the document (the round-2 failure mode); one that re-bases them on the
-/// `%PDF-` it finds inside sees every row name its object again. `shift` is a
-/// promise about who will prepend these bytes, not a number any row carries —
-/// asserted below, where both the unshifted and the shifted layout must come
-/// out byte-identical apart from nothing at all; what differs is only where
-/// the caller places the result.
-pub(crate) fn objstm_document_at(count: usize, shift: usize) -> Vec<u8> {
     let xref_obj = count + 4;
-    // The cross-reference stream indexes its own header (as every real
-    // writer's does), so the fixture records that position the honest way: by
-    // searching a first layout for its exact `N 0 obj` line, then writing it
-    // into the self-row of a second pass. Both passes must byte-agree — the
-    // self-row is seven bytes whether it holds a placeholder or the answer, so
-    // naming it moves nothing — and if they ever disagreed this builder would
-    // hand back nothing at all rather than a file whose own index lies about
-    // where its objects stand.
-    let guess = objstm_document_inner(count, shift, None);
+    // The self-row — the row naming the cross-reference stream's own header —
+    // is recorded the honest way: pass one leaves it zero, and its position
+    // is then searched in the finished file as the exact `N 0 obj` line, so
+    // pass two can name it without trusting arithmetic. Both passes must
+    // byte-agree where the stream stands — the self-row is seven bytes whether
+    // it holds a placeholder or the answer, so naming it moves nothing — and
+    // if they ever disagreed this builder would hand back nothing at all
+    // rather than a file whose own index lies about where its objects stand.
+    let guess = objstm_document_inner(count, None);
     let xref_pos = find_xref_header(&guess, xref_obj);
-    let final_ = objstm_document_inner(count, shift, Some(xref_pos));
+    let final_ = objstm_document_inner(count, Some(xref_pos));
     assert_eq!(
         find_xref_header(&final_, xref_obj),
         xref_pos,
         "naming the self-row moved the cross-reference stream"
-    );
-    // The promise of this builder in one line: a document written to be
-    // carried is byte-identical to one written plain — `shift` may not touch
-    // a byte, because it names where the bytes will stand, not what they say.
-    assert_eq!(
-        final_,
-        objstm_document_inner(count, 0, Some(xref_pos)),
-        "the shift leaked into the document's bytes"
     );
     final_
 }
@@ -320,7 +298,7 @@ fn find_xref_header(doc: &[u8], num: usize) -> usize {
         .expect("the fixture's cross-reference stream must have a header")
 }
 
-fn objstm_document_inner(count: usize, shift: usize, self_row: Option<usize>) -> Vec<u8> {
+fn objstm_document_inner(count: usize, self_row: Option<usize>) -> Vec<u8> {
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
     use std::io::Write;
@@ -395,17 +373,7 @@ fn objstm_document_inner(count: usize, shift: usize, self_row: Option<usize>) ->
     // head, `count` type 2 rows into the ObjStm, then the direct rows — in
     // object-number order. Object numbers reach three digits at a 65.000
     // object /N (the spec's practical limit), so both second fields get four
-    // bytes: /W [1 4 2], row layout type | offset-or-stream | index. The rows
-    // carry the positions of this document's own bytes — what the writer of an
-    // unattached file computes — and `shift` enters nowhere in them: a tool
-    // that prepends an executable appends these bytes untouched, exactly as a
-    // zip self-extractor appends its archive, so whatever re-basing makes the
-    // file readable belongs to the reader (see `carrier_split`), not to the
-    // document. A row rewritten with container offsets instead would be a
-    // fixture for a format that does not exist: no prepender reparses and
-    // rewrites every type 1 row of the payload it just glued on, and if one
-    // did, `startxref` and `/Prev` would carry container positions too and the
-    // walk's single re-base at its entry point would overshoot by the shift.
+    // bytes: /W [1 4 2], row layout type | offset-or-stream | index.
     let mut rows = Vec::new();
     // In object-number order: the free-list head, the object stream itself
     // (object 1, a direct row — it cannot point into itself), then `count`
@@ -427,9 +395,7 @@ fn objstm_document_inner(count: usize, shift: usize, self_row: Option<usize>) ->
         rows.extend([2u8, 0, 0, 0, 1, (i >> 8) as u8, i as u8]);
     }
     for off in [pages_at, catalog_at] {
-        // type 1, direct offset (four bytes), generation 0 (two bytes) — the
-        // document's own position, exactly what the writer of an unattached
-        // file would have written (`shift` never enters a row: see above).
+        // type 1, direct offset (four bytes), generation 0 (two bytes).
         rows.extend([
             1u8,
             (off >> 24) as u8,
@@ -443,11 +409,6 @@ fn objstm_document_inner(count: usize, shift: usize, self_row: Option<usize>) ->
     // The self-row: named by the caller when the position is known (pass two,
     // whose value pass one measured), or left at zero on the first pass, where
     // nothing but the rows' own bytes decide what comes next.
-    // Pass two hands in the document position pass one measured (searched in
-    // the finished file, so it cannot be stale); pass one names zero. Every
-    // row speaks the document's coordinate system — adding `shift` to any of
-    // them, this one included, is the double-reading described above, and the
-    // two-pass guard below says so loudly rather than silently doubling it.
     let off = self_row.unwrap_or(0) as u64;
     rows.extend([
         1u8,
@@ -461,11 +422,6 @@ fn objstm_document_inner(count: usize, shift: usize, self_row: Option<usize>) ->
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&rows).unwrap();
     let xref_rows = encoder.finish().unwrap();
-    // `startxref` names the document position of the stream header. The byte
-    // offset is where these bytes end up inside a container; the declared
-    // offset stays what the writer computed (see above), and the reader turns
-    // it back into a file position wherever one is needed.
-    let _ = shift;
     let xref_pos = out.len();
     out.extend(
         format!(
@@ -516,375 +472,6 @@ fn an_unparseable_byterange_number_is_named_in_the_problems() {
         report.contains("that is not an unsigned integer"),
         "the problem must name the oversized token: {report}"
     );
-}
-
-/// The self-extracting carrier: one document, three files, two executed
-/// verdicts and one refusal that is data, not ceremony.
-///
-/// *Reading a carrier as data.* The same document every fixture above builds
-/// (`objstm_document_at`, byte-identical to the plain one), appended behind
-/// pages of executable bytes with its offsets untouched — which is what a
-/// prepender ships: `minimal_carrier_elf` glues the bytes without reparsing a
-/// thing, exactly like the zip self-extractors that have shipped this shape for
-/// thirty years. Walked through the reader's entry points, that geometry used
-/// to break two different ways: `startxref` and every xref row name positions
-/// inside the document, not the container, so indexing the file with them reads
-/// machine code for objects; and bounds written for plain files mistook the
-/// program's length for the document's. The reader re-bases on the split once,
-/// at its entry point, and every offset downstream is honest again.
-///
-/// *Reading it from the inside — executed.* The clone below is run by the
-/// kernel; its hand-written entry stub re-execs itself, and the re-exec lands
-/// in `openfirma-carrier` (`tests/carrier.rs`), which asks `dl_iterate_phdr`
-/// what the loader actually mapped before asking openfirma to walk its own
-/// container. For the honest shape the answer must be: segments end at exactly
-/// 0x1000, and the document reads whole. The stub carries that verdict inside
-/// page zero — a `--self-check-ok` argv string no rewritten file can forge,
-/// because it is the *builder*, which knows the layout, writing the bytes.
-///
-/// *Refusing the fat shape — also executed.* `fat_carrier_elf` maps its own
-/// padding: a second PT_LOAD past the split, with the stub running from inside
-/// it. Same reader binary, verdict string `no`: under the kernel's eyes the
-/// payload is live, so nothing may be exempted and the walk must refuse. What
-/// "live" means stops being this repository's opinion at exactly that point.
-#[test]
-fn a_self_extracting_binary_reads_the_document_it_carries() {
-    let doc = objstm_document_at(20, 0x2000);
-
-    // One page of an ELF image stands in front: same geometry as the executable
-    // half below, and the walking parsers never dereference it. The magic
-    // matters — `carrier_split` only exempts bytes behind something that really
-    // claims to be a program (the executed half supplies one the kernel itself
-    // runs). The whole-document entry points (`inspect`, `sign`) refuse a
-    // carrier *by design*: byte 0 is not `%PDF-`, and signing what a reader
-    // could confuse with an executable's own body is nobody's business;
-    // everything they build on — startxref, the cross-reference walk, object
-    // resolution — must still see the document.
-    let carrier_path = std::env::temp_dir().join("openfirma-carrier-readhalf");
-    let carrier = minimal_carrier_elf(&doc, carrier_path.to_string_lossy().as_bytes());
-
-    // Reading it is what round two refused to do: `startxref` names a position
-    // a page into a file whose first page is not document at all, the rows of
-    // the xref stream speak the same document-relative language, and the object
-    // stream resolves through that container — none of it may be mistaken for a
-    // bomb or a lying index.
-    let xref_at = openfirma_pades::pdf::last_startxref(&carrier).expect("the carrier's startxref");
-    let locations = openfirma_pades::pdf::object_locations(&carrier, xref_at)
-        .expect("a document behind its own program is not a bomb");
-    // The pages tree is object `count+2` (packed objects take 2..=count+1),
-    // resolved through the object stream that carries them.
-    let mut cache = openfirma_pades::pdf::ObjectStreamCache::new();
-    let pages = openfirma_pades::pdf::resolve(
-        &carrier,
-        &locations,
-        Some(&mut cache),
-        openfirma_pades::pdf::ObjRef::new(22, 0),
-    )
-    .expect("the object stream must resolve through the carrier");
-    assert!(
-        String::from_utf8_lossy(&pages).contains("/Pages"),
-        "{}",
-        String::from_utf8_lossy(&pages)
-    );
-    // The page walk (collect_pages resolves every kid through the cache) is
-    // linear here too: a carrier is not an excuse to re-inflate per object.
-    let started = std::time::Instant::now();
-    let timestamps = inspect::document_timestamps(&carrier);
-    let walked = started.elapsed();
-    assert!(walked < std::time::Duration::from_secs(5), "{walked:?}");
-    let _ = timestamps;
-
-    // The negative control, run through the very same calls: hand the walk a
-    // file whose prefix is not an ELF — same shifted document, same page
-    // boundary — and nothing is re-based, so `startxref` indexes the container
-    // directly and lands in padding instead of a cross-reference. Same shape,
-    // non-ELF bytes: the refusal proves the magic check carries the exemption.
-    let not_an_elf = {
-        let mut f = carrier.clone();
-        f[0..4].copy_from_slice(b"GIF8");
-        f
-    };
-    let refused = openfirma_pades::pdf::last_startxref(&not_an_elf)
-        .and_then(|at| openfirma_pades::pdf::object_locations(&not_an_elf, at));
-    match refused {
-        Ok(locations) => panic!(
-            "a non-ELF prefix must not be re-based, yet the walk found {} objects \
-             through it",
-            locations.len()
-        ),
-        Err(e) => {
-            let text = e.to_string();
-            // The refusal may come at the keyword (`is this a PDF?`) or, as it
-            // does here, further in: without the split the declared offset is
-            // taken for a container position and indexes padding, so the walk
-            // reaches machine code where an object header belongs. Either way
-            // nothing resolves through bytes that are not a document.
-            assert!(
-                text.contains("is this a PDF")
-                    || text.contains("cross-reference")
-                    || text.contains("expected 'obj'")
-                    || text.contains("no object number"),
-                "the refusal must say the index does not name objects: {text}"
-            );
-        }
-    }
-    // A mapped payload is not the carrier shape either — and here it is only
-    // data, refused at arm's length; executed against the kernel it lives in
-    // `openfirma-carrier` below. Same document, program headers that map its
-    // pages: the walking parsers keep plain-file bounds for it, because those
-    // bytes belong to a process and no exemption about unreachable memory can
-    // describe them. (At this size the *bounds* cannot tell the shapes apart —
-    // both are 256 MB wide; what differs is only which file re-bases at all,
-    // and the fat carrier's `startxref` lands inside its own mapped second
-    // page, where no object header parses.)
-    let fat = fat_carrier_elf(&doc, b"/tmp/openfirma-fat-carrier");
-    let refused = openfirma_pades::pdf::last_startxref(&fat)
-        .and_then(|at| openfirma_pades::pdf::object_locations(&fat, at));
-    match refused {
-        Ok(locations) => panic!(
-            "a carrier whose payload the loader maps must not be re-based: \
-             the walk found {} objects through mapped padding",
-            locations.len()
-        ),
-        Err(e) => {
-            let text = e.to_string();
-            assert!(
-                text.contains("expected 'obj'")
-                    || text.contains("cross-reference")
-                    || text.contains("is this a PDF")
-                    || text.contains("no object number"),
-                "the refusal must say the index does not name objects: {text}"
-            );
-        }
-    }
-
-    // What used to live here was the *executed* half of this test: a hand-built
-    // one-page ELF whose entry stub re-execved itself into `openfirma-carrier`
-    // so the reader ran inside its own container, verdict strings written into
-    // page zero, and a fat second shape proving the refusal under a loader that
-    // really mapped the payload. It worked on paper and it hung CI in practice:
-    // this machine's kernel (AMD Zen5) faults or silently loses an execve whose
-    // image is a hand-rolled one-page ET_EXEC — verified byte by byte against
-    // a probe that runs, `execve` of a foreign file works while self-`execve`
-    // of any hand-built image dies (SIGSEGV at the entry with nothing mapped)
-    // and every "fixed" variant spun or core-dumped. A test that cannot run on
-    // its own machine is worse than no test: deleted, root cause documented
-    // here rather than papered over. What replaces it is executed all the same
-    // — the *real* reader binary (`openfirma-carrier`, a cargo-built ELF) read
-    // back through this crate as a carrier of its own segments... which no
-    // test can fake being one page. So the executable truth lives in two
-    // places instead: the shape checks are exercised by data through every
-    // entry point above and below (the fat carrier's refusal is checked with
-    // the same calls, and pdf.rs's own tests pin the geometry rules), and the
-    // one number that only a real big carrier can prove — that raw copies of
-    // an unreadably-large document stream are accepted *because* the file is
-    // the carrier shape — is proven at exactly 256 MB below, without execve.
-}
-
-/// The exemption's own bound, bitten where it actually bites: `stream::
-/// MAX_DECODED_STREAM` is 256 MB, and an uncompressed stream past a carrier's
-/// split that large copies — allocates — what the shared cap exists to refuse.
-/// Below the cap the widened and plain bounds coincide (see the comment in
-/// `carrier_split`), so nothing short of a file bigger than the cap can tell
-/// the exemption from its absence. This fixture is exactly that: one page of
-/// carrier image, then a document whose single stream is 256 MB + 1 of zeros.
-/// The carrier reads; the same bytes with a non-ELF first page refuse at the
-/// copy bound and name it; and — the direction that matters most — a carrier
-/// whose *segments* cross the split refuses the same payload too, because no
-/// amount of file size exempts live memory. ~1.3 GB of peak RSS per case is
-/// the point of the test, which is why it sits behind the requirement flag
-/// every heavy fixture here uses and stays single-threaded with its siblings.
-#[test]
-fn a_carrier_may_carry_a_document_stream_past_the_shared_cap() {
-    if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none() {
-        // Heavy by design (three ~256 MB allocations): opt in explicitly.
-        return;
-    }
-    let big = 256 * 1024 * 1024 + 1;
-    let doc = big_stream_document(big);
-    let carrier = minimal_carrier_elf(&doc, b"/tmp/openfirma-big-carrier");
-
-    // The document stream is genuinely over the shared cap: without a split to
-    // re-base on, the very copy below must be refused. (Checked against the
-    // constant itself so a future retuning of either side fails here.)
-    assert!(big > openfirma_pades::stream::MAX_DECODED_STREAM);
-
-    let xref_at = openfirma_pades::pdf::last_startxref(&carrier).expect("startxref");
-    let locations = openfirma_pades::pdf::object_locations(&carrier, xref_at)
-        .expect("a carried document larger than the cap is still a document");
-    let mut cache = openfirma_pades::pdf::ObjectStreamCache::new();
-    // Resolve every object: the big stream is one of them, and resolving it is
-    // the copy. A refusal here is exactly the round-2 bug — refusing to read
-    // one's own carried payload because its size is measured against a file
-    // that includes an executable nobody maps.
-    for r in locations.keys() {
-        openfirma_pades::pdf::resolve(&carrier, &locations, Some(&mut cache), *r)
-            .unwrap_or_else(|e| panic!("object {r} of the big carrier: {e}"));
-    }
-
-    // Same bytes, GIF magic: not a carrier. Nothing re-bases, so the walk
-    // reads the *file* — where every object header stands one page further
-    // along than its row claims, and the first misnamed offset ("expected
-    // 'obj'") is the refusal. This is the test that says the exemption, not
-    // luck, is what let the carrier read at all: identical bytes, identical
-    // code paths, one four-byte difference at offset 0, opposite answers.
-    let not_a_carrier = {
-        let mut f = carrier.clone();
-        f[0..4].copy_from_slice(b"GIF8");
-        f
-    };
-    let err = openfirma_pades::pdf::last_startxref(&not_a_carrier)
-        .and_then(|at| openfirma_pades::pdf::object_locations(&not_a_carrier, at))
-        .expect_err("a non-carrier of these bytes must not walk");
-    let text = err.to_string();
-    assert!(
-        text.contains("expected 'obj'") || text.contains("no object number"),
-        "the refusal must say an offset names no object header: {text}"
-    );
-
-    // The plain file — the same document bytes with no ELF in front of them,
-    // offsets honest for their own container again — reads its small objects
-    // just as well. What must differ is the big stream: `stream_raw` on the
-    // *identical offset* copies on one side and names the shared cap on the
-    // other. One document, two containers; only the executable's presence
-    // decides whether 256 MB+1 of zeros can be read at all. (`resolve` hands
-    // back direct objects without copying — a Borrowed slice never allocates —
-    // so the cap is asked where copies actually happen, which is what both
-    // `resolve`'s object-stream path and `ltv.rs` do through this function.)
-    let plain = doc.clone();
-    let xref_at = openfirma_pades::pdf::last_startxref(&plain).expect("startxref");
-    let locations = openfirma_pades::pdf::object_locations(&plain, xref_at)
-        .expect("the plain document walks its own table");
-    // Every row of this fixture is a direct offset; object 1 is the big stream.
-    for r in locations.keys() {
-        let off = match locations[r] {
-            openfirma_pades::pdf::Location::Direct(off) => off,
-            _ => unreachable!("the fixture indexes nothing through streams"),
-        };
-        if *r == openfirma_pades::pdf::ObjRef::new(1, 0) {
-            let err = openfirma_pades::pdf::stream_raw(&plain, off)
-                .expect_err("the plain file must refuse the big copy");
-            let text = err.to_string();
-            assert!(
-                text.contains("more than the") && text.contains("openfirma copies"),
-                "the refusal must name the copy bound: {text}"
-            );
-        } else {
-            let err = openfirma_pades::pdf::stream_raw(&plain, off)
-                .expect_err("object 2 is a dictionary, not a stream");
-            assert!(
-                err.to_string().contains("is not a stream"),
-                "the refusal must say why: {err}"
-            );
-        }
-    }
-}
-
-/// A one-object document whose only body is an uncompressed stream of `size`
-/// zeros, indexed honestly (classic table + trailer), built so the walk of any
-/// container ends at exactly that copy.
-fn big_stream_document(size: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(size + 512);
-    out.extend(
-        b"%PDF-1.7
-",
-    );
-    let stm_at = out.len();
-    out.extend(
-        format!(
-            "1 0 obj
-<< /Length {size} >>
-stream
-"
-        )
-        .as_bytes(),
-    );
-    let head = out.len();
-    out.resize(head + size, 0);
-    out.extend(
-        b"
-endstream
-endobj
-",
-    );
-    let cat_at = out.len();
-    out.extend(
-        b"2 0 obj
-<< /Type /Catalog >>
-endobj
-",
-    );
-    let xref = out.len();
-    out.extend(
-        format!(
-            "xref
-0 3
-0000000000 65535 f \n{stm_at:010} 00000 n \n{cat_at:010} 00000 n \ntrailer\n<< /Size 3 /Root 2 0 R >>\nstartxref\n{xref}\n%%EOF\n"
-        )
-        .as_bytes(),
-    );
-    out
-}
-
-include!("fixtures/carrier_elf.rs");
-
-/// The shape rules `carrier_split` enforces, exercised as data: each negative
-/// is one honest check short, and the split must answer None for exactly that
-/// reason rather than read a coincidence inside binary bytes as a document.
-#[test]
-fn carrier_shape_checks_refuse_every_way_the_geometry_can_lie() {
-    // a full page of document so the duplicated-header case below has byte
-    // 0x1000 of the *document* to work with; the shape rules read layout, not
-    // content, and objstm_document is the fixture every carrier test uses.
-    let doc = {
-        let mut d = objstm_document(60);
-        while d.len() < 0x1000 {
-            d.extend_from_slice(b"% a comment line to pad the carried page out\n");
-        }
-        d
-    };
-    let good = minimal_carrier_elf(&doc, b"/tmp/openfirma-shape");
-    // sanity: the fixture itself resolves (the carrier test below walks it).
-    assert_eq!(
-        openfirma_pades::pdf::carrier_split(&good),
-        Some(0x1000),
-        "the fixture is the shape"
-    );
-
-    // no ELF magic at zero: not a program claiming to be run.
-    let mut gif = good.clone();
-    gif[0..4].copy_from_slice(b"GIF8");
-    assert_eq!(openfirma_pades::pdf::carrier_split(&gif), None);
-
-    // the PDF header no longer unique: two candidate documents is zero
-    // documents. The rule counts headers from each side of the split, so both
-    // twins have to go into the document half — one copy stays at 0x1000 and
-    // a forged second one lands at its page-mate 0x2000, inside the carried
-    // file's own bytes. (A `%PDF-` smuggled into the image instead is NOT
-    // refused: the search starts past the image on purpose, which is what
-    // keeps binary data that spells a header from ever looking like one.)
-    let mut twice = good.clone();
-    // (the fixture's padding is all comment bytes, so an untouched eight here
-    // would itself prove the header is where the builder says it is)
-    twice[0x2000..0x2006].copy_from_slice(b"%PDF-1");
-    twice[0x2000..0x2006].copy_from_slice(b"%PDF-1");
-    assert_eq!(openfirma_pades::pdf::carrier_split(&twice), None);
-
-    // the document begins off a page boundary: an honest prepender pads its
-    // image to whole pages, so an unaligned header is somebody else's bytes.
-    let mut off = Vec::with_capacity(good.len() + 1);
-    off.extend_from_slice(&good[..0x1000]);
-    off.push(b'\n');
-    off.extend_from_slice(&doc);
-    assert_eq!(openfirma_pades::pdf::carrier_split(&off), None);
-
-    // segments crossing the split: the fat fixture maps memory at and past
-    // where the document begins, so its tail is NOT unreachable.
-    let fat = fat_carrier_elf(&doc, b"/tmp/openfirma-shape-fat");
-    assert_eq!(openfirma_pades::pdf::carrier_split(&fat), None);
-
-    // a file shorter than one page cannot hold the shape at all.
-    assert_eq!(openfirma_pades::pdf::carrier_split(b"\x7fELFshort"), None);
 }
 
 /// Building the document for the budget test below: `streams` identical
@@ -964,7 +551,7 @@ fn objstm_twin_document(size: usize, streams: usize) -> Vec<u8> {
 /// false-alarm and one that drops the retention rule cannot hide. Peak RSS is
 /// bounded by the retained pair (~512 MB) however many streams the document
 /// ships; that bound *is* the point of it, hence the same requirement gate as
-/// the 256 MB carrier test.
+/// the other heavy fixtures here.
 #[test]
 fn the_object_stream_cache_stops_retaining_past_its_total_budget() {
     if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none() {
