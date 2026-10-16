@@ -744,7 +744,15 @@ impl App {
                 // decided by the library — one write, next to the original —
                 // and it is durable before the word "guardada" appears). The
                 // bytes also stay on the Done screen for Save As / never lose.
-                if let Err(e) = std::fs::write(&out, &signature).and_then(|()| file_sync(&out)) {
+                // Write then flush the SAME handle (see `file_sync`): the
+                // bytes are on disk before "guardada" can appear.
+                let written = (|| -> std::io::Result<()> {
+                    use std::io::Write;
+                    let mut f = std::fs::File::create(&out)?;
+                    f.write_all(&signature)?;
+                    file_sync(&f)
+                })();
+                if let Err(e) = written {
                     return Err(errors::report(&openfirma_core::Error::Other(format!(
                         "cannot write {}: {e}",
                         out.display()
@@ -839,7 +847,13 @@ impl App {
                 // this screen until a copy is proven at exactly the path now
                 // shown; the first write (sign_with, synced) still stands if
                 // this one fails, so a failed copy cannot silently un-save.
-                match std::fs::write(&dest, signature.as_slice()).and_then(|()| file_sync(&dest)) {
+                let copied = (|| -> std::io::Result<()> {
+                    use std::io::Write;
+                    let mut f = std::fs::File::create(&dest)?;
+                    f.write_all(signature.as_slice())?;
+                    file_sync(&f)
+                })();
+                match copied {
                     Ok(()) => *output = dest,
                     Err(e) => {
                         let note = format!("No se pudo guardar: {e}");
@@ -1200,9 +1214,12 @@ fn open_in_file_manager(dir: &Path) -> std::io::Result<()> {
 
 /// Durability behind "Firma guardada": the bytes are on disk before the word
 /// is shown (ADR-0006's never-a-silent-success clause, pinned in docs too).
-fn file_sync(path: &Path) -> std::io::Result<()> {
-    let f = std::fs::File::open(path)?;
-    f.sync_data()
+/// The same handle the write used is flushed — a re-open would ask for a
+/// second share of the file, which on Windows an antivirus real-time scan can
+/// answer with ERROR_ACCESS_DENIED while it still holds its own scan open:
+/// a durability check must never depend on who else is looking.
+fn file_sync(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_data()
 }
 
 /// How many signature dictionaries a PDF holds (the question that splits
