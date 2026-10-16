@@ -122,6 +122,15 @@ pub fn verify(pdf: &[u8], opts: &VerifyOptions) -> Result<DocumentReport> {
 
     let mut sig_reports = Vec::with_capacity(signatures.len());
     let mut failures = Vec::new();
+    // A-2, the verification half: a document whose final catalog carries a
+    // /Perms /DocMDP certification with /P 1 ("no changes permitted") may not
+    // have ANY revision after the certifying one — every later change breaks
+    // the certification. AutoFirma's validator marks those revisions KO;
+    // openfirma adds the sentence to the failures it already reports. Checked
+    // once for the whole document.
+    if let Err(e) = certification_gate(pdf) {
+        failures.push(unwrap(&e));
+    }
     for (i, sig) in signatures.iter().enumerate() {
         let label = format!(
             "signature {} (object {} {})",
@@ -242,6 +251,158 @@ fn revision_gate_problems(pdf: &[u8], byte_range: [usize; 4]) -> Result<Vec<Stri
         .filter(|(_, change)| !change.allowed())
         .map(|(_, change)| change.to_string())
         .collect())
+}
+
+/// A-2, the verification half: a document whose FINAL catalog carries a
+/// `/Perms /DocMDP` certification with `/P 1` ("no changes to the document
+/// are permitted") and that has any revision after the one holding the
+/// certifying dictionary is one every conforming reader shows as a broken
+/// certification. AutoFirma's validator (`ValidatePdfSignature`) marks exactly
+/// those revisions KO, and openfirma says so as a verification failure instead
+/// of letting B-B signatures pass over an overwritten certification.
+///
+/// The certifying revision is where the `/Sig` the certification refers to
+/// lives; when the pointer cannot be resolved at all, more than one revision
+/// under a final P=1 certification is reported — fail closed on what readers
+/// will flag. A single-revision certified document passes: nothing followed
+/// the certification. `Err` is the refusal sentence; `Ok(())` reports nothing.
+fn certification_gate(pdf: &[u8]) -> Result<()> {
+    // A document whose newest revision is encrypted cannot be signed anyway
+    // (C-2 refuses it upstream); reporting a certification sentence on top of
+    // that error would bury the real cause. Silence here, loudly elsewhere.
+    if trailer_is_encrypted(pdf) {
+        return Ok(());
+    }
+    let at = pdf::last_startxref(pdf)?;
+    let trailer = pdf::trailer(pdf, at)?;
+    let locations = pdf::object_locations(pdf, at)?;
+    let catalog = pdf::resolve(pdf, &locations, None, trailer.root)?;
+    let Some(value) = pdf::get(&catalog, "/Perms") else {
+        return Ok(());
+    };
+    let perms_owned = match pdf::parse_ref(value) {
+        Some(r) => pdf::resolve(pdf, &locations, None, r)?.into_owned(),
+        None => pdf::trim_ws(value).to_vec(),
+    };
+    if perms_owned.len() > crate::stream::MAX_DECODED_STREAM {
+        return Err(Error::Verification(
+            "the catalog's /Perms object is too large to read".into(),
+        ));
+    }
+    let Some(mdp) = crate::sign::docmdp_of(&perms_owned)? else {
+        return Ok(());
+    };
+    if mdp.lowest_p > 1 {
+        // P=2 and above permit signing; only filling in form fields is limited.
+        return Ok(());
+    }
+    // This gate runs on its own scan of the /Prev chain, not on wave 1's
+    // `revisions()`: that one refuses a chain whose middle revision has no
+    // honest closing record, and a forged certification lives in exactly such a
+    // chain — the sentence must be issuable there too. A broken or looping
+    // scan reports nothing: the other gates refuse that file for its own sake.
+    let mut chain: Vec<usize> = Vec::new();
+    let mut cur = Some(at);
+    while let Some(x) = cur {
+        if chain.len() > 100 || chain.contains(&x) || x > pdf.len() {
+            return Ok(());
+        }
+        chain.push(x);
+        cur = match pdf::trailer(pdf, x) {
+            Ok(t) => t.prev,
+            Err(_) => return Ok(()),
+        };
+    }
+    if chain.len() == 1 {
+        return Ok(());
+    }
+    // Both spellings of a certification (ISO 32000-1 12.8.4.3: an older one is
+    // /Perms /DocMDP << … >> directly; PDF 2.0 multiple certifications put the
+    // dictionaries into a /Reference array). Every dictionary is asked whether
+    // it certifies with P=1, because any one of them being so constrained
+    // binds the document.
+    let mut dicts: Vec<Vec<u8>> =
+        vec![pdf::trim_ws(pdf::get(&perms_owned, "/DocMDP").unwrap_or_default()).to_vec()];
+    if let Some(reference) = pdf::get(&perms_owned, "/Reference") {
+        let reference = pdf::trim_ws(reference);
+        if reference.starts_with(b"<<") {
+            dicts.push(reference.to_vec());
+        } else if let Ok(items) = pdf::array_refs(reference) {
+            for r in items {
+                if let Ok(body) = pdf::resolve(pdf, &locations, None, r) {
+                    dicts.push(body.into_owned());
+                }
+            }
+        }
+    }
+    for d in dicts.iter().filter(|d| d.starts_with(b"<<")) {
+        let Some(params_value) = pdf::get(d, "/TransformParams") else {
+            continue;
+        };
+        let params = pdf::trim_ws(params_value);
+        if !params.starts_with(b"<<") {
+            continue;
+        }
+        let p = pdf::get(params, "/P")
+            .and_then(|v| std::str::from_utf8(pdf::trim_ws(v)).ok())
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(1);
+        if p > 1 {
+            continue;
+        }
+        // The certifying /Sig sits under the certification dictionary (/V in
+        // the PDF 2.0 shape, or the older flat one; a bare /DocMDP without /V
+        // falls through to the document-level sentence below).
+        let v_ref = pdf::get(d, "/V").and_then(pdf::parse_ref);
+        if let Some(v_ref) = v_ref {
+            // Which revision wrote the certifying dictionary: its definition sits at
+            // or below chain[i]'s own cross-reference (`startxref` is the last offset
+            // that revision wrote), and above the newest revision's cross-reference —
+            // `chain` is newest-first, so position() over those answers "how many
+            // revisions were appended after this one". A certification the newest
+            // revision itself wrote has nothing after it; a forged one naming an OLDER
+            // signature object (certification-after-the-fact) resolves through THIS
+            // xref to where that signature really stands, which is what flags it. The
+            // merged cross-reference resolves every object to its newest definition —
+            // an older revision re-INDEXING an object it did not write leaves the bytes
+            // at their original offset — so this placement never invents a revision for
+            // bytes that one never touched.
+            let Some(pdf::Location::Direct(offset)) = locations.get(&v_ref).copied() else {
+                continue;
+            };
+            match chain.iter().position(|x| offset <= *x) {
+                // The certifying signature lives in the newest revision: the
+                // certification closes its own state and nothing followed it.
+                Some(0) => return Ok(()),
+                Some(i) => {
+                    return Err(Error::Verification(format!(
+                        "the document was certified with /Perms /DocMDP /P 1 (no changes                          permitted) by the signature at object {v_ref}, and {i} revision(s)                          were appended after that certification: every reader that honours                          it shows the certification as broken"
+                    )));
+                }
+                None => {}
+            }
+        }
+    }
+    Err(Error::Verification(format!(
+        "the final catalog certifies this document with /Perms /DocMDP /P 1 (no changes          permitted), and the document has {} revisions whose order the certification does          not explain: whatever was appended after the certification breaks it",
+        chain.len()
+    )))
+}
+
+/// Whether the newest trailer of `pdf` names an encryption dictionary. Read
+/// with the most forgiving key scan there is (this module's own hole-aware
+/// one), so a false "not encrypted" cannot silence the certification gate on
+/// a file the C-2 refusal may or may not catch for its own reasons.
+fn trailer_is_encrypted(pdf: &[u8]) -> bool {
+    let Ok(at) = pdf::last_startxref(pdf) else {
+        return false;
+    };
+    let Ok(dict) = crate::pdf::trailer_dict(pdf, at) else {
+        return false;
+    };
+    key_spans(&dict)
+        .into_iter()
+        .any(|(name, _)| dict.get(name) == Some(b"/Encrypt".as_slice()))
 }
 
 fn is_ws(b: u8) -> bool {

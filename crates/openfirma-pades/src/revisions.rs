@@ -116,7 +116,20 @@ pub fn revisions(pdf: &[u8]) -> Result<Vec<Revision>> {
     // later record without failing `covering_revision` on the gap.
     let mut closing = Vec::with_capacity(sections.len());
     for &startxref in &sections {
-        closing.push(candidates.iter().find(|end| **end > startxref).copied());
+        // A candidate closes THIS section only if its own `startxref` names it:
+        // every conforming append ends exactly that way, and a record naming a
+        // different section (or no section at all, already filtered out) closes
+        // nothing. The old rule — the first past-the-offset candidate whatever
+        // it named — merged two revisions into one byte range whenever a forged
+        // middle %%EOF carried the newest startxref, which is precisely how a
+        // certification-after-the-fact hides: the certifying revision then
+        // looks newest and every later change sits inside its own range.
+        closing.push(
+            candidates
+                .iter()
+                .find(|end| **end > startxref && record_names(pdf, **end) == Some(startxref))
+                .copied(),
+        );
     }
     let mut out = Vec::with_capacity(sections.len());
     for (i, &startxref) in sections.iter().enumerate() {
@@ -126,6 +139,9 @@ pub fn revisions(pdf: &[u8]) -> Result<Vec<Revision>> {
         // Newest revision: the file's end — trailing bytes past its record were
         // appended after every cross-reference and can only be claimed as whole-
         // file coverage (inspect::range_problems demanded exactly that number).
+        // A middle section whose own offset no %%EOF line names has no honest
+        // boundary: guessing one from a candidate floated above it would let a
+        // certification-after-the-fact hide, so this stays an error.
         let end = match (closing[i], i + 1 < sections.len()) {
             (Some(boundary), true) => boundary,
             (None, true) => {
@@ -645,7 +661,7 @@ fn only_mod_and_creation_dates(newer: &[u8]) -> bool {
             .all(|(k, _)| matches!(&newer[k.clone()][..], b"/ModDate" | b"/CreationDate"))
 }
 
-fn is_type(body: &[u8], name: &str) -> bool {
+pub(crate) fn is_type(body: &[u8], name: &str) -> bool {
     pdf::get(body, "/Type").is_some_and(|t| pdf::trim_ws(t) == name.as_bytes())
 }
 
