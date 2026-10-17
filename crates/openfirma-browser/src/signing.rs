@@ -592,7 +592,12 @@ mod tests {
             // A detached shape with no signing-time attribute is byte-for-byte
             // reproducible: same content, key, digest -> same CMS. That is the
             // strongest equality two dispatchers can be held to without a
-            // clock mock.
+            // clock mock — except PAdES, whose /M and /ModDate do read the
+            // clock: both sides take it from `clock::now()`, floored to the
+            // whole second, so the two sign here cannot land on different
+            // seconds. Before that floor existed, CI's macOS runner measured a
+            // straddle and this equality went red over one /M second; the
+            // straddle test right after the loop keeps that honest.
             let mut req = SignRequest::new(format, DigestAlg::Sha256);
             req.cades_no_signing_time = true;
             let expected = execute_with_detection(&mut req, doc, &signer)
@@ -672,6 +677,61 @@ mod clock_tests {
                     .saturating_sub(1)
             ),
             "the floored instant belongs to the second the raw clock showed"
+        );
+    }
+
+    #[test]
+    fn a_second_boundary_crossing_changes_no_single_byte() {
+        // The straddle CI measured: two signatures built on either side of a
+        // real second boundary used to differ in /M (and /ModDate) alone. With
+        // the whole-second floor, wait past the boundary and sign again — any
+        // difference at all is the flake back. Signer RNG adds nothing here:
+        // RSA PKCS#1 v1.5 is deterministic, so bytes are comparable directly.
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name));
+        let (Ok(cert), Ok(key)) = (read("certs/signer-rsa.crt"), read("certs/signer-rsa.key"))
+        else {
+            eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let signer = openfirma_core::signer::SoftwareSigner::from_pkcs8_pem(&cert, &key)
+            .expect("the test PKI is usable");
+        let signer = openfirma_core::signer::SoftwareSigner::from_pkcs8_pem(&cert, &key)
+            .expect("the test PKI is usable");
+        // The same fixture every PAdES crosscheck signs (it has no /Info, so
+        // the first signing writes the one whose /ModDate this pins).
+        let Ok(pdf) = std::fs::read(dir.join("inputs/simple.pdf")) else {
+            eprintln!("skipped, the test PDF is missing, run tools/gen-testpdf.py");
+            return;
+        };
+        let sign_once = || {
+            let opts = crate::signing::PadesOptions {
+                // The same instant every production path hands pades_sign:
+                // the shared clock, nothing else may write /M.
+                sign_time: clock::now(),
+                ..crate::signing::PadesOptions::default()
+            };
+            openfirma_pades::pades_sign(&pdf, &signer, &opts).expect("the mini PDF signs")
+        };
+        let first = sign_once();
+        // Leave the second the floor resolved to (worst case: one instant
+        // after resolution was nearly a full second old).
+        let floor_secs = clock::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        loop {
+            let raw = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if raw != floor_secs {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let second = sign_once();
+        assert_eq!(
+            first, second,
+            "a signature must not depend on the second its signing call crossed"
         );
     }
 }
