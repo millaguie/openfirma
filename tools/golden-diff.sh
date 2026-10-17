@@ -51,18 +51,33 @@ run_case() {
 
   # The contentHint description comes from AutoFirma's jmimemagic database,
   # which we do not ship, so it is read back from its own output instead of
-  # being guessed. The comparison stays structural.
-  local hint
+  # being guessed. `inspect` dumps raw DER — attribute types appear as OIDs:
+  # the ESS contentHint is …16.2.4. The comparison stays structural.
+  # Only the hint attribute's own value block may produce the description:
+  # OID line, then SET, SEQUENCE, and at that depth the UTF8String is the
+  # contentDescription. Any other line (the contentType OID, a sibling
+  # attribute) ends the search — mime-type and certificate-policies strings
+  # sit at this same indentation in other attributes and are not it. The jar's
+  # description reads "binary" today because this driver's classpath has no
+  # jmimemagic database; a real AutoFirma would write the Spanish one, so the
+  # dump stays the source of truth.
+  local hint of=()
   hint="$(awk '
-    /OID 1\.2\.840\.113549\.1\.9\.16\.2\.4$/ { found = 1; next }
-    found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
-    found && /OID /        { exit }
+    /^ *OID 1\.2\.840\.113549\.1\.9\.16\.2\.4$/ { found = 1; next }
+    !found { next }
+    /^ *SET [0-9]/       { depth = 1; next }
+    depth == 1 && /^ *SEQUENCE [0-9]/ { depth = 2; next }
+    depth == 2 && /UTF8String / { sub(/^.*UTF8String "/, ""); sub(/".*$/, ""); print; exit }
+    { exit }
   ' "$OUT/$name.autofirma.dump")"
+  grep -qE '^ +INTEGER [0-9A-F]+$' "$OUT/$name.autofirma.dump" \
+    || of+=(--no-issuer-serial)
+  [ -n "$hint" ] && of+=(--content-hint "$hint")
 
   ./target/debug/openfirma sign -i "$input" -o "$ours" \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
-    ${hint:+--content-hint "$hint"} >/dev/null
+    "${of[@]}" >/dev/null
 
   ./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
 
@@ -74,7 +89,203 @@ run_case() {
   fi
 }
 
+# run_alg_case <name> <input> <cert base> <SHA1|SHA256|SHA384|SHA512>
+# Like run_case, but the digest is pinned on both sides. The AutoFirma dump is
+# read first and every knob it shows — encapsulation, whether signingTime is
+# there, which signer-certificate attribute, its issuerAndSerialNumber, the
+# contentHint description — is passed to openfirma explicitly. What stays under
+# test is exactly what CAdESParameters.load derives from the digest: v1 for
+# SHA-1, V2 for SHA-2, and no hashAlgorithm inside a SHA-256 ESSCertIDv2.
+run_alg_case() {
+  local name="$1" input="$2" base="$3" sha="$4"; shift 4
+  local af="$OUT/$name.autofirma.csig" ours="$OUT/$name.openfirma.csig"
+  local dump="$OUT/$name.autofirma.dump"
+  # AutoFirma runs with these defaults plus any extraParams the caller passes
+  # as trailing arguments; openfirma mirrors from the dump whatever shape came
+  # out — encapsulation, signingTime, issuerAndSerialNumber, the contentHint
+  # text — and appends EXTRA_OF, the flags array its side needs beyond them.
+  # The finding under test stays unhidden either way: the v1 vs V2 choice
+  # CAdESParameters.load derives from the digest is in the dump.
+
+  java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
+    "$CERTS/$base.p12" "$PASS" "$input" "$af" "${sha}withRSA" "$@" >/dev/null 2>&1 \
+    || { echo "SKIP   $name (AutoFirma refused to sign it)"; return 0; }
+
+  ./target/debug/openfirma inspect -i "$af" | normalize >"$dump"
+
+  local hint of=(--digest "$(echo "$sha" | tr 'A-Z' 'a-z')")
+  hint="$(awk '
+    /OID 1\.2\.840\.113549\.1\.9\.16\.2\.4$/ { found = 1; next }
+    found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
+    found && /OID /        { exit }
+  ' "$dump")"
+  # encapsulated or detached: after the encapContentInfo contentType OID line,
+  # `inspect` prints an `[0]` line one below it when eContent is present. The
+  # top-level contentType (2-space indent) never has an [0] under it, so only
+  # the nested occurrence (deeper indent) counts.
+  awk '
+    /OID 1\.2\.840\.113549\.1\.7\.2$/ {
+      line = $0; sub(/OID.*$/, "", line)
+      if (length(line) > 6) pending = 1
+      next
+    }
+    pending { found = ($0 ~ /\[0\]/); pending = 0 }
+    END { exit !found }
+  ' "$dump" && of+=(--encapsulate)
+  grep -qE '^ +OID 1\.2\.840\.113549\.1\.9\.5$' "$dump" || of+=(--no-signing-time)
+  grep -qE 'OID 1\.2\.840\.113549\.1\.9\.16\.2\.(12|47)$' "$dump" \
+    || { echo "SKIP   $name (the AutoFirma dump names no signer-certificate attribute)"; return 0; }
+  # the issuerAndSerialNumber inside the signer-certificate attribute carries
+  # the serial as its own INTEGER line, indented below the issuer Name
+  grep -qE '^ +INTEGER [0-9A-F]+$' "$dump" || of+=(--no-issuer-serial)
+  [ -n "$hint" ] && of+=(--content-hint "$hint")
+  # openfirma-side flags beyond the dump-derived ones, set by the caller
+  of+=("${EXTRA_OF[@]+"${EXTRA_OF[@]}"}")
+
+  ./target/debug/openfirma sign -i "$input" -o "$ours" \
+    --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
+    --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
+    "${of[@]}" >/dev/null; echo "ALG-CASE $name flags: ${of[*]}" >&2
+
+  ./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
+
+  if diff -u "$dump" "$OUT/$name.openfirma.dump" >"$OUT/$name.diff"; then
+    rm -f "$OUT/$name.diff"
+    echo "MATCH  $name ($sha)"
+  else
+    echo "DIFF   $name  ($(grep -c '^[-+][^-+]' "$OUT/$name.diff") lines, see $OUT/$name.diff)"
+  fi
+}
+
 run_case simple "$INPUTS/simple.txt" signer-rsa
+
+# Finding M1, measured rather than argued: AutoFirma signs SHA-1 with the v1
+# signingCertificate (its CAdESParameters.load picks v1 whenever the digest is
+# not SHA-2), and openfirma must produce the identical shape.
+# openfirma refuses weak output by default (finding M5), so the golden side
+# that must reproduce AutoFirma's SHA-1 shape opts out explicitly.
+EXTRA_OF=(--allow-weak-algorithms) run_alg_case sha1 "$INPUTS/simple.txt" signer-rsa SHA1
+EXTRA_OF=()
+
+# Finding B1: AutoFirma's ECDSA signatureAlgorithm carries an explicit NULL
+# parameter (BouncyCastle's shape; RFC 5758 would leave it absent), and the
+# digest algorithm is ecdsa-withSHA384/… as named by the digest. run_alg_case
+# builds openfirma's flags from its own RSA key, so this one runs through a
+# fixed pair of commands with the EC certificate on both sides; the contentHint
+# description ("Texto plano") comes from the jar's jmimemagic database and is
+# passed to openfirma explicitly, which is how every other case handles it.
+if [ -f "$CERTS/signer-ec.p12" ]; then
+  name=ecdsa
+  af="$OUT/$name.autofirma.csig"; ours="$OUT/$name.openfirma.csig"
+  # the test EC certificate is P-256, so the digest both sides use is SHA-256
+  java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
+    "$CERTS/signer-ec.p12" "$PASS" "$INPUTS/simple.txt" "$af" SHA256withECDSA >/dev/null 2>&1
+  ./target/debug/openfirma inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
+  hint="$(awk '
+    /OID 1\.2\.840\.113549\.1\.9\.16\.2\.4$/ { found = 1; next }
+    found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
+    found && /OID /        { exit }
+  ' "$OUT/$name.autofirma.dump")"
+  ./target/debug/openfirma sign -i "$INPUTS/simple.txt" -o "$ours" \
+    --cert "$CERTS/signer-ec.crt" --key "$CERTS/signer-ec.key" \
+    --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
+    --digest sha256 ${hint:+--content-hint "$hint"} >/dev/null
+  ./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
+  if diff -u "$OUT/$name.autofirma.dump" "$OUT/$name.openfirma.dump" >"$OUT/$name.diff"; then
+    rm -f "$OUT/$name.diff"
+    echo "MATCH  $name"
+  else
+    echo "DIFF   $name  ($(grep -c '^[-+][^-+]' "$OUT/$name.diff") lines, see $OUT/$name.diff)"
+  fi
+else
+  echo "SKIP   ecdsa (run tools/gen-testcert.sh for signer-ec.p12)"
+fi
+
+# Findings M2 and M9, measured against the real thing:
+#
+#   `policies`      a certificate that declares certificatePolicies has them
+#                   copied verbatim into the signer-certificate attribute —
+#                   AutoFirma's getPolicyInformation, on by default (M2). No
+#                   other knob on either side.
+#   `policy_commit` signaturePolicyIdentifier and commitmentTypeIndication as
+#                   a Spanish sede sends them. policyIdentifier alone crashes
+#                   the jar's AdESPolicy (it parses the value as a URL), so
+#                   hash and algorithm travel with it, exactly the shape an
+#                   AGE invocation produces; the commitment attribute needs
+#                   its count and index parameters, which is how
+#                   CommitmentTypeIndicationsHelper reads it. The jar's hash
+#                   (AQI= = bytes 01 02) is passed to openfirma too, so the
+#                   case measures the DigestInfo shape itself, not the hash
+#                   choice; openfirma also does AutoFirma's no-assertion
+#                   fallback (placeholder byte 0x01).
+# Without the policy certificate both cases skip.
+if [ -f "$CERTS/signer-policy.p12" ]; then
+  run_case policies "$INPUTS/simple.txt" signer-policy
+
+  # the same cert with the two ETSI attributes; openfirma needs its CLI flags,
+  # so this side runs through them with the values AutoFirma was given.
+  name=policy_commit
+  af="$OUT/$name.autofirma.csig"; ours="$OUT/$name.openfirma.csig"
+  java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
+    "$CERTS/signer-policy.p12" "$PASS" "$INPUTS/simple.txt" "$af" SHA256withRSA \
+    policyIdentifier=2.16.724.1.3.1.1.2.1.9 \
+    policyIdentifierHash=AQI= policyIdentifierHashAlgorithm=SHA-256 \
+    commitmentTypeIndications=1 commitmentTypeIndication0Identifier=5 >/dev/null 2>&1
+  ./target/debug/openfirma inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
+  hint="$(awk '
+    /OID 1\.2\.840\.113549\.1\.9\.16\.2\.4$/ { found = 1; next }
+    found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
+    found && /OID /        { exit }
+  ' "$OUT/$name.autofirma.dump")"
+  ./target/debug/openfirma sign -i "$INPUTS/simple.txt" -o "$ours" \
+    --cert "$CERTS/signer-policy.crt" --key "$CERTS/signer-policy.key" \
+    --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
+    ${hint:+--content-hint "$hint"} \
+    --signature-policy 2.16.724.1.3.1.1.2.1.9 \
+    --signature-policy-hash 0102 \
+    --commitment-type 1.2.840.113549.1.9.16.6.5 >/dev/null
+  ./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
+  if diff -u "$OUT/$name.autofirma.dump" "$OUT/$name.openfirma.dump" >"$OUT/$name.diff"; then
+    rm -f "$OUT/$name.diff"
+    echo "MATCH  $name"
+  else
+    echo "DIFF   $name  ($(grep -c '^[-+][^-+]' "$OUT/$name.diff") lines, see $OUT/$name.diff)"
+  fi
+else
+  echo "SKIP   policies (run tools/gen-testcert.sh for signer-policy.p12)"
+fi
+
+# Finding M3: the mime-type attribute is a UTF8String under 0.4.0.1733.2.1,
+# AutoFirma's shape (measured against the jar), not the IA5String openfirma
+# used to emit. run_case mirrors from the dump whatever AutoFirma wrote except
+# this one attribute, which is what the finding names: the mime-type value is
+# already pinned identically on both sides by the parameters below, so it is
+# passed to openfirma as a flag instead of being read back. Without them both
+# sides sign detached with only contentType/signingTime/messageDigest/hint/
+# ESSCertIDv2/messageHash, exactly like `simple`, plus this attribute.
+name=mime
+af="$OUT/$name.autofirma.csig"; ours="$OUT/$name.openfirma.csig"
+java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
+  "$CERTS/signer-rsa.p12" "$PASS" "$INPUTS/simple.txt" "$af" SHA256withRSA \
+  includeMimeTypeAttribute=true mimeType=text/plain >/dev/null 2>&1
+./target/debug/openfirma inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
+hint="$(awk '
+  /OID 1\.2\.840\.113549\.1\.9\.16\.2\.4$/ { found = 1; next }
+  found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
+  found && /OID /        { exit }
+' "$OUT/$name.autofirma.dump")"
+./target/debug/openfirma sign -i "$INPUTS/simple.txt" -o "$ours" \
+  --cert "$CERTS/signer-rsa.crt" --key "$CERTS/signer-rsa.key" \
+  --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
+  ${hint:+--content-hint "$hint"} \
+  --mime-type text/plain >/dev/null
+./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
+if diff -u "$OUT/$name.autofirma.dump" "$OUT/$name.openfirma.dump" >"$OUT/$name.diff"; then
+  rm -f "$OUT/$name.diff"
+  echo "MATCH  $name"
+else
+  echo "DIFF   $name  ($(grep -c '^[-+][^-+]' "$OUT/$name.diff") lines, see $OUT/$name.diff)"
+fi
 
 # PAdES: same idea, but the comparison goes through qpdf and a normalizer that
 # is deliberately not our own PDF parser, so a bug in it cannot appear on both

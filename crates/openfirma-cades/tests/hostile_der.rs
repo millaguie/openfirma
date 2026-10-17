@@ -32,7 +32,7 @@ fn truncated_der_lengths_are_errors_not_panics() {
     assert!(err.to_string().contains("length"), "{err}");
 
     // token_from_response — the TSA's network answer
-    let err = tsp::token_from_response(&[0x30, 0x83], DigestAlg::Sha256, b"x")
+    let err = tsp::token_from_response(&[0x30, 0x83], DigestAlg::Sha256, b"x", None)
         .expect_err("one byte of length is not a TimeStampResp");
     assert!(err.to_string().contains("length"), "{err}");
 
@@ -107,7 +107,7 @@ fn every_truncation_and_length_mutation_of_a_token_is_an_error() {
         // none of these may panic; the errors are allowed to differ
         let _ = tsp::token_imprint(input);
         let _ = tsp::check_token(input, DigestAlg::Sha256, b"x");
-        let _ = tsp::token_from_response(input, DigestAlg::Sha256, b"x");
+        let _ = tsp::token_from_response(input, DigestAlg::Sha256, b"x", None);
         let _ = tsp::token_from_attribute(input, DigestAlg::Sha256, b"x");
         let _ = revocation::parse_ocsp_response(input);
         let _ = revocation::verify_crl(input, &[], now);
@@ -143,5 +143,6 @@ fn verify_opts() -> openfirma_cades::verify::VerifyOptions {
         trust_anchors: Vec::new(),
         validation_time: std::time::SystemTime::now(),
         ts_mode: false,
+        ..openfirma_cades::verify::VerifyOptions::default()
     }
 }

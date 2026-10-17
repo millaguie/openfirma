@@ -47,6 +47,29 @@ fn run(args: &[&str]) -> (bool, String) {
     (out.status.success(), text)
 }
 
+/// A TSA config with its serial file inside the temp area: openssl's own
+/// `/etc/ssl/openssl.cnf` points `ts -reply` at `/etc/ssl/tsaserial`, which no
+/// unprivileged process can write. The same recipe as adversarial-wave1.rs.
+fn tsa_cnf(name: &str) -> PathBuf {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace("::", "_");
+    let dir = std::env::temp_dir().join(format!("openfirma-{}-{test}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("cannot create the TSA scratch dir");
+    std::fs::write(dir.join("tsaserial"), "4242\n").unwrap();
+    let cnf = dir.join("tsa.cnf");
+    std::fs::write(
+        &cnf,
+        format!(
+            "[tsa]\ndefault_tsa = tsa_config1\n[tsa_config1]\nserial = {}\ncrypto_device = builtin\ndefault_policy = 1.2.3.4.1\ndigests = sha256\naccuracy = secs:1\nordering = no\ntsa_name = no\ness_cert_id_chain = no\ness_cert_id_alg = sha256\nsigner_digest = sha256\n",
+            dir.join("tsaserial").display()
+        ),
+    )
+    .unwrap();
+    cnf
+}
+
 /// Temp file named after the running test: the integration test binary is one
 /// process and cargo runs its tests in parallel threads.
 fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
@@ -113,6 +136,8 @@ fn b_t_carries_a_token_that_openssl_accepts() {
         let (ok, text) = run(&[
             "ts",
             "-reply",
+            "-config",
+            tsa_cnf("b-t").to_str().unwrap(),
             "-queryfile",
             q.to_str().unwrap(),
             "-out",
@@ -131,7 +156,7 @@ fn b_t_carries_a_token_that_openssl_accepts() {
         *grab_response.lock().unwrap() = response.clone();
         *grab_path.lock().unwrap() = r;
 
-        let token = tsp::token_from_response(&response, digest, sig)?;
+        let token = tsp::token_from_response(&response, digest, sig, Some(&query))?;
         Ok(vec![tsp::unsigned_attribute(&token)?])
     });
 
@@ -172,10 +197,29 @@ fn b_t_carries_a_token_that_openssl_accepts() {
 
     // a token is only good for the value it imprints
     let response = tsa_response.lock().unwrap().clone();
-    let refusal = tsp::token_from_response(&response, DigestAlg::Sha256, b"another value");
+    let refusal = tsp::token_from_response(&response, DigestAlg::Sha256, b"another value", None);
     assert!(
         refusal.is_err(),
         "a token must not be embeddable over a value it does not imprint"
+    );
+
+    // finding M7: and a token is only good for the query that asked for it.
+    // openssl echoes the request's nonce back into TSTInfo.nonce; a different
+    // query carries a different nonce, and taking this response for that query
+    // must be refused even though the response itself is well formed. The
+    // substitution test uses the SAME imprinted value so the imprint check
+    // passes and only the nonce can refuse it.
+    let value = signed_value.lock().unwrap().clone();
+    let other_query = tsp::request(DigestAlg::Sha256, &value, 0xdead_beef).expect("a second query");
+    let substituted =
+        tsp::token_from_response(&response, DigestAlg::Sha256, &value, Some(&other_query));
+    let error = match substituted {
+        Ok(_) => panic!("a token answering another query's nonce was accepted"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        error.contains("nonce"),
+        "the refusal must name the nonce: {error}"
     );
 }
 
@@ -202,6 +246,8 @@ fn the_token_signature_verifies_against_an_anchor_and_only_against_it() {
     let (ok, text) = run(&[
         "ts",
         "-reply",
+        "-config",
+        tsa_cnf("token-sig").to_str().unwrap(),
         "-queryfile",
         q.to_str().unwrap(),
         "-out",
@@ -215,7 +261,7 @@ fn the_token_signature_verifies_against_an_anchor_and_only_against_it() {
     ]);
     assert!(ok, "openssl ts -reply failed:\n{text}");
     let response = std::fs::read(&r).expect("the TSA wrote no response");
-    let token = tsp::token_from_response(&response, DigestAlg::Sha256, message)
+    let token = tsp::token_from_response(&response, DigestAlg::Sha256, message, Some(&query))
         .expect("the answer must hold a token over the message");
 
     let load = |name: &str| {

@@ -15,9 +15,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use openfirma_cades::verify::{
-    CHECK_CERTIFICATE_CHAIN, CHECK_CONTENT_TYPE, CHECK_MESSAGE_DIGEST, CHECK_SIGNATURE_VALUE,
-    CHECK_SIGNER_CERTIFICATE, CHECK_SIGNING_CERTIFICATE_V2, CHECK_VALIDITY_DATES, VerifyOptions,
-    verify,
+    AlgorithmPolicy, CHECK_CERTIFICATE_CHAIN, CHECK_CONTENT_TYPE, CHECK_MESSAGE_DIGEST,
+    CHECK_SIGNATURE_VALUE, CHECK_SIGNER_CERTIFICATE, CHECK_SIGNING_CERTIFICATE_V2,
+    CHECK_VALIDITY_DATES, VerifyOptions, verify,
 };
 use openfirma_cades::{CadesOptions, attributes, sign};
 use openfirma_core::alg::DigestAlg;
@@ -165,6 +165,93 @@ fn default_opts() -> CadesOptions {
         digest: DigestAlg::Sha256,
         ..CadesOptions::default()
     }
+}
+
+#[test]
+fn the_conservative_policy_refuses_weak_signing_and_all_opts_out() {
+    // Finding M5 on the production side: openfirma must not hand out SHA-1
+    // signatures or signatures from sub-2048 RSA keys by accident — that is
+    // the shape AutoFirma has, and every conservative validator (VALIDe, DSS,
+    // ETSI TS 119 312) refuses it. AlgorithmPolicy::All is the explicit opt
+    // out, and using it must actually work: whoever sets it owns the result.
+    let Some(signer) =
+        load_signer_with_chain("signer-rsa.crt", "signer-rsa.key", &["intermediate.crt"])
+    else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let err = sign(
+        CONTENT,
+        &signer,
+        &CadesOptions {
+            digest: DigestAlg::Sha1,
+            ..default_opts()
+        },
+    )
+    .expect_err("a SHA-1 signature must not leave the signing side by default");
+    assert!(err.to_string().contains("SHA-1"), "{err}");
+    sign(
+        CONTENT,
+        &signer,
+        &CadesOptions {
+            digest: DigestAlg::Sha1,
+            algorithms: AlgorithmPolicy::All,
+            ..default_opts()
+        },
+    )
+    .expect("AlgorithmPolicy::All is the documented opt-out");
+
+    // The weak certificate (RSA-1024, issued with SHA-1 by the intermediate)
+    // is refused for the same reason: the key, not the request.
+    let Some(weak) =
+        load_signer_with_chain("signer-weak.crt", "signer-weak.key", &["intermediate.crt"])
+    else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let err = sign(CONTENT, &weak, &default_opts())
+        .expect_err("a 1024-bit RSA key must not sign by default");
+    assert!(err.to_string().contains("1024"), "{err}");
+    sign(
+        CONTENT,
+        &weak,
+        &CadesOptions {
+            algorithms: AlgorithmPolicy::All,
+            ..default_opts()
+        },
+    )
+    .expect("and All lets it through, explicitly");
+
+    // Verifying the signature that All produced still shows what it is: with
+    // the default policy the SHA-1 signature value is refused; with All the
+    // report carries the truth.
+    let sha1_sig = sign(
+        CONTENT,
+        &signer,
+        &CadesOptions {
+            digest: DigestAlg::Sha1,
+            algorithms: AlgorithmPolicy::All,
+            ..default_opts()
+        },
+    )
+    .expect("signed under All above");
+    let err = verify(
+        &sha1_sig,
+        Some(CONTENT),
+        &VerifyOptions::new(anchors(&["ca.crt"])),
+    )
+    .expect_err("the conservative policy must refuse to verify a SHA-1 signature");
+    assert!(err.to_string().contains("SHA-1"), "{err}");
+    let reports = verify(
+        &sha1_sig,
+        Some(CONTENT),
+        &VerifyOptions {
+            algorithms: AlgorithmPolicy::All,
+            ..VerifyOptions::new(anchors(&["ca.crt"]))
+        },
+    )
+    .expect("All verifies it and reports the algorithm honestly");
+    assert_eq!(reports[0].digest, DigestAlg::Sha1);
 }
 
 #[test]
@@ -318,6 +405,46 @@ fn ecdsa_p256_verifies() {
         .expect("an ECDSA signature must verify");
     assert_eq!(reports[0].signature_alg, "ECDSA with SHA-256");
     assert!(reports[0].signer_subject.contains("LOPEZ MARTIN"));
+}
+
+#[test]
+fn ecdsa_signature_algorithm_carries_null_parameters() {
+    // Finding B1: RFC 5758 leaves the ECDSA signatureAlgorithm parameters
+    // absent, but BouncyCastle — AutoFirma — writes an explicit NULL, and the
+    // golden (tools/golden-diff.sh, case `ecdsa`) proves it is the shape the
+    // whole ecosystem produces. openfirma must emit that shape too, so a byte
+    // walk of the DER sees SEQUENCE { OID, NULL }, not a bare OID.
+    let Some(signer) =
+        load_signer_with_chain("signer-ec.crt", "signer-ec.key", &["intermediate.crt"])
+    else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let signature = sign(CONTENT, &signer, &default_opts()).expect("signing failed");
+    // the OID bytes of ecdsa-withSHA256 followed immediately by a NULL TLV,
+    // inside one SEQUENCE: 30 <len> 06 08 2A8648CE3D040302 05 00. The length
+    // is left out of the pattern and checked structurally by the DER shape
+    // itself: SEQUENCE(12) { OID(8), NULL }, i.e. `30 0c 06 08 …`.
+    const ECDSA_SHA256_WITH_NULL: &[u8] = &[
+        0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02, 0x05, 0x00,
+    ];
+    assert!(
+        signature
+            .windows(ECDSA_SHA256_WITH_NULL.len())
+            .any(|w| w == ECDSA_SHA256_WITH_NULL),
+        "the signatureAlgorithm must be ecdsa-withSHA256 with an explicit NULL parameter"
+    );
+    // The verifier reads the digest algorithm from digestAlgorithm and does
+    // not condition on the parameters bytes (present or absent), so what it
+    // verifies here is the whole point: an AutoFirma-shaped EC signature is a
+    // signature to openfirma, not an anomaly.
+    let reports = verify(
+        &signature,
+        Some(CONTENT),
+        &VerifyOptions::new(anchors(&["ca.crt"])),
+    )
+    .expect("the NULL-parameter ECDSA signature must still verify");
+    assert_eq!(reports[0].signature_alg, "ECDSA with SHA-256");
 }
 
 #[test]
@@ -526,7 +653,11 @@ fn unsigned_attributes_are_reported() {
     };
     let opts = CadesOptions {
         unsigned_attributes: vec![
-            attributes::signature_time_stamp_token(b"not-a-real-token").expect("attribute"),
+            // B5: the attribute value IS the token's ContentInfo (a CMS
+            // SignedData), not an OCTET STRING wrapped around it. The smallest
+            // well formed ContentInfo SEQUENCE is enough to be reported; a
+            // real B-T test uses a genuine token, see tsp_crosscheck.
+            attributes::signature_time_stamp_token(&[0x30, 0x00]).expect("attribute"),
         ],
         ..default_opts()
     };

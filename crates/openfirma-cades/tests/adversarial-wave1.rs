@@ -132,6 +132,7 @@ fn tsa_token(certs: &Path, dir: &Path, message: &[u8]) -> Vec<u8> {
         &std::fs::read(&reply).unwrap(),
         DigestAlg::Sha256,
         message,
+        None,
     )
     .expect("el token del TSA de pruebas debe leerse")
 }
