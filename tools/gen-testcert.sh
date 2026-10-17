@@ -154,6 +154,58 @@ openssl req -newkey rsa:2048 -nodes -keyout "$TMP/rep-raw.key" -out "$TMP/rep.cs
 to_pkcs8 "$TMP/rep-raw.key" signer-representative.key
 issue "$TMP/rep.csr" signer-representative.crt intermediate.crt intermediate.key "$SUB_EXT"
 
+echo "== RSA 2048 signer con certificatePolicies, para M2 =="
+# Un certificado cuyo certificatePolicies declara dos políticas. El atributo
+# signingCertificate debe copiar los PolicyInformation del certificado en su
+# campo policies (el getPolicyInformation de AutoFirma, activo por defecto).
+# openssl solo copia extensiones del CSR al emitir con -copy_extensions; el
+# resto de certificados del repo se emiten con -extfile y no cambian. Las dos
+# OIDs son las que usa material de prueba de AutoFirma: 0.4.0.194112.1.2 es la
+# politica de firma espanola@Europe y 1.3.6.1.4.1.5734.3.10.1 un ejemplo del IETF.
+dn_conf "$TMP/pol.cnf" "C = ES" "O = openfirma test" "OU = Test PKI" \
+  "CN = PEREZ GARCIA, ANA (policy)"
+printf 'certificatePolicies = 1.3.6.1.4.1.5734.3.10.1,0.4.0.194112.1.2\n' > "$TMP/pol.csr.ext"
+printf '%s\n%s\n' "[req]" "distinguished_name = dn" "req_extensions = pol" \
+  "prompt = no" "[dn]" "C = ES" "O = openfirma test" "OU = Test PKI" \
+  "CN = PEREZ GARCIA, ANA (policy)" "[pol]" \
+  "certificatePolicies = 1.3.6.1.4.1.5734.3.10.1,0.4.0.194112.1.2" > "$TMP/pol.req.cnf"
+openssl req -newkey rsa:2048 -nodes -keyout "$TMP/pol-raw.key" -out "$TMP/pol.csr" \
+  -config "$TMP/pol.req.cnf"
+to_pkcs8 "$TMP/pol-raw.key" signer-policy.key
+cp "$SUB_EXT" "$TMP/pol.ext"
+printf 'certificatePolicies = 1.3.6.1.4.1.5734.3.10.1,0.4.0.194112.1.2\n' >> "$TMP/pol.ext"
+issue "$TMP/pol.csr" signer-policy.crt intermediate.crt intermediate.key "$TMP/pol.ext"
+# Los OID que el certificado declara, uno por linea: lo que el test unitario
+# exige ver en el campo policies del atributo.
+printf '%s\n' 1.3.6.1.4.1.5734.3.10.1 0.4.0.194112.1.2 > signer-policy.policies.txt
+
+echo "== ECDSA P-384 signer, para M6 =="
+# Varias raices y CAs europeas son P-384 (p. ej. las de la Alemana D-Trust y
+# algunas Suiza-Swisscom); sin curvas P-384/P-521 openfirma no puede ni leer
+# esas cadenas. El certificado exercising la curva, SHA-384 es su pareja de
+# digest en todo perfil objetivo ( igual que P-256/SHA-256 arriba).
+dn_conf "$TMP/ec384.cnf" "C = ES" "O = openfirma test" "OU = Test PKI" \
+  "CN = PEREZ GARCIA, ANA (P-384)"
+openssl ecparam -name secp384r1 -genkey -noout -out "$TMP/ec384-sec1.key"
+to_pkcs8 "$TMP/ec384-sec1.key" signer-p384.key
+openssl req -new -key signer-p384.key -out "$TMP/ec384.csr" \
+  -config "$TMP/ec384.cnf"
+issue "$TMP/ec384.csr" signer-p384.crt intermediate.crt intermediate.key "$SUB_EXT"
+
+echo "== RSA 1024 firmado con SHA-1, para M5 =="
+# El certificado debil del hallazgo M5: modulus de 1024 bits y hash de la emision
+# SHA-1. La politica conservadora (la default) debe rechazarlo en la firma y en
+# la verificacion; AlgorithmPolicy::All lo acepta, que es exactamente para lo
+# que existe la opcion: archivos viejos que alguien decide asumir validos.
+dn_conf "$TMP/weak.cnf" "C = ES" "O = openfirma test" "OU = Test PKI" \
+  "CN = PEREZ GARCIA, ANA (debil)"
+openssl req -newkey rsa:1024 -nodes -keyout "$TMP/weak-raw.key" -out "$TMP/weak.csr" \
+  -config "$TMP/weak.cnf"
+to_pkcs8 "$TMP/weak-raw.key" signer-weak.key
+openssl x509 -req -in "$TMP/weak.csr" -out signer-weak.crt -days 825 -sha1 \
+  -CA intermediate.crt -CAkey intermediate.key -CAcreateserial -extfile "$SUB_EXT"
+openssl x509 -in signer-weak.crt -outform DER -out signer-weak.crt.der
+
 echo "== adversario CA:FALSE emitido por la intermedia (revisión C1) =="
 # Un certificado normal y corriente (CA:FALSE) que un atacante usaria para
 # firmar. Antes del arreglo de reglas de cadena, si ademas se ponian sus
@@ -283,11 +335,14 @@ openssl pkcs12 -export -in signer-ec.crt -inkey signer-ec.key -certfile chain.cr
   -out signer-ec.p12 -passout pass:openfirma -name "LOPEZ MARTIN, JUAN"
 openssl pkcs12 -export -in signer-juridical.crt -inkey signer-juridical.key -certfile chain.crt \
   -out signer-juridical.p12 -passout pass:openfirma -name "OPENFIRMA TEST SL"
+openssl pkcs12 -export -in signer-policy.crt -inkey signer-policy.key -certfile chain.crt \
+  -out signer-policy.p12 -passout pass:openfirma -name "PEREZ GARCIA, ANA (policy)"
 
 echo "== chain verification =="
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-rsa.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-ec.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-juridical.crt
+openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-policy.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-representative.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt signer-nonca.crt
 openssl verify -CAfile ca.crt -untrusted intermediate.crt tsa.crt
@@ -295,8 +350,8 @@ openssl verify -CAfile ca.crt -untrusted intermediate.crt ocsp.crt
 
 echo "== every key must be PKCS#8, our loader accepts nothing else =="
 for k in ca.key intermediate.key signer-rsa.key signer-ec.key \
-         signer-juridical.key signer-representative.key signer-nonca.key \
-         tsa.key ocsp.key; do
+         signer-juridical.key signer-representative.key signer-policy.key \
+         signer-nonca.key tsa.key ocsp.key; do
   # The pattern avoids spelling out the PEM header, tools/check-no-real-certs.sh
   # would flag this script for containing one
   head -1 "$k" | grep -qE '^-----BEGIN.*KEY-----$' || { echo "$k is not PKCS#8" >&2; exit 1; }
