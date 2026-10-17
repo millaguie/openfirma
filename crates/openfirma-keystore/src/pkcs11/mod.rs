@@ -82,12 +82,10 @@ pub(crate) struct Module {
     call_lock: Mutex<()>,
     /// Dropping this dlcloses the image; nothing may call `functions` after,
     /// which is why they live in the same struct and are handed out only as
-    /// borrows tied to `&self`.
-    /// Read nowhere but by `Drop` and the borrow rules of `Module::f`; the
-    /// name is kept plain because it *is* the mapping that keeps `functions`
-    /// valid. Clippy's never-read lint is satisfied by `keep_alive`, whose
-    /// debug_assert proves the library is still mapped on every call path.
-    #[allow(dead_code)]
+    /// borrows tied to `&self`. The field *is* read — by the liveness check of
+    /// `Module::f` below (`addr_of!` keeps it address-only) — so no lint
+    /// exception is needed: the mapping's mere existence in the struct is what
+    /// keeps `functions` valid.
     library: Library,
     functions: *const CkFunctionList,
 }
@@ -109,6 +107,11 @@ impl Module {
     }
 
     fn f(&self) -> FunctionListGuard<'_> {
+        // The library field's address read here is the liveness statement of
+        // this type: `functions` points into the mapped image that `library`
+        // keeps alive, and taking its address (never a value) touches it in
+        // exactly the way its purpose says.
+        std::hint::black_box(std::ptr::addr_of!(self.library));
         // Hold the call lock for exactly as long as the borrow of the table:
         // every code path that reads `f().anything` is therefore serialised
         // against every other thread in this process, which is what SoftHSM's
@@ -213,13 +216,12 @@ pub struct Pkcs11Store {
 impl Pkcs11Store {
     /// Loads `module_path` (or reuses this process's handle for it) and picks
     /// the token whose label matches `token` when given, otherwise the first
-    /// slot with a token present. `pin`, if any, is used for login at sign
-    /// time; listing certificates never logs in.
-    /// The PIN is checked at open time, not deferred to the first document:
-    /// a wrong PIN is an action-worthy failure while the user still has the
-    /// reader in hand. Listing itself never needs it (certificates are public
-    /// unless the token hides everything), but logging in on `open` proves the
-    /// credentials and reveals what a no-login listing cannot see.
+    /// slot with a token present. The PIN, if any, is proven on `open` — not
+    /// deferred to the first document: a wrong PIN is an action-worthy failure
+    /// while the user still has the reader in hand. Listing itself never *needs*
+    /// it (certificates are public unless the token hides everything), but the
+    /// login at open time proves the credentials and reveals what a no-login
+    /// listing cannot see.
     pub fn open(module_path: &Path, token: Option<&str>, pin: Option<String>) -> Result<Self> {
         let with_login = pin.is_some();
         Self::open_with(
@@ -523,11 +525,13 @@ fn slots_with_tokens(module: &Module) -> Result<Vec<CkSlotId>> {
     Ok(with_tokens)
 }
 
-/// Raw access to the `C_GetSlotInfo` slot: NSS's softokn3 leaves it null in
-/// its v2 list (its real v3 table carries C_CancelFunction there and refuses
-/// the call anyway), so a partial-table reader must treat null as
-/// "unsupported" rather than call through it — unlike the functions openfirma
-/// requires, which `load_and_init` checks.
+/// Raw access to the `C_GetSlotInfo` slot. The reason it is read as a raw
+/// pointer rather than through the typed table: NSS's softokn3 exports a v2
+/// function list whose slot 6 exists and answers (measured on its 3.131: a
+/// real pointer, CKR_FUNCTION_CANCELED when called), while older or partial
+/// modules leave it null — and PKCS#11 says an application must treat an
+/// absent function as unsupported rather than call through it. Unlike the
+/// functions openfirma requires, which `load_and_init` checks by name.
 fn slot_info_ptr(module: &Module) -> *const c_void {
     // Read the pointer stored in slot 6 of the table (byte offset 48): no
     // dereference at all — `add` walks the array, `read` copies the entry.

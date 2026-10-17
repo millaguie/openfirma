@@ -35,7 +35,7 @@ operation themselves and only want a digest.
 pub trait Signer {
     fn certificate(&self) -> &CertificateHandle;
     fn chain(&self) -> &[CertificateHandle];
-    fn key_algorithm(&self) -> KeyAlgorithm;
+    fn key_algorithm(&self) -> Result<KeyAlgorithm>;
     fn sign_prehash(&self, digest: DigestAlg, prehash: &[u8]) -> Result<Vec<u8>>;
 }
 ```

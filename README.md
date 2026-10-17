@@ -80,7 +80,7 @@ docs/adr/0005-browser-protocol.md and the table row below.
 | CAdES ES-LT / ES-LTA (validation data inside the CMS) | out of scope: the long-term path is PAdES B-LT/B-LTA, see docs/pades.md |
 | Keystores: PKCS#12 | works, pure Rust, MAC checked before decrypting |
 | Keystores: PKCS#11 tokens (OpenSC/DNIe shape), NSS shared DB | works, FFI into the vendor module at runtime, tested against SoftHSM and libsoftokn3 with signatures double-verified by openfirma and openssl |
-| Keystores: Windows cert store, macOS keychain | Windows compiles on CI and is untested at runtime; macOS lists, refuses to sign until tested, see docs/adr/0004-system-keystores.md |
+| Keystores: Windows cert store, macOS keychain | Windows compiles on CI and is untested at runtime; macOS refuses both listing and signing until it can be tested, see docs/adr/0004-system-keystores.md |
 | XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
 | XAdES B-T and above, FacturaE, enveloping/detached shapes | not started |
 | Browser integration (`afirma://` parsing, dispatch, loopback endpoint) | works end to end against a fake sede (openssl crosschecks the signature it produces); plain HTTP transport: real sedes need wss, refused rather than faked, see docs/adr/0005-browser-protocol.md |

@@ -123,7 +123,7 @@ pub trait SystemStore {
     the legacy CSP provider (`CryptAcquireCertificatePrivateKey`), which is
     what AutoFirma's own helper uses; TPM-backed keys that expose no CSP will
     need NCrypt later.
-  - `macos.rs` lists and refuses to sign ("not implemented yet"): there was
+  - `macos.rs` refuses both listing and signing ("unfinished"): there was
     no way to test a keychain prompt, and an untested keychain write is worse
     than an honest error. Windows compiles but has never run: same honesty
     applies at the feature-table level, not in code comments only.

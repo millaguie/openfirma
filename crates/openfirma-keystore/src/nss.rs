@@ -75,12 +75,22 @@ pub fn discover() -> Vec<openfirma_core::workflow::StoreSpec> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // profiles.ini is the authority on which directories under a parent
+        // are profiles: Crash Reports, Profile Groups and whatever else a
+        // browser keeps beside them can hold files too (a stray cert9.db in
+        // one made this very listing offer a non-profile as a keystore). An
+        // ini that exists but names no profile is therefore the strictest
+        // answer — list nothing, ask for the path by name. Only an *unreadable*
+        // ini falls back to the database files themselves: snap mirror roots
+        // genuinely have none, and there the files are all there is to go by.
+        let listed = profile_paths(&dir.join("profiles.ini"));
+        let fallback = listed.is_empty() && !dir.join("profiles.ini").is_file();
         for entry in entries.flatten() {
             let path = entry.path();
-            // A profile directory is an NSS database by definition (cert9.db
-            // or the older cert8.db); profiles.ini also lists "ProfileX"
-            // sections for things like Crash Reports, which carry neither.
-            if path.join("cert9.db").exists() || path.join("cert8.db").exists() {
+            if !path.join("cert9.db").exists() && !path.join("cert8.db").exists() {
+                continue;
+            }
+            if fallback || listed.contains(&path) {
                 let db = path.display().to_string();
                 specs.push(StoreSpec::Nss {
                     db: format!("sql:{db}"),
@@ -89,6 +99,48 @@ pub fn discover() -> Vec<openfirma_core::workflow::StoreSpec> {
         }
     }
     specs
+}
+
+/// Every profile directory profiles.ini names, whether or not it is on disk.
+fn profile_paths(ini: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(ini) else {
+        return Vec::new();
+    };
+    let parent = ini.parent().unwrap_or(Path::new("."));
+    let mut out = Vec::new();
+    let (mut is_profile, mut path, mut relative) = (false, String::new(), true);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            if is_profile && !path.is_empty() {
+                out.push(profile_root(parent, &path, relative));
+            }
+            is_profile = line[1..line.len() - 1].starts_with("Profile");
+            path.clear();
+            relative = true;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "path" => path = value.trim().replace('\\', std::path::MAIN_SEPARATOR_STR),
+            "isrelative" => relative = value.trim() != "0",
+            _ => {}
+        }
+    }
+    if is_profile && !path.is_empty() {
+        out.push(profile_root(parent, &path, relative));
+    }
+    out
+}
+
+fn profile_root(parent: &Path, path: &str, relative: bool) -> PathBuf {
+    if relative {
+        parent.join(path)
+    } else {
+        PathBuf::from(path)
+    }
 }
 
 /// Whether the standard shared database (`$HOME/.pki/nssdb`) exists.
@@ -108,6 +160,11 @@ pub fn shared_db_location() -> String {
 }
 
 fn home_dir() -> Option<PathBuf> {
+    // A single read per call from one place: the tests that lay a fake HOME
+    // down for discovery swap it with set_var, and a sibling test's window in
+    // between two reads of `HOME` would otherwise let one discover() mix two
+    // homes. (std::env::home_dir is not an option here on purpose — its
+    // deprecation warning would leak into builds that deny warnings.)
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
@@ -485,12 +542,24 @@ mod tests {
     use crate::store::SystemStore;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("openfirma-nss-test-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "openfirma-nss-test-{}-{}-{name}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace("::", "_")
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("test temp dir");
         dir
     }
+
+    /// One HOME swap at a time: `set_var` is process-global, so every test in
+    /// this module that changes it takes the same lock. (These tests are about
+    /// *paths*; nothing else in the suite reads HOME while they run — the
+    /// guard exists because cargo runs them on four threads.)
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn profiles_ini_default_follows_firefoxs_own_rules() {
@@ -636,7 +705,16 @@ mod tests {
     fn tilde_and_home_expansion_reach_the_config_string() {
         // B-9: both frontends' expansions were one-sided; the shared helper
         // means `~/db` and `$HOME/db` arrive absolute at either entry point.
+        // The real HOME travels untouched through a second call first, so a
+        // sibling thread mid-its-own-HOME-swap cannot make this assertion read
+        // another test's value: with the machine's own home expanded and
+        // asserted, only our two spellings can match once the swap is in.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(h) = &home {
+            let own = format!("configDir='sql:{}' flags=readOnly", h.display());
+            assert_eq!(config_string("~").unwrap(), own, "the real HOME expands");
+        }
         unsafe { std::env::set_var("HOME", "/home/openfirma-nss-test") };
         assert_eq!(
             config_string("~/db").unwrap(),
@@ -678,6 +756,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".mozilla/firefox")).unwrap();
         std::fs::create_dir_all(dir.join("snap/firefox/4285/common/.mozilla/firefox")).unwrap();
         std::fs::create_dir_all(dir.join(".var/app/org.mozilla.firefox/.mozilla/firefox")).unwrap();
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::var_os("HOME").map(PathBuf::from);
         unsafe { std::env::set_var("HOME", &dir) };
         let parents = firefox_parents();
@@ -705,13 +784,18 @@ mod tests {
 
     #[test]
     fn discovery_finds_profile_databases_and_names_them() {
-        let dir = tmp("discover");
+        let name = "discover";
+        let dir = tmp(name);
         let profile = dir.join(".mozilla/firefox/abcd.default-release");
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(profile.join("cert9.db"), b"synthetic").unwrap();
         std::fs::write(
             dir.join(".mozilla/firefox/profiles.ini"),
-            "[General]\nVersion=2\n",
+            // The strictest shape the listing honours: an ini that names a
+            // profile — and names nothing else. Crash Reports below is thus a
+            // directory a real browser's own bookkeeping excludes.
+            "[Profile0]\nName=release\nIsRelative=1\nPath=abcd.default-release\nDefault=1\n\n\
+             [General]\nStartWithLastProfile=1\nVersion=2\n",
         )
         .unwrap();
         // A non-profile directory inside the same parent must stay invisible.
@@ -721,11 +805,19 @@ mod tests {
             b"synthetic",
         )
         .unwrap();
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::var_os("HOME").map(PathBuf::from);
+        // Discovery reads HOME through the real environment; a sibling test
+        // swapping HOME concurrently would make it look at the wrong tree, so
+        // this particular assertion is made stable: with every candidate path
+        // containing this test's own directory name (they all do — the fake
+        // root is per-test), HOME is only consulted through one swap of ours.
         unsafe { std::env::set_var("HOME", &dir) };
         let specs: Vec<_> = discover()
             .into_iter()
-            .filter(|s| matches!(s, openfirma_core::workflow::StoreSpec::Nss { db } if db.contains("abcd")))
+            .filter(|s| {
+                matches!(s, openfirma_core::workflow::StoreSpec::Nss { db } if db.contains(name))
+            })
             .collect();
         unsafe {
             match home {
