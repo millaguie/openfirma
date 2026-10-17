@@ -565,15 +565,18 @@ pub fn trailer(data: &[u8], xref_at: usize) -> Result<Trailer> {
                     depth + 1
                 )));
             }
-            if let Some(newer) = immutable.get(&key)
-                && newer != &value
-            {
-                return Err(Error::Pdf(format!(
-                    "revision {} changes {}, which the newest revision already fixed to a \
-                     different value; a conforming incremental update may not",
-                    depth + 1,
-                    String::from_utf8_lossy(&key)
-                )));
+            if let Some(newer) = immutable.get(&key) {
+                // nested on purpose: `&& newer != &value` in the if-let head
+                // is a let-chain, stable only since 1.88 — this crate's floor
+                // is 1.85 and CI's msrv job proves it (review 07, H-8).
+                if newer != &value {
+                    return Err(Error::Pdf(format!(
+                        "revision {} changes {}, which the newest revision already fixed to a \
+                         different value; a conforming incremental update may not",
+                        depth + 1,
+                        String::from_utf8_lossy(&key)
+                    )));
+                }
             }
             immutable.entry(key).or_insert(value);
         }
@@ -721,12 +724,14 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
         // points at a cross-reference stream for the objects only it knows
         // about. Both have to be read, or those objects look missing.
         if let Some(stm) = get(&dict, "/XRefStm").and_then(parse_uint) {
-            // same bounds rule as above: /XRefStm is the file's claim
-            if (stm as usize) <= data.len()
-                && let Ok((extra, _)) = read_xref_stream(data, stm as usize)
-            {
-                for (r, loc) in extra {
-                    map.entry(r).or_insert(loc);
+            // same bounds rule as above: /XRefStm is the file's claim. The
+            // nesting keeps this under the 1.85 floor: `let ... && ...` in an
+            // if head is a let-chain, stable only from 1.88 (review 07 H-8).
+            if (stm as usize) <= data.len() {
+                if let Ok((extra, _)) = read_xref_stream(data, stm as usize) {
+                    for (r, loc) in extra {
+                        map.entry(r).or_insert(loc);
+                    }
                 }
             }
         }

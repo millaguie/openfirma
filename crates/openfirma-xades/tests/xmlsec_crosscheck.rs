@@ -44,6 +44,26 @@ fn xmlsec_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Whether this xmlsec1 knows `--add-id-attr` (it arrived in 1.3.0; Ubuntu's
+/// runner image ships 1.2.x, where an unknown option is a usage banner and
+/// exit — the crosscheck would then assert on help text). Probed, not read
+/// off `--version`: what matters is whether the flag is accepted, and the
+/// probe fails closed exactly like the tool probe H-1 found broken.
+fn xmlsec_supports_id_attr() -> bool {
+    Command::new("xmlsec1")
+        .args([
+            "--verify",
+            "--add-id-attr",
+            "Id",
+            "/nonexistent-no-such-file.xml",
+        ])
+        .output()
+        .is_ok_and(|o| {
+            let text = String::from_utf8_lossy(&o.stderr).to_lowercase();
+            !(text.contains("unknown option") || text.contains("is not supported"))
+        })
+}
+
 fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> {
     let dir = certs_dir();
     let (Ok(cert_pem), Ok(key_pem)) = (
@@ -66,17 +86,19 @@ fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> 
     Some(signer.with_chain(handles))
 }
 
-/// xmlsec1 needs the trust anchor for the chain and the Id hack because the
-/// fixture declares no DTD that would type Id as an XML ID.
+/// xmlsec1 needs the trust anchor for the chain and, on 1.3+, the Id hack:
+/// the fixture declares no DTD that would type `Id` as an XML ID, and only
+/// `--add-id-attr` tells xmlsec so (1.2.x treats `Id` as a known ID name by
+/// default — probing which shape this binary speaks is what
+/// `xmlsec_supports_id_attr` exists for).
 fn xmlsec_verify(file: &Path) -> (bool, String) {
-    let out = Command::new("xmlsec1")
+    let mut cmd = Command::new("xmlsec1");
+    cmd.args(["--verify", "--verbose", "--enabled-key-data", "x509"]);
+    if xmlsec_supports_id_attr() {
+        cmd.args(["--add-id-attr", "Id"]);
+    }
+    let out = cmd
         .args([
-            "--verify",
-            "--verbose",
-            "--enabled-key-data",
-            "x509",
-            "--add-id-attr",
-            "Id",
             "--trusted-pem",
             certs_dir().join("ca.crt").to_str().unwrap(),
         ])

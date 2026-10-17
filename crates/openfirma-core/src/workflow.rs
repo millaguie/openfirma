@@ -535,12 +535,15 @@ fn split_trailing_token(rest: &str) -> (&str, Option<&str>) {
 /// openfirma-gui, which share this spelling): core must not know keystores
 /// exist, or the layering of docs/architecture.md flips upside down.
 pub fn discoverable_stores() -> Vec<StoreSpec> {
-    #[allow(unused_mut)]
-    let mut specs = Vec::new();
+    // No `mut`, so clippy's `vec_init_then_push` stays quiet on the platforms
+    // that push (its heuristic reads cfg'd statements as unconditional), and
+    // no `unused_mut` waits on the ones that do not.
     #[cfg(target_os = "windows")]
-    specs.push(StoreSpec::Windows);
+    let specs = vec![StoreSpec::Windows];
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    specs.push(StoreSpec::Macos);
+    let specs = vec![StoreSpec::Macos];
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    let specs = Vec::new();
     specs
 }
 

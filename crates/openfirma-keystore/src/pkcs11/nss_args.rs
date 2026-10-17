@@ -28,7 +28,7 @@ use super::types::CkUlong;
 /// `repr` moves per platform, never the fields.
 #[cfg_attr(windows, repr(C, packed))]
 #[cfg_attr(not(windows), repr(C))]
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct NssInitializeArgs {
     /// The four application-supplied mutex callbacks. NSS's own header comment
     /// documents their slots but softokn3 never calls them (it locks with
@@ -89,11 +89,20 @@ const _: () = {
 
 impl NssInitializeArgs {
     /// An initialize-args pointing the module at `library_parameters`, passed
-    /// verbatim (see the type-level docs on accepted shapes).
+    /// verbatim (see the type-level docs on accepted shapes). Every other
+    /// field is zero: hand-written, not `..Default::default()`, because a
+    /// derive of `Default` over raw-pointer fields only exists from Rust 1.87
+    /// and this crate's floor — CI's msrv job proves it at 1.85 (review 07,
+    /// H-8) — is older than that.
     pub fn new(library_parameters: *const u8) -> Self {
         Self {
+            create_mutex: core::ptr::null_mut(),
+            destroy_mutex: core::ptr::null_mut(),
+            lock_mutex: core::ptr::null_mut(),
+            unlock_mutex: core::ptr::null_mut(),
+            flags: 0,
             library_parameters,
-            ..Default::default()
+            p_reserved: core::ptr::null_mut(),
         }
     }
 }
