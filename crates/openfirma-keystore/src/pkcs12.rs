@@ -1642,22 +1642,9 @@ fn key_matches(key_pkcs8: &[u8], cert_der: &[u8]) -> bool {
 /// could not sign with; the caller then falls back to localKeyID order and
 /// lets SoftwareSigner refuse a mismatch at signing time.
 fn pkcs8_spki(key_pkcs8: &[u8]) -> Option<Vec<u8>> {
-    use pkcs8::DecodePrivateKey;
-    use spki::EncodePublicKey;
-    if let Ok(key) = rsa::RsaPrivateKey::from_pkcs8_der(key_pkcs8) {
-        return rsa::RsaPublicKey::from(&key)
-            .to_public_key_der()
-            .map(|d| d.as_bytes().to_vec())
-            .ok();
-    }
-    if let Ok(key) = p256::ecdsa::SigningKey::from_pkcs8_der(key_pkcs8) {
-        return key
-            .verifying_key()
-            .to_public_key_der()
-            .map(|d| d.as_bytes().to_vec())
-            .ok();
-    }
-    None
+    // one derivation, in core, kept next to the curve list it must cover; a
+    // per-curve copy here silently stopped at P-256 for a while (finding M6)
+    openfirma_core::signer::SoftwareSigner::pkcs8_public_spki(key_pkcs8)
 }
 
 #[cfg(test)]
