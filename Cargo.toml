@@ -20,6 +20,7 @@ repository = "https://github.com/millaguie/openfirma"
 description = "Pure Rust reimplementation of the Spanish government's AutoFirma electronic signature client"
 
 [workspace.dependencies]
+tempfile = "3"
 # --- ASN.1 / X.509 stack, one coherent generation (see docs/adr/0002) ---
 const-oid = { version = "0.10", features = ["db"] }
 der = { version = "0.8", features = ["derive", "oid", "alloc", "std"] }

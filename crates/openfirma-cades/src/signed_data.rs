@@ -165,6 +165,49 @@ pub const AUTOFIRMA_DEFAULT_CONTENT_DESCRIPTION: &str = "binary";
 /// of it, see [`CadesOptions::unsigned_attributes`].
 pub fn sign(content: &[u8], signer: &dyn Signer, opts: &CadesOptions) -> Result<Vec<u8>> {
     let digest_alg = opts.digest;
+    // The normal path hashes the content itself; AutoFirma's own split (its
+    // `CAdESParameters.load`) is between "the bytes are the document" and
+    // "the bytes ARE the message imprint already" (`precalculatedHashAlgorithm`).
+    sign_with_digest(content, &digest_alg.digest(content), signer, opts)
+}
+
+/// The same signature built from a MESSAGE IMPRINT the caller computed. The
+/// browser protocol needs exactly this when `properties` carries
+/// `precalculatedHashAlgorithm`: AutoFirma then signs the sede's hash as
+/// `messageDigest` and never hashes it again (`CAdESParameters.load`, recorded:
+/// `dataDigest = data; contentData = null`). Passing a pre-computed digest to
+/// [`sign`] instead — hashing the payload once more, the first openfirma
+/// revision did — produces a valid signature over nobody's bytes (finding A-4).
+/// The imprint must be the output of `opts.digest` for the CMS digest algorithm
+/// identifiers to describe what was actually signed; a caller that carries a
+/// hash under another algorithm sets `CadesOptions::digest` to that algorithm
+/// (which is precisely AutoFirma's rule: the precalculated name selects the
+/// signature's digest algorithm, and the key half must then still fit it — an
+/// RSA-PSS/ECDSA constraint checked by [`Signer::signature_alg`] below).
+pub fn sign_with_digest(
+    content: &[u8],
+    message_imprint: &[u8],
+    signer: &dyn Signer,
+    opts: &CadesOptions,
+) -> Result<Vec<u8>> {
+    let digest_alg = opts.digest;
+    // A pre-computed imprint travels in the DETACHED shape only. AutoFirma's
+    // `CAdESParameters.load` drops the content from encapsulatedContentInfo
+    // whenever a precalculated digest is in play (`contentData = null`), and it
+    // reaches that state through either mode — but implicit (encapsulating)
+    // would have to carry, as the signature's content, bytes whose imprint the
+    // signer was told not to recompute: a container claiming content it cannot
+    // vouch for. openfirma refuses the combination instead of inventing one.
+    let recomputed = digest_alg.digest(content);
+    let explicit_imprint =
+        message_imprint.len() != digest_alg.output_len() || message_imprint != recomputed;
+    if opts.encapsulate_content && explicit_imprint {
+        return Err(openfirma_core::Error::other(
+            "a pre-computed message imprint cannot sign while encapsulating the payload: \
+             AutoFirma's precalculatedHashAlgorithm always leaves the content out of \
+             encapsulatedContentInfo",
+        ));
+    }
     // M5 on the production side: refuse weak output before any crypto runs.
     // The same helper the verifier uses, so both sides of the door quote the
     // same rule and the same error text. A signature this function refuses to
@@ -179,7 +222,30 @@ pub fn sign(content: &[u8], signer: &dyn Signer, opts: &CadesOptions) -> Result<
         })?,
         &opts.algorithms,
     )?;
-    let content_digest = digest_alg.digest(content);
+    // The message imprint is what `messageDigest` names and (for the detached
+    // shape) whatever the verifier must find in the content. Normal path: the
+    // digest of the bytes. Precalculated path: the caller's own imprint, whose
+    // length MUST belong to the digest algorithm it claims — a SHA-256-length
+    // hash signed under a SHA-1 identifier would put a mis-sized imprint in a
+    // signature whose DigestAlgorithmId lies about it (and every validator
+    // that re-hashes then rejects). AutoFirma cannot make that shape: its
+    // precalculated name selects the digest algorithm itself. openfirma keeps
+    // the two halves locked together with this check instead of trusting the
+    // caller to hold them straight. A wrong-but-same-length imprint is not
+    // detectable here (there is no re-hashed content to compare against), which
+    // is why the browser dispatch that feeds it refuses every property it
+    // cannot honour: the sede's bytes arrive exactly as sent and nothing in
+    // between may replace them.
+    if message_imprint.len() != digest_alg.output_len() {
+        return Err(openfirma_core::Error::other(format!(
+            "the pre-computed message imprint is {} bytes but the signature's digest \
+             algorithm ({digest_alg:?}) produces {}; pass CadesOptions::digest as the \
+             algorithm that hashed the imprint (this is AutoFirma's rule: \
+             precalculatedHashAlgorithm decides the signature's digest algorithm)",
+            message_imprint.len(),
+            digest_alg.output_len()
+        )));
+    }
 
     // Signed attributes. Order in the vector does not matter, set_of_content
     // sorts them the way X.690 requires.
@@ -188,7 +254,7 @@ pub fn sign(content: &[u8], signer: &dyn Signer, opts: &CadesOptions) -> Result<
     if let Some(t) = opts.signing_time {
         signed_attrs.push(attributes::signing_time(t)?);
     }
-    signed_attrs.push(attributes::message_digest(&content_digest)?);
+    signed_attrs.push(attributes::message_digest(message_imprint)?);
     if opts.signing_certificate_v2 {
         // AutoFirma's rule (CAdESParameters.load): V2 for SHA-2 digests, v1
         // for SHA-1. A SHA-1 signature that names V2 is a shape no other

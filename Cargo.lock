@@ -2580,13 +2580,16 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "const-oid",
+ "der",
  "flate2",
  "getrandom 0.4.3",
+ "hex",
  "openfirma-cades",
  "openfirma-core",
  "openfirma-keystore",
  "openfirma-pades",
  "openfirma-xades",
+ "tempfile",
  "zeroize",
 ]
 
