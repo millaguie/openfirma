@@ -34,6 +34,10 @@ pbkdf2 = "0.13"
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
 des = "0.9"
+# RC2-CBC: the cipher PKCS#12 legacy cert bags are encrypted with (OpenSSL
+# -legacy, old Java, NSS). Pure Rust RustCrypto on the same cipher-gen
+# generation des and aes sit on.
+rc2 = "0.9"
 sha1 = "0.11"
 sha2 = { version = "0.11", features = ["oid"] }
 
