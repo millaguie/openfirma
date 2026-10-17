@@ -177,6 +177,35 @@ jobs:
         with:
           targets: i686-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
+      # Same PKI recipe as the matrix's windows jobs (Git Bash can see the
+      # openssl Git for Windows bundles), because openfirma-core's lib tests
+      # exercise 32-bit integer/pointer behaviour and belong in this job.
+      - name: generate test PKI
+        shell: bash
+        run: |
+          openssl_bin="$(command -v openssl || true)"
+          if [ -z "$openssl_bin" ]; then
+            for candidate in "$(dirname "$(command -v git)")/../usr/bin" "/c/Program Files/Git/usr/bin"; do
+              if [ -x "$candidate/openssl.exe" ]; then openssl_bin="$candidate/openssl.exe"; break; fi
+            done
+          fi
+          if [ -z "$openssl_bin" ]; then
+            echo "no openssl on this runner, tests needing the PKI will skip"
+            echo "OPENFIRMA_ALLOW_SKIP=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          dir="$(dirname "$openssl_bin")"
+          export PATH="$dir:$PATH"
+          if command -v cygpath >/dev/null 2>&1; then dir="$(cygpath -w "$dir")"; fi
+          echo "$dir" >> "$GITHUB_PATH"
+          openssl version
+          ./tools/gen-testcert.sh
+      # No SoftHSM/NSS test modules exist for i686 Windows, so the keystore
+      # integration tests must skip instead of panicking under
+      # OPENFIRMA_REQUIRE_TESTS. The ABI tests and asserts need nothing.
+      - name: allow keystore skips where no store exists (windows)
+        run: echo "OPENFIRMA_ALLOW_SKIP=1" >> "$GITHUB_ENV"
+        shell: bash
       - name: build every member without the GUI (no 32-bit windowing stack here)
         run: cargo build --workspace --exclude openfirma-gui --target i686-pc-windows-msvc
       - name: keystore tests on the 32-bit ABI (ABI asserts execute natively)
