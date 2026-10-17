@@ -36,6 +36,12 @@ pub const ID_SIGNATURE_TIME_STAMP_TOKEN: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.14");
 pub const ID_SIGNATURE_POLICY_IDENTIFIER: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.15");
+/// `id-aa-commitmentTypeIndication` (RFC 5035 / EN 319 122-1 6.5). The OID is
+/// spelled here because no consumer of this crate has a reason to compute it;
+/// AutoFirma emits exactly this one for its `commitmentTypeIndications`
+/// extraParams (`PKCSObjectIdentifiers.id_aa_ets_commitmentTypeIndication`).
+pub const ID_COMMITMENT_TYPE_INDICATION: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.16");
 pub const ID_ATTRIBUTE_CERTIFICATE_REFERENCES: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.44");
 pub const ID_REVOCATION_REFERENCES: ObjectIdentifier =
@@ -96,8 +102,30 @@ pub const ID_SHA384_WITH_RSA: ObjectIdentifier =
 pub const ID_SHA512_WITH_RSA: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
 
+// ESS signature policies (ETSI TS 102 918 / EN 319 122-1, and the policy
+// identifiers real CAs publish in certificatePolicies)
+/// The conservative policy of ETSI TS 119 312: SHA-1 is not accepted for any
+/// new signature or new certificate (its own Appendix), and neither are RSA
+/// keys below 2048 bits. openfirma's algorithm policy implements exactly this
+/// profile, so the OID is what a report can name when it refuses.
+pub const ID_ETSIG_POLICY_CONSERVATIVE: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("0.4.0.194112.1.3");
+/// The policy of Spanish administration (AGE) that its sede pages hand to
+/// AutoFirma as `policyIdentifier`. Only here so a caller can name it without
+/// a string literal; openfirma emits whatever OID the user asks for.
+pub const ID_AGE_POLICY: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.724.1.3.1.1.2.1.9");
+
 // X.509 extensions
-pub const ID_SUBJECT_KEY_IDENTIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.35");
+/// `subjectKeyIdentifier` (RFC 5280 4.2.1.2): what a SignerInfo version 3
+/// `sid` carries, and the extension this crate reads to resolve it. It used
+/// to be spelled `2.5.4.35`, which is `userPassword` — an X.500 attribute
+/// type from a different arc entirely; every signature whose sid named the
+/// signer by SKI failed to resolve because of that one digit group.
+pub const ID_SUBJECT_KEY_IDENTIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.14");
+/// `certificatePolicies` (RFC 5280 4.2.1.7): the extension whose
+/// `PolicyInformation`s AutoFirma copies into the OPTIONAL `policies` field
+/// of `signingCertificateV2`.
+pub const ID_CERTIFICATE_POLICIES: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.32");
 
 // Elliptic curve
 pub const ID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
