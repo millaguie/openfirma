@@ -40,26 +40,32 @@ struct CertContext {
 // CI proved why it must: plain `#[link(name = ...)]` directives — thirteen of
 // them, per item — linked in vain, link.exe reporting every symbol under
 // `crypt32.lib`/`advapi32.lib` unresolved. The cause is decoration at the
-// import level. Win32's 32-bit stdcall exports are name-mangled with their
-// argument byte count (`CertOpenStore@10`, thunk `__imp_CertOpenStore@10`),
-// while an undeclared extern fn has no signature for rustc to decorate with,
-// so it asks the linker for the undecorated symbol — which is not what either
-// import library actually contains (x86_64 exports are undecorated, but the
-// aarch64/x86 jobs showed the same failure, because the *thunks* still do not
-// match: rustc asks for `__imp_CertOpenStore`, crypt32.lib defines
-// `__imp_CertOpenStore@10` on 32-bit; and on every architecture both requests
-// are only half of what a raw extern block gets you — no `#[link_name]` was
-// ever meant to cover an eleven-function hand table). raw-dylib skips import
-// libraries entirely: rustc reads the export names out of the DLL at link
-// time and emits the import itself. It has been stable since 1.65, it is what
-// `windows-targets` relies on for exactly this class of symbol, and it keeps
-// ADR-0004's promise of no dependency beyond libloading.
-// raw-dylib solves it without any dependency: at link time rustc reads the
-// real export names out of the DLL, resolves both the decorated form and the
-// `__imp_` thunk, and emits the import itself (stable since 1.65). It is also
-// what every modern Windows binding generator does for exactly this reason;
-// taking `windows-sys` would only borrow the tool that writes those tables,
-// against ADR-0004's decision to keep this crate at libloading only.
+// import level: Win32's 32-bit exports carry their calling convention in the
+// name, an undeclared extern asks the linker for a spelling that matches
+// nothing, and on x86_64/aarch64 even the `__imp_` thunks differ per tooling.
+// raw-dylib skips import libraries entirely: rustc writes the import itself,
+// using exactly the symbol name the declaration resolves to — stable since
+// 1.65 and what every modern Windows binding generator does, without adding
+// a dependency beyond libloading (ADR-0004).
+//
+// Because rustc writes *that* name verbatim, the declaration is on the hook
+// for what each DLL actually exports — and the loader checks it at process
+// start, before a single test runs. That is exactly how the i686 job died:
+// with STATUS_ENTRYPOINT_NOT_FOUND, naming nothing. Which spelling is right
+// is per-DLL measured fact, not taste: crypt32 genuinely decorates its 32-bit
+// exports (both CRYPT32.dll and every consumer of them — msvcrt-era link
+// tables — read `CertOpenStore@20`), while advapi32.dll and ncrypt.dll export
+// plain names on every architecture, so their blocks must say so with
+// `import_name_type = "undecorated"` (windows-targets' raw-dylib macro passes
+// exactly that for its x86 tables). Nothing about the ABI changes: these are
+// all stdcall on x86 — the decoration was never wrong for *calling*, only as
+// an import name. The two blocks below carry that key; crypt32 above does
+// not, and that difference is load-or-die on i686.
+//
+// The loader's STATUS_ENTRYPOINT_NOT_FOUND named nothing (PE load failures
+// never do), so the diagnosis came from reading the binary: a hand PE import
+// dump of the test executable cross-checked against the DLLs' export strings,
+// run in CI — five advapi32 names MISSING there, crypt32's table complete.
 #[link(name = "crypt32", kind = "raw-dylib")]
 unsafe extern "system" {
     fn CertOpenStore(
@@ -84,7 +90,16 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-#[link(name = "ncrypt", kind = "raw-dylib")]
+// ncrypt.dll and advapi32.dll export their names plain on every architecture
+// — `NCryptFreeObject`, `CryptSignHashW`, no decoration (dumped from the i686
+// runner's own System32) — so rustc must be told not to stdcall-decorate them
+// when writing the import: without this, x86 resolves `extern "system"` names
+// to `_CryptSignHashW@24` and the loader kills the process at startup with
+// STATUS_ENTRYPOINT_NOT_FOUND, which is the bug this line fixes. crypt32's
+// block above needs no key because that DLL really does export decorated
+// names on 32-bit; the difference between the two blocks is measured fact,
+// not taste — see the comment over there.
+#[link(name = "ncrypt", kind = "raw-dylib", import_name_type = "undecorated")]
 unsafe extern "system" {
     /// CNG signs (and stores its keys) through `NCrypt*` handles. A key that
     /// `CryptAcquireCertificatePrivateKey` returns with
@@ -99,7 +114,14 @@ unsafe extern "system" {
     fn NCryptFreeObject(h_object: usize) -> u32;
 }
 
-#[link(name = "advapi32", kind = "raw-dylib")]
+// Undecorated like ncrypt: advapi32's exports are plain names on every
+// architecture, and a decorated import is what made the 32-bit keystore test
+// binary refuse to load at all (see the two comments above).
+#[link(
+    name = "advapi32",
+    kind = "raw-dylib",
+    import_name_type = "undecorated"
+)]
 unsafe extern "system" {
     fn CryptGetHashParam(
         h_hash: usize,
