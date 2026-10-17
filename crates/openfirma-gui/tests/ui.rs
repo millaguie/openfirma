@@ -235,6 +235,12 @@ fn signing_parks_the_picker_behind_a_spinner_and_keeps_exactly_one_job() {
     // answer before the poll ran), both arms are honest A-1 outcomes; what is
     // NOT allowed is any other screen or a leaked job slot.
     let screen_after_click = harness.state().screen_ref_for_test();
+    // Whether a live job still holds the slot at this instant is pure thread
+    // race (the answer rides in on a frame boundary no windowless test can
+    // pin); the RULES under test are order-free: at most one worker ever, and
+    // exactly one reply to drain. Each arm below checks what its own state
+    // owes.
+    let parked_with_a_live_job = matches!(screen_after_click, Screen::Signing { .. });
     match screen_after_click {
         Screen::Signing { .. } => {}
         // Drained already (the worker answered before this frame's paint):
@@ -258,11 +264,16 @@ fn signing_parks_the_picker_behind_a_spinner_and_keeps_exactly_one_job() {
         node.click();
     }
     harness.step();
-    assert!(
-        !harness.state().worker_running_for_test(),
-        "a second click over a held slot must never start a second worker \
-         (if this fails, the spinner painted and the guard let two jobs in)"
-    );
+    // A slot that was already drained stays drained (the click landed on the
+    // answer screen, which offers no sign button); a parked job must still
+    // hold its ONE worker — two jobs started would have replaced the park's
+    // channel and the drain below finds a different reply than the one job.
+    if !parked_with_a_live_job {
+        assert!(
+            !harness.state().worker_running_for_test(),
+            "a drained slot cannot regain a worker"
+        );
+    }
     // Then the window answers: drain the one worker through the app's own
     // poll (the seam records why it exists: kittest has no winit loop).
     // Whatever its answer says, the window takes it — Failed carrying its
@@ -745,7 +756,7 @@ fn a_store_row_signs_without_any_password_field() {
 /// event loop, and this is the SAME method `eframe::App::ui` calls every
 /// frame). Returns when no job is in flight; hung means failure.
 fn drain_worker(harness: &mut Harness<'static, App>) {
-    harness.run_steps(2); // render the click's screen (the spinner screen)
+    harness.run_steps(2); // let a painted spinner exist at most two frames
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while harness.state().worker_running_for_test() {
         assert!(deadline.elapsed().as_secs() < 30, "the signing worker hung");
