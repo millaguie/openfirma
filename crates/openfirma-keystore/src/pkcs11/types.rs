@@ -32,11 +32,16 @@
 //!   pointer past an equal-width ulong — so they carry the cfg'd packed repr
 //!   as pure fidelity to the headers (`cryptoki_packed!`) while this file's
 //!   assertions pin every measured offset per target.
-//! - Slot arithmetic therefore has exactly two forms: windows and any
-//!   pointer-sized-ulong-but-packed table read spec function *k* at
-//!   `2 + k·sizeof(pointer)` (4 on i686, 8 on x64/arm64); LP64 unixes read it
-//!   at `8k`. `function_slot_offset` and the assertions in this file carry
-//!   that rule; nothing else may hardcode slot addresses.
+//! - Slot arithmetic therefore has exactly two forms. Number the table by
+//!   its declared fields: slot 0 is the `CK_VERSION` pair, C_Initialize is
+//!   slot 1 (what the PKCS#11 spec itself calls function 1; on unix its
+//!   pointer lands at byte 8 because slot 0 carries six bytes of tail
+//!   padding). A packed table — Windows under `pack(1)`, or any target where
+//!   the headers pack it — puts slot k at `2 + (k−1)·sizeof(pointer)` (p is
+//!   4 on i686, 8 on x86_64/aarch64), so C_Initialize sits immediately
+//!   behind the version pair; LP64 unixes read it at `8k`. Every declared
+//!   slot resolves through `offset_of!` in `function_slot_offset`, never a
+//!   formula; nothing else may hardcode slot addresses.
 //! - Callback pointers (`C_OpenSession`'s application/notify) are passed as
 //!   null `*mut c_void`: identical layout to the spec's function-pointer
 //!   types, without declaring a callback ABI we never implement.
@@ -447,12 +452,14 @@ cryptoki_packed! {
     /// documentation for why a partial table is safe). Field order is exactly
     /// the v2.40 definition; underscore entries are spec functions this crate
     /// never calls and exist only to keep every offset honest. The layout rule
-    /// is in `cryptoki_packed!` above: unix (natural alignment) puts spec
-    /// function *k* at byte `8k`, with the two-byte version plus its 6-byte
-    /// tail occupying slot 0; Windows (pack(1) headers, MSVC layout verified
-    /// against clang targeting the same ABI) puts it at `2 + k·p` — p is 4 on
-    /// i686 and 8 on x86_64/aarch64, so the two tables genuinely disagree by
-    /// six bytes and the cfg'd repr below is what keeps each target reading a
+    /// is in `cryptoki_packed!` above: unix (natural alignment) puts the
+    /// pointer of function *k* at byte `8k`, with the two-byte version plus
+    /// its 6-byte tail occupying slot 0; Windows (pack(1) headers, MSVC
+    /// layout verified against clang targeting the same ABI) slides every
+    /// field down to where the packed header puts it — function *k* at
+    /// `2 + (k−1)·p`, p is 4 on i686 and 8 on x86_64/aarch64, so C_Initialize
+    /// sits at byte 2 and the two tables genuinely disagree by six bytes at
+    /// every slot; the cfg'd repr below is what keeps each target reading a
     /// real vendor DLL correctly:
     ///
     /// ```text
@@ -466,7 +473,7 @@ cryptoki_packed! {
     /// C_FindObjects 224   C_FindObjectsFinal 232   (cipher/digest family) ...
     /// C_SignInit 344   C_Sign 352
     ///
-    /// windows:  version 0   C_Initialize 2   C_Finalize 2+p   …   C_Sign 2+44p
+    /// windows:  version 0   C_Initialize 2   C_Finalize 2+p   …   C_Sign 2+43p
     ///           (p = 4 on i686, 8 on x86_64/aarch64)
     /// ```
     ///
@@ -598,12 +605,12 @@ cryptoki_packed! {
 /// slot *k* of a `CK_FUNCTION_LIST` (slot 0 is the version pair, and the
 /// table is dense from there on — every field after it has pointer width, so
 /// slot k simply sits k slots in). Windows reads it under the packed headers
-/// (`2 + k·p`, p = 4 on i686, 8 on x86_64/aarch64); unix LP64 uses naturally
-/// aligned 8-byte slots with version+padding occupying slot 0 (so 8k), and
-/// 32-bit unixes land on the packed formula through natural alignment. Every
-/// declared slot resolves through `offset_of!` on this target's repr, so the
-/// loader probe, this function, and the struct can never drift apart; for
-/// undeclared slots it extrapolates with the slot stride, which the assertions
+/// (C_Initialize at byte 2, one pointer per slot: `2 + (k−1)·p`, p = 4 on
+/// i686, 8 on x86_64/aarch64); unix LP64 uses naturally aligned 8-byte slots
+/// with version+padding occupying slot 0 (so 8k). Every declared slot
+/// resolves through `offset_of!` on this target's repr, so the loader probe,
+/// this function, and the struct can never drift apart; for undeclared slots
+/// it extrapolates from slot 1 with the pointer stride, which the assertions
 /// at the bottom of this file prove exact wherever our slots could reach.
 pub fn function_slot_offset(k: usize) -> usize {
     use core::mem::{offset_of, size_of};
@@ -623,8 +630,11 @@ pub fn function_slot_offset(k: usize) -> usize {
             28 => offset_of!(CkFunctionList, find_objects),
             29 => offset_of!(CkFunctionList, find_objects_final),
             43 => offset_of!(CkFunctionList, sign_init),
-            // Slot 44 is the last declared entry; nothing reads past it.
-            _ => 2 + k * ptr,
+            // Slot 44 (C_Sign) is the last declared entry; nothing reads
+            // past it. For undeclared slots extrapolate from slot 1's own
+            // measured position with the stride — never a hard-coded base,
+            // which would silently drift from this struct again.
+            _ => offset_of!(CkFunctionList, initialize) + (k - 1) * ptr,
         }
     } else {
         match k {

@@ -28,17 +28,21 @@ const fn c_ulong_width() -> usize {
 }
 
 /// The byte offset of spec function *k* in a `CK_FUNCTION_LIST`, derived here
-/// from the packing rules, not by peeking at `types.rs`: the packed cryptoki
-/// headers put slot 1 right behind the two version bytes (byte 2) and every
-/// following slot one pointer-width apart — Windows reads its vendor DLLs
-/// under that packing for every MSVC ABI. Unix LP64 aligns each 8-byte
-/// pointer behind slot 0's tail padding, so slot k lands at 8k there. (A
-/// 32-bit unix *test* target would differ from both formulas — nothing here
-/// runs it: the compile-time asserts in `types.rs` guard the slots that file
-/// actually declares on such targets.)
+/// from the packing rules, not by peeking at `types.rs`: under the packed
+/// cryptoki headers (all Windows MSVC ABIs) slot 1 — C_Initialize — sits
+/// immediately behind the two version bytes at byte 2, and every following
+/// spec slot one pointer-width after it: `2 + (k−1)·p`. Unix LP64 aligns
+/// each 8-byte pointer behind slot 0's tail padding, so slot k lands at 8k
+/// there. (A 32-bit unix *test* target would differ from both formulas —
+/// nothing here runs it: the compile-time asserts in `types.rs` guard the
+/// slots that file actually declares on such targets.)
 fn abi_slot(k: usize) -> usize {
     let ptr = size_of::<*const u8>();
-    if cfg!(windows) { 2 + k * ptr } else { 8 * k }
+    if cfg!(windows) {
+        2 + (k - 1) * ptr
+    } else {
+        8 * k
+    }
 }
 
 #[test]

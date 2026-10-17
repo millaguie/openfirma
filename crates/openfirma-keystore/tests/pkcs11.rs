@@ -292,7 +292,7 @@ fn not_a_module_is_reported_clearly() {
 #[test]
 fn function_list_offsets_match_their_documented_bytes() {
     // The same numbers types.rs asserts at compile time, spelled out here as
-    // the test the module documentation promises (spec function k at byte 8k).
+    // the test the module documentation promises.
     for (name, off) in openfirma_keystore::pkcs11::function_list_offsets() {
         let slot: usize = match name {
             "C_Initialize" => 1,
@@ -306,12 +306,15 @@ fn function_list_offsets_match_their_documented_bytes() {
             other => panic!("offsets() grew a new entry: {other}"),
         };
         // Slot addresses depend on the platform ABI: Windows modules are
-        // read under the packed cryptoki headers (first pointer at 2, stride
-        // = pointer size), unix LP64 naturally aligns behind slot 0's tail
-        // padding (byte 8k). See types.rs for why each rule is what it is.
+        // read under the packed cryptoki headers, where C_Initialize (spec
+        // slot 1) sits two bytes into the table right behind the version
+        // pair and every later spec slot one pointer after it — `2 +
+        // (k−1)·p`. Unix LP64 naturally aligns each pointer behind slot 0's
+        // tail padding, putting function k at byte 8k. See types.rs for the
+        // measured tables both rules come from.
         let ptr = std::mem::size_of::<*const u8>();
-        let want = if cfg!(windows) || ptr == 4 {
-            2 + slot * ptr
+        let want = if cfg!(windows) {
+            2 + (slot - 1) * ptr
         } else {
             slot * 8
         };
