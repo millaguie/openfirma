@@ -198,9 +198,14 @@ pub const CKF_SERIAL_SESSION: CkUlong = 0x0000_0004;
 // (`NssInitializeArgs`), so it has nothing to set. (0x2 in every header; do not
 // confuse it with `CKF_SERIAL_SESSION`, which is 0x4.)
 
-/// `CKU_USER`: the only user type openfirma logs in as. The SO PIN is an
-/// administration secret and signing never needs it.
+/// `CKU_USER`: the only user type openfirma logs in as for the store itself.
+/// The SO PIN is an administration secret and signing never needs it.
 pub const CKU_USER: CkUlong = 1;
+
+/// `CKU_CONTEXT_SPECIFIC` (2): the second authentication of a key marked
+/// `CKA_ALWAYS_AUTHENTICATE`, required between `C_SignInit` and `C_Sign` on
+/// qualified cards (see finding A4).
+pub const CKU_CONTEXT_SPECIFIC: CkUlong = 2;
 
 pub const CKO_CERTIFICATE: CkUlong = 0x0000_0001;
 pub const CKO_PRIVATE_KEY: CkUlong = 0x0000_0003;
@@ -211,6 +216,18 @@ pub const CKA_VALUE: CkUlong = 0x0000_0011;
 pub const CKA_CERTIFICATE_TYPE: CkUlong = 0x0000_0080;
 pub const CKA_KEY_TYPE: CkUlong = 0x0000_0100;
 pub const CKA_ID: CkUlong = 0x0000_0102;
+/// `CKA_ALWAYS_AUTHENTICATE` (CK_BBOOL): the key demands a fresh
+/// `C_Login(CKU_CONTEXT_SPECIFIC)` for each signature it takes.
+///
+/// Its code is **0x0202**, not 0x0105 — both NSS (`/usr/include/nss/pkcs11t.h:641`)
+/// and botan's copy of the PKCS#11 headers carry `0x00000202`, as does the
+/// OASIS manifest. 0x0105 is a hole in the attribute table (nothing is defined
+/// there), and SoftHSM answers it with whatever its default-attribute pass put
+/// there: `[1]` for every private key — which is exactly the wrong answer this
+/// constant caused (a naive `boolean()` read called every token's keys
+/// always-authenticate, while OpenSC, reading 0x0202, never showed the flag on
+/// keys that don't have it).
+pub const CKA_ALWAYS_AUTHENTICATE: CkUlong = 0x0000_0202;
 
 /// `CKC_X_509`. Certificate objects of another type (attribute certificates,
 /// WTLS) cannot be embedded in a CMS as X.509 and are skipped at list time.

@@ -271,6 +271,10 @@ impl SystemStore for WindowsStore {
                 label: None, // the friendly name needs cryptui-style property
                 // reads; subject CN is what users actually compare here.
                 key_handle: KeyHandle::WindowsStoreIndex(out.len()),
+                // No equivalent of CKA_ALWAYS_AUTHENTICATE in the CryptoAPI
+                // store index we read; A6 will revisit this with the NCrypt
+                // path, where per-signature consent is a flag on the key.
+                always_authenticate: false,
                 chain: Vec::new(),
             });
         }

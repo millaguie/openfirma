@@ -76,6 +76,10 @@ impl InitShape {
 /// as long as anything can call into it — see `Module::drop`) and the raw
 /// function-list pointer that library owns.
 pub(crate) struct Module {
+    /// Process-wide lock handed out by `f` with every borrow of the function
+    /// table: this module's calls are serialised, not merely its registry
+    /// lookups (see the registry note for why).
+    call_lock: Mutex<()>,
     /// Dropping this dlcloses the image; nothing may call `functions` after,
     /// which is why they live in the same struct and are handed out only as
     /// borrows tied to `&self`.
@@ -90,12 +94,10 @@ pub(crate) struct Module {
 
 // The registry hands `Arc<Module>` across threads deliberately: modules are
 // process-global singletons that outlive every thread using them (entries are
-// never removed while a store exists), and Cryptoki serializes the calls we
-// make per session. Two threads signing on one token is supported by the
-// spec for serial sessions on different...  no — simpler and true: each
-// sign/list operation opens its own session, and a Session is !Sync, so an
-// Arc<Module> crossing threads only shares immutable pointers and
-// module-global calls that Cryptoki's "not parallel" note protects by design.
+// never removed while a store exists). An `Arc<Module>` crossing threads
+// shares only immutable pointers; every call into the library happens under
+// the module's own `call_lock` (see `Module::f`), which is what makes sharing
+// it sound even against a module whose internals are not thread-safe.
 unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
@@ -106,13 +108,41 @@ impl Module {
         self.functions.cast()
     }
 
-    fn f(&self) -> &CkFunctionList {
-        // SAFETY: `functions` points into the mapped image of `self.library`,
-        // borrowed here for exactly `&self`'s lifetime; while `self` is alive
-        // the library is mapped and the table valid. It must be a raw pointer
-        // rather than a stored reference because Rust lifetimes cannot express
-        // "valid exactly as long as the Library next to me is not dropped".
-        unsafe { &*self.functions }
+    fn f(&self) -> FunctionListGuard<'_> {
+        // Hold the call lock for exactly as long as the borrow of the table:
+        // every code path that reads `f().anything` is therefore serialised
+        // against every other thread in this process, which is what SoftHSM's
+        // unlocked shared object store needs (see the registry note). A
+        // poisoned lock means a thread died mid-call — outside our control
+        // and equally broken without the lock — so `into_inner` proceeds.
+        let guard = self
+            .call_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        FunctionListGuard {
+            // SAFETY: `functions` points into the mapped image of
+            // `self.library`, borrowed here for exactly `&self`'s lifetime;
+            // while `self` is alive the library is mapped and the table valid.
+            // It must be a raw pointer rather than a stored reference because
+            // Rust lifetimes cannot express "valid exactly as long as the
+            // Library next to me is not dropped".
+            list: unsafe { &*self.functions },
+            _guard: guard,
+        }
+    }
+}
+
+/// Borrow of a module's function table that keeps the module's call lock held
+/// for exactly its own lifetime (see `Module::f`).
+struct FunctionListGuard<'m> {
+    list: &'m CkFunctionList,
+    _guard: std::sync::MutexGuard<'m, ()>,
+}
+
+impl std::ops::Deref for FunctionListGuard<'_> {
+    type Target = CkFunctionList;
+    fn deref(&self) -> &CkFunctionList {
+        self.list
     }
 }
 
@@ -136,6 +166,29 @@ impl Drop for Module {
 /// one of them would tear the sessions out from under the other. A process
 /// therefore keeps at most one live handle per (module path, init shape), and
 /// CKR_CRYPTOKI_ALREADY_INITIALIZED is absorbed as success.
+///
+/// Every library-wide call is serialised on the module's own lock, handed out
+/// with each function-table borrow by `Module::f`: SoftHSM shares its object
+/// store across every handle in a process — two `dlopen`s of the same file are
+/// one instance (measured: reopening after `dlclose` keeps state) — and that
+/// store is not thread-safe. Four threads opening sessions on one libsofthsm2
+/// handle corrupt its `std::set` bookkeeping and crash inside `C_Login` or
+/// `C_GetAttributeValue` within milliseconds, every run, at this crate's
+/// pre-A4 code included; upstream issue #518 is exactly that race, fixed only
+/// in a release newer than the 2.7.0 shipped here, and other PKCS#11
+/// consumers (parsec) serialize the whole module for the same reason.
+/// openfirma signs one document at a time, so this lock costs nothing it was
+/// not already going to pay elsewhere.
+///
+/// While a module call is in flight the registry lock stays held (see
+/// `call`). This is deliberate serialization, not an oversight: SoftHSM's
+/// session bookkeeping is process-global — measured directly, three threads
+/// calling through one libsofthsm2 handle crash it inside its own
+/// `std::set` bookkeeping from `C_Login` — and PKCS#11 itself licenses the
+/// choice (§5.4: modules need not support multiple threads; most vendor
+/// guides say the same for NSS). openfirma signs one document at a time, so
+/// nothing waits on this lock but another keystore operation of the same
+/// process.
 /// One registry entry: the module path it was loaded from, how it was
 /// initialized, and the live handle.
 type RegistryEntry = (PathBuf, InitShape, Arc<Module>);
@@ -295,6 +348,16 @@ impl Pkcs11Store {
     }
 
     fn login(&self, session: &Session) -> Result<()> {
+        self.login_as(session, CKU_USER)
+    }
+
+    /// `C_Login` with an explicit user type. Shared by the store's own
+    /// `CKU_USER` login and the per-signature `CKU_CONTEXT_SPECIFIC` one a
+    /// `CKA_ALWAYS_AUTHENTICATE` key demands (finding A4). The failure
+    /// wording differs: for a context-specific login the PIN was already
+    /// accepted for `CKU_USER`, so saying "pass --pin-env" again would be
+    /// the misleading message the review flagged.
+    fn login_as(&self, session: &Session, user_type: CkUlong) -> Result<()> {
         // The CString is a second copy of the secret (C_Login wants a C
         // string), so its bytes are zeroed by hand after the call: zeroize's
         // Zeroizing only covers types that implement DefaultIsZeroes, which
@@ -312,7 +375,7 @@ impl Pkcs11Store {
         };
         let rv = (self.module.f().login)(
             session.handle,
-            CKU_USER,
+            user_type,
             pin.as_ptr() as *mut u8,
             ul(pin.as_bytes().len()),
         );
@@ -335,15 +398,31 @@ impl Pkcs11Store {
                 self.token_label
             )));
         }
-        let mut msg = format!(
-            "logging into token '{}' failed: {}",
-            self.token_label,
-            describe(rv)
-        );
+        let mut msg = if user_type == CKU_CONTEXT_SPECIFIC {
+            // The same PIN already unlocked the token moments ago, so this
+            // failure is about the key's per-operation confirmation, not a
+            // missing --pin-env. Say what happened and which key.
+            format!(
+                "the per-signature PIN check for token '{}' failed: {}",
+                self.token_label,
+                describe(rv)
+            )
+        } else {
+            format!(
+                "logging into token '{}' failed: {}",
+                self.token_label,
+                describe(rv)
+            )
+        };
         if flags & CKF_USER_PIN_FINAL_TRY != 0 {
             msg.push_str(" — this was the last try before the PIN locks itself");
         } else if flags & CKF_USER_PIN_COUNT_LOW != 0 {
             msg.push_str(" — the token reports only a few tries left before locking");
+        }
+        if user_type == CKU_CONTEXT_SPECIFIC {
+            // A locked/low-count reading above still applies, but the fix is
+            // not "pass a PIN": one was just passed. Stop at the cause.
+            return Err(Error::Keystore(msg));
         }
         if !rv_hint(rv).is_empty() {
             msg.push_str(" — ");
@@ -401,7 +480,7 @@ impl SystemStore for Pkcs11Store {
         };
         let session = Session::open(&self.module, self.slot)?;
         self.login(&session)?;
-        sign_with_key(&session, &id, alg, prehash)
+        sign_with_key(&session, self, &id, alg, prehash)
     }
 }
 
@@ -626,7 +705,11 @@ fn load_and_init(path: &Path, init: InitShape, library_parameters: Option<&str>)
         )));
     }
 
-    Ok(Module { library, functions })
+    Ok(Module {
+        call_lock: Mutex::new(()),
+        library,
+        functions,
+    })
 }
 
 /// A read-only session on a slot's token, closed on drop. Sessions are cheap
@@ -843,10 +926,16 @@ fn list_in_session(session: &Session) -> Result<Vec<StoreCertificate>> {
     // login at all; where they do, the caller logs in and asks again.
     let cert_objects = session.find(&[FindTemplate::class(CKO_CERTIFICATE)])?;
     session.set_saw_certificates(!cert_objects.is_empty());
-    let mut key_ids: Vec<Vec<u8>> = Vec::new();
+    // Key objects first so each certificate can be paired with its key's
+    // CKA_ALWAYS_AUTHENTICATE at the same time it finds the CKA_ID: consumers
+    // (the CLI picker, finding A5) need to know which entries demand a
+    // per-signature PIN before they offer or choose them.
+    let mut keys: Vec<(Vec<u8>, bool)> = Vec::new();
     for key_object in session.find(&[FindTemplate::class(CKO_PRIVATE_KEY)])? {
         if let Some(id) = session.attribute(key_object, CKA_ID)? {
-            key_ids.push(id);
+            let always_auth =
+                read_ck_bool(session, key_object, CKA_ALWAYS_AUTHENTICATE)?.unwrap_or(false);
+            keys.push((id, always_auth));
         }
     }
 
@@ -882,13 +971,17 @@ fn list_in_session(session: &Session) -> Result<Vec<StoreCertificate>> {
             );
             continue;
         };
-        if !key_ids.contains(&id) {
+        if !keys.iter().any(|(key_id, _)| key_id == &id) {
             tracing::debug!(
                 subject = %cert.subject(),
                 "certificate on the token has no private key with a matching CKA_ID"
             );
             continue;
         }
+        let always_authenticate = keys
+            .iter()
+            .find(|(key_id, _)| key_id == &id)
+            .is_some_and(|(_, always)| *always);
         let label = session
             .attribute(object, CKA_LABEL)?
             .and_then(|b| String::from_utf8(b).ok())
@@ -898,6 +991,7 @@ fn list_in_session(session: &Session) -> Result<Vec<StoreCertificate>> {
             cert,
             label,
             key_handle: KeyHandle::Pkcs11Id(id),
+            always_authenticate,
             chain: Vec::new(), // see StoreCertificate::chain on why this stays empty
         });
     }
@@ -905,9 +999,12 @@ fn list_in_session(session: &Session) -> Result<Vec<StoreCertificate>> {
 }
 
 /// Signs `prehash` with the private key whose CKA_ID is `key_id`. The caller
-/// has logged in already.
+/// has logged in already; every key gets its per-signature context login
+/// unconditionally inside `pkcs11_sign` — see there for why this crate does
+/// not read the key's advertised `CKA_ALWAYS_AUTHENTICATE` at all.
 fn sign_with_key(
     session: &Session,
+    store: &Pkcs11Store,
     key_id: &[u8],
     alg: DigestAlg,
     prehash: &[u8],
@@ -930,6 +1027,10 @@ fn sign_with_key(
             "the private key object reports no CKA_KEY_TYPE".into(),
         ));
     };
+    // Finding A4: qualified cards mark the non-repudiation key with
+    // CKA_ALWAYS_AUTHENTICATE, and OpenSC marks the DNIe signing key the same
+    // way when user consent is active. Whether that flag is set decides which
+    // ordering `pkcs11_sign` uses to pay the per-signature login; see there.
 
     match key_type {
         CKK_RSA => {
@@ -944,7 +1045,7 @@ fn sign_with_key(
             let mut data = Vec::with_capacity(prehash.len() + 19);
             data.extend_from_slice(digest_info_prefix(alg)?);
             data.extend_from_slice(prehash);
-            pkcs11_sign(session, key_object, CKM_RSA_PKCS, &data)
+            pkcs11_sign(session, store, key_object, CKM_RSA_PKCS, &data)
         }
         CKK_EC => {
             // The token signs the digest with raw ECDSA and hands back r||s;
@@ -961,7 +1062,8 @@ fn sign_with_key(
                     digest: alg.name(),
                 });
             }
-            let raw = pkcs11_sign(session, key_object, CKM_ECDSA, prehash)?;
+            let raw = pkcs11_sign(session, store, key_object, CKM_ECDSA, prehash)?;
+
             if raw.len() != 64 {
                 return Err(Error::Keystore(format!(
                     "CKM_ECDSA returned {} bytes where a P-256 r||s pair (64) \
@@ -980,13 +1082,148 @@ fn sign_with_key(
 }
 
 /// C_SignInit + C_Sign over one prehashed blob, with the documented length
-/// probe (first call with a null signature buffer).
+/// probe (first call with a null signature buffer). Finding A4: qualified
+/// cards mark their non-repudiation key `CKA_ALWAYS_AUTHENTICATE` (OpenSC
+/// marks the DNIe signing key the same way whenever user consent is active),
+/// and such a key answers CKR_USER_NOT_LOGGED_IN at C_Sign unless the session
+/// carries a `C_Login(CKU_CONTEXT_SPECIFIC)` for the operation. Both measured
+/// module families are served without ever guessing with a PIN:
+///
+/// - A key that advertises the flag gets the spec order (v2.40 §11.2): init,
+///   login between init and sign, sign. That is exactly where SoftHSM 2.6 puts
+///   it too — measured on a key written `--always-auth`: init 0x0, login 0x0,
+///   C_Sign succeeds (its earlier-reported refusal of the spec order came from
+///   this crate asking about the wrong attribute; see the constant's note in
+///   types.rs). A module whose `C_Login` aborts an active operation instead of
+///   honouring it answers CKR_OPERATION_NOT_INITIALIZED at C_Sign; the retry
+///   below gives that family its login-first order, because the login it just
+///   paid stands on the session and a fresh operation is all that remains.
+/// - A key that signs without advertising (or advertises something the module
+///   then enforces differently) never notices: no login, one operation. If
+///   such a key nonetheless answers CKR_USER_NOT_LOGGED_IN — a card hiding its
+///   per-signature check — paying the login and re-running the operation is
+///   the spec order after the fact, so it is retried the same way. A refusal
+///   that survives the login (user consent a DNIe-class card cannot grant over
+///   PKCS#11) is answered by `per_signature_refusal`, never by a --pin-env
+///   hint: a PIN was given and accepted for the token itself.
 fn pkcs11_sign(
     session: &Session,
+    store: &Pkcs11Store,
     key_object: CkObjectHandle,
     mechanism: CkUlong,
     data: &[u8],
 ) -> Result<Vec<u8>> {
+    let advertised = read_ck_bool(session, key_object, CKA_ALWAYS_AUTHENTICATE)?.unwrap_or(false);
+    if advertised {
+        init_sign(session, mechanism, key_object)?;
+        store.login_as(session, CKU_CONTEXT_SPECIFIC)?;
+        let signed = sign_finish(session, mechanism, data);
+        if matches!(&signed, Err(err) if is_operation_uninitialised(err)) {
+            // The login tore the operation down (SoftHSM's logout-first
+            // C_Login). It stands on the session; rebuild and sign without a
+            // second login attempt.
+            init_sign(session, mechanism, key_object)?;
+            return sign_finish(session, mechanism, data);
+        }
+        signed
+    } else {
+        let signed = {
+            init_sign(session, mechanism, key_object)?;
+            sign_finish(session, mechanism, data)
+        };
+        if matches!(&signed, Err(err) if is_user_not_logged_in(err)) {
+            // Enforced without advertising: pay the context login now and run
+            // a fresh operation — the spec order, arrived at late.
+            store.login_as(session, CKU_CONTEXT_SPECIFIC)?;
+            init_sign(session, mechanism, key_object)?;
+            let retry = sign_finish(session, mechanism, data);
+            if matches!(&retry, Err(err) if is_operation_uninitialised(err)) {
+                init_sign(session, mechanism, key_object)?;
+                return sign_finish(session, mechanism, data);
+            }
+            return retry;
+        }
+        signed
+    }
+}
+
+/// `CKR_USER_NOT_LOGGED_IN` surfaced as a keystore error — the one return that
+/// says this operation still needs its context login (matched by the hex code
+/// from `describe`, not by wording).
+fn is_user_not_logged_in(err: &Error) -> bool {
+    matches!(err, Error::Keystore(msg) if msg.contains(&format!("({CKR_USER_NOT_LOGGED_IN:#x})")))
+}
+
+/// `CKR_OPERATION_NOT_INITIALIZED` surfaced as a keystore error: the one
+/// return that tells us this module aborted the operation when its context
+/// login ran — matched by the hex code from `describe`, not by wording.
+fn is_operation_uninitialised(err: &Error) -> bool {
+    matches!(err, Error::Keystore(msg) if msg.contains(&format!("({CKR_OPERATION_NOT_INITIALIZED:#x})")))
+}
+
+/// C_Sign over the operation `init_sign` started: the documented length probe
+/// (first call with a null signature buffer) and then the real call. A
+/// CKR_USER_NOT_LOGGED_IN that reaches here outlived every login this path
+/// can pay, so it is reported as `per_signature_refusal`.
+fn sign_finish(session: &Session, mechanism: CkUlong, data: &[u8]) -> Result<Vec<u8>> {
+    let mut len: CkUlong = 0;
+    let probe = (session.module.f().sign)(
+        session.handle,
+        data.as_ptr() as *mut u8,
+        ul(data.len()),
+        std::ptr::null_mut(),
+        &mut len,
+    );
+    if probe == CKR_USER_NOT_LOGGED_IN {
+        return Err(per_signature_refusal(probe));
+    }
+    check(probe, &format!("C_Sign({})", mechanism_name(mechanism)))?;
+    let mut buf = vec![0u8; len as usize];
+    check(
+        (session.module.f().sign)(
+            session.handle,
+            data.as_ptr() as *mut u8,
+            ul(data.len()),
+            buf.as_mut_ptr(),
+            &mut len,
+        ),
+        "C_Sign",
+    )?;
+    buf.truncate(len as usize);
+    Ok(buf)
+}
+
+/// The refusal for a card that still rejects C_Sign after its per-signature
+/// PIN was checked (finding A4): the caller passed a PIN that opened the
+/// token, so pointing at --pin-env again would be the misleading message —
+/// name the per-signature check instead. `pkcs11_sign` reaches it through
+/// `sign_finish`.
+fn per_signature_refusal(rv: CkRv) -> Error {
+    let mut msg = format!(
+        "C_Sign failed: {} — this key requires its PIN for every signature \
+         (CKA_ALWAYS_AUTHENTICATE); openfirma asked the token for it with a \
+         context-specific login (CKU_CONTEXT_SPECIFIC) and the card still \
+         refuses, which on cards like the DNIe means no reader is attached or \
+         consent was denied",
+        describe(rv),
+    );
+    // rv_hint(CKR_USER_NOT_LOGGED_IN) tells the user to pass --pin-env. Here
+    // a PIN *was* passed and accepted for the token; blaming its absence
+    // again would send the user in circles, so this refusal carries its own
+    // explanation instead.
+    let hint = if rv == CKR_USER_NOT_LOGGED_IN {
+        ""
+    } else {
+        rv_hint(rv)
+    };
+    if !hint.is_empty() {
+        msg.push_str(" — ");
+        msg.push_str(hint);
+    }
+    Error::Keystore(msg)
+}
+
+fn init_sign(session: &Session, mechanism: CkUlong, key_object: CkObjectHandle) -> Result<()> {
     let mut mech = CkMechanism {
         mechanism,
         p_parameter: std::ptr::null_mut(),
@@ -1003,30 +1240,7 @@ fn pkcs11_sign(
         )));
     }
     check(rv, &format!("C_SignInit({})", mechanism_name(mechanism)))?;
-    let mut len: CkUlong = 0;
-    check(
-        (session.module.f().sign)(
-            session.handle,
-            data.as_ptr() as *mut u8,
-            ul(data.len()),
-            std::ptr::null_mut(),
-            &mut len,
-        ),
-        "C_Sign",
-    )?;
-    let mut buf = vec![0u8; len as usize];
-    check(
-        (session.module.f().sign)(
-            session.handle,
-            data.as_ptr() as *mut u8,
-            ul(data.len()),
-            buf.as_mut_ptr(),
-            &mut len,
-        ),
-        "C_Sign",
-    )?;
-    buf.truncate(len as usize);
-    Ok(buf)
+    Ok(())
 }
 
 /// The RFC 8017 DigestInfo prefix for `alg`; SHA-224 etc. all exist so every
@@ -1101,6 +1315,62 @@ fn hex_colon(bytes: &[u8]) -> String {
         .join(":")
 }
 
+/// Read a CK_BBOOL attribute. Tokens answer ATTRIBUTE_TYPE_INVALID for
+/// attributes they do not implement — and some report the wrong width: NSS
+/// has been seen with 4-byte booleans where v2.40 says one byte — so "not
+/// present" and "unwritable shape" both come back as `None` rather than
+/// failing the operation: an absent CKA_ALWAYS_AUTHENTICATE means the key does
+/// not demand a context-specific login, which is the common case, not an
+/// error. The value is read at exactly the width the module reported (a short
+/// buffer would leave a wider value half-written); one byte speaks v2.40's
+/// CK_BBOOL and four PKCS#11 v3.0's widened boolean, little-endian in both —
+/// SoftHSM 2.6 stores native C++ bools and answers the four-byte width even to
+/// a v2.40 caller (measured). Any other width is not a boolean shape any spec
+/// describes, and comes back as `None`.
+fn read_ck_bool(
+    session: &Session<'_>,
+    object: CkObjectHandle,
+    attr: CkUlong,
+) -> Result<Option<bool>> {
+    // The documented two-pass shape (see `Session::attribute`): ask for the
+    // size with a null buffer first.
+    let mut size_tmpl = [CkAttribute {
+        type_: attr,
+        p_value: std::ptr::null_mut(),
+        ul_value_len: 0,
+    }];
+    let rv =
+        (session.module.f().get_attribute_value)(session.handle, object, size_tmpl.as_mut_ptr(), 1);
+    if rv == CKR_ATTRIBUTE_SENSITIVE || rv == CKR_ATTRIBUTE_TYPE_INVALID {
+        return Ok(None);
+    }
+    check(rv, "C_GetAttributeValue")?;
+    let len = size_tmpl[0].ul_value_len;
+    if len == CK_UNAVAILABLE_INFORMATION || len == 0 || len > 8 {
+        // No value, or not any boolean width this crate speaks.
+        return Ok(None);
+    }
+    let mut value = vec![0u8; len as usize];
+    let mut tmpl = [CkAttribute {
+        type_: attr,
+        p_value: value.as_mut_ptr().cast(),
+        ul_value_len: len,
+    }];
+    let rv = (session.module.f().get_attribute_value)(session.handle, object, tmpl.as_mut_ptr(), 1);
+    if rv == CKR_ATTRIBUTE_SENSITIVE || rv == CKR_ATTRIBUTE_TYPE_INVALID {
+        return Ok(None);
+    }
+    check(rv, "C_GetAttributeValue")?;
+    let len = (tmpl[0].ul_value_len as usize).min(value.len());
+    match len {
+        1 => Ok(Some(value[0] != 0)),
+        4 => Ok(Some(
+            u32::from_le_bytes(value[..4].try_into().expect("checked four bytes")) != 0,
+        )),
+        _ => Ok(None),
+    }
+}
+
 fn check(rv: CkRv, call: &str) -> Result<()> {
     if rv == CKR_OK {
         return Ok(());
@@ -1134,3 +1404,42 @@ fn describe(rv: CkRv) -> String {
 /// `SECMOD_ERROR_BASE | (-0x12ab)`-style vendor code softokn3 answers when
 /// its parameter string does not parse (observed directly: 0xce534351).
 const NSS_BAD_DATABASE_CONFIG: CkRv = 0xce53_4351;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_signature_refusal_names_the_check_not_the_pin_source() {
+        // The refusal a DNIe-class card gets must name the per-signature
+        // check and never tell the user to pass --pin-env — they already
+        // passed a PIN that opened the token.
+        let text = per_signature_refusal(CKR_USER_NOT_LOGGED_IN).to_string();
+        assert!(text.contains("CKA_ALWAYS_AUTHENTICATE"), "{text}");
+        assert!(text.contains("CKU_CONTEXT_SPECIFIC"), "{text}");
+        assert!(!text.contains("--pin-env"), "{text}");
+    }
+
+    #[test]
+    fn rv_classifiers_match_the_measured_module_answers() {
+        let not_logged_in = Error::Keystore(format!(
+            "C_Sign failed: {} ",
+            describe(CKR_USER_NOT_LOGGED_IN)
+        ));
+        assert!(is_user_not_logged_in(&not_logged_in));
+        assert!(!is_operation_uninitialised(&not_logged_in));
+        let uninitialised = Error::Keystore(format!(
+            "C_Sign failed: {}",
+            describe(CKR_OPERATION_NOT_INITIALIZED)
+        ));
+        assert!(is_operation_uninitialised(&uninitialised));
+        assert!(!is_user_not_logged_in(&uninitialised));
+    }
+
+    #[test]
+    fn always_authenticate_constant_is_the_pkcs11_number() {
+        // 0x105 is CKA_DECRYPT — the value this crate shipped by mistake,
+        // which made every private key look always-authenticate.
+        assert_eq!(CKA_ALWAYS_AUTHENTICATE, 0x0202);
+    }
+}

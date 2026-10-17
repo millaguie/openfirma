@@ -41,6 +41,19 @@ for pair in "0a:$CERTS/signer-rsa.crt.der:$TESTDIR/rsa.pk8.der:openfirma rsa" \
     --write-object "$key" --type privkey --id "$id" --label "$lbl key" >/dev/null
 done
 
+# A third pair marked CKA_ALWAYS_AUTHENTICATE (pkcs11-tool's --always-auth):
+# the shape a qualified card's non-repudiation key carries (and OpenSC's DNIe
+# signing key with user consent). SoftHSM enforces it — C_Sign answers
+# CKR_USER_NOT_LOGGED_IN until C_Login(CKU_CONTEXT_SPECIFIC) runs between
+# C_SignInit and C_Sign — which is exactly what tests/pkcs11_always_auth.rs
+# pins (finding A4).
+pkcs11-tool --module "$P11" --login --pin "$PIN" \
+  --write-object "$CERTS/signer-rsa.crt.der" --type cert \
+  --id 0c --label "openfirma always-auth" >/dev/null
+pkcs11-tool --module "$P11" --login --pin "$PIN" \
+  --write-object "$TESTDIR/rsa.pk8.der" --type privkey \
+  --id 0c --label "openfirma always-auth key" --always-auth >/dev/null
+
 # NSS shared DB (empty password) with the same signers as PKCS#12.
 rm -f "$TESTDIR/nssdb"/*
 for who in rsa ec; do

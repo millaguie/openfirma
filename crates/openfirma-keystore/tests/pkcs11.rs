@@ -142,11 +142,17 @@ fn softhsm_lists_pairs_and_signs_both_keys() {
     assert_eq!(store.token_label(), "openfirma test");
 
     let certs = store.certificates().expect("listing must succeed");
-    // Two certificates with a signable key each; nothing without a key.
-    assert_eq!(certs.len(), 2, "expected the rsa + ec pair, got {certs:?}");
+    // Three certificates with a signable key each; nothing without a key.
+    // (The third one, id 0c, exists for tests/pkcs11_always_auth.rs.)
+    assert_eq!(
+        certs.len(),
+        3,
+        "expected rsa + ec + always-auth, got {certs:?}"
+    );
     let labels: Vec<&str> = certs.iter().filter_map(|c| c.label.as_deref()).collect();
     assert!(labels.contains(&"openfirma rsa"), "{labels:?}");
     assert!(labels.contains(&"openfirma ec"), "{labels:?}");
+    assert!(labels.contains(&"openfirma always-auth"), "{labels:?}");
     for c in &certs {
         assert!(
             matches!(c.key_handle, openfirma_keystore::KeyHandle::Pkcs11Id(_)),

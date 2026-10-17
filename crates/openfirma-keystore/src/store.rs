@@ -62,6 +62,12 @@ pub struct StoreCertificate {
     /// PKCS#11 object's `CKA_ID`, the Windows provider handle, the macOS
     /// SecKey reference. Nothing may interpret it but its own backend.
     pub key_handle: KeyHandle,
+    /// The key demands a fresh PIN for every signature (PKCS#11
+    /// `CKA_ALWAYS_AUTHENTICATE`; other backends report what their platform's
+    /// equivalent means). Qualified cards mark their non-repudiation key this
+    /// way. Backends honour it themselves at sign time; listing it lets a
+    /// picker warn before the document is opened (finding A4).
+    pub always_authenticate: bool,
     /// The rest of the chain (intermediates and any root) that the store
     /// carries, for `SignedData.certificates`. A token usually holds only the
     /// leaf; whatever is not there the caller supplies with `--chain` exactly
