@@ -34,9 +34,9 @@ use std::time::SystemTime;
 use const_oid::ObjectIdentifier;
 use der::asn1::{GeneralizedTime, OctetString, UtcTime};
 use der::{Decode, Encode};
-use openfirma_core::alg::{DigestAlg, KeyAlgorithm, SignatureAlg};
+use openfirma_core::alg::{DigestAlg, KeyAlgorithm, KeyInfo, SignatureAlg};
 use openfirma_core::cert::CertificateHandle;
-use openfirma_core::signer::verify_prehash;
+use openfirma_core::signer::{RSA_MINIMUM_BITS, verify_prehash};
 use openfirma_core::{Error, Result, oid, tlv};
 use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
 use x509_cert::name::Name;
@@ -69,7 +69,7 @@ const KNOWN_EXTENSIONS: &[ObjectIdentifier] = &[
     ObjectIdentifier::new_unwrap(OID_BASIC_CONSTRAINTS),
     ObjectIdentifier::new_unwrap(OID_EXTENDED_KEY_USAGE),
     ObjectIdentifier::new_unwrap("2.5.29.31"), // cRLDistributionPoints
-    ObjectIdentifier::new_unwrap("2.5.29.32"), // certificatePolicies
+    oid::ID_CERTIFICATE_POLICIES,              // certificatePolicies
     ObjectIdentifier::new_unwrap("2.5.29.33"), // policyMappings
     ObjectIdentifier::new_unwrap("2.5.29.35"), // authorityKeyIdentifier
     ObjectIdentifier::new_unwrap("2.5.29.36"), // policyConstraints
@@ -98,6 +98,7 @@ pub const CHECK_VALIDITY_DATES: &str = "validityDates";
 const MAX_CHAIN_DEPTH: usize = 16;
 
 /// What the verifier is handed besides the signature itself.
+#[derive(Clone)]
 pub struct VerifyOptions {
     /// Roots (or any certificate the caller trusts) the signer's chain has to
     /// reach. At least one, or every verification fails.
@@ -115,6 +116,69 @@ pub struct VerifyOptions {
     /// 2.4.2 says MUST include one, so v1 is accepted), and its content type
     /// is `id-ct-TSTInfo`, not `id-data`.
     pub ts_mode: bool,
+
+    /// Which algorithms the verifier still accepts, see [`AlgorithmPolicy`].
+    /// The default is the ETSI TS 119 312 conservative policy: verification
+    /// of a signature is a security decision, and silently accepting SHA-1 or
+    /// a 1024-bit RSA key is how a forged signature reaches a citizen as OK.
+    pub algorithms: AlgorithmPolicy,
+
+    /// Fail when `signingTime` falls outside the signer certificate's
+    /// validity window (RFC 5652 11.3 expects the attribute to record when
+    /// the signer produced the signature, which is inside its own
+    /// certificate's life). Off by default: without a trusted time source, a
+    /// `signingTime` outside validity is evidence of nothing on its own —
+    /// the clock belongs to the signer — so it is a check callers opt into
+    /// when their trust model has one. When on, signatures without the
+    /// attribute are not judged (there is nothing to place in time).
+    pub require_signing_time_in_validity: bool,
+}
+
+/// The minimum algorithm strengths a verifier accepts — finding M5. A
+/// verifier that accepts anything tells a user "OK" about a signature that
+/// any department with a budget could have forged; ETSI made that decision
+/// for us (TS 119 312, conservative: no SHA-1 anywhere in new work, RSA at
+/// least 2048). The OID of that policy is
+/// [`openfirma_core::oid::ID_ETSIG_POLICY_CONSERVATIVE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlgorithmPolicy {
+    /// ETSI TS 119 312 conservative (the default): SHA-1 is refused for the
+    /// signature digest; RSA keys below 2048 bits are refused wherever they
+    /// appear. Certificates *self-signed with* or *signed under* a refused
+    /// algorithm fail like everything else, which is deliberate: in this
+    /// policy an old root that only signs SHA-1 is not trusted material, and
+    /// VALIDe agrees by refusing SHA-1 end-to-end (finding M5: silently OK
+    /// was the bug).
+    Conservative,
+    /// Everything this implementation can read. For archives and for tools
+    /// whose operator decides what to trust; a report under this policy must
+    /// not be presented as "valid" by any frontend without saying the policy
+    /// allowed algorithms ETSI refuses.
+    All,
+}
+
+impl Default for AlgorithmPolicy {
+    // derive(Default) would pick the first variant, and that is exactly this
+    // one; the explicit impl states the intent.
+    #[allow(clippy::derivable_impls)]
+    fn default() -> Self {
+        AlgorithmPolicy::Conservative
+    }
+}
+
+impl Default for VerifyOptions {
+    /// Trust anchors empty, which makes every verification fail: an option set
+    /// with no anchor trusts nobody, inventing one here would be the unfounded
+    /// success this project bans.
+    fn default() -> Self {
+        Self {
+            trust_anchors: Vec::new(),
+            validation_time: SystemTime::now(),
+            ts_mode: false,
+            algorithms: AlgorithmPolicy::default(),
+            require_signing_time_in_validity: false,
+        }
+    }
 }
 
 impl VerifyOptions {
@@ -124,6 +188,8 @@ impl VerifyOptions {
             trust_anchors,
             validation_time: SystemTime::now(),
             ts_mode: false,
+            algorithms: AlgorithmPolicy::default(),
+            require_signing_time_in_validity: false,
         }
     }
 
@@ -134,12 +200,20 @@ impl VerifyOptions {
             trust_anchors,
             validation_time,
             ts_mode: true,
+            algorithms: AlgorithmPolicy::default(),
+            require_signing_time_in_validity: false,
         }
     }
 
     /// Builder for [`VerifyOptions::validation_time`].
     pub fn at(mut self, validation_time: SystemTime) -> Self {
         self.validation_time = validation_time;
+        self
+    }
+
+    /// Builder for [`VerifyOptions::algorithms`].
+    pub fn with_algorithm_policy(mut self, policy: AlgorithmPolicy) -> Self {
+        self.algorithms = policy;
         self
     }
 }
@@ -362,8 +436,20 @@ fn verify_signer_info(
 ) -> Result<VerifyReport> {
     let mut passed = Vec::new();
 
+    // The algorithm policy of M5 runs over every claim on the wire before
+    // any crypto does: a SHA-1 signature digest or a sub-2048 RSA key under
+    // `Conservative` is refused here, naming the check. The chain walk below
+    // judges each certificate's own key through `check_certificate_rules`.
+    check_algorithm_policy(CHECK_SIGNATURE_VALUE, si.digest_alg, &opts.algorithms)?;
+
     // (c) the signer certificate, located through the sid
     let cert = find_signer_cert(sd, &si.sid)?;
+    check_key_strength(
+        CHECK_SIGNATURE_VALUE,
+        cert.key_info()
+            .map_err(|e| fail(CHECK_SIGNER_CERTIFICATE, detail_of(&e)))?,
+        &opts.algorithms,
+    )?;
     passed.push(CHECK_SIGNER_CERTIFICATE);
 
     let attrs_content = si.signed_attrs.ok_or_else(|| {
@@ -380,11 +466,20 @@ fn verify_signer_info(
     // attribute and it must say id-ct-TSTInfo. The encapContentInfo check in
     // tsp::verify_token_signature reads the same name from the other place
     // where CMS records the type; both have to agree on what was stamped.
-    if opts.ts_mode && attrs.content_type.is_none() {
+    if attrs.content_type.is_none() {
+        // RFC 5652 11.1 names contentType mandatory in signedAttrs, and both
+        // RFC 3161 2.4.2 (TST) and EN 319 122-1 (CAdES) repeat it. A CAdES
+        // signature without it used to pass — finding B7.
         return Err(fail(
             CHECK_CONTENT_TYPE,
-            "the token's signed attributes carry no contentType attribute, and RFC 3161 \
-             2.4.2 requires one naming id-ct-TSTInfo",
+            if opts.ts_mode {
+                "the token's signed attributes carry no contentType attribute, and RFC 3161 \
+                 2.4.2 requires one naming id-ct-TSTInfo"
+            } else {
+                "the signed attributes carry no contentType attribute; RFC 5652 11.1 makes \
+                 it mandatory inside a CMS signature, and without it nothing binds these \
+                 attributes to the content type they claim to digest"
+            },
         ));
     }
 
@@ -474,27 +569,39 @@ fn verify_signer_info(
         .map_err(|e| fail(CHECK_SIGNATURE_VALUE, detail_of(&e)))?;
     passed.push(CHECK_SIGNATURE_VALUE);
 
-    // (d) signingCertificateV2 hashes to the signer certificate. A TST may
-    // carry the v1 `signingCertificate` instead (RFC 3161 2.4.2: the TSA MUST
-    // include one, many TSAs still emit ESSCertID); a CAdES signature must
-    // carry v2, and says so with its own rule name.
-    let attr = if opts.ts_mode {
-        attrs.signing_cert_v2.or(attrs.signing_cert)
-    } else {
-        attrs.signing_cert_v2
+    // (d) the ESS signer-certificate attribute hashes to the signer
+    // certificate. A TST may carry the v1 `signingCertificate` instead (RFC
+    // 3161 2.4.2: the TSA MUST include one, many TSAs still emit ESSCertID);
+    // a CAdES signature must carry one too — but which of the two is defined
+    // by the digest, exactly like AutoFirma's `CAdESParameters.load`: RFC
+    // 5035 reserves V2 for SHA-2, so a SHA-1 CAdES (AutoFirma signs those,
+    // so do all pre-2011 CAdES-BES files) legitimately names v1. Refusing v1
+    // outright rejected every AutoFirma SHA-1 signature — finding M1. An
+    // unknown digest in a v1 attribute still fails the hash comparison below.
+    let (attr, is_v1) = match (attrs.signing_cert_v2, attrs.signing_cert) {
+        (Some(v2), _) => (v2, false),
+        (None, Some(v1)) if opts.ts_mode || si.digest_alg == DigestAlg::Sha1 => (v1, true),
+        (None, Some(_)) => {
+            return Err(fail(
+                CHECK_SIGNING_CERTIFICATE_V2,
+                "the signature carries the v1 signingCertificate but digests with \
+                 something other than SHA-1; RFC 5035 requires signingCertificateV2 for \
+                 SHA-2, and AutoFirma emits it accordingly",
+            ));
+        }
+        (None, None) => {
+            return Err(fail(
+                CHECK_SIGNING_CERTIFICATE_V2,
+                if opts.ts_mode {
+                    "the token carries neither signingCertificate nor signingCertificateV2; \
+                     RFC 3161 2.4.2 makes the TSA include one"
+                } else {
+                    "the attribute is missing, and every CAdES profile requires it"
+                },
+            ));
+        }
     };
-    let attr = attr.ok_or_else(|| {
-        fail(
-            CHECK_SIGNING_CERTIFICATE_V2,
-            if opts.ts_mode {
-                "the token carries neither signingCertificate nor signingCertificateV2; \
-                 RFC 3161 2.4.2 makes the TSA include one"
-            } else {
-                "the attribute is missing, and every CAdES profile requires it"
-            },
-        )
-    })?;
-    check_signing_certificate_v2(&attr, cert)?;
+    check_signing_certificate_v2(&attr, cert, is_v1)?;
     passed.push(CHECK_SIGNING_CERTIFICATE_V2);
 
     // (e) chain to a trust anchor, dates against the validation time
@@ -503,9 +610,28 @@ fn verify_signer_info(
         &sd.certificates,
         &opts.trust_anchors,
         opts.validation_time,
+        &opts.algorithms,
     )?;
     passed.push(CHECK_CERTIFICATE_CHAIN);
     passed.push(CHECK_VALIDITY_DATES);
+
+    // B7: a caller with a trusted clock (a timestamped archive being audited,
+    // say) can require the claimed signingTime to sit inside the signer
+    // certificate's life. Off by default because without such a clock the
+    // attribute is the signer's own claim and proves nothing on its own.
+    if opts.require_signing_time_in_validity {
+        if let Some(t) = attrs.signing_time {
+            check_validity(cert, t).map_err(|e| {
+                fail(
+                    CHECK_VALIDITY_DATES,
+                    format!(
+                        "signingTime is outside the certificate's validity: {}",
+                        detail_of(&e)
+                    ),
+                )
+            })?;
+        }
+    }
 
     let signature_alg = match key_alg {
         KeyAlgorithm::Rsa => SignatureAlg::RsaPkcs1v15(si.digest_alg),
@@ -718,12 +844,20 @@ fn check_signature_algorithm(
     Ok(())
 }
 
-fn check_signing_certificate_v2(value: &Tlv<'_>, cert: &CertificateHandle) -> Result<()> {
+fn check_signing_certificate_v2(
+    value: &Tlv<'_>,
+    cert: &CertificateHandle,
+    is_v1: bool,
+) -> Result<()> {
     // value is the attribute value itself:
     // SigningCertificateV2 ::= SEQUENCE { certs, policies OPTIONAL },
     // certs ::= SEQUENCE OF ESSCertIDv2. Three nested SEQUENCEs, the same
-    // three the encoder in attributes.rs builds.
-    let wrapper = expect_tag(value, tlv::TAG_SEQUENCE, "SigningCertificateV2")?;
+    // three the encoder in attributes.rs builds. A v1 SigningCertificate has
+    // the identical shape with ESSCertID in place of ESSCertIDv2 — RFC 5035
+    // defines v1 as `SigningCertificate ::= SEQUENCE { certs SEQUENCE OF
+    // ESSCertID, policies ... }` — so one reader serves both, and `is_v1`
+    // only decides what an absent hashAlgorithm means.
+    let wrapper = expect_tag(value, tlv::TAG_SEQUENCE, "SigningCertificate")?;
     let mut w = der_cursor(wrapper.content);
     let certs = w.expect(tlv::TAG_SEQUENCE, "SigningCertificateV2.certs")?;
     // the optional policies sequence is not interpreted
@@ -749,10 +883,11 @@ fn check_signing_certificate_v2(value: &Tlv<'_>, cert: &CertificateHandle) -> Re
             (d, e.expect(tlv::TAG_OCTET_STRING, "ESSCertIDv2.certHash")?)
         }
         // absent hashAlgorithm means the default: SHA-256 for a V2
-        // (RFC 5035 3), SHA-1 for the v1 ESSCertID, whose hash is exactly 20
-        // bytes and nothing else. A 32-byte hash with no algorithm would be
-        // ambiguous DER and stays refused below.
-        tlv::TAG_OCTET_STRING if first.content.len() == 20 => (DigestAlg::Sha1, first),
+        // (RFC 5035 3), SHA-1 for the v1 ESSCertID, whose implicit digest is
+        // always SHA-1. A 32-byte hash with no algorithm inside a v1 would
+        // be ambiguous DER; below a v1 refuses anything that does not match
+        // its own SHA-1 of the certificate, which is what the compare does.
+        tlv::TAG_OCTET_STRING if is_v1 => (DigestAlg::Sha1, first),
         tlv::TAG_OCTET_STRING => (DigestAlg::Sha256, first),
         other => {
             return Err(fail(
@@ -1049,6 +1184,7 @@ fn build_chain_refs<'c, 'a>(
     embedded: &'c [CertificateHandle],
     anchors: &'a [CertificateHandle],
     at: SystemTime,
+    policy: &AlgorithmPolicy,
 ) -> Result<(Vec<&'c CertificateHandle>, &'a CertificateHandle)> {
     if anchors.is_empty() {
         return Err(fail(
@@ -1057,6 +1193,16 @@ fn build_chain_refs<'c, 'a>(
         ));
     }
     check_validity(signer, at)?;
+    // the signer's own key was already judged with the signature-value check
+    // by verify_signer_info; chain_certificates callers (PAdES /DSS) get it
+    // here, where no signature value exists to judge it against
+    check_key_strength(
+        CHECK_CERTIFICATE_CHAIN,
+        signer
+            .key_info()
+            .map_err(|e| fail(CHECK_CERTIFICATE_CHAIN, detail_of(&e)))?,
+        policy,
+    )?;
     check_certificate_rules(signer, CertRole::Signer)?;
     let mut chain: Vec<&'c CertificateHandle> = vec![signer];
     let mut visited: Vec<&[u8]> = vec![signer.der()];
@@ -1104,7 +1250,7 @@ fn build_chain_refs<'c, 'a>(
                 continue;
             }
             name_matches += 1;
-            match check_cert_signature(current, anchor) {
+            match check_cert_signature(current, anchor, policy) {
                 Ok(()) => {
                     check_validity(anchor, at)?;
                     check_certificate_rules(anchor, CertRole::Issuer { depth_below })?;
@@ -1119,7 +1265,7 @@ fn build_chain_refs<'c, 'a>(
                 continue;
             }
             name_matches += 1;
-            if check_cert_signature(current, candidate).is_err() {
+            if check_cert_signature(current, candidate, policy).is_err() {
                 signature_failures += 1;
                 continue;
             }
@@ -1181,8 +1327,9 @@ fn build_chain<'c>(
     embedded: &'c [CertificateHandle],
     anchors: &[CertificateHandle],
     at: SystemTime,
+    policy: &AlgorithmPolicy,
 ) -> Result<(Vec<String>, String)> {
-    let (chain, anchor) = build_chain_refs(signer, embedded, anchors, at)?;
+    let (chain, anchor) = build_chain_refs(signer, embedded, anchors, at, policy)?;
     // The report's chain_subjects excludes the anchor, except in the one
     // case where the chain already stands on the anchor itself (an embedded
     // root), and build_chain_refs returns exactly the elements for either
@@ -1205,7 +1352,16 @@ pub fn chain_certificates(
     anchors: &[CertificateHandle],
     at: SystemTime,
 ) -> Result<Vec<CertificateHandle>> {
-    let (chain, anchor) = build_chain_refs(signer, embedded, anchors, at)?;
+    // the archived-validation-data check rebuilds a chain for archival, not
+    // for a verdict, so it runs with the conservative policy — the strictest
+    // one available — and its caller decides what to do with a refusal
+    let (chain, anchor) = build_chain_refs(
+        signer,
+        embedded,
+        anchors,
+        at,
+        &AlgorithmPolicy::Conservative,
+    )?;
     let mut out: Vec<CertificateHandle> = chain.iter().map(|c| (*c).clone()).collect();
     if out.last().map(|c| c.der() != anchor.der()).unwrap_or(true) {
         out.push(anchor.clone());
@@ -1243,10 +1399,27 @@ fn check_validity(cert: &CertificateHandle, at: SystemTime) -> Result<()> {
 }
 
 /// Verifies the signature a certificate carries, under its issuer's key.
-fn check_cert_signature(cert: &CertificateHandle, issuer: &CertificateHandle) -> Result<()> {
+fn check_cert_signature(
+    cert: &CertificateHandle,
+    issuer: &CertificateHandle,
+    policy: &AlgorithmPolicy,
+) -> Result<()> {
     let sig_oid = &cert.parsed().signature_algorithm().oid;
     let digest =
         digest_from_signature_oid(sig_oid).map_err(|e| Error::Verification(detail_of(&e)))?;
+    // A CA that signs its issued certificates with SHA-1 is a weak link no
+    // matter how good the leaf's own signature is — and in the conservative
+    // policy an old root whose cross-signature is SHA-1 does not anchor
+    // anything, which is what VALIDe does with it too. The issuer's key is
+    // the one that signs, so it is the one whose strength gets judged.
+    check_algorithm_policy(CHECK_CERTIFICATE_CHAIN, digest, policy)?;
+    check_key_strength(
+        CHECK_CERTIFICATE_CHAIN,
+        issuer
+            .key_info()
+            .map_err(|e| Error::Verification(detail_of(&e)))?,
+        policy,
+    )?;
     let tbs = tbs_der(cert)?;
     let prehash = digest.digest(&tbs);
     let signature = cert.parsed().signature().as_bytes().ok_or_else(|| {
@@ -1331,6 +1504,61 @@ fn fmt_time(t: SystemTime) -> String {
 
 fn fail(check: &str, detail: impl std::fmt::Display) -> Error {
     Error::Verification(format!("{check} check failed: {detail}"))
+}
+
+/// The M5 refusal of a digest the caller's [`AlgorithmPolicy`] does not
+/// accept. The name of the check is the caller's because the same SHA-1 rule
+/// guards the signature value, a certificate's own signature and a CRL's —
+/// every one of them is "the thing that signs chose a broken algorithm".
+pub(crate) fn check_algorithm_policy(
+    check: &str,
+    digest: DigestAlg,
+    policy: &AlgorithmPolicy,
+) -> Result<()> {
+    if *policy == AlgorithmPolicy::Conservative && digest == DigestAlg::Sha1 {
+        return Err(fail(
+            check,
+            format!(
+                "SHA-1 is not accepted: the algorithm policy is the conservative one \
+                 (ETSI TS 119 312, {}), which SHA-1 signatures and pre-SHA-256 \
+                 certificate signatures cannot satisfy. A caller verifying an archive \
+                 of old signatures opts out with AlgorithmPolicy::All and takes \
+                 responsibility for what it shows as valid.",
+                openfirma_core::oid::ID_ETSIG_POLICY_CONSERVATIVE
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The M5 refusal of a key weaker than the caller's policy allows. Like the
+/// digest rule it runs before any crypto: checking first is also cheaper when
+/// refusing.
+pub(crate) fn check_key_strength(
+    check: &str,
+    info: KeyInfo,
+    policy: &AlgorithmPolicy,
+) -> Result<()> {
+    if *policy == AlgorithmPolicy::Conservative {
+        // An RSA key whose modulus is below the floor cannot be trusted to
+        // have signed anything at any date (factoring it, not forging a hash,
+        // is the realistic attack), so there is no "old but valid" exception
+        // for key size. EC curves this verifier accepts are all >= 256 bits.
+        if let Some(bits) = info.modulus_bits {
+            if bits < RSA_MINIMUM_BITS {
+                return Err(fail(
+                    check,
+                    format!(
+                        "an RSA key of {bits} bits is below the {} bits the conservative \
+                         algorithm policy requires; no signature it produced is safe to \
+                         believe at any signing time. AlgorithmPolicy::All opts out.",
+                        RSA_MINIMUM_BITS
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The message of a verification error without the shared prefix, for

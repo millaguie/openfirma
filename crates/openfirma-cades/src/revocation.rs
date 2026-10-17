@@ -26,7 +26,10 @@ use openfirma_core::cert::CertificateHandle;
 use openfirma_core::signer::verify_prehash;
 use openfirma_core::{Error, Result, oid, tlv};
 
-use crate::verify::{detail_of, digest_from_signature_oid, subject};
+use crate::verify::{
+    AlgorithmPolicy, CHECK_CERTIFICATE_CHAIN, check_algorithm_policy, check_key_strength,
+    detail_of, digest_from_signature_oid, subject,
+};
 
 /// The RFC 6960 `responseStatus` values, for errors that name the refusal.
 fn ocsp_status_name(code: u32) -> &'static str {
@@ -501,6 +504,67 @@ pub struct OcspCertId {
 ///
 /// `at` is the validation time: a CRL whose `nextUpdate` has passed says
 /// nothing about the present and is refused, with the way out named.
+/// The CRL entry-less extensions whose presence a reader understands enough
+/// to ignore safely when non-critical (RFC 5280 5.2): the issuing-distribution-
+/// point family and the delta indicator are NOT in this list, because they
+/// change what "this list covers" means, so critical ones are refused above.
+const CRL_EXTENSIONS_UNDERSTOOD: &[ObjectIdentifier] = &[
+    // authorityKeyIdentifier — names the issuer, which verify_crl matched by
+    // name and key already; it carries no scope claim.
+    ObjectIdentifier::new_unwrap("2.5.29.35"),
+    // authInfoAccess — pointers to fetch things; nothing about state.
+    ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.1.1"),
+    // cRLNumber — a sequence number for the list, no scope claim either.
+    ObjectIdentifier::new_unwrap("2.5.29.20"),
+];
+
+/// The `crlExtensions` of a parsed tbsCertList: every (OID, critical) pair in
+/// `[0] crlExtensions`. A malformed block yields no extensions rather than an
+/// error: its absence is not what this function's verdict rests on, and the
+/// DER cursor has already bounds-checked its way to here.
+fn crl_extensions(tbs_content: &[u8]) -> Vec<(ObjectIdentifier, bool)> {
+    let mut out = Vec::new();
+    let mut f = der_cursor(tbs_content);
+    if f.peek_tag() == Some(tlv::TAG_INTEGER) {
+        let _ = f.value(); // version
+    }
+    let _ = f.value(); // signature AlgorithmIdentifier
+    let _ = f.value(); // issuer Name
+    let _ = f.value(); // thisUpdate
+    if matches!(f.peek_tag(), Some(tlv::TAG_UTC_TIME) | Some(0x18)) {
+        let _ = f.value(); // nextUpdate
+    }
+    if f.peek_tag() == Some(tlv::TAG_SEQUENCE) {
+        let _ = f.value(); // revokedCertificates
+    }
+    let Ok(exts) = f.expect(0xA0, "crlExtensions") else {
+        return out;
+    };
+    let Ok(exts) = der_cursor(exts.content).expect(tlv::TAG_SEQUENCE, "the extensions SEQUENCE")
+    else {
+        return out;
+    };
+    let mut e = der_cursor(exts.content);
+    while !e.done() {
+        let Ok(one) = e.expect(tlv::TAG_SEQUENCE, "one CRL extension") else {
+            break;
+        };
+        let mut o = der_cursor(one.content);
+        let Ok(oid) = o.oid("the CRL extension OID") else {
+            break;
+        };
+        let critical = match o.peek_tag() {
+            Some(tlv::TAG_BOOLEAN) => match o.value() {
+                Ok(v) => v.content.first().copied().unwrap_or(0) != 0,
+                Err(_) => break,
+            },
+            _ => false, // absent means FALSE (RFC 5280 4.1.2.9)
+        };
+        out.push((oid, critical));
+    }
+    out
+}
+
 pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> Result<CrlReport> {
     let mut outer = der_cursor(der);
     let list = outer.expect(tlv::TAG_SEQUENCE, "the CertificateList")?;
@@ -544,7 +608,26 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
             // revocationDate and any entry extensions carry nothing we check
         }
     }
-    // crlExtensions [0] is not interpreted
+    // M8: crlExtensions is interpreted for the one thing that changes what
+    // the bytes mean when nothing is said about it — a CRITICAL extension.
+    // `deltaCRLIndicator` or `issuingDistributionPoint` marked critical make
+    // this list something other than "the complete revocation state", and
+    // reading it as complete turns an empty delta into "nothing revoked". A
+    // non-critical extension says, by RFC 5280's own rule, that a reader may
+    // ignore it, so only the critical ones are refused here. `authorityInfoAccess`
+    // (id-pkix-...) is common and understood to carry nothing about revocation
+    // state itself; `deltaCRLIndicator` and the DPD OIDs appear in errors by
+    // their dotted form because this reader does not decode their content.
+    for (oid, critical) in crl_extensions(tbs.content) {
+        if critical && !CRL_EXTENSIONS_UNDERSTOOD.contains(&oid) {
+            return Err(Error::Verification(format!(
+                "the CRL marks extension {oid} critical; it says the list must be read \
+                 with a meaning this reader does not implement (a delta or partitioned \
+                 CRL is not the complete revocation state), and RFC 5280 4.2 forbids \
+                 accepting one"
+            )));
+        }
+    }
 
     let mut sa = der_cursor(f.expect(tlv::TAG_SEQUENCE, "signatureAlgorithm")?.content);
     let sig_oid = sa.oid("signatureAlgorithm")?;
@@ -566,11 +649,17 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
 
     let digest =
         digest_from_signature_oid(&sig_oid).map_err(|e| Error::Verification(detail_of(&e)))?;
+    // M5 again: an archived CRL nobody can any longer trust cryptographically
+    // (SHA-1 signature, 1024-bit CA) is not long-term validation data, and a
+    // B-LT archive exists precisely to be trusted years later. The CRL signs
+    // with the issuer's key, so that certificate's strength is what counts.
+    check_algorithm_policy(CHECK_CERTIFICATE_CHAIN, digest, &AlgorithmPolicy::default())?;
     let prehash = digest.digest(tbs.whole);
 
     // The issuing CA is found by name and proved by key: a CRL that names a
     // CA but is signed by anyone else is exactly the attack this check stops.
     let mut candidates = 0usize;
+    let mut crl_sign_rejections = 0usize;
     for cert in issuers {
         if cert.subject_der().ok().as_deref() != Some(issuer.whole) {
             continue;
@@ -579,6 +668,24 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
         if verify_prehash(cert, digest, &prehash, sig_bytes).is_err() {
             continue;
         }
+        // M8: the certificate whose key verified the signature gets judged
+        // for the role a CRL demands of it — `cRLSign` in its keyUsage when
+        // keyUsage is present. A CA may delegate CRL signing to another
+        // certificate of the same name, so one candidate without cRLSign
+        // moves on instead of condemning the list; if none carries it, the
+        // refusal below names cRLSign as the reason. The strength policy
+        // applies to that key too: archived revocation data must outlive its
+        // own crypto, which is what B-LT archives are for.
+        if !cert.key_usage().is_none_or(|ku| ku.crl_sign()) {
+            crl_sign_rejections += 1;
+            continue;
+        }
+        check_key_strength(
+            CHECK_CERTIFICATE_CHAIN,
+            cert.key_info()
+                .map_err(|e| Error::Verification(detail_of(&e)))?,
+            &AlgorithmPolicy::default(),
+        )?;
         if this_update > at {
             return Err(Error::Verification(format!(
                 "the CRL was issued in the future (thisUpdate {}), which cannot be the \
@@ -595,6 +702,9 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
                 )));
             }
         }
+        // A CRL is only a revocation datum if its signer may sign CRLs: the
+        // candidate whose key verified the signature but whose keyUsage says
+        // it may not was rejected above without reaching this point.
         return Ok(CrlReport {
             issuer: subject(cert),
             issuer_der: issuer.whole.to_vec(),
@@ -605,6 +715,13 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
     }
 
     let issuer_name = name_string(issuer.whole);
+    if candidates > 0 && crl_sign_rejections == candidates {
+        return Err(Error::Verification(format!(
+            "the CRL's signature verifies under \"{issuer_name}\", but that certificate's \
+             keyUsage does not grant cRLSign (RFC 5280 4.2.1.3): something with that name \
+             signed this list without being allowed to, which is not a revocation datum"
+        )));
+    }
     if candidates == 0 {
         Err(Error::Verification(format!(
             "the CRL claims to be issued by \"{issuer_name}\" but none of the {} certificate(s) \
