@@ -290,9 +290,12 @@ pub fn linux_install_and_register() -> Result<(), crate::dispatch::BrowserError>
 /// Whether `xdg-mime` names a program on PATH (a bare existence check: the
 /// installer skips its association step when it does not and the caller has
 /// already promised to tolerate that — see OPENFIRMA_ASSUME_XDG_MIME below).
-#[expect(
-    dead_code,
-    reason = "the only caller is the linux install path (cfg'd); on macOS/Windows this helper compiles with no calls — H-9's per-platform clippy caught it"
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "the only caller is the cfg'd linux install path; H-9's per-platform clippy compiles this platform without it"
+    )
 )]
 fn which_on_path(program: &str) -> bool {
     std::env::var_os("PATH")
