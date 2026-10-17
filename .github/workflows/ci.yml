@@ -3,8 +3,6 @@ name: ci
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: ['w4-bisect-*']
   workflow_dispatch:
 
 env:
@@ -256,104 +254,9 @@ jobs:
           else
             echo "no openssl on this runner; fixture tests will skip"
           fi
-      # Diagnostic for the STATUS_ENTRYPOINT_NOT_FOUND this job's keystore lib
-      # test takes since CertDuplicateCertificateContext joined the crypt32
-      # import table, while x64/arm64 build clean. The binary itself is a dead
-      # end — raw-dylib writes the import directory with names rustc chose at
-      # link time, and no tool on this runner reads PE imports (no dumpbin or
-      # link.exe here), so scan it by hand: locate the import-directory RVA in
-      # the PE header, resolve it to a file offset through the section table,
-      # and print every DLL name and imported symbol the loader will look for.
-      # The same pass now runs over the runner's own System32 DLLs at runtime:
-      # whatever the binary asks for that no DLL exports appears as MISSING on
-      # this list, which names the entry point the loader could not find.
-      # Remove once diagnosed.
-      - name: build the test binaries to look at their imports
-        run: cargo test -p openfirma-keystore --target i686-pc-windows-msvc --no-run
-      - name: diagnose crypt32 imports of the keystore test binary
-        shell: pwsh
-        run: |
-          function Get-RvaOffset([byte[]]$b, [int64]$rva) {
-            $peOff = [BitConverter]::ToInt32($b, 0x3C)
-            $nSec = [BitConverter]::ToUInt16($b, $peOff + 6)
-            $sizeOpt = [BitConverter]::ToUInt16($b, $peOff + 20)
-            $sec = $peOff + 24 + $sizeOpt
-            for ($i = 0; $i -lt $nSec; $i++) {
-              $s = $sec + $i * 40
-              $va = [BitConverter]::ToUInt32($b, $s + 12)
-              $vsize = [BitConverter]::ToUInt32($b, $s + 8)
-              $raw = [BitConverter]::ToUInt32($b, $s + 20)
-              $rawSize = [BitConverter]::ToUInt32($b, $s + 16)
-              if ($rva -ge $va -and $rva -lt ($va + [Math]::Max($vsize, $rawSize))) {
-                return $raw + ($rva - $va)
-              }
-            }
-            throw "rva $rva maps to no section"
-          }
-          function Dump-Imports([string]$path) {
-            $b = [System.IO.File]::ReadAllBytes($path)
-            $peOff = [BitConverter]::ToInt32($b, 0x3C)
-            # Data directories start after the optional header; PE32 import
-            # dir is entry 1 at +104 from the optional-header start.
-            $importRva = [BitConverter]::ToUInt32($b, $peOff + 24 + 104)
-            if ($importRva -eq 0) { "  (no import directory)"; return }
-            $off = Get-RvaOffset $b $importRva
-            for (;;) {
-              $nameRva = [BitConverter]::ToUInt32($b, $off + 12)
-              $origRva = [BitConverter]::ToUInt32($b, $off)
-              if ($nameRva -eq 0 -and $origRva -eq 0) { break }
-              $nameOff = Get-RvaOffset $b $nameRva
-              $end = $nameOff; while ($b[$end] -ne 0) { $end++ }
-              $dll = [System.Text.Encoding]::ASCII.GetString($b, $nameOff, $end - $nameOff)
-              $thunkRva = if ($origRva -ne 0) { $origRva } else { [BitConverter]::ToUInt32($b, $off + 16) }
-              $tOff = Get-RvaOffset $b $thunkRva
-              $names = @()
-              for (;;) {
-                $e = [BitConverter]::ToUInt32($b, $tOff); $tOff += 4
-                if ($e -eq 0) { break }
-                if (($e -band 0x80000000) -ne 0) { $names += "#$($e -band 0xffff)"; continue }
-                $sOff = Get-RvaOffset $b $e; $end = $sOff + 2
-                while ($b[$end] -ne 0) { $end++ }
-                $names += [System.Text.Encoding]::ASCII.GetString($b, $sOff + 2, $end - $sOff - 2)
-              }
-              "$dll : $($names -join ', ')"
-              $off += 20
-            }
-          }
-          $exe = Get-ChildItem -Recurse target\i686-pc-windows-msvc\debug\deps -Filter openfirma_keystore-*.exe -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $exe) { "no keystore test binary found"; exit 0 }
-          "binary: $($exe.FullName)"
-          $imports = Dump-Imports $exe.FullName
-          # Cross the requested names against each imported DLL's own export
-          # table, exactly as the loader resolves them at load time.
-          foreach ($dllName in (@($imports | ForEach-Object { ($_ -split ' : ')[0] } | Sort-Object -Unique))) {
-            $path = if ($dllName -match '^api-ms') { $null } else { Join-Path "$env:SystemRoot\System32" $dllName }
-            if (-not $path -or -not (Test-Path $path)) { "resolve $dllName : not in System32 (api-set or missing)"; continue }
-            $bytes = [System.IO.File]::ReadAllBytes($path)
-            $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-            $line = $imports | Where-Object { $_ -like "$dllName : *" } | Select-Object -First 1
-            foreach ($sym in (($line -split ' : ',2)[1] -split ', ')) {
-              if (-not $sym) { continue }
-              # Names appear in the export table either bare or, for ordinals
-              # only, absent entirely; a plain ASCII scan catches every named
-              # export and flags what is truly not there.
-              if ($text.Contains($sym)) {
-                "exported: $dllName!$sym"
-              } else {
-                $bare = $sym.TrimStart('_') -replace '@\d+$', ''
-                if ($text.Contains($bare)) {
-                  "MISSING(exact): $dllName!$sym  (DLL exports '$bare' in some form)"
-                } else {
-                  "MISSING: $dllName!$sym"
-                }
-              }
-            }
-          }
-      # A serial run: the lib tests swap process-wide HOME, and one thread
-      # keeps them from stepping on each other's environment. The load failure
-      # this job is being diagnosed over reproduces with a single test running
-      # alone (see the scan below), so ordering cannot be its cause either way.
+      # Serial: the lib tests swap process-wide HOME inside one locked
+      # window, and one thread per binary keeps sibling binaries from
+      # stepping on each other's environment.
       - name: keystore tests on the 32-bit ABI (ABI asserts execute natively)
         run: cargo test -p openfirma-keystore --target i686-pc-windows-msvc --lib -- --test-threads=1
       - name: keystore integration tests and openfirma-core on the 32-bit ABI
