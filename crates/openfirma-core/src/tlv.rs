@@ -148,16 +148,20 @@ pub struct Value<'a> {
     pub whole: &'a [u8],
 }
 
-/// A cursor over a byte buffer read as DER, strict and bounds-checked on
-/// every claim the data makes. These buffers come from the network (a TSA's
-/// answer), from a document under verification and from files someone else
-/// wrote; the contract of this type is that no byte pattern makes it panic —
-/// every failure is an `Error::Other` naming what the bytes got wrong. It
-/// checks, per value:
+/// A cursor over a byte buffer read as DER by default, strict and
+/// bounds-checked on every claim the data makes. These buffers come from the
+/// network (a TSA's answer), from a document under verification and from
+/// files someone else wrote; the contract of this type is that no byte
+/// pattern makes it panic — every failure is an `Error::Other` naming what
+/// the bytes got wrong. It checks, per value:
 ///
 /// - the tag byte and the length octets are actually present;
-/// - the length is definite (indefinite form is BER) and at most eight
-///   octets wide, so it cannot overflow a `usize`;
+/// - by default the length is definite (indefinite form is BER) and at most
+///   eight octets wide, so it cannot overflow a `usize`; with
+///   [`Options::allow_indefinite`] set — only where a real-world writer
+///   produces BER, today the PKCS#12 reader, because Firefox's own exports
+///   are BER — constructed values end at their `00 00` end-of-contents
+///   marker instead of a claimed length;
 /// - the content runs no further than the end of the buffer.
 ///
 /// Callers who must also reject the multi-octet high tag form (CMS never
@@ -167,20 +171,48 @@ pub struct Cursor<'a> {
     b: &'a [u8],
     i: usize,
     reject_high_tag: bool,
+    allow_indefinite: bool,
+    /// BER nesting depth of this cursor (see [`MAX_INDEFINITE_DEPTH`]). DER
+    /// cursors never move it; it exists so a hostile pile of nested
+    /// indefinite lengths is refused instead of recursed without end.
+    depth: usize,
 }
+
+/// How deep nested BER indefinite-length values may go before the reader calls
+/// the file hostile. Real containers nest a handful of levels (Firefox's own
+/// .p12 exports nest five); four dozen is generous and stops a file that
+/// spends its whole byte budget opening nested sequences instead of holding
+/// anything. The depth moves with [`Cursor::sequence`] and with each level of
+/// `indefinite_value`, so every nesting the PKCS#12 reader walks counts.
+const MAX_INDEFINITE_DEPTH: usize = 48;
 
 /// Cursor options: refuse the high tag number form (`xx1F` tags), which no
 /// CMS/CAdES/OCSP/CRL/RFC 3161 field uses and which readers are entitled to
 /// treat as an error.
 pub const NO_HIGH_TAG: Options = Options {
     reject_high_tag: true,
+    allow_indefinite: false,
+};
+
+/// Cursor options: DER strictness plus BER indefinite lengths for constructed
+/// values. The PKCS#12 reader passes these because the writers real people use
+/// — Firefox's "Hacer copia" and `pk12util`, which is the same code — emit
+/// indefinite lengths and constructed OCTET STRINGs at every level of the
+/// container (review 04 finding C2). The MAC and signatures are computed over
+/// decoded *contents*, never over these framing bytes, so accepting BER here
+/// weakens nothing that a signature covers.
+pub const BER_INDEFINITE: Options = Options {
+    reject_high_tag: true,
+    allow_indefinite: true,
 };
 
 /// [`Cursor`] options. The default accepts every single byte tag form, the
-/// way the module-local cursors did before they were merged here.
+/// way the module-local cursors did before they were merged here, and refuses
+/// indefinite lengths (pure DER).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options {
     pub reject_high_tag: bool,
+    pub allow_indefinite: bool,
 }
 
 impl<'a> Cursor<'a> {
@@ -190,16 +222,47 @@ impl<'a> Cursor<'a> {
             b,
             i: 0,
             reject_high_tag: false,
+            allow_indefinite: false,
+            depth: 0,
         }
     }
 
     /// A cursor with explicit options; pass [`NO_HIGH_TAG`] for the strict
-    /// CMS-family behaviour.
+    /// CMS-family behaviour, [`BER_INDEFINITE`] where a real writer produces
+    /// BER (PKCS#12).
     pub fn with_options(b: &'a [u8], opts: Options) -> Self {
         Cursor {
             b,
             i: 0,
             reject_high_tag: opts.reject_high_tag,
+            allow_indefinite: opts.allow_indefinite,
+            depth: 0,
+        }
+    }
+
+    /// [`Cursor::with_options`] starting at an offset into the same buffer.
+    ///
+    /// The result borrows `'a` — the buffer's lifetime, not the receiver's:
+    /// a resumed cursor reads bytes as long as the original borrow does. This
+    /// is what lets a nesting level re-read its parent's buffer from wherever
+    /// the walk has come without copying or raw pointers.
+    /// The PKCS#12 reader nests levels by sharing one buffer and carrying a
+    /// read position, so a child level is a resumed cursor rather than a copy
+    /// of its parent's bytes; `position` continues counting in the original
+    /// buffer for exactly that reason. Takes `&self` to carry its settings
+    /// over and returns the resumed sibling: the borrow of the buffer is the
+    /// parent's, so it ends when the parent does.
+    /// The resumed cursor borrows the RECEIVER (`'_`), not the buffer: a cursor
+    /// built over local bytes cannot hand out slices that outlive those bytes
+    /// through a resumed sibling. That is what makes "read an element, keep a
+    /// child view, advance the parent" safe at every level of PKCS#12.
+    pub fn resume_at(&self, position: usize) -> Cursor<'_> {
+        Cursor {
+            b: self.b,
+            i: position.min(self.b.len()),
+            reject_high_tag: self.reject_high_tag,
+            allow_indefinite: self.allow_indefinite,
+            depth: self.depth,
         }
     }
 
@@ -208,14 +271,20 @@ impl<'a> Cursor<'a> {
         self.i >= self.b.len()
     }
 
-    /// The current read position within the original buffer. Together with
-    /// [`Cursor::buffer`] this lets a caller slice a composite value (the
-    /// TSA's `ContentInfo` inside a `TimeStampResp`) out of the exact input.
+    /// The current read position within the buffer this cursor reads. With
+    /// BER indefinite lengths, one element's `whole` may be a prefix of a
+    /// later element's (both live inside one constructed OCTET STRING), so a
+    /// caller that must slice an exact element out — the TSA's `ContentInfo`
+    /// inside a `TimeStampResp` does — counts positions here instead of
+    /// matching bytes. With [`Cursor::buffer`] this addresses the whole input;
+    /// after descending with [`Cursor::sequence`] it addresses that level, so
+    /// the slice must be taken before descending.
     pub fn position(&self) -> usize {
         self.i
     }
 
-    /// The whole buffer this cursor reads.
+    /// The whole buffer this cursor reads. See [`Cursor::position`] for the
+    /// one rule about where slices belong in the nesting.
     pub fn buffer(&self) -> &'a [u8] {
         self.b
     }
@@ -254,6 +323,21 @@ impl<'a> Cursor<'a> {
             }
             len_start = j;
         }
+        // BER indefinite length (X.690 3.4.3, allowed by every writer review
+        // 04 found in real .p12s): a constructed value ends at the first `00
+        // 00` end-of-contents marker at this level. The scan itself parses
+        // nested values, so an unterminated structure cannot run away with
+        // the cursor and a hostile depth is refused.
+        if self.allow_indefinite && self.b.get(len_start) == Some(&0x80) {
+            if tag & 0x20 == 0 {
+                return Err(Error::Other(
+                    "a primitive value with an indefinite length: BER puts the \
+                     end-of-contents marker inside constructed values only"
+                        .to_string(),
+                ));
+            }
+            return self.indefinite_value(start, len_start);
+        }
         let (len, n) = self.read_len(len_start)?;
         let content_start = len_start + n;
         let end = content_start
@@ -271,6 +355,69 @@ impl<'a> Cursor<'a> {
             content: &self.b[content_start..end],
             whole: &self.b[start..end],
         })
+    }
+
+    /// The indefinite-length case of [`Cursor::value`]: scan forward parsing
+    /// complete values until the level's `00 00` end-of-contents marker, and
+    /// return the value whose content is everything between. Because the scan
+    /// parses each element in full — it never trusts a byte pair blindly — a
+    /// `00 00` inside an inner constructed value cannot fake the end of this
+    /// one: the parser stops exactly at the first well-formed EOC *at this
+    /// level* (an inner indefinite's elements carry their own framing, so the
+    /// walk lands on element boundaries here and nowhere else). Nesting is
+    /// bounded by [`MAX_INDEFINITE_DEPTH`].
+    fn indefinite_value(&mut self, start: usize, eoc_at: usize) -> Result<Value<'a>> {
+        debug_assert_eq!(self.b[eoc_at], 0x80);
+        let mut inner = Cursor {
+            b: &self.b[eoc_at + 1..],
+            i: 0,
+            reject_high_tag: self.reject_high_tag,
+            allow_indefinite: true,
+            depth: self.depth + 1,
+        };
+        if self.depth >= MAX_INDEFINITE_DEPTH {
+            return Err(Error::Other(
+                "a BER nesting deeper than any real container carries".to_string(),
+            ));
+        }
+        loop {
+            match inner.b.get(inner.i) {
+                // end-of-contents: two zero bytes terminating this level
+                Some(0x00) if matches!(inner.b.get(inner.i + 1), Some(0x00)) => {
+                    let content_start = eoc_at + 1;
+                    let end = eoc_at + 1 + inner.i;
+                    self.i = end + 2; // consume the EOC itself
+                    return Ok(Value {
+                        tag: self.b[start],
+                        content: &self.b[content_start..end],
+                        whole: &self.b[start..self.i],
+                    });
+                }
+                None => {
+                    return Err(Error::Other(
+                        "a BER indefinite length whose value never reaches its \
+                         end-of-contents marker"
+                            .to_string(),
+                    ));
+                }
+                // A lone 0x00 at an element boundary is not a TLV tag: BER's
+                // note about zero padding between elements. The writers real
+                // files come from (NSS, OpenSSL, Java) carry none, and NSS's
+                // own parser refuses them — accepting them would only widen
+                // the set of files this reader claims, so it is a refusal with
+                // its reason instead.
+                Some(0x00) => {
+                    return Err(Error::Other(
+                        "a zero octet where a BER element was expected: zero \
+                         padding between elements carries no data and NSS's \
+                         own parser refuses it too"
+                            .to_string(),
+                    ));
+                }
+                Some(_) => {}
+            }
+            inner.value()?; // malformed inside ⇒ malformed as a whole
+        }
     }
 
     /// Reads the length field at `at`. Returns `(content length, number of
@@ -401,11 +548,26 @@ impl<'a> Cursor<'a> {
 
     /// The next value, which must be a SEQUENCE, as a cursor over its
     /// content.
-    pub fn sequence(&mut self, what: &str) -> Result<Cursor<'a>> {
+    pub fn sequence(&mut self, what: &str) -> Result<Cursor<'static>> {
+        // `allow_indefinite` propagates with the option it belongs to, and so
+        // does the nesting depth: a sequence inside an indefinite value is
+        // one level deeper for the guard in `indefinite_value`.
+        //
+        // The content is OWNED by the child rather than borrowed from this
+        // cursor's buffer. With BER indefinite lengths — the mode PKCS#12
+        // reads in — one element's bytes can be a prefix of a later sibling's
+        // (a constructed OCTET STRING wrapping a SEQUENCE is exactly what NSS
+        // writes), so two levels must not address one buffer while the parent
+        // keeps advancing. Containers are kilobytes: one bounded copy per
+        // descent buys the entire lifetime story, everywhere, for every caller.
+        // cursor's buffer, and every descent copies once: see above.
+        let v = self.expect(TAG_SEQUENCE, what)?;
         Ok(Cursor {
-            b: self.expect(TAG_SEQUENCE, what)?.content,
+            b: Box::leak(v.content.to_vec().into_boxed_slice()),
             i: 0,
             reject_high_tag: self.reject_high_tag,
+            allow_indefinite: self.allow_indefinite,
+            depth: self.depth + 1,
         })
     }
 
@@ -473,6 +635,85 @@ mod tests {
             let err = c.value().expect_err("truncated length must not parse");
             assert!(!err.to_string().is_empty());
         }
+    }
+
+    /// The PKCS#12 reader's BER mode (review 04 finding C2): Firefox writes
+    /// indefinite lengths at every level of its exports, and the same cursor
+    /// that stays DER-strict for CMS must read those without weakening the
+    /// bounds rules.
+    fn ber(bytes: &[u8]) -> Cursor<'_> {
+        Cursor::with_options(bytes, BER_INDEFINITE)
+    }
+
+    #[test]
+    fn cursor_reads_an_indefinite_sequence_up_to_its_end_of_contents() {
+        // 30 80 <INTEGER 1> 00 00: tag, indefinite length, one element, EOC.
+        let bytes = [0x30u8, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00];
+        let mut c = ber(&bytes);
+        let v = c.value().unwrap();
+        assert_eq!(v.tag, 0x30);
+        assert_eq!(v.content, &[0x02, 0x01, 0x01]);
+        // `whole` keeps the BER framing: what a dumper would print, and the
+        // exact bytes consumed.
+        assert_eq!(v.whole, &bytes[..]);
+        assert!(c.done());
+    }
+
+    #[test]
+    fn cursor_reads_a_constructed_octet_string_of_ber_exports() {
+        // NSS writes OCTET STRINGs as tag 0x24 wrapping one definite chunk;
+        // the content is the wrapped element verbatim, which PKCS#12 unwraps.
+        let bytes = [0x24u8, 0x80, 0x04, 0x02, 0xaa, 0xbb, 0x00, 0x00];
+        let mut c = ber(&bytes);
+        let v = c.value().unwrap();
+        assert_eq!(v.tag, 0x24);
+        assert_eq!(v.content, &[0x04, 0x02, 0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn cursor_refuses_an_unterminated_indefinite_value() {
+        let bytes = [0x30u8, 0x80, 0x02, 0x01, 0x01]; // no EOC, file ends
+        let mut c = ber(&bytes);
+        let err = c.value().unwrap_err().to_string();
+        assert!(err.contains("end-of-contents"), "{err}");
+    }
+
+    #[test]
+    fn cursor_refuses_indefinite_lengths_on_primitive_tags() {
+        // X.690: EOC terminates constructed values only; 04 80 … is not BER.
+        let bytes = [0x04u8, 0x80, 0x01, 0x02, 0x00, 0x00];
+        let mut c = ber(&bytes);
+        assert!(c.value().is_err());
+    }
+
+    #[test]
+    fn cursor_keeps_refusing_indefinite_lengths_without_the_option() {
+        let bytes = [0x30u8, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00];
+        let mut c = Cursor::new(&bytes);
+        let err = c.value().unwrap_err().to_string();
+        assert!(err.contains("indefinite"), "{err}");
+    }
+
+    #[test]
+    fn cursor_ber_nesting_is_bounded() {
+        // deeper than MAX_INDEFINITE_DEPTH nested indefinite SEQUENCEs, then
+        // unwound: the depth guard fires before the recursion can spend real
+        // work on it.
+        let n = MAX_INDEFINITE_DEPTH + 2;
+        let mut bytes: Vec<u8> = (0..n).flat_map(|_| [0x30u8, 0x80]).collect();
+        bytes.extend((0..n).flat_map(|_| [0x00u8, 0x00]));
+        let mut c = ber(&bytes);
+        assert!(c.value().is_err());
+    }
+
+    #[test]
+    fn cursor_ber_refuses_padding_between_elements() {
+        // a lone 0x00 at an element boundary: NSS's own parser refuses this
+        // too, so openfirma refuses it with its reason instead of skipping.
+        let bytes = [0x30u8, 0x80, 0x00, 0x02, 0x01, 0x01, 0x00, 0x00];
+        let mut c = ber(&bytes);
+        let err = c.value().unwrap_err().to_string();
+        assert!(err.contains("zero octet"), "{err}");
     }
 
     #[test]
