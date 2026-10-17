@@ -15,12 +15,12 @@ in format code, ever.
 
 | Capability | Windows | macOS | Linux | Rust approach |
 |---|---|---|---|---|
-| System certificate store | CAPI/CNG `CertOpenSystemStoreW` | `SecItemCopyMatching`, keychain | none canonical, use PKCS#11 + NSS | `windows` crate, `security-framework` crate, `cryptoki` |
+| System certificate store | CAPI/CNG via hand-written FFI (`windows.rs`) | refused until testable (`macos.rs`, see ADR-0004) | none canonical, use PKCS#11 + NSS | one `SystemStore` trait per `cfg(target_os)` backend |
 | Non exportable keys, sign with OS key | NCrypt / CAPI CSP | `SecKeyCreateSignature` | PKCS#11 | platform bindings |
-| PKCS#11 tokens | vendor DLL | vendor dylib | `pkcs11-module` via p11-kit | `cryptoki` (dlopen at runtime) |
+| PKCS#11 tokens | vendor DLL | vendor dylib | `pkcs11-module` via p11-kit | openfirma-keystore loads the module at runtime with `libloading` (hand-written Cryptoki types, no bindings crate) |
 | Smartcards, DNIe | WinSCard | WinSCard equivalent (PCSC.framework) | pcsclite | `pcsc` crate, one API on all three |
-| Firefox / NSS store | cert9.db | cert9.db | cert9.db | open softokn3 through PKCS#11, no sqlite needed |
-| Local wss service | tokio + rustls | same | same | identical code |
+| Firefox / NSS store | cert9.db | cert9.db | cert9.db | open softokn3 through PKCS#11 (loaded with `libloading`), no sqlite needed |
+| Local endpoint for the browser protocol | plain HTTP on loopback (docs/adr/0005) + an `afirma://` launcher that dials it | same | same | identical code; a wss service would need a TLS client, and the pure-Rust rule keeps rustls/openssl out until that decision is made |
 | `afirma://` URL scheme | registry `HKCU\Software\Classes` | Info.plist `CFBundleURLTypes` | `.desktop` + `gio`/`xdg-mime`, D-Bus on KDE | per OS installer step |
 | Trust store install of local CA | `certutil` / `CertAddCertificateContextToStore` | `SecTrustSettingsSetTrustSettings` + admin auth | `update-ca-trust`, `update-ca-certificates`, NSS `certutil` | per OS, needs elevation |
 | Elevation | UAC manifest / runas | `AuthorizationExecuteWithPrivileges` replaced by SMAppService or `security` with prompt | pkexec / sudo | installer only |
@@ -42,7 +42,7 @@ in format code, ever.
   keeps the Linux path free of a C database dependency.
 - **DNIe**: the official route is the vendor PKCS#11 module
   (`libDNIe_Pkcs11.so`, `DNIe_Pkcs11.dll`, `.dylib`), which we reach through
-  `cryptoki` with zero new code. Talking raw APDUs over `pcsc` is the fallback
+  the same runtime-loaded PKCS#11 path with zero new code. Talking raw APDUs over `pcsc` is the fallback
   for when the module is not installed, and it is a port of the jmulticard
   logic. Phase 3 decision.
 - **Mobile**: the core crate must stay `no_std` friendly at the edges (no
@@ -52,7 +52,15 @@ in format code, ever.
 
 ## CI
 
-`.github/workflows/ci.yml` runs build, test and the golden diff on
-`ubuntu-latest`, `windows-latest` and `macos-latest` for every push. Keystore
-backends are tested behind feature flags so the matrix can exercise each one
-where it exists.
+`.github/workflows/ci.yml` runs build, test and clippy on `ubuntu-latest`,
+`ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm` and `macos-latest`
+(both Apple and Intel targets) for every push, plus the Linux-only jobs:
+lint (fmt+clippy), RustSec audit, MSRV floors (1.85 / 1.95 for the GUI), the
+i686-Windows ABI tests, and the certificate-material guard over the tree and
+the whole history. Keystore integration tests need real modules behind them:
+they run on Linux, where SoftHSM and libsoftokn3 are installed, and declare
+their skip on macOS/Windows runners through a keystore-scoped environment
+opt-in — every other test keeps the panic-on-skip guarantee everywhere. The
+golden diff is NOT in CI (the AutoFirma jar's download answers 403 to headless
+clients); it is the pre-release local gate `docs/validation-log.md` records,
+and nothing else claims otherwise.

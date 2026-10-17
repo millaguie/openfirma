@@ -5,6 +5,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The pipeline only reads the repository; nothing here writes to it. (The
+# release workflow is where content: write lives, and only its publish job.)
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -18,30 +23,82 @@ env:
   # The crosscheck tests skip themselves when the test PKI is missing. In CI
   # the material is generated on purpose, so a skip there means the generation
   # step silently broke and the suite would go green without verifying
-  # anything. This turns a skip into a failure — EXCEPT for OPENFIRMA_ALLOW_SKIP
-  # below: keystores cannot be provisioned everywhere. Windows runners have no
-  # packaged SoftHSM and their cert store holds no enrolled user certificate;
-  # macOS runners likewise have no softhsm and an empty keychain. On those, a
-  # keystore skip is the honest outcome, not a broken step, so they say so
-  # while every other test keeps the panic-on-skip guarantee. (The Linux jobs
-  # install and build the real modules, so REQUIRE_TESTS bites there fully.)
+  # anything. This turns a skip into a failure.
+  #
+  # Two opt-outs exist, and neither one is this variable (review 07, H-2):
+  #   OPENFIRMA_ALLOW_SKIP            — read ONLY by openfirma-keystore's
+  #       tests: keystore material that cannot exist on a runner (no packaged
+  #       SoftHSM on macOS/Windows, an empty system store) may skip there.
+  #   OPENFIRMA_ALLOW_NONKEYSTORE_SKIP — set by a job whose PKI step could
+  #       not run because the runner has no openssl at all; nothing sets it
+  #       today (every runner ships an openssl), and it is spelled out here
+  #       so an accidental export in a future job is auditable.
+  # A job may never blanket-disable REQUIRE_TESTS: if the PKI step fails for
+  # any other reason, the job must go red, loudly.
   OPENFIRMA_REQUIRE_TESTS: "1"
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # actions/checkout@v4.2.2, pinned to the tag's commit (review 07, H-13:
+      # tags are mutable references; a workflow that trusts a tag trusts
+      # whatever it happened to point at on the day someone bumped it).
+      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
+      # dtolnay/rust-toolchain pinned by commit; the `stable` *channel* stays
+      # fresh on purpose (the MSRV floor is what msrv pins, not this).
+      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
         with:
+          channel: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
       # eframe (the GUI workspace member, feature `gui` is on by default)
       # links the X11/xkb client libraries at check time on Linux; without
       # them `cargo clippy --all-targets` cannot resolve the sys crates.
-      - run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev
+      # qpdf/poppler/xmlsec ride along: the require_or_skip helpers now treat
+      # a missing crosscheck tool as a CI failure, so the runners that must
+      # prove those checks have to install them (review 07, H-1).
+      - run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev qpdf poppler-utils xmlsec1
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
+
+  # RustSec advisory gate (review 07, H-5/H-14). The audit reads the lockfile
+  # and fails on any vulnerability that is not explicitly ignored in
+  # .cargo/audit.toml, where every exception carries its reason. This is what
+  # keeps "the pin does not fix Marvin" from ever becoming a secret again: the
+  # ignore list IS the documented risk register.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
+      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
+        with:
+          channel: stable
+      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  # MSRV gate (review 07, H-8). The workspace declares two floors: everything
+  # but the GUI builds on 1.85; eframe/egui 0.37 demand 1.95, so openfirma-gui
+  # carries that rust-version itself. Each floor is checked at its own
+  # toolchain, which is what makes the declarations tested rather than wished.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
+      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
+        with:
+          channel: "1.85"
+      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev
+      # --ignore-rust-version is NOT used anywhere on this job's CLI path: the
+      # dependency graph of every member below must genuinely build on 1.85.
+      - name: check everything but the GUI at 1.85
+        run: cargo +1.85 check --workspace --exclude openfirma-gui --all-targets --locked
+      - name: check the GUI at its own floor, 1.95
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          cargo +1.95 check -p openfirma-gui --all-targets --locked
 
   test:
     name: test ${{ matrix.target }}
@@ -72,11 +129,12 @@ jobs:
             openssl: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
+      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
         with:
+          channel: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
 
       # The crosscheck tests are the ones that prove our CMS output is
       # accepted by an independent implementation, so openssl has to be on
@@ -103,8 +161,16 @@ jobs:
             done
           fi
           if [ -z "$openssl_bin" ]; then
+            # Honest label: this runner has no openssl, so PKI-gated tests
+            # skip. H-2: the opt-out is now NONKEYSTORE-scoped — it relaxes
+            # nothing a keystore test reads, and it is exported only after
+            # proving the absence below (the old blanket ALLOW_SKIP let this
+            # step's failure mode green-light every other test too). The
+            # gen-testcert/gen-p12-fixtures calls below do NOT carry `|| true`
+            # on purpose: with REQUIRE_TESTS still in force, a generation
+            # failure must fail the job loudly, never masquerade as skips.
             echo "no openssl on this runner, crosscheck tests will skip"
-            echo "OPENFIRMA_ALLOW_SKIP=1" >> "$GITHUB_ENV"
+            echo "OPENFIRMA_ALLOW_NONKEYSTORE_SKIP=1" >> "$GITHUB_ENV"
             exit 0
           fi
           dir="$(dirname "$openssl_bin")"
@@ -116,13 +182,22 @@ jobs:
           ./tools/gen-p12-fixtures.sh
 
       # Where no keystore can be built (see the two linux-only steps above),
-      # the keystore tests must skip instead of panicking under
+      # the KEYSTORE tests must skip instead of panicking under
       # OPENFIRMA_REQUIRE_TESTS: the platform stores on macOS and Windows are
-      # empty on a CI runner, which is an environment fact, not a bug.
+      # empty on a CI runner, which is an environment fact, not a bug. This
+      # variable reaches openfirma-keystore's tests ONLY — every other test
+      # keeps the panic-on-skip guarantee on these platforms (review 07, H-2).
       - name: allow keystore skips where no store exists (macos, windows)
         if: runner.os != 'Linux'
         run: echo "OPENFIRMA_ALLOW_SKIP=1" >> "$GITHUB_ENV"
         shell: bash
+
+      # clippy on every OS in the matrix (review 07, H-9): windows.rs and
+      # macos.rs sit behind cfg(target_os) gates and Linux's lint job never
+      # compiles them, so their unsafe FFI blocks were unlinted code. This
+      # runs AFTER the test step; a lint failure fails the job like any other.
+      - name: clippy for this platform's own code
+        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
 
       # The PKCS#11 integration tests need real modules to load: SoftHSM as a
       # generic token and NSS's libsoftokn3 for the shared-DB path. Linux only
@@ -134,10 +209,13 @@ jobs:
       # needs the real modules: SoftHSM as a generic token and NSS's
       # libsoftokn3 for the shared-DB path. macOS and Windows have no packaged
       # softhsm and their stores cannot be provisioned, so there those tests
-      # skip by design.
-      - name: install PKCS#11 test modules (linux)
+      # skip by design. qpdf/poppler/xmlsec join the install: the crosscheck
+      # tools are CI dependencies now (their absence fails the suite through
+      # require_or_skip instead of silently skipping it — review 07, H-1).
+      # Installed before the PKI step so its failure is visible on its own.
+      - name: install PKCS#11 test modules and crosscheck tools (linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc libnss3
+        run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc libnss3 qpdf poppler-utils xmlsec1
 
       # eframe's sys crates need the windowing client libraries to LINK on
       # Linux even for a headless build (the kittest tests never open a
@@ -175,6 +253,15 @@ jobs:
           SOFTHSM2_CONF: /tmp/opencode/keystores/softhsm/softhsm2.conf
         run: cargo test --target ${{ matrix.target }}
 
+      # H-22: the version-guard test is `#[ignore]`d because it sets a
+      # process-global variable, and its production hook exists ONLY so this
+      # branch can be exercised on CI against a real module. Running it here
+      # (own invocation, serial threads) closes "the test never runs" for
+      # good; Linux-only because it needs SoftHSM itself.
+      - name: version guard refusal (ignored test, run alone)
+        if: runner.os == 'Linux'
+        run: cargo test -p openfirma-keystore --test pkcs11 -- --ignored --test-threads=1
+
   # i686-pc-windows-msvc is where the PKCS#11 ABI cfgs differ most (packed
   # cryptoki headers, 4-byte pointers) and where a natural-alignment or
   # usize-equals-unsigned-long assumption breaks first. It ships in the
@@ -187,11 +274,12 @@ jobs:
   test-i686-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
+      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
         with:
+          channel: stable
           targets: i686-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
       # Same PKI recipe as the matrix's windows jobs (Git Bash can see the
       # openssl Git for Windows bundles), because openfirma-core's lib tests
       # exercise 32-bit integer/pointer behaviour and belong in this job.
@@ -206,7 +294,7 @@ jobs:
           fi
           if [ -z "$openssl_bin" ]; then
             echo "no openssl on this runner, tests needing the PKI will skip"
-            echo "OPENFIRMA_ALLOW_SKIP=1" >> "$GITHUB_ENV"
+            echo "OPENFIRMA_ALLOW_NONKEYSTORE_SKIP=1" >> "$GITHUB_ENV"
             exit 0
           fi
           dir="$(dirname "$openssl_bin")"
@@ -223,10 +311,14 @@ jobs:
         shell: bash
       - name: build every member without the GUI (no 32-bit windowing stack here)
         run: cargo build --workspace --exclude openfirma-gui --target i686-pc-windows-msvc
-      # The PKI this step's Git Bash can generate is cheap and lets the pure
-      # parsing tests (PKCS#12 fixtures, CMS crosschecks that don't shell out)
-      # run for real on the 32-bit ABI instead of skipping.
-      - name: generate test PKI
+      # A PKI means this runner is complete: REQUIRE_TESTS stays in force for
+      # the tests below, and an openssl that was not found keeps only the
+      # NONKEYSTORE opt-out (set above). The old dance of flipping
+      # OPENFIRMA_REQUIRE_TESTS back on here existed because one blanket
+      # ALLOW_SKIP covered everything; with H-2's scoping the keystore skips
+      # and the PKI-dependent tests no longer share an opt-out, so nothing
+      # needs un-setting.
+      - name: fixtures for the 32-bit ABI tests
         shell: bash
         run: |
           openssl_bin="$(command -v openssl || true)"
@@ -235,21 +327,8 @@ jobs:
               if [ -x "$candidate/openssl.exe" ]; then openssl_bin="$candidate/openssl.exe"; break; fi
             done
           fi
-          # The PKI this step's Git Bash can generate is cheap and lets the pure
-          # parsing tests (PKCS#12 fixtures, CMS crosschecks that don't shell out)
-          # run for real on the 32-bit ABI instead of skipping.
-          #
-          # One more thing rides on this step: if no openssl was found, the job
-          # would have set OPENFIRMA_ALLOW_SKIP and exited above; a PKI means the
-          # runner is complete, so REQUIRE_TESTS must stay in force for the core
-          # tests below — the earlier of these two steps switched it off on the
-          # way past, and openfirma-core's keystore tests honour whichever flag
-          # is set last (2ba4b3f's i686 failures were that flip: every PKI test
-          # skipped when REQUIRE_TESTS was supposed to gate this job).
           if [ -n "$openssl_bin" ]; then
-            echo "OPENFIRMA_REQUIRE_TESTS=1" >> "$GITHUB_ENV"
             export PATH="$(dirname "$openssl_bin"):$PATH"
-            ./tools/gen-testcert.sh
             ./tools/gen-p12-fixtures.sh
           else
             echo "no openssl on this runner; fixture tests will skip"
@@ -265,7 +344,7 @@ jobs:
   no-real-certs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
         with:
           fetch-depth: 0
       - name: tracked files

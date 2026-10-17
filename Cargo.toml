@@ -43,9 +43,17 @@ sha1 = "0.11"
 sha2 = { version = "0.11", features = ["oid"] }
 
 # --- asymmetric ---
-# pinned: rsa 0.9 stable sits on digest 0.10 / signature 2 and carries
-# RUSTSEC-2023-0071 (Marvin). 0.10 rc is the only pure Rust RSA that joins
-# the current generation and fixes it. Re-evaluate on 0.10 stable.
+# rsa pinned to 0.10.0-rc.19 for generation coherence (digest 0.11 /
+# signature 3, the stack everything else here sits on). It does NOT fix
+# RUSTSEC-2023-0071 (Marvin): RustSec lists no patched version, and rc.19 is
+# still affected — the earlier comment on this line claimed the opposite and
+# was wrong (review 07, H-5). The accepted-risk statement lives in
+# .cargo/audit.toml: openfirma has no RSA decryption path at all (no call to
+# decrypt/Oaep/Pkcs1v15Encrypt anywhere — check before re-trusting this), and
+# Marvin is a decryption-timing attack, so the practical exposure of
+# sign/verify-only use is nil; `afirma-serve`'s sign-on-demand endpoint is
+# named in the register because it is the one place timing could matter.
+# Re-evaluate on rsa 0.10 stable.
 rsa = { version = "=0.10.0-rc.19", features = ["std", "sha2"] }
 p256 = { version = "0.14", default-features = false, features = ["std", "pem", "pkcs8", "ecdsa", "arithmetic"] }
 p384 = { version = "0.14", default-features = false, features = ["std", "pem", "pkcs8", "ecdsa", "arithmetic"] }

@@ -362,6 +362,33 @@ fn test_certs() -> Option<std::path::PathBuf> {
     dir.join("signer-rsa.crt").is_file().then_some(dir)
 }
 
+/// The certificate guard proves itself (review 07, H-3): the script signs
+/// throwaway rogue certificates into PAdES/XAdES/CMS shapes and must block
+/// every one of them. Needs bash + openssl + the debug binary; where any is
+/// absent it skips like the other external-tool tests do, which CI's
+/// REQUIRE_TESTS then forbids on the runners that install all three.
+#[test]
+fn cert_guard_blocks_every_nested_signature_shape() {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/test-check-no-real-certs.sh");
+    let require = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
+    let allowed = std::env::var("OPENFIRMA_ALLOW_NONKEYSTORE_SKIP").is_ok();
+    let out = match Command::new("bash").arg(&script).output() {
+        Ok(out) => out,
+        Err(_) if !require || allowed => {
+            eprintln!("skipped, no bash to run the guard self-test");
+            return;
+        }
+        Err(e) => panic!("cannot run the guard self-test: {e}"),
+    };
+    if !out.status.success() {
+        panic!(
+            "the cert guard failed its own probes:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// A signer that can only fail loudly: anything but the dispatcher's own
 /// refusal must not silently succeed past it.
 fn fail_signer() -> NoSigner {

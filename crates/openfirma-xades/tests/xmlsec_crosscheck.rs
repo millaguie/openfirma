@@ -22,9 +22,15 @@ fn certs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
 }
 
+/// CI sets OPENFIRMA_REQUIRE_TESTS so a missing tool or a missing test PKI
+/// fails the build instead of quietly skipping. Only the keystore-scoped
+/// opt-out (OPENFIRMA_ALLOW_SKIP, read exclusively by openfirma-keystore's
+/// tests) may relax this; every other skip stays mandatory — review 07, H-2:
+/// one flag for everything let a broken PKI step go green with nothing
+/// verified on macOS and Windows.
 fn require_or_skip(reason: &str) {
     let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
-    let allowed = std::env::var("OPENFIRMA_ALLOW_SKIP").is_ok();
+    let allowed = std::env::var("OPENFIRMA_ALLOW_NONKEYSTORE_SKIP").is_ok();
     if required && !allowed {
         panic!("cannot run the crosscheck: {reason}");
     }
@@ -93,8 +99,7 @@ fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
 #[test]
 fn xmlsec_verifies_the_rsa_signature() {
     if !xmlsec_available() {
-        // not a CI dependency, the golden diff needs it and that runs locally
-        eprintln!("skipped, xmlsec1 not found");
+        require_or_skip("xmlsec1 not found, install xmlsec1");
         return;
     }
     let Some(signer) = load_signer(
@@ -128,7 +133,7 @@ fn xmlsec_verifies_the_rsa_signature() {
 #[test]
 fn xmlsec_verifies_signatures_over_documents_with_namespaced_roots() {
     if !xmlsec_available() {
-        eprintln!("skipped, xmlsec1 not found");
+        require_or_skip("xmlsec1 not found, install xmlsec1");
         return;
     }
     let Some(signer) = load_signer(
@@ -167,7 +172,7 @@ fn xmlsec_verifies_signatures_over_documents_with_namespaced_roots() {
 #[test]
 fn xmlsec_verifies_the_ecdsa_signature() {
     if !xmlsec_available() {
-        eprintln!("skipped, xmlsec1 not found");
+        require_or_skip("xmlsec1 not found, install xmlsec1");
         return;
     }
     let Some(signer) = load_signer(
@@ -194,7 +199,7 @@ fn xmlsec_verifies_the_ecdsa_signature() {
 #[test]
 fn xmlsec_notices_a_tampered_document() {
     if !xmlsec_available() {
-        eprintln!("skipped, xmlsec1 not found");
+        require_or_skip("xmlsec1 not found, install xmlsec1");
         return;
     }
     let Some(signer) = load_signer(

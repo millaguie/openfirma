@@ -248,11 +248,18 @@ Everything is generated locally and stays out of git:
 git config core.hooksPath tools/hooks # install the pre-commit guard
 ```
 
-`tools/check-no-real-certs.sh` enforces it. It rejects banned extensions and
-keystore filenames, any PEM private key block, and any file that parses as an
-X.509 certificate not issued by the synthetic `openfirma Test` PKI. It runs on
-pre-commit, over every tracked file with `--tracked`, and over every blob in
-history with `--history`. CI runs the last two on each push.
+`tools/check-no-real-certs.sh` enforces it, by content first and extension
+second. It rejects banned extensions and keystore filenames; any PEM private
+key block in ANY file, markdown included; any file that parses as an X.509
+certificate not issued by the synthetic `openfirma Test` PKI; and every way a
+signature hides one inside an innocent-looking name — a `%PDF-` file whose
+`/Contents` CMS carries foreign certificates, XML carrying
+`ds:SignatureValue`/`X509Certificate`, and raw CMS `SignedData` under any
+extension. Allowlisted paths (`docs/`, generated fixtures) skip the extension
+rule only, never the content rules. The guard tests itself against all of
+these shapes (`tools/test-check-no-real-certs.sh`, run as a cargo test). It
+runs on pre-commit, over every tracked file with `--tracked`, and over every
+blob in history with `--history`. CI runs the last two on each push.
 
 Acceptance runs against VALIDe that need a trusted certificate are done by hand
 by whoever holds one, outside the repository, and only the verdict is written

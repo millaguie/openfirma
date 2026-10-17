@@ -1,0 +1,38 @@
+# cargo-audit configuration — this file is the project's risk register.
+#
+# An entry here does not make an advisory harmless; it records, in public,
+# why the maintainers accept it and what would reopen the question. The CI
+# `audit` job runs `cargo audit` with this file, so an advisory can never go
+# back to being invisible, and removing an ignore without fixing the crate
+# turns CI red. Review 07, H-5/H-14 is the measurement this register came from.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 (Marvin): a timing side channel in RSA *decryption*
+  # (and in PKCS#1 v1.5 signature forgery checks). openfirma holds no RSA
+  # decryption path: there is not one call to `RsaPrivateKey::decrypt`,
+  # `decrypt_blinded`, `Oaep` or `Pkcs1v15Encrypt` anywhere in the tree — a
+  # signing client signs and verifies; RSA private-key work goes through
+  # pkcs1v15::SigningKey (sign_prehash) and verification is public-key. The
+  # pin to `rsa = "=0.10.0-rc.19"` buys current-generation RustCrypto, NOT a
+  # Marvin fix: RustSec lists patched = [] ("No fixed upgrade is available",
+  # still affected as of rc.18/rc.19; upstream tracking issues #711/#702 are
+  # open). Re-evaluate the moment rsa 0.10 stable ships a constant-time/CRT
+  # hardening release: remove this entry and bump, or accept it again with a
+  # new reason here. The residual exposure worth stating out loud is
+  # `afirma-serve`: a localhost endpoint that signs on a web page's demand;
+  # it attacks signing timing, not the decryption oracle Marvin describes.
+  "RUSTSEC-2023-0071",
+  # RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml 0.38.4): a quadratic
+  # attribute-name scan and an unbounded namespace-declaration allocation —
+  # both denial of service over hostile XML, fixed in quick-xml >= 0.41.
+  # The crate reaches us through exactly one path: eframe -> egui-winit ->
+  # accesskit_unix -> atspi -> zbus_xml, parsing the local accessibility
+  # D-Bus bus's own introspection documents. It never sees a document from
+  # the user or the network — openfirma's XAdES parser is our own code in
+  # openfirma-xades (xml.rs), not quick-xml. Re-evaluate when eframe moves
+  # to a zbus stack built against quick-xml >= 0.41; until then this is the
+  # honest reason, and the local-only attack surface is the mitigation.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]

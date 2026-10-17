@@ -36,13 +36,25 @@ fn openssl_available() -> bool {
 }
 
 fn pdfsig_available() -> bool {
+    // `pdfsig --version` is not a thing: pdfsig takes files, and an argument
+    // that is not one fails as "I/O Error: Couldn't open file '--version'"
+    // with exit 1 (measured on poppler 26.x). That probe made this function
+    // answer false on every machine that had pdfsig installed, so the two
+    // pdfsig crosschecks skipped silently since the day they were written —
+    // while docs/validation-log.md claimed them as passing. `-v` is the real
+    // invocation: "show signature details" with no file; poppler prints its
+    // usage and exits 0. macOS' podofo-based `pdfsig` (if any) exits nonzero,
+    // so it keeps skipping there, honestly labelled.
     Command::new("pdfsig")
-        .arg("--version")
+        .arg("-v")
         .output()
         .is_ok_and(|o| o.status.success())
 }
 
 fn qpdf_available() -> bool {
+    // `qpdf --version` is a real invocation (it prints the version and exits
+    // 0); unlike pdfsig, this probe was honest. It stays because it also
+    // rejects a half-installed qpdf that cannot print its version.
     Command::new("qpdf")
         .arg("--version")
         .output()
@@ -81,10 +93,14 @@ fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> 
 }
 
 /// CI sets OPENFIRMA_REQUIRE_TESTS so a missing tool or a missing test PKI
-/// fails the build instead of quietly skipping.
+/// fails the build instead of quietly skipping. Only the keystore-scoped
+/// opt-out (OPENFIRMA_ALLOW_SKIP, read exclusively by openfirma-keystore's
+/// tests) may relax this; every other skip stays mandatory — review 07, H-2:
+/// one flag for everything let a broken PKI step go green with nothing
+/// verified on macOS and Windows.
 fn require_or_skip(reason: &str) {
     let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
-    let allowed = std::env::var("OPENFIRMA_ALLOW_SKIP").is_ok();
+    let allowed = std::env::var("OPENFIRMA_ALLOW_NONKEYSTORE_SKIP").is_ok();
     if required && !allowed {
         panic!("cannot run the crosscheck: {reason}");
     }
@@ -318,8 +334,7 @@ fn openssl_verifies_the_signature() {
 #[test]
 fn qpdf_reads_the_signed_document() {
     if !qpdf_available() {
-        // not a CI dependency, the golden diff needs it and that runs locally
-        eprintln!("skipped, qpdf not found");
+        require_or_skip("qpdf not found, install qpdf");
         return;
     }
     let Some(signer) = load_signer(
@@ -350,7 +365,7 @@ fn qpdf_reads_the_signed_document() {
 #[test]
 fn poppler_pdfsig_verifies_the_signature() {
     if !pdfsig_available() {
-        eprintln!("skipped, pdfsig (poppler-utils) not found");
+        require_or_skip("pdfsig not found, install poppler-utils");
         return;
     }
     let Some(signer) = load_signer(
@@ -365,7 +380,15 @@ fn poppler_pdfsig_verifies_the_signature() {
     let path = write_tmp("for-pdsig.pdf", &signed);
 
     let (ok, text) = run("pdfsig", &[path.to_str().unwrap()]);
-    assert!(ok, "pdfsig failed to read the document:\n{text}");
+    // The exit code carries the certificate verdict too, and nothing on a
+    // test machine trusts the synthetic PKI: pdfsig exits 1 while still
+    // calling the signature itself valid. So an unreadable document is the
+    // only case the exit status may decide — it must at least have produced
+    // its per-signature report. The asserts below pin the cryptographic
+    // verdict out of that report, which is what this crosscheck is about.
+    if !ok && !text.contains("Signature #") {
+        panic!("pdfsig failed to read the document:\n{text}");
+    }
     assert!(
         text.contains("Signature Validation: Signature is Valid."),
         "poppler does not consider the signature valid:\n{text}"
