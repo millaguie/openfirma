@@ -45,22 +45,23 @@ fn xmlsec_available() -> bool {
 }
 
 /// Whether this xmlsec1 knows `--add-id-attr` (it arrived in 1.3.0; Ubuntu's
-/// runner image ships 1.2.x, where an unknown option is a usage banner and
-/// exit — the crosscheck would then assert on help text). Probed, not read
-/// off `--version`: what matters is whether the flag is accepted, and the
-/// probe fails closed exactly like the tool probe H-1 found broken.
+/// runner image ships 1.2.x). Probed by what the run PARSED, not by one
+/// version's refusal phrasing and not by one stream: the probe names a
+/// sentinel file, and only a tool that got past its option table says that
+/// name back (1.3 errors over the missing file; 1.2 answers the unknown flag
+/// with a usage banner — on stdout, where the first probe here did not look).
 fn xmlsec_supports_id_attr() -> bool {
+    let sentinel = "xmlsec-idattr-probe-nonexistent.xml";
     Command::new("xmlsec1")
-        .args([
-            "--verify",
-            "--add-id-attr",
-            "Id",
-            "/nonexistent-no-such-file.xml",
-        ])
+        .args(["--verify", "--add-id-attr", "Id", sentinel])
         .output()
         .is_ok_and(|o| {
-            let text = String::from_utf8_lossy(&o.stderr).to_lowercase();
-            !(text.contains("unknown option") || text.contains("is not supported"))
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            text.contains(sentinel) && !text.to_lowercase().contains("usage: xmlsec")
         })
 }
 

@@ -25,11 +25,34 @@ use openfirma_core::error::Error;
 
 use crate::store::{KeyHandle, StoreCertificate, SystemStore};
 
+// Every symbol in the two framework blocks below is declared against its
+// header and lives until the backend's first line of real work: `certificates`
+// and `sign_prehash` refuse before ever calling (ADR-0004), so there is no
+// call site to point at — review 07 H-9 proved the lint fires exactly where
+// this file compiles. The expectation is per item, with its own reason; when
+// a call lands, that line's `expect` becomes a stale-expectation warning all
+// by itself (review 07 I-1's point about `expect` over `allow`).
 #[link(name = "Security", kind = "framework")]
 unsafe extern "C" {
+    #[expect(
+        dead_code,
+        reason = "the identity listing the backend refuses to run until tested (ADR-0004) will call it"
+    )]
     fn SecItemCopyMatching(query: *const c_void, result: *mut *mut c_void) -> i64; // OSStatus
+    #[expect(
+        dead_code,
+        reason = "no caller yet: same unimplemented listing path (ADR-0004)"
+    )]
     fn SecIdentityCopyCertificate(identity: *const c_void, cert: *mut *const c_void) -> i64;
+    #[expect(
+        dead_code,
+        reason = "no caller yet: same unimplemented listing path (ADR-0004)"
+    )]
     fn SecIdentityCopyPrivateKey(identity: *const c_void, key: *mut *const c_void) -> i64;
+    #[expect(
+        dead_code,
+        reason = "no caller yet: sign_prehash refuses until hardware-tested (ADR-0004)"
+    )]
     fn SecKeyCreateSignature(
         key: *const c_void,
         algorithm: *const c_void,
@@ -40,10 +63,30 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    #[expect(
+        dead_code,
+        reason = "no caller yet: the CoreFoundation glue of the unimplemented sign/list paths (ADR-0004)"
+    )]
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const i8, encoding: u32) -> *mut c_void;
+    #[expect(
+        dead_code,
+        reason = "no caller yet: the CoreFoundation glue of the unimplemented sign/list paths (ADR-0004)"
+    )]
     fn CFDataCreate(alloc: *const c_void, bytes: *const u8, len: isize) -> *mut c_void;
+    #[expect(
+        dead_code,
+        reason = "no caller yet: the CoreFoundation glue of the unimplemented sign/list paths (ADR-0004)"
+    )]
     fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
+    #[expect(
+        dead_code,
+        reason = "no caller yet: the CoreFoundation glue of the unimplemented sign/list paths (ADR-0004)"
+    )]
     fn CFDataGetLength(data: *const c_void) -> isize;
+    #[expect(
+        dead_code,
+        reason = "no caller yet: the CoreFoundation glue of the unimplemented sign/list paths (ADR-0004)"
+    )]
     fn CFRelease(cf: *const c_void);
 }
 
@@ -100,6 +143,10 @@ impl SystemStore for MacStore {
 /// exported *symbols* whose value is a CFString, so their address is the
 /// string object — fetching their addresses must happen after the framework
 /// is loaded, hence OnceLock rather than link-time `dlsym` shuffling.
+#[expect(
+    dead_code,
+    reason = "belongs to the unimplemented sign path (see sign_prehash's refusal): no caller exists until SecKeyCreateSignature is wired (ADR-0004)"
+)]
 fn algorithm_for(digest: DigestAlg) -> Result<*const c_void> {
     // The names below are the public constant symbols (Security/SecKey.h); we
     // take their addresses as CFStringRef values.

@@ -390,12 +390,16 @@ def integrity(path, trusted):
                      "be verified independently")
         return lines
     cmd = [xmlsec, "--verify", "--verbose", "--enabled-key-data", "x509"]
-    # --add-id-attr only exists from xmlsec1 1.3 on (Ubuntu ships 1.2.x,
-    # where an unknown option is a usage banner and exit): probe it, and on
-    # the older shape rely on its built-in knowledge of the "Id" ID name.
-    probe = subprocess.run([xmlsec, "--verify", "--add-id-attr", "Id", "/nonexistent.xml"],
+    # --add-id-attr only exists from xmlsec1 1.3 on (Ubuntu ships 1.2.x).
+    # Probe by what the run PARSED: a sentinel file name only comes back
+    # from a tool that got past its option table, and both streams are read
+    # — 1.2 answers an unknown flag with a usage banner on stdout, which is
+    # exactly where the first version of this probe did not look.
+    sentinel = "xmlsec-idattr-probe-nonexistent.xml"
+    probe = subprocess.run([xmlsec, "--verify", "--add-id-attr", "Id", sentinel],
                            capture_output=True, text=True)
-    if "is not supported" not in (probe.stderr or ""):
+    probe_text = (probe.stdout or "") + (probe.stderr or "")
+    if sentinel in probe_text and "usage: xmlsec" not in probe_text.lower():
         cmd += ["--add-id-attr", "Id"]
     for t in trusted:
         cmd += ["--trusted-pem", str(t)]

@@ -158,6 +158,13 @@ unsafe extern "system" {
 #[cfg(not(target_arch = "x86"))]
 #[link(name = "advapi32", kind = "raw-dylib")]
 unsafe extern "system" {
+    // The Get side of the Set/Get pair stays declared even though only Set is
+    // called today; `expect` says so to the compiler (review 07 H-9: this file
+    // only compiles where the lint can fire).
+    #[expect(
+        dead_code,
+        reason = "declared with its Set counterpart; no read call path yet"
+    )]
     fn CryptGetHashParam(
         h_hash: usize,
         dw_param: u32,
@@ -192,6 +199,11 @@ unsafe extern "system" {
     import_name_type = "undecorated"
 )]
 unsafe extern "system" {
+    // Same pair as the x64 block above: declared, not yet called.
+    #[expect(
+        dead_code,
+        reason = "declared with its Set counterpart; no read call path yet"
+    )]
     fn CryptGetHashParam(
         h_hash: usize,
         dw_param: u32,
@@ -246,6 +258,12 @@ const CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG: u32 = 0x0001_0000;
 /// KEY_HANDLE` to functions expecting an `HCRYPTPROV`. Listing still passes
 /// ALLOW so CNG-only keys (every EC key on a modern machine) are *seen*; the
 /// handle is dropped immediately and signing refuses them by name.
+/// `expect`, not `allow` (review 07 I-1): when a future NCryptSignHash call
+/// path makes this flag live, the stale expectation itself becomes a warning.
+#[expect(
+    dead_code,
+    reason = "documented refusal: PREFER would hand CNG handles to CAPI APIs (A6)"
+)]
 const CRYPT_ACQUIRE_PREFER_NCRYPT_KEY_FLAG: u32 = 0x0002_0000;
 /// Never prompt the user, even for a smart card without a cached PIN. Listing
 /// certificates must not ask anyone to unlock anything; without this flag a
