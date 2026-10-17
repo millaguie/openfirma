@@ -55,7 +55,7 @@ fn der_corpus_refuses_through_every_cms_and_tsp_entry_point() {
         );
         // The same bytes through the TSA-response door: refusing is required,
         // and only refusing — panicking fails this test by unwinding.
-        let _ = tsp::token_from_response(&bytes, DigestAlg::Sha256, b"x")
+        let _ = tsp::token_from_response(&bytes, DigestAlg::Sha256, b"x", None)
             .expect_err("{name} cannot be a TimeStampResp");
         let _ = tsp::token_imprint(&bytes);
         // CRL/OCSP readers may refuse however they like — they must only
@@ -133,7 +133,7 @@ fn feed_all(family: &str, bytes: &[u8]) {
         "cms" => {
             let _ = verify(bytes, None, &VerifyOptions::new(Vec::new()));
             let _ = tsp::token_imprint(bytes);
-            let _ = tsp::token_from_response(bytes, DigestAlg::Sha256, b"sweep");
+            let _ = tsp::token_from_response(bytes, DigestAlg::Sha256, b"sweep", None);
             let _ = revocation::verify_crl(bytes, &[], std::time::SystemTime::now());
             let _ = revocation::parse_ocsp_response(bytes);
         }

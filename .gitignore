@@ -7,6 +7,10 @@ Cargo.lock.bak
 # particular *.pk8.der and *.p12 are private keys.
 /testdata/certs/*
 !/testdata/certs/README.md
+# the policy OIDs signer-policy declares are plain text, and a unit test reads
+# them to know what the signingCertificate policies field must carry. The file
+# is derived from tools/gen-testcert.sh itself, never private.
+!/testdata/certs/signer-policy.policies.txt
 /testdata/golden/*
 !/testdata/golden/README.md
 

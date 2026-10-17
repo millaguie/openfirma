@@ -312,8 +312,10 @@ fn every_cades_flag_reaches_the_signature_the_binary_writes() {
         dump.contains("1.2.840.113549.1.9.16.2.4") && dump.contains("UTF8String \"documento\""),
         "no contentHint reached the CMS:\n{dump}"
     );
+    // M3: AutoFirma encodes mimeType as a UTF8String, not the IA5String openfirma
+    // used to emit; the golden diff measures exactly that.
     assert!(
-        dump.contains("OID 0.4.0.1733.2.1") && dump.contains("IA5String \"text/plain\""),
+        dump.contains("OID 0.4.0.1733.2.1") && dump.contains("UTF8String \"text/plain\""),
         "no mimeType reached the CMS:\n{dump}"
     );
     assert!(

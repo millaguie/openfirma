@@ -288,6 +288,41 @@ struct SignArgs {
     #[arg(long)]
     content_hint: Option<String>,
 
+    /// Omit the ESS contentHint attribute. AutoFirma includes it by default
+    /// with its generic description "binary" (its per-type descriptions come
+    /// from a jmimemagic database openfirma does not ship), so we do too; this
+    /// flag is `includeContentHintAttribute=false` in AutoFirma's vocabulary.
+    #[arg(long)]
+    no_content_hint: bool,
+
+    /// OID of the ETSI signaturePolicyIdentifier attribute — AutoFirma's
+    /// `policyIdentifier` extraParam (a Spanish sede's policy is
+    /// 2.16.724.1.3.1.1.2.1.9 or an 0.4.0.194 one). The sigPolicyHash follows
+    /// AutoFirma's shape: a DigestInfo of the signature's own digest over the
+    /// placeholder byte.
+    #[arg(long)]
+    signature_policy: Option<String>,
+
+    /// Hex bytes for the sigPolicyHash to write with --signature-policy —
+    /// the digest of the policy assertion text, what AutoFirma's
+    /// `policyIdentifierHash` extraParam carries (base64 there). Without it
+    /// the AutoFirma placeholder stays.
+    #[arg(long, value_parser = clap::value_parser!(String))]
+    signature_policy_hash: Option<String>,
+
+    /// OID of the ETSI commitmentTypeIndication attribute — AutoFirma's
+    /// `commitmentTypeIndication0Identifier` extraParam (1 for approval, i.e.
+    /// proofOfApproval 1.2.840.113549.1.9.16.6.5, 5 for delivery).
+    #[arg(long)]
+    commitment_type: Option<String>,
+
+    /// Do not copy the signer certificate's certificatePolicies into the
+    /// signer-certificate attribute. AutoFirma copies them by default
+    /// (doNotIncludePolicyOnSigningCertificate=false), so we do too; this
+    /// flag turns it off for a verifier that chokes on the policies field.
+    #[arg(long)]
+    no_certificate_policies: bool,
+
     /// Omit the RFC 5652 signingTime attribute. AutoFirma includes it by
     /// default in the advanced profile, so we do too.
     #[arg(long)]
@@ -388,6 +423,16 @@ struct SignArgs {
     /// rule (AutoFirma asks for the same permission). PAdES only.
     #[arg(long)]
     allow_certified: bool,
+
+    /// Sign despite the conservative algorithm policy — SHA-1 digests and RSA
+    /// keys below 2048 bits — the way AutoFirma signs whatever it is handed.
+    /// Without it `sign` refuses such output (`--digest sha1` or a weak key):
+    /// ETSI TS 119 312's conservative policy, openfirma's default, says no
+    /// signature like that should leave a tool that claims CAdES. Passing this
+    /// flag is the explicit opt-out; whoever passes it owns what validators
+    /// make of the result.
+    #[arg(long)]
+    allow_weak_algorithms: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -474,14 +519,11 @@ fn timestamp_provider(
                 );
             }
             Ok(Some(Arc::new(move |sig: &[u8], digest| {
-                let nonce = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0);
+                let nonce = tsp::random_nonce()?;
                 let query = tsp::request(digest, sig, nonce)?;
                 let response = http_post(&url, &query)
                     .map_err(|e| openfirma_core::Error::Other(e.to_string()))?;
-                let token = tsp::token_from_response(&response, digest, sig)?;
+                let token = tsp::token_from_response(&response, digest, sig, Some(&query))?;
                 warn_if_token_unverified(&format!("the TSA at {url}"), &token, &tsa_trust);
                 Ok(vec![tsp::unsigned_attribute(&token)?])
             })))
@@ -491,7 +533,7 @@ fn timestamp_provider(
                 std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let source = format!("{}", path.display());
             Ok(Some(Arc::new(move |sig: &[u8], digest| {
-                let token = tsp::token_from_response(&response, digest, sig)?;
+                let token = tsp::token_from_response(&response, digest, sig, None)?;
                 warn_if_token_unverified(&format!("the token file {source}"), &token, &tsa_trust);
                 Ok(vec![tsp::unsigned_attribute(&token)?])
             })))
@@ -802,6 +844,24 @@ fn check_not_in_place(
 }
 
 /// Parses `llx,lly,urx,ury`, accepting commas or spaces as separators.
+/// `--signature-policy-hash`: hex bytes, with or without spaces or colons.
+fn parse_hex_bytes(text: &str) -> std::result::Result<Vec<u8>, String> {
+    let clean: String = text
+        .chars()
+        .filter(|c| !matches!(c, ' ' | ':' | '_'))
+        .collect();
+    if clean.len() % 2 != 0 {
+        return Err("hex string must be a whole number of bytes".into());
+    }
+    (0..clean.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&clean[i..i + 2], 16)
+                .map_err(|_| format!("not a hex byte: {:?}", &clean[i..i + 2]))
+        })
+        .collect()
+}
+
 fn parse_rect(text: &str) -> std::result::Result<[f64; 4], String> {
     let parts: Vec<&str> = text
         .split([',', ';', ' '])
@@ -827,6 +887,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Sign(args) => {
+            // The M5 gate on the production side: `sign` refuses weak output
+            // unless --allow-weak-algorithms opts out explicitly. Read before
+            // the destructuring below takes the fields by value.
+            let algorithms = if args.allow_weak_algorithms {
+                openfirma_cades::verify::AlgorithmPolicy::All
+            } else {
+                openfirma_cades::verify::AlgorithmPolicy::Conservative
+            };
             let SignArgs {
                 input,
                 output,
@@ -838,6 +906,11 @@ fn main() -> Result<()> {
                 encapsulate,
                 mime_type,
                 content_hint,
+                no_content_hint,
+                signature_policy,
+                signature_policy_hash,
+                commitment_type,
+                no_certificate_policies,
                 no_signing_time,
                 no_issuer_serial,
                 reason,
@@ -862,6 +935,8 @@ fn main() -> Result<()> {
                 contents_reserved,
                 force,
                 allow_certified,
+                // already read into `algorithms` above, before the move
+                allow_weak_algorithms: _,
             } = *args;
             check_not_in_place(&input, &output, force)?;
             let ltv = matches!(format, Format::PadesLt | Format::PadesLta);
@@ -985,6 +1060,16 @@ fn main() -> Result<()> {
             request.cades_encapsulate_content = encapsulate;
             request.cades_mime_type = mime_type.clone();
             request.cades_content_hint = content_hint;
+            request.cades_include_content_hint = !no_content_hint;
+            request.cades_allow_weak_algorithms =
+                algorithms == openfirma_cades::verify::AlgorithmPolicy::All;
+            request.cades_signature_policy = signature_policy;
+            if let Some(hash) = signature_policy_hash.as_deref() {
+                request.cades_signature_policy_hash =
+                    parse_hex_bytes(hash).map_err(anyhow::Error::msg)?;
+            }
+            request.cades_commitment_type = commitment_type;
+            request.cades_include_certificate_policies = !no_certificate_policies;
             request.cades_include_issuer_serial = !no_issuer_serial;
             if no_signing_time {
                 request.cades_signing_time = None;
@@ -1091,6 +1176,7 @@ fn main() -> Result<()> {
                 trust_anchors: anchors,
                 validation_time,
                 ts_mode: false,
+                ..openfirma_cades::VerifyOptions::new(Vec::new())
             };
             println!("validation time: {}", fmt_system_time(validation_time));
 
@@ -1830,7 +1916,15 @@ fn attribute_names(a: &openfirma_cades::Attributes) -> (Vec<String>, Vec<String>
         signed.push("contentHint".to_string());
     }
     for o in &a.other_signed {
-        signed.push(o.to_string());
+        // the two ETSI attributes M9 added encoders for are recognised here
+        // even though the report does not parse their values yet
+        if *o == openfirma_core::oid::ID_SIGNATURE_POLICY_IDENTIFIER {
+            signed.push("signaturePolicyIdentifier".to_string());
+        } else if *o == openfirma_core::oid::ID_COMMITMENT_TYPE_INDICATION {
+            signed.push("commitmentTypeIndication".to_string());
+        } else {
+            signed.push(o.to_string());
+        }
     }
     let unsigned = a
         .unsigned_attributes
