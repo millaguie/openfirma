@@ -1530,16 +1530,32 @@ fn assemble(keys: Vec<FoundKey>, certs: Vec<(Option<Vec<u8>>, Vec<u8>)>) -> Resu
         // the pairing check in SoftwareSigner is what decides.
         let matched: Vec<Vec<u8>> = match &key_id {
             Some(id) => {
-                let by_id: Vec<Vec<u8>> = certs
+                // Bags that carry this localKeyID are the direct answers, in
+                // bag order. openssl writes it only on the leaf's bag: the
+                // intermediate and root bags of the same container carry no
+                // attributes at all (finding M-4 — keeping only the matched
+                // ones shipped a one-certificate chain where AutoFirma emits
+                // three). The unmatched bags are candidates too, after the
+                // matched ones; when several keys share a file each gets its
+                // own keyID-matched certificates first and the rest as chain
+                // material. Dropped only on their exact DER: repeating another
+                // key's leaf inside this chain is what the old by_id-only
+                // behaviour was protecting against, and dedup keeps it out
+                // without hiding anonymous bags. `order_chain` puts a bag
+                // that does not chain at the end, so offering everything
+                // cannot corrupt the ordered part.
+                let mut owned: Vec<Vec<u8>> = certs
                     .iter()
                     .filter(|(cid, _)| cid.as_ref() == Some(id))
                     .map(|(_, der)| der.clone())
                     .collect();
-                if by_id.is_empty() {
-                    certs.iter().map(|(_, der)| der.clone()).collect()
-                } else {
-                    by_id
+                for (cid, der) in &certs {
+                    if !owned.iter().any(|kept| kept == der) {
+                        let _ = cid;
+                        owned.push(der.clone());
+                    }
                 }
+                owned
             }
             None => certs.iter().map(|(_, der)| der.clone()).collect(),
         };
