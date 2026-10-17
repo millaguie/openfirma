@@ -21,15 +21,6 @@ fn ai_with_null(oid: ObjectIdentifier) -> Result<AlgorithmIdentifierOwned> {
     })
 }
 
-/// An `AlgorithmIdentifier` with absent parameters, as required for the ECDSA
-/// signature algorithms by RFC 5758.
-fn ai_no_params(oid: ObjectIdentifier) -> AlgorithmIdentifierOwned {
-    AlgorithmIdentifierOwned {
-        oid,
-        parameters: None,
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DigestAlg {
     Sha1,
@@ -119,6 +110,67 @@ impl EcCurve {
             EcCurve::P384 => oid::ID_SECP384R1,
             EcCurve::P521 => oid::ID_SECP521R1,
         }
+    }
+}
+
+/// The kind of key behind a certificate, together with the one parameter an
+/// acceptance decision needs besides the kind: RSA's modulus length in bits.
+/// [`CertificateHandle::key_info`] reads it off the SPKI; nothing here parses
+/// keys, only counts what x509-cert already decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyInfo {
+    pub algorithm: KeyAlgorithm,
+    /// RSA modulus length in bits; `None` for EC keys, whose strength the
+    /// curve name already states and every curve we accept is over 256 bits.
+    pub modulus_bits: Option<usize>,
+}
+
+impl KeyInfo {
+    pub fn from_spki(spki: &x509_cert::spki::SubjectPublicKeyInfoOwned) -> Result<Self> {
+        let algorithm = {
+            // the same hand-decoded curve lookup CertificateHandle uses
+            let curve = spki.algorithm.parameters.as_ref().and_then(|params| {
+                let any: der::asn1::AnyRef = params.into();
+                ObjectIdentifier::try_from(any).ok()
+            });
+            KeyAlgorithm::from_spki_oid(&spki.algorithm.oid, curve.as_ref())?
+        };
+        let modulus_bits = match algorithm {
+            KeyAlgorithm::Rsa => {
+                // the BIT STRING content is an RSAPublicKey (RFC 3279
+                // 2.3.1): SEQUENCE { modulus INTEGER, publicExponent INTEGER }.
+                // Its modulus's encoded length is what a policy compares.
+                let bits = spki.subject_public_key.raw_bytes();
+                let mut cur = crate::tlv::Cursor::new(bits);
+                let seq = cur
+                    .expect(crate::tlv::TAG_SEQUENCE, "the RSAPublicKey")
+                    .map_err(|e| {
+                        Error::Certificate(format!(
+                            "the RSA public key is not an RSAPublicKey: {e}"
+                        ))
+                    })?;
+                let mut inner = crate::tlv::Cursor::new(seq.content);
+                let modulus = inner
+                    .expect(crate::tlv::TAG_INTEGER, "the RSA modulus")
+                    .map_err(|_| {
+                        Error::Certificate("the RSA public key carries no modulus".to_string())
+                    })?;
+                // DER strips the sign bit, so a leading zero byte is not part
+                // of the number; 2048-bit moduli encode as 257 bytes with one
+                // pad and are exactly 2048 bits strong.
+                let bytes = modulus.content;
+                let bytes = match bytes.first() {
+                    Some(0) if bytes.len() > 1 => &bytes[1..],
+                    _ => bytes,
+                };
+                Some(bytes.len() * 8)
+            }
+            KeyAlgorithm::EcPrimeField(_) => None,
+        };
+        Ok(KeyInfo {
+            algorithm,
+            modulus_bits,
+        })
     }
 }
 
@@ -227,7 +279,13 @@ impl SignatureAlg {
                 DigestAlg::Sha384 => oid::ID_SHA384_WITH_RSA,
                 DigestAlg::Sha512 => oid::ID_SHA512_WITH_RSA,
             }),
-            SignatureAlg::Ecdsa(_) => Ok::<_, Error>(ai_no_params(match d {
+            // BouncyCastle — and therefore AutoFirma — writes the ECDSA
+            // signatureAlgorithm with an explicit NULL parameter (measured:
+            // `SEQUENCE { OID ecdsa-withSHA256, NULL }`). RFC 3279 says the
+            // field is absent for ECDSA, but every producer of the ecosystem
+            // writes the NULL, and a verifier that demands its absence would
+            // refuse all of them. We match the ecosystem's shape.
+            SignatureAlg::Ecdsa(_) => ai_with_null(match d {
                 DigestAlg::Sha256 => oid::ID_ECDSA_WITH_SHA256,
                 DigestAlg::Sha384 => oid::ID_ECDSA_WITH_SHA384,
                 DigestAlg::Sha512 => oid::ID_ECDSA_WITH_SHA512,
@@ -243,7 +301,7 @@ impl SignatureAlg {
                         digest: d.name(),
                     });
                 }
-            })),
+            }),
             SignatureAlg::RsaPss { .. } => Err(Error::other(
                 "RSASSA-PSS AlgorithmIdentifier encoding is not implemented yet",
             )),

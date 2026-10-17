@@ -47,6 +47,8 @@ sha2 = { version = "0.11", features = ["oid"] }
 # the current generation and fixes it. Re-evaluate on 0.10 stable.
 rsa = { version = "=0.10.0-rc.19", features = ["std", "sha2"] }
 p256 = { version = "0.14", default-features = false, features = ["std", "pem", "pkcs8", "ecdsa", "arithmetic"] }
+p384 = { version = "0.14", default-features = false, features = ["std", "pem", "pkcs8", "ecdsa", "arithmetic"] }
+p521 = { version = "0.14", default-features = false, features = ["std", "pem", "pkcs8", "ecdsa", "arithmetic"] }
 signature = "3"
 rand_core = "0.10"
 

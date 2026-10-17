@@ -28,6 +28,7 @@ pub const TAG_INTEGER: u8 = 0x02;
 pub const TAG_BIT_STRING: u8 = 0x03;
 pub const TAG_OCTET_STRING: u8 = 0x04;
 pub const TAG_NULL: u8 = 0x05;
+pub const TAG_BOOLEAN: u8 = 0x01;
 pub const TAG_OID: u8 = 0x06;
 pub const TAG_SEQUENCE: u8 = 0x30;
 pub const TAG_SET: u8 = 0x31;
@@ -491,6 +492,29 @@ impl<'a> Cursor<'a> {
             v = (v << 8) | u32::from(*b);
         }
         Ok(v)
+    }
+
+    /// The next value as an INTEGER holding `0..=u64::MAX`, minimal form:
+    /// what a RFC 3161 nonce (a random up-to-63-bit integer) is.
+    pub fn u64(&mut self, what: &str) -> Result<u64> {
+        let t = self.expect(TAG_INTEGER, what)?;
+        let bytes = t.content;
+        let non_minimal = match bytes {
+            [] => true,
+            [0x00] => false,
+            [0x00, rest @ ..] => rest[0] & 0x80 == 0,
+            [first, ..] => *first & 0x80 != 0, // negative
+        };
+        if non_minimal || bytes.len() > 8 {
+            return Err(Error::Other(format!(
+                "{what} is not a minimal non negative integer up to u64"
+            )));
+        }
+        let mut n = 0u64;
+        for b in bytes {
+            n = (n << 8) | u64::from(*b);
+        }
+        Ok(n)
     }
 
     /// The next value as an INTEGER holding `0..=usize::MAX` in minimal

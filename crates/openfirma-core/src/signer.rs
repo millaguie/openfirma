@@ -58,6 +58,8 @@ impl<S: Signer + ?Sized> Signer for &S {
 enum SoftwareKey {
     Rsa(rsa::RsaPrivateKey),
     P256(p256::ecdsa::SigningKey),
+    P384(p384::ecdsa::SigningKey),
+    P521(p521::ecdsa::SigningKey),
 }
 
 /// A signer is the one object that must not leave the private key in freed
@@ -69,6 +71,8 @@ const _: fn() = || {
     fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
     assert_zeroize_on_drop::<rsa::RsaPrivateKey>();
     assert_zeroize_on_drop::<p256::ecdsa::SigningKey>();
+    assert_zeroize_on_drop::<p384::ecdsa::SigningKey>();
+    assert_zeroize_on_drop::<p521::ecdsa::SigningKey>();
 };
 
 enum KeyMaterial<'a> {
@@ -85,6 +89,12 @@ fn parse_key(material: KeyMaterial<'_>) -> Result<SoftwareKey> {
             if let Ok(key) = p256::ecdsa::SigningKey::from_pkcs8_pem(pem) {
                 return Ok(SoftwareKey::P256(key));
             }
+            if let Ok(key) = p384::ecdsa::SigningKey::from_pkcs8_pem(pem) {
+                return Ok(SoftwareKey::P384(key));
+            }
+            if let Ok(key) = p521::ecdsa::SigningKey::from_pkcs8_pem(pem) {
+                return Ok(SoftwareKey::P521(key));
+            }
         }
         KeyMaterial::Der(der) => {
             if let Ok(key) = rsa::RsaPrivateKey::from_pkcs8_der(der) {
@@ -93,10 +103,16 @@ fn parse_key(material: KeyMaterial<'_>) -> Result<SoftwareKey> {
             if let Ok(key) = p256::ecdsa::SigningKey::from_pkcs8_der(der) {
                 return Ok(SoftwareKey::P256(key));
             }
+            if let Ok(key) = p384::ecdsa::SigningKey::from_pkcs8_der(der) {
+                return Ok(SoftwareKey::P384(key));
+            }
+            if let Ok(key) = p521::ecdsa::SigningKey::from_pkcs8_der(der) {
+                return Ok(SoftwareKey::P521(key));
+            }
         }
     }
     Err(Error::PrivateKey(
-        "not a PKCS#8 RSA or EC P-256 private key".into(),
+        "not a PKCS#8 RSA or EC (P-256/P-384/P-521) private key".into(),
     ))
 }
 
@@ -130,6 +146,45 @@ impl SoftwareSigner {
         self
     }
 
+    /// A signer from an already parsed certificate and a PKCS#8 key (DER).
+    /// The `from_pkcs8_*` constructors parse the certificate themselves; a
+    /// caller that read one through another route (a keystore's DER bytes)
+    /// takes this one instead of re-encoding into PEM to feed those.
+    pub fn from_certificate_and_pkcs8_der(cert: CertificateHandle, key_der: &[u8]) -> Result<Self> {
+        Self::new(cert, parse_key(KeyMaterial::Der(key_der))?)
+    }
+
+    /// The public half of a PKCS#8 key as the `SubjectPublicKeyInfo` DER a
+    /// certificate carries. Total for every key this crate can sign with —
+    /// RSA, P-256, P-384, P-521 — and None for anything else, which lets a
+    /// PKCS#12 chain matcher pair keys and certificates without re-signing
+    /// anything. (Finding M6 taught the lesson: a hand-written derivation per
+    /// curve drifts behind the curve list; this one is the single source.)
+    pub fn pkcs8_public_spki(key_pkcs8: &[u8]) -> Option<Vec<u8>> {
+        use spki::EncodePublicKey;
+        match parse_key(KeyMaterial::Der(key_pkcs8)).ok()? {
+            SoftwareKey::Rsa(k) => rsa::RsaPublicKey::from(&k)
+                .to_public_key_der()
+                .map(|d| d.as_bytes().to_vec())
+                .ok(),
+            SoftwareKey::P256(k) => k
+                .verifying_key()
+                .to_public_key_der()
+                .map(|d| d.as_bytes().to_vec())
+                .ok(),
+            SoftwareKey::P384(k) => k
+                .verifying_key()
+                .to_public_key_der()
+                .map(|d| d.as_bytes().to_vec())
+                .ok(),
+            SoftwareKey::P521(k) => k
+                .verifying_key()
+                .to_public_key_der()
+                .map(|d| d.as_bytes().to_vec())
+                .ok(),
+        }
+    }
+
     fn new(cert: CertificateHandle, key: SoftwareKey) -> Result<Self> {
         // Reject a mismatched key here. Otherwise the failure shows up much
         // later, in a validator, with no clue about the cause.
@@ -140,6 +195,16 @@ impl SoftwareSigner {
                 .map(|d| d.as_bytes() == cert_spki)
                 .unwrap_or(false),
             SoftwareKey::P256(priv_key) => priv_key
+                .verifying_key()
+                .to_public_key_der()
+                .map(|d| d.as_bytes() == cert_spki)
+                .unwrap_or(false),
+            SoftwareKey::P384(priv_key) => priv_key
+                .verifying_key()
+                .to_public_key_der()
+                .map(|d| d.as_bytes() == cert_spki)
+                .unwrap_or(false),
+            SoftwareKey::P521(priv_key) => priv_key
                 .verifying_key()
                 .to_public_key_der()
                 .map(|d| d.as_bytes() == cert_spki)
@@ -193,6 +258,30 @@ impl Signer for SoftwareSigner {
                 // CMS carries ECDSA signatures DER encoded, not as raw r||s
                 Ok(sig.to_der().as_bytes().to_vec())
             }
+            SoftwareKey::P384(key) => {
+                if !matches!(digest, DigestAlg::Sha384) {
+                    return Err(Error::UnsupportedCombination {
+                        key: "secp384r1",
+                        digest: digest.name(),
+                    });
+                }
+                let sig: p384::ecdsa::Signature = key
+                    .sign_prehash(prehash)
+                    .map_err(|e| Error::Signing(e.to_string()))?;
+                Ok(sig.to_der().as_bytes().to_vec())
+            }
+            SoftwareKey::P521(key) => {
+                if !matches!(digest, DigestAlg::Sha512) {
+                    return Err(Error::UnsupportedCombination {
+                        key: "secp521r1",
+                        digest: digest.name(),
+                    });
+                }
+                let sig: p521::ecdsa::Signature = key
+                    .sign_prehash(prehash)
+                    .map_err(|e| Error::Signing(e.to_string()))?;
+                Ok(sig.to_der().as_bytes().to_vec())
+            }
         }
     }
 }
@@ -227,11 +316,22 @@ fn rsa_sign_prehash(
 /// `Signer` trait stays the only home of key material for *signing*; a
 /// verifier never holds a private key, it holds certificates.
 ///
-/// Supported: RSA PKCS#1 v1.5 and ECDSA P-256, each over SHA-1/256/384/512
-/// (RSA also SHA-224). The digest is named explicitly, exactly like on the
-/// signing side, because that is what CMS carries: `digestAlgorithm` in the
-/// `SignerInfo` and, for RSA PKCS#1 v1.5, inside the DigestInfo the signature
-/// recovers.
+/// Supported: RSA PKCS#1 v1.5 and ECDSA over P-256, P-384 and P-521, each
+/// over SHA-1/256/384/512 (RSA also SHA-224). The digest is named explicitly,
+/// exactly like on the signing side, because that is what CMS carries:
+/// `digestAlgorithm` in the `SignerInfo` and, for RSA PKCS#1 v1.5, inside the
+/// DigestInfo the signature recovers. Algorithm *strength* is not this
+/// function's decision — see `openfirma_cades::verify::AlgorithmPolicy`,
+/// which refuses SHA-1 and short RSA keys before anything reaches here.
+/// The RSA modulus length, in bits, below which nothing signs that anyone
+/// should trust: 2048 is the floor of ETSI TS 119 312's conservative policy
+/// and of every CA/B baseline since. Lives here because both sides of the
+/// door need the same number — the signing side would refuse to produce such
+/// a signature before its digest gets refused, and the verifying side
+/// (`openfirma_cades::verify::AlgorithmPolicy`) refuses one. It is a policy
+/// constant, not an arithmetic limit: the crypto itself has no opinion.
+pub const RSA_MINIMUM_BITS: usize = 2048;
+
 pub fn verify_prehash(
     cert: &CertificateHandle,
     digest: DigestAlg,
@@ -287,10 +387,34 @@ pub fn verify_prehash(
                 .verify_prehash(prehash, &sig)
                 .map_err(|e| Error::Verification(format!("the signature does not verify: {e}")))
         }
-        KeyAlgorithm::EcPrimeField(curve) => Err(Error::UnsupportedKeyAlgorithm(format!(
-            "{}: signature verification is implemented for RSA and ECDSA P-256 only",
-            curve.name()
-        ))),
+        // P-384 and P-521 join P-256 (finding M6): several European roots and
+        // CAs are P-384, so refusing them is refusing the chain of real
+        // certificates. Same pattern, same DER signature encoding; p384/p521
+        // are RustCrypto's own crates of the same generation as p256.
+        KeyAlgorithm::EcPrimeField(EcCurve::P384) => {
+            let key = p384::PublicKey::from_public_key_der(&spki_der).map_err(|e| {
+                Error::Certificate(format!(
+                    "the certificate carries no readable P-384 key: {e}"
+                ))
+            })?;
+            let sig = p384::ecdsa::Signature::from_der(signature)
+                .map_err(|e| Error::Verification(format!("the ECDSA signature is not DER: {e}")))?;
+            p384::ecdsa::VerifyingKey::from(key)
+                .verify_prehash(prehash, &sig)
+                .map_err(|e| Error::Verification(format!("the signature does not verify: {e}")))
+        }
+        KeyAlgorithm::EcPrimeField(EcCurve::P521) => {
+            let key = p521::PublicKey::from_public_key_der(&spki_der).map_err(|e| {
+                Error::Certificate(format!(
+                    "the certificate carries no readable P-521 key: {e}"
+                ))
+            })?;
+            let sig = p521::ecdsa::Signature::from_der(signature)
+                .map_err(|e| Error::Verification(format!("the ECDSA signature is not DER: {e}")))?;
+            p521::ecdsa::VerifyingKey::from(key)
+                .verify_prehash(prehash, &sig)
+                .map_err(|e| Error::Verification(format!("the signature does not verify: {e}")))
+        }
     }
 }
 

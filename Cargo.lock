@@ -1361,6 +1361,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fiat-crypto"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2573,6 +2579,7 @@ name = "openfirma-browser"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "const-oid",
  "flate2",
  "getrandom 0.4.3",
  "openfirma-cades",
@@ -2592,6 +2599,7 @@ dependencies = [
  "const-oid",
  "der",
  "digest",
+ "getrandom 0.4.3",
  "hex",
  "openfirma-core",
  "sha1",
@@ -2630,6 +2638,8 @@ dependencies = [
  "digest",
  "hex",
  "p256",
+ "p384",
+ "p521",
  "pkcs8",
  "rand_core 0.10.1",
  "rsa",
@@ -2754,6 +2764,34 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2c9239b2dbc807adbbe147e8cf72ea7450c3a0aabe62cb8e75ff4ec22e1f72a"
 dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primefield",
+ "primeorder",
+ "sha2",
+]
+
+[[package]]
+name = "p384"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d17b851e6b3e378ab4ecb07fa2ed23f4d15f075735f8fec9fa1e7bdce5f8301f"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "fiat-crypto",
+ "primefield",
+ "primeorder",
+ "sha2",
+]
+
+[[package]]
+name = "p521"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ad64cc32c2dc466317c12ee5853e61f159f9eab1fe7efade0395dc2e7b43449"
+dependencies = [
+ "base16ct",
  "ecdsa",
  "elliptic-curve",
  "primefield",

@@ -80,15 +80,19 @@ impl CertificateHandle {
         self.parsed.tbs_certificate().serial_number()
     }
 
+    /// The kind of key plus its concrete parameters (RSA's modulus length,
+    /// which decides whether the algorithm policy accepts it).
+    pub fn key_info(&self) -> Result<crate::alg::KeyInfo> {
+        crate::alg::KeyInfo::from_spki(self.parsed.tbs_certificate().subject_public_key_info())
+    }
+
     pub fn key_algorithm(&self) -> Result<KeyAlgorithm> {
         let spki = self.parsed.tbs_certificate().subject_public_key_info();
-        // `parameters_oid` only exists on the borrowed form, and the owned one
-        // is what x509-cert hands out, so the curve OID is decoded by hand
-        let curve = spki
-            .algorithm
-            .parameters
-            .as_ref()
-            .and_then(|params| ObjectIdentifier::try_from(params.to_ref()).ok());
+        // the owned form x509-cert hands out, decoded by hand for its curve OID
+        let curve = spki.algorithm.parameters.as_ref().and_then(|params| {
+            let any: der::asn1::AnyRef = params.into();
+            ObjectIdentifier::try_from(any).ok()
+        });
         KeyAlgorithm::from_spki_oid(&spki.algorithm.oid, curve.as_ref())
     }
 

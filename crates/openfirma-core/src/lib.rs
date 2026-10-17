@@ -12,7 +12,7 @@ pub mod signer;
 pub mod tlv;
 pub mod workflow;
 
-pub use alg::{DigestAlg, KeyAlgorithm, SignatureAlg};
+pub use alg::{DigestAlg, KeyAlgorithm, KeyInfo, SignatureAlg};
 pub use cert::CertificateHandle;
 pub use dump::der_dump;
 pub use error::{Error, Result};
