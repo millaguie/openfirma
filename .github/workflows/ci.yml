@@ -44,14 +44,14 @@ jobs:
       # actions/checkout@v4.2.2, pinned to the tag's commit (review 07, H-13:
       # tags are mutable references; a workflow that trusts a tag trusts
       # whatever it happened to point at on the day someone bumped it).
-      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # dtolnay/rust-toolchain pinned by commit; the `stable` *channel* stays
       # fresh on purpose (the MSRV floor is what msrv pins, not this).
-      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           channel: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # eframe (the GUI workspace member, feature `gui` is on by default)
       # links the X11/xkb client libraries at check time on Linux; without
       # them `cargo clippy --all-targets` cannot resolve the sys crates.
@@ -70,11 +70,11 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
-      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           channel: stable
-      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
@@ -85,11 +85,11 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
-      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           channel: "1.85"
-      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev
       # --ignore-rust-version is NOT used anywhere on this job's CLI path: the
       # dependency graph of every member below must genuinely build on 1.85.
@@ -129,12 +129,12 @@ jobs:
             openssl: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
-      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           channel: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # The crosscheck tests are the ones that prove our CMS output is
       # accepted by an independent implementation, so openssl has to be on
@@ -274,12 +274,12 @@ jobs:
   test-i686-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
-      - uses: dtolnay/rust-toolchain@915b19c73ad683a715923a4ac6bbe56e5d5ae977
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           channel: stable
           targets: i686-pc-windows-msvc
-      - uses: Swatinem/rust-cache@98c37becf720b42c7c916b8dff94c2040c81ccdf # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Same PKI recipe as the matrix's windows jobs (Git Bash can see the
       # openssl Git for Windows bundles), because openfirma-core's lib tests
       # exercise 32-bit integer/pointer behaviour and belong in this job.
@@ -344,7 +344,7 @@ jobs:
   no-real-certs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe182cb818bf2bf779e1fb5f869ad8ce20 # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: tracked files
