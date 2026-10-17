@@ -17,7 +17,17 @@
 /// described in ADR-0004.
 use super::types::CkUlong;
 
-#[repr(C)]
+/// The spec's `CK_C_INITIALIZE_ARGS` order is `callbacks, flags(ulong),
+/// reserved(pointer)` and that is the byte order on *every* platform once
+/// each one's packing rule is applied. On unix (LP64 and 32-bit alike)
+/// natural alignment already places the ulong exactly there; on Windows the
+/// cryptoki headers are consumed under `pack(1)` (see `types.rs`), which
+/// removes x64 LLP64's temptation to float the two pointers ahead of the
+/// 4-byte ulong, and the spec order comes out unchanged — this is precisely
+/// what bindgen emits for cryptoki on `x86_64-pc-windows-msvc`. So only the
+/// `repr` moves per platform, never the fields.
+#[cfg_attr(windows, repr(C, packed))]
+#[cfg_attr(not(windows), repr(C))]
 #[derive(Default, Clone, Copy)]
 pub struct NssInitializeArgs {
     /// The four application-supplied mutex callbacks. NSS's own header comment
@@ -25,7 +35,11 @@ pub struct NssInitializeArgs {
     /// NSPR); what it does check is shape only — all four set without
     /// `CKF_OS_LOCKING_OK` answers CKR_CANT_LOCK, *some* of them answers
     /// CKR_ARGUMENTS_BAD. Null is the compliant, verified-working shape: we
-    /// pass neither callbacks nor anything to avoid them by.
+    /// pass neither callbacks nor anything to avoid them by. The packed cfg
+    /// mirrors how Windows consumes the same header (see `CkAttribute`): with
+    /// `pack(1)`, C's member order puts the ulong before both pointers there
+    /// too, and the field order below matches that read exactly — which is
+    /// what bindgen produces for cryptoki on `x86_64-pc-windows-msvc`.
     pub create_mutex: *mut core::ffi::c_void,
     pub destroy_mutex: *mut core::ffi::c_void,
     pub lock_mutex: *mut core::ffi::c_void,
@@ -45,6 +59,33 @@ pub struct NssInitializeArgs {
     /// presence to tell this struct's length apart from the older one.
     pub p_reserved: *mut core::ffi::c_void,
 }
+
+const _: () = {
+    use core::mem::offset_of;
+    // The four callback slots are consecutive pointers on every target: no
+    // ABI we compile for ever inserts padding between them, packed or not.
+    assert!(offset_of!(NssInitializeArgs, destroy_mutex) == core::mem::size_of::<*const u8>());
+    assert!(offset_of!(NssInitializeArgs, unlock_mutex) == 3 * core::mem::size_of::<*const u8>());
+    // Spec order everywhere once each platform's packing is applied: the
+    // ulong sits after the callbacks and before the two pointers — natural
+    // alignment gives it on unixes (verified against live softokn3), pack(1)
+    // gives it on Windows, where a naturally aligned compiler would have
+    // floated the 8-byte pointer ahead of the 4-byte flags. Same slot, same
+    // meaning, both platforms.
+    assert!(offset_of!(NssInitializeArgs, flags) == 4 * core::mem::size_of::<*const u8>());
+    if !cfg!(windows) {
+        // On unix, `flags` is ulong-width like the pointers, so C also
+        // demands it before them; on Windows (packed) member order decides.
+        assert!(
+            offset_of!(NssInitializeArgs, library_parameters)
+                > offset_of!(NssInitializeArgs, flags)
+        );
+    }
+    assert!(
+        offset_of!(NssInitializeArgs, p_reserved)
+            > offset_of!(NssInitializeArgs, library_parameters)
+    );
+};
 
 impl NssInitializeArgs {
     /// An initialize-args pointing the module at `library_parameters`, passed
