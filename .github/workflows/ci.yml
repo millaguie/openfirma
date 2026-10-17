@@ -236,14 +236,14 @@ jobs:
           else
             echo "no openssl on this runner; fixture tests will skip"
           fi
-      - name: keystore tests on the 32-bit ABI (ABI asserts execute natively)
-        run: cargo test -p openfirma-keystore -p openfirma-core --target i686-pc-windows-msvc --no-run
       # Diagnostic for the STATUS_ENTRYPOINT_NOT_FOUND this job's keystore lib
       # test takes since CertDuplicateCertificateContext joined the crypt32
       # import table, while x64/arm64 build clean: walk the freshly built test
       # binary's own strings for each imported symbol (a raw-dylib binding
       # emits `__imp_<name>` thunks and plain names alike) and scan
       # System32\crypt32.dll for its export name strings. Remove once diagnosed.
+      - name: build the test binaries to look at their imports
+        run: cargo test -p openfirma-keystore --target i686-pc-windows-msvc --no-run
       - name: diagnose crypt32 imports of the keystore test binary
         shell: pwsh
         run: |
@@ -267,11 +267,14 @@ jobs:
           $n = "$env:SystemRoot\System32\ncrypt.dll"
           $ntext = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($n))
           "ncrypt.dll export-string 'NCryptFreeObject': $(if ($ntext.Contains('NCryptFreeObject')) { 'yes' } else { 'NO' })"
-      # A serial run: the lib tests swap process-wide HOME (under an in-crate
-      # lock), and on a 1-core runner thread overlap plus env mutation is where
-      # a load-time failure would otherwise hide between tests.
+      # A serial run: the lib tests swap process-wide HOME, and one thread
+      # keeps them from stepping on each other's environment. The load failure
+      # this job is being diagnosed over reproduces with a single test running
+      # alone (see the scan below), so ordering cannot be its cause either way.
       - name: keystore tests on the 32-bit ABI (ABI asserts execute natively)
-        run: cargo test -p openfirma-keystore -p openfirma-core --target i686-pc-windows-msvc -- --test-threads=1
+        run: cargo test -p openfirma-keystore --target i686-pc-windows-msvc --lib -- --test-threads=1
+      - name: keystore integration tests and openfirma-core on the 32-bit ABI
+        run: cargo test -p openfirma-keystore -p openfirma-core --target i686-pc-windows-msvc
 
   no-real-certs:
     runs-on: ubuntu-latest

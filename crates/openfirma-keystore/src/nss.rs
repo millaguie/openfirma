@@ -806,21 +806,61 @@ mod tests {
             b"synthetic",
         )
         .unwrap();
-        // The shared DB too: with HOME moved below, discovery's own candidate
-        // ($HOME/.pki/nssdb) lives under this directory, so the count is fully
-        // determined — one profile plus the shared DB, nothing else. Leaving
-        // it absent made the result depend on whether $HOME existed at all
-        // (GitHub macOS runners have no HOME set for a process).
+        // The shared DB too — but asserted through a HOME of its own, not
+        // through whatever the machine happens to have: `shared_db_exists` is
+        // a $HOME thing (`$HOME/.pki/nssdb`, the Chromium location) on every
+        // platform, so the candidate exists exactly as long as we say HOME
+        // exists. Swapping it into the fixture inside this test's own locked
+        // window makes the fixture, not the runner, decide the count — which
+        // is precisely what GitHub's macOS runners broke before, when they
+        // start test processes with no HOME at all and an unconditional
+        // expectation became a guess.
         std::fs::create_dir_all(dir.join(".pki/nssdb")).unwrap();
         std::fs::write(dir.join(".pki/nssdb/cert9.db"), b"synthetic").unwrap();
         let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        // Discovery reads HOME through the real environment; a sibling test
-        // swapping HOME concurrently would make it look at the wrong tree, so
-        // this particular assertion is made stable: with every candidate path
-        // containing this test's own directory name (they all do — the fake
-        // root is per-test), HOME is only consulted through one swap of ours.
-        unsafe { std::env::set_var("HOME", &dir) };
+        // Every variable discovery consults moves into this fixture for the
+        // duration of the call, so the fixture — not the runner's environment
+        // — decides what gets found: $HOME carries the unix trees and the
+        // shared DB on every platform, and Windows browsers keep profiles
+        // under %APPDATA%/%LOCALAPPDATA% (firefox_parents reads both). A
+        // sibling test swapping them concurrently would make discovery look at
+        // the wrong tree, so the whole swap lives inside one locked window;
+        // every candidate path contains this test's own directory name, so a
+        // leaked window elsewhere could not add to this count either.
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = if cfg!(windows) {
+            ["HOME", "APPDATA", "LOCALAPPDATA"]
+                .into_iter()
+                .map(|v| (v, std::env::var_os(v)))
+                .collect()
+        } else {
+            vec![("HOME", std::env::var_os("HOME"))]
+        };
+        unsafe {
+            for v in saved.iter().map(|(v, _)| *v) {
+                std::env::set_var(v, &dir);
+            }
+        }
+        // On Windows the profile parent is %APPDATA%\Mozilla\Firefox; lay the
+        // fixture's firefox tree where that platform looks for it too.
+        let parents: Vec<std::path::PathBuf> = if cfg!(windows) {
+            vec![
+                dir.join("Mozilla").join("Firefox"),
+                dir.join(".mozilla").join("firefox"),
+            ]
+        } else {
+            vec![dir.join(".mozilla").join("firefox")]
+        };
+        for parent in parents {
+            let profile = parent.join("abcd.default-release");
+            if std::fs::create_dir_all(&profile).is_err() {
+                continue;
+            }
+            let _ = std::fs::write(profile.join("cert9.db"), b"synthetic");
+            let _ = std::fs::write(
+                parent.join("profiles.ini"),
+                "[Profile0]\nName=release\nIsRelative=1\nPath=abcd.default-release\nDefault=1\n",
+            );
+        }
         let specs: Vec<_> = discover()
             .into_iter()
             .filter(|s| {
@@ -828,11 +868,19 @@ mod tests {
             })
             .collect();
         unsafe {
-            match home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
+            for (v, value) in saved {
+                match value {
+                    Some(h) => std::env::set_var(v, h),
+                    None => std::env::remove_var(v),
+                }
             }
         }
+        // One profile plus the shared DB. With every lookup variable pointed
+        // into this fixture, nothing else can answer on any platform — which
+        // is exactly what failed before: the runner's own %APPDATA% had a real
+        // Firefox profile (Windows found that parent first), and macOS runners
+        // start test processes with no HOME at all. Both counted through the
+        // `name` filter, so only a fixture-decided count is stable.
         assert_eq!(specs.len(), 2, "{specs:?}");
     }
 }
