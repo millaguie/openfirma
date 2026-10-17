@@ -2575,7 +2575,9 @@ mod tests {
         // The refusal a fresh `--register` (no --p12 anywhere) must print:
         // naming the fix, not just the missing flag — the whole point of the
         // round-two finding was an install step that "succeeded" into a
-        // handler that always failed.
+        // handler that always failed. No xdg-mime promise here: every refusal
+        // this test pins fires long before the association step, so it fails
+        // for the tested reason on images with and without xdg-utils.
         let dir =
             std::env::temp_dir().join(format!("openfirma-register-empty-{}", std::process::id()));
         // The refusal must arrive BEFORE any file exists — the round-two state
@@ -2586,10 +2588,6 @@ mod tests {
         std::fs::create_dir_all(dir.join(".local/share/applications")).unwrap();
         let cfg = dir.join("browser.toml");
         let _ = std::fs::remove_file(&cfg);
-        // A CI image may not ship xdg-utils; the refusal under test is the
-        // missing key, so promise xdg-mime and let the key rule decide.
-        let _xdg_guard = lock_quiet(&XDG_MIME_OVERRIDE);
-        unsafe { std::env::set_var("OPENFIRMA_ASSUME_XDG_MIME", "1") };
         let err = with_home(&dir, || {
             register_scheme(None, None, Some(&cfg), false, false)
                 .unwrap_err()

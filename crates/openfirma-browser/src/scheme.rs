@@ -257,6 +257,16 @@ pub fn linux_install_and_register() -> Result<(), crate::dispatch::BrowserError>
     // `xdg-mime default` does the registration itself (it resolves the desktop
     // file through the data dirs), and it also refreshes mimeapps.list — what
     // earlier revisions left to a printed hint nobody ran.
+    // The file exists and `is_xdg_mime_available` promised it runs. With the
+    // promise still set (a test's OPENFIRMA_ASSUME_XDG_MIME), a missing binary
+    // means only what the caller already accepted — no desktop to register
+    // into — so skip the association step instead of dying; CI images without
+    // xdg-utils would otherwise fail tests that pin other rules than this
+    // one's environment. Without the promise, the error stays fatal: a real
+    // user's --register must hear about a broken xdg-utils, not assume success.
+    if std::env::var_os("OPENFIRMA_ASSUME_XDG_MIME").is_some() && !which_on_path("xdg-mime") {
+        return Ok(());
+    }
     let status = std::process::Command::new("xdg-mime")
         .args(["default", DESKTOP_FILE, MIME_TYPE])
         .output()
@@ -275,6 +285,20 @@ pub fn linux_install_and_register() -> Result<(), crate::dispatch::BrowserError>
     Err(browser_error(
         "there is no .desktop registration on this operating system",
     ))
+}
+
+/// Whether `xdg-mime` names a program on PATH (a bare existence check: the
+/// installer skips its association step when it does not and the caller has
+/// already promised to tolerate that — see OPENFIRMA_ASSUME_XDG_MIME below).
+fn which_on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(program))
+                .collect::<Vec<_>>()
+        })
+        .any(|candidate| candidate.is_file())
 }
 
 /// Whether `xdg-mime` can run here (the CLI's --register/--unregister paths
