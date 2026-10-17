@@ -202,19 +202,23 @@ safe — its own help says so; every other command takes `--password-file`.
 
 ```
 crates/
-  openfirma-core     shared types: algorithms, certificates, Signer trait
+  openfirma-core     shared types: algorithms, certificates, Signer trait,
+                     the frontends' one implementation of their decision rules
   openfirma-cades    CMS / CAdES
   openfirma-pades    PDF reading, incremental updates, PAdES
   openfirma-xades    XML reader, Canonical XML, XAdES-B-B
   openfirma-keystore PKCS#12 + system stores: PKCS#11/NSS FFI, Windows, macOS
   openfirma-browser  browser protocol: afirma:// URIs, dispatch, loopback endpoint
   openfirma-cli      the `openfirma` binary
+  openfirma-gui      the window (`openfirma-gui`), same library calls as the CLI
 docs/
   architecture.md    crate layering and data flow
   pades.md           what AutoFirma's PAdES output actually contains
   xades.md           what AutoFirma's XAdES output actually contains
   platforms.md       the multiplatform matrix
   validation.md      how we prove output validates
+  validation-log.md  what has actually been run, where, with what verdict
+  review-findings.md the surprise review's findings and each one's status
   adr/               decisions that are expensive to reverse
 testdata/
   inputs/            documents to sign, committed because they must not change

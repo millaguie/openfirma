@@ -47,3 +47,8 @@ autofirma.pfx
 # output signed by hand while testing
 *.signed.pdf
 /tmp/
+
+# the generated third-party licence report (tools/ABOUT_TEMPLATE.hbs + `cargo
+# about generate` produce it in the release job from this lockfile); a copy
+# committed here would drift from the lockfile it is supposed to describe.
+/THIRD-PARTY-LICENSES.html

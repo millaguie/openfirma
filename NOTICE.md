@@ -42,6 +42,36 @@ to be compatible with.
 
 ## Third party components
 
-Rust crates used by openfirma keep their own licenses, recorded by
-`cargo about` / `cargo license`. At the time of writing the dependency tree is
-Apache-2.0 OR MIT (RustCrypto), plus the crates listed in `Cargo.lock`.
+openfirma statically links the crates resolved in `Cargo.lock`. MIT, Apache-2.0,
+BSD, ISC, Zlib, BSL-1.0 and OFL-style licences all require shipping their
+copyright notices and licence texts with the binaries — that is a condition of
+distribution, not a courtesy — so every release artifact carries
+`THIRD-PARTY-LICENSES.html`, generated at build time by `cargo about` from the
+very lockfile the artifact was built from (`tools/ABOUT_TEMPLATE.hbs` and
+`about.toml` in this repository define the report). A binary built from source
+regenerates the same list with:
+
+```
+cargo install cargo-about && cargo about generate tools/ABOUT_TEMPLATE.hbs > THIRD-PARTY-LICENSES.html
+```
+
+The tree is NOT "Apache-2.0 OR MIT (RustCrypto)" as an earlier revision of this
+file claimed; the lockfile's census (measured with `cargo metadata`, 495
+packages) is: MIT/Apache-2.0 dual licences ~318, MIT-only 93, Unicode-3.0 18,
+Apache-2.0-only 12 (`flagset`, reached through `der`, and the GUI's winit/
+glutin/accesskit stack), Zlib-family ~24, plus singletons: ISC (libloading),
+BSD-3-Clause (subtle), BSL-1.0, Unlicense, 0BSD, LGPL-options (never elected —
+each is `OR MIT`), and the fonts (`epaint_default_fonts`: OFL-1.1 and the
+Ubuntu Font Licence). Every one of these permits distribution under openfirma's
+GPL-2.0-or-later OR EUPL-1.1 combined work; the per-component texts travel in
+the generated report so each notice reaches the recipient wherever the binary
+goes.
+
+One honest caveat belongs here, not hidden: FSF reads Apache-2.0-only as
+incompatible with GPL-2.0 (and compatible with GPL-3.0). openfirma's license is
+GPL-2.0-*or-later*, so any distribution of these binaries under the GPL option
+uses the "or later" (GPL-3.0), which accepts the combination; the EUPL-1.1
+option accepts compatible permissive code as well. That reasoning should be
+confirmed with legal counsel before a formal release; if it ever fails, the
+Apache-2.0-only components above are the ones to look at first, and this file
+must change accordingly.

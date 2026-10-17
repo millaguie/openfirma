@@ -3,21 +3,19 @@
 ## Layering
 
 ```
-        openfirma-cli        openfirma-gui
-                 \              /
-             openfirma-browser       <- afirma:// verbs, loopback endpoint (docs/adr/0005)
-                        |
-        +---------------+----------------+
-        |               |                |
-  openfirma-cades  openfirma-pades  openfirma-xades      <- signature formats
-        \               |               /
-         \              |              /
-              openfirma-core                       <- algorithms, certs, Signer trait, params
-                        |
-              openfirma-keystore                   <- where keys live
-                        |
-   +--------+-----------+-----------+---------+
-   | pkcs12 | pkcs11    | capi/cng  | keychain| nss  | pcsc (DNIe, Ceres)
+     openfirma-cli                    openfirma-gui
+          \                              /
+           +---- openfirma-browser ------+   <- afirma:// verbs, loopback endpoint,
+           |              |              |      and the shared signing dispatcher
+           |              |              |      both frontends call (docs/adr/0005)
+   openfirma-cades  openfirma-pades  openfirma-xades     <- signature formats
+           \              |              /
+            \             |             /
+                 openfirma-core         <- algorithms, certs, Signer trait, the
+                          |               frontends' shared decision rules
+                 openfirma-keystore     <- where keys live (depends on core;
+    +--------+------------+-------------+    the PKCS#12/PKCS#11/NSS/CAPI/keychain
+    | pkcs12 | pkcs11     | nss   capi/cng/keychain |   backends sit inside it)
 ```
 
 Rule: format crates never talk to a keystore directly. They receive an
@@ -28,6 +26,21 @@ backends swappable.
 Rule: nothing above `openfirma-core` may depend on a platform. Platform access
 is confined to `openfirma-keystore`, `openfirma-browser` (loopback sockets, URL
 scheme registration) and the installers.
+
+Honesty about what happened to these rules (review 07, H-19): the diagram is
+the *goal*, and reality drifted in two known ways. `openfirma-core::workflow`
+carries the frontends' decision rules — which format a file gets, output
+naming, trust anchors, store descriptors, password posture — and some of it
+reads environment variables and files (`OPENFIRMA_TRUST`, `$HOME`,
+`OPENFIRMA_PASSWORD`, password files). That broke the "no filesystem
+assumptions" edge this document asked core to keep for a future mobile link;
+the env-touching helpers are isolated in `workflow.rs` behind narrow functions
+so the day an iOS binding wants them, they move to a small `-app` crate
+without touching the decision logic itself. And the signing dispatcher both
+frontends share lives in `openfirma-browser::signing`, so the GUI depends on
+the browser crate for more than serving browsers — moving it (with `workflow`)
+into an `openfirma-app` crate is the recorded next step, deliberately not
+done mid-review because it renames the seam every frontend crosses.
 
 ## Crate responsibilities
 
@@ -69,12 +82,21 @@ scheme registration) and the installers.
   The wire shapes are measured off AutoFirma; its self-signed wss transport is
   deliberately not reproduced — docs/adr/0005-browser-protocol.md records what
   a real sede still needs before end-to-end AutoScript compatibility.
-- **openfirma-validate**: revocation, certificate policy, validation data and
-  the report format VALIDe shows. The cryptographic verification of CAdES and
-  PAdES already lives in the format crates, behind `openfirma verify`; PAdES
-  verification extracts each signature's covered bytes and delegates to the
-  CAdES verifier, so every signature of a co-signed document is checked.
-- **openfirma-cli**: `openfirma sign|verify|list-certs|serve`.
+- **openfirma-gui**: the window (egui/eframe, docs/adr/0006): sign, verify,
+  keystores, .p12 — every action through the same library calls and shared
+  decision rules the CLI uses; its logic is asserted windowless by egui_kittest
+  tests driving the real App.
+
+There is no `openfirma-validate` crate: revocation reading lives in
+`openfirma_cades::revocation`, the cryptographic verification of CAdES and
+PAdES lives in the format crates behind `openfirma verify`, and PAdES
+verification extracts each signature's covered bytes and delegates to the
+CAdES verifier, so every signature of a co-signed document is checked. What
+VALIDe-level policy reporting would need (certificate policies, signature
+policies) is deliberately unimplemented and named as such in docs/validation.md.
+- **openfirma-cli**: `openfirma sign | verify | inspect | keystores list |
+  afirma-uri | afirma-serve`, plus the `openfirma autofirma …` compat parser
+  for AutoFirma's own console spelling.
 
 ## Why hand rolled CMS
 

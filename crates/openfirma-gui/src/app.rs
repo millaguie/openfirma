@@ -821,10 +821,9 @@ impl App {
         if let Screen::Picked {
             catalog, selected, ..
         } = &mut self.screen
+            && let Some(i) = catalog.entries.iter().position(|c| c.pending_p12.is_some())
         {
-            if let Some(i) = catalog.entries.iter().position(|c| c.pending_p12.is_some()) {
-                *selected = Some(i);
-            }
+            *selected = Some(i);
         }
     }
 
@@ -2203,7 +2202,7 @@ fn run_sign_job(job: SignJob, tr: &Tr) -> SignOutcome {
         let timestamp = if tsa_url.trim().is_empty() {
             None
         } else {
-            Some(crate::tsa::provider(tsa_url.trim()).map_err(openfirma_core::Error::Other)?)
+            Some(crate::tsa::provider(tsa_url.trim())?)
         };
         let signer = key.signer()?;
         signing::execute(

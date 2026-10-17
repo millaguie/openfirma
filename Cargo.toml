@@ -14,6 +14,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# The floor every member but the GUI builds on (openfirma-gui carries 1.95
+# itself: eframe/egui 0.37 demand it). CI's msrv job verifies BOTH numbers, so
+# neither is decorative (review 07, H-8 raised a declaration that was lying).
 rust-version = "1.85"
 license = "GPL-2.0-or-later OR EUPL-1.1"
 repository = "https://github.com/millaguie/openfirma"
@@ -83,13 +86,16 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 # dlopen/GetProcAddress for PKCS#11 modules (ADR-0004: a Cryptoki module is a
 # plugin loaded at runtime, never linked). Pinned to 0.8 because 0.9 raises
-# its own MSRV above the workspace's rust-version = 1.85. The crate has no
-# unsafe beyond the FFI it wraps and pulls no C code.
+# its own MSRV above the workspace floor of 1.85 — which only matters because
+# every NON-GUI member (the CLI included) builds there; had the pin been free
+# to float, 1.85 would still hold via this pin and break only if a future
+# libloading major came with it. The crate has no unsafe beyond the FFI it
+# wraps and pulls no C code.
 libloading = "0.8"
 # The file dialogs of openfirma-gui (docs/adr/0006). Not a second signing
-# stack: it only shows the OS's own open/save dialog, so on Linux and Windows
-# the dialog is GTK/Win32 (not RustCrypto, not crypto) — like every native
-# file picker. Version chosen by lookup: 0.16 is the current release, and its
+# stack: it only shows the OS's own open/save dialog — Win32 on Windows, the
+# XDG desktop portal (ashpd/zbus, pure Rust) on Linux with rfd 0.16's default
+# features, not GTK, and NSOpenPanel through objc on macOS. Version chosen by lookup: 0.16 is the current release, and its
 # rfd-derive proc macro is pure Rust. Everything else in the GUI goes through
 # egui itself, which drags no system library beyond OpenGL (see ADR-0006).
 rfd = "0.16"

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 repository.workspace = true
 description = "PAdES signature format for openfirma: PDF incremental updates carrying a detached CAdES"
 

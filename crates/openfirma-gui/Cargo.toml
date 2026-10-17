@@ -2,8 +2,13 @@
 name = "openfirma-gui"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# eframe/egui 0.37 declare rust-version 1.95 and the workspace floor is 1.85
+# (every other member, CLI included, builds there — CI's msrv job checks both
+# floors at their own toolchain). The GUI therefore carries its OWN floor; a
+# .workspace one would either lie about 1.85 here or raise it everywhere.
+rust-version = "1.95"
 license.workspace = true
+publish = false
 repository.workspace = true
 description = "openfirma graphical client: one window that signs and verifies, built on the same library calls as the CLI (docs/adr-0006)"
 

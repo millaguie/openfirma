@@ -19,6 +19,7 @@
 pub mod attributes;
 pub mod revocation;
 pub mod signed_data;
+pub mod tsa;
 pub mod tsp;
 pub mod verify;
 

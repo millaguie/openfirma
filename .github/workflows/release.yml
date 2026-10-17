@@ -58,7 +58,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          channel: stable
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -96,6 +96,20 @@ jobs:
         if: matrix.gui
         run: cargo build --release --target ${{ matrix.target }} -p openfirma-gui --bin openfirma-gui
 
+      # Third-party licence report: MIT/Apache/BSD/ISC/Zlib/OFL all require
+      # their notices to travel with the binaries, so `cargo about` renders
+      # them from THIS job's Cargo.lock and the archive carries the result
+      # (review 07, H-12: before this, artifacts shipped openfirma's own
+      # LICENSES/ only and NOTICE pointed at a tool nobody ran). Built once
+      # per matrix leg on the runner itself — the report describes the exact
+      # lockfile the binary was compiled from.
+      - name: third-party licence report
+        shell: bash
+        run: |
+          cargo install cargo-about --locked --version "^0.9"
+          cargo about generate tools/ABOUT_TEMPLATE.hbs > THIRD-PARTY-LICENSES.html
+          grep -q "epaint_default_fonts" THIRD-PARTY-LICENSES.html  # the GUI fonts must appear
+
       # Every artifact carries the license texts and the attribution notice,
       # because that is a condition of the GPL/EUPL distribution, not a nicety
       - name: package (unix)
@@ -109,7 +123,7 @@ jobs:
           if [ "${{ matrix.gui }}" = "true" ]; then
             cp "target/${{ matrix.target }}/release/openfirma-gui" "$name/"
           fi
-          cp README.md NOTICE.md "$name/"
+          cp README.md NOTICE.md THIRD-PARTY-LICENSES.html "$name/"
           cp LICENSES/* "$name/LICENSES/"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
@@ -124,7 +138,7 @@ jobs:
           if ("${{ matrix.gui }}" -eq "true") {
             Copy-Item "target/${{ matrix.target }}/release/openfirma-gui.exe" "$name/"
           }
-          Copy-Item README.md,NOTICE.md "$name/"
+          Copy-Item README.md,NOTICE.md,THIRD-PARTY-LICENSES.html "$name/"
           Copy-Item LICENSES/* "$name/LICENSES/"
           Compress-Archive -Path "$name" -DestinationPath "$name.zip"
           $h = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()

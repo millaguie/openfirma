@@ -565,22 +565,22 @@ fn timestamp_provider(
             anyhow::bail!("--tsa and --timestamp-token are alternatives, not companions")
         }
         (Some(url), None) => {
-            if !url.starts_with("http://") {
-                anyhow::bail!(
-                    "--tsa only speaks plain http today. An https TSA needs a TLS client, \
-                     which is a dependency decision recorded separately; until then fetch \
-                     the token by hand and pass --timestamp-token."
-                );
-            }
-            Ok(Some(Arc::new(move |sig: &[u8], digest| {
-                let nonce = tsp::random_nonce()?;
-                let query = tsp::request(digest, sig, nonce)?;
-                let response = http_post(&url, &query)
-                    .map_err(|e| openfirma_core::Error::Other(e.to_string()))?;
-                let token = tsp::token_from_response(&response, digest, sig, Some(&query))?;
-                warn_if_token_unverified(&format!("the TSA at {url}"), &token, &tsa_trust);
-                Ok(vec![tsp::unsigned_attribute(&token)?])
-            })))
+            // One transport for both frontends (review 06, M-9): the POST,
+            // the status parsing and the response cap live in
+            // openfirma-cades' tsa module — the GUI's TSA field runs the same
+            // code. What stays local is the CLI's own warning posture: with
+            // --validation-cert anchors, a token whose signature verifies
+            // gets NO warning; anything else says so on stderr.
+            let trust = tsa_trust.clone();
+            openfirma_cades::tsa::provider(
+                &url,
+                "--tsa only speaks plain http today. An https TSA needs a TLS client, \
+                 which is a dependency decision recorded separately; until then fetch \
+                 the token by hand and pass --timestamp-token.",
+                move |source, token| warn_if_token_unverified(source, token, &trust),
+            )
+            .map(Some)
+            .map_err(anyhow::Error::from)
         }
         (None, Some(path)) => {
             let response =
@@ -612,120 +612,6 @@ fn warn_if_token_unverified(source: &str, token: &[u8], tsa_trust: &[Certificate
              yourself: openssl ts -verify -CAfile <tsa-ca.pem> -in <answer.tsr> -data <file>"
         );
     }
-}
-
-/// How long the TSA may take to answer, per read or write. A signing run must
-/// not hang on a black hole; 10 seconds is generous for a timestamp query.
-const TSA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// The most a TSA answer may weigh. A `TimeStampResp` with a full chain is
-/// kilobytes; a megabyte is already nothing legitimate, and reading without a
-/// cap hands a hostile server an unbounded allocation.
-const TSA_MAX_RESPONSE: usize = 1024 * 1024;
-
-/// A minimal HTTP/1.1 POST, enough for a timestamp query and nothing more.
-/// std::net only: no dependency for a request that is two headers and a body.
-fn http_post(url: &str, body: &[u8]) -> Result<Vec<u8>> {
-    use std::io::{Read, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
-    let rest = url
-        .strip_prefix("http://")
-        .context("only http:// TSA urls are supported")?;
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h,
-            p.parse::<u16>()
-                .with_context(|| format!("the TSA url port {p:?} is not a number"))?,
-        ),
-        None => (authority, 80),
-    };
-    let mut stream: Option<TcpStream> = None;
-    let mut last_error = None;
-    for addr in (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("the TSA host {host} does not resolve"))?
-    {
-        match TcpStream::connect_timeout(&addr, TSA_TIMEOUT) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(e) => last_error = Some(e),
-        }
-    }
-    let mut stream = stream.ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot reach the TSA at {host}:{port}: {}",
-            last_error
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "no address to connect to".into())
-        )
-    })?;
-    stream
-        .set_read_timeout(Some(TSA_TIMEOUT))
-        .context("cannot arm the TSA read timeout")?;
-    stream
-        .set_write_timeout(Some(TSA_TIMEOUT))
-        .context("cannot arm the TSA write timeout")?;
-    stream
-        .write_all(
-            format!(
-                "POST /{path} HTTP/1.1\r\nHost: {authority}\r\n\
-                 Content-Type: application/timestamp-query\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .context("cannot send the timestamp query")?;
-    stream
-        .write_all(body)
-        .context("cannot send the timestamp query")?;
-    let mut raw = Vec::new();
-    // one byte over the cap so an answer exactly at the cap still parses and
-    // anything past it is provably past it
-    (&mut stream)
-        .take(TSA_MAX_RESPONSE as u64 + 1)
-        .read_to_end(&mut raw)
-        .context("the TSA closed the connection without answering")?;
-    if raw.len() > TSA_MAX_RESPONSE {
-        anyhow::bail!(
-            "the TSA sent more than {TSA_MAX_RESPONSE} bytes without finishing; a \
-             timestamp answer is kilobytes, so this server is not a TSA"
-        );
-    }
-    split_http_response(&raw)
-}
-
-/// The body of an HTTP answer, with the status line read as a status line:
-/// version, then the three digit code as its own token. A substring match on
-/// " 200" also accepts "HTTP/1.1 2006 ...", and a hostile server gets to pick
-/// the reason phrase.
-fn split_http_response(raw: &[u8]) -> Result<Vec<u8>> {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .context("the TSA answer has no header/body separator")?;
-    let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    let status = head.lines().next().unwrap_or_default();
-    let mut parts = status.split_whitespace();
-    let version = parts.next().unwrap_or_default();
-    let code = parts.next().unwrap_or_default();
-    if !version.starts_with("HTTP/1.") || code != "200" {
-        anyhow::bail!("the TSA answered {status:?}, expected an HTTP/1.x 200");
-    }
-    let mut body_out = raw[split + 4..].to_vec();
-    // honour Content-Length when present; otherwise the connection close was
-    // the terminator and everything after the headers is the body
-    if let Some(line) = head
-        .lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-    {
-        let n: usize = line[15..].trim().parse().unwrap_or(body_out.len());
-        body_out.truncate(n);
-    }
-    Ok(body_out)
 }
 
 /// One `--store` / `keystores list --store` descriptor, parsed. The type and
@@ -3452,7 +3338,23 @@ mod tests {
     /// and every thread sees any set_var — edition-2024's warning exactly: this
     /// helper keeps the window as small as a call and restores whatever was
     /// there before, including "nothing was there".
+    ///
+    /// H-17 (review 07): no HOME write may happen outside a locked window —
+    /// every caller of `with_home` takes HOME_LOCK itself, exactly like the
+    /// XDG_MIME_OVERRIDE callers do. Locking inside the helper instead looked
+    /// like the stronger form and deadlocked: `std::sync::Mutex` is not
+    /// reentrant, and the register tests must hold the lock across two
+    /// with_home calls (their assertions observe what the platform block
+    /// wrote through HOME between them).
+    ///
+    /// MOVING_HOME is the helper's own marker — a second mutex held for
+    /// exactly the set/restore window. It serializes HOME movers even if a
+    /// caller forgets HOME_LOCK, and `home_moves_only_inside_the_locked_
+    /// window` watches it from outside to prove the window exists at all.
+    static MOVING_HOME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn with_home<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
+        let _moving_home = lock_quiet(&MOVING_HOME);
         let real_home = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", dir) };
         let out = run();
@@ -3577,7 +3479,10 @@ mod tests {
         ));
         // HOME moves to this scratch tree for the duration only: --register's
         // platform block writes its .desktop through HOME (restored right
-        // after the call below, set_var discipline as everywhere else).
+        // after the call below, set_var discipline as everywhere else). The
+        // caller holds HOME_LOCK for the whole window: with_home does not
+        // lock (a non-reentrant mutex would self-deadlock a locked helper),
+        // so guarding HOME is each test's own job.
         std::fs::create_dir_all(dir.join(".local/share/applications")).unwrap();
         let cfg = dir.join("browser.toml");
         let _ = std::fs::remove_file(&cfg);
@@ -3621,6 +3526,77 @@ mod tests {
         // refusal), a present one is read.
         std::fs::remove_file(&cfg).ok();
         let _ = dir;
+    }
+
+    /// H-17's proof for this binary: HOME only ever moves inside a locked
+    /// window. A sibling test that set HOME unguarded made concurrent getenv
+    /// undefined behaviour (glibc), and macOS CI runs these threads on
+    /// machines with no HOME at all. What makes the rule checkable is that
+    /// `with_home` holds MOVING_HOME for exactly its set/restore window: a
+    /// probe from inside sees it busy, outside sees it free, so two HOME
+    /// movers can never overlap; and a poller sampling HOME through the run
+    /// never sees any value but the real one or the fixture's own. The
+    /// caller-side half (each test takes HOME_LOCK before calling) is the
+    /// discipline this same test models: it never moves HOME outside its own
+    /// guard below.
+    #[test]
+    fn home_moves_only_inside_the_locked_window() {
+        let real = std::env::var_os("HOME");
+        let dir = std::env::temp_dir().join(format!("openfirma-home-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let _home_guard = lock_quiet(&HOME_LOCK);
+        // Outside any window the marker is free (held only for the duration,
+        // or every caller would serialize forever). The busy half gets proven
+        // from inside the window below, where a `try_lock` answers "busy"
+        // with certainty; a background poller racing a microsecond-long
+        // set/restore would only measure scheduler noise.
+        let free_outside = MOVING_HOME.try_lock().is_ok();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
+        let poller = {
+            let seen = std::sync::Arc::clone(&seen);
+            std::thread::spawn(move || {
+                while stop_rx.try_recv().is_err() {
+                    seen.lock().unwrap().push(std::env::var_os("HOME"));
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+            })
+        };
+
+        let inner = dir.clone();
+        with_home(&dir, || {
+            // inside the window HOME is the fixture and the marker is busy —
+            // a second mover waiting on MOVING_HOME cannot be mid-set right
+            // now, which is exactly H-17's serialization.
+            assert_eq!(std::env::var_os("HOME").as_deref(), Some(inner.as_os_str()));
+            assert!(MOVING_HOME.try_lock().is_err());
+        });
+        // outside it, HOME is back to what it was and the marker is free
+        // again, even while the poller keeps sampling.
+        assert_eq!(std::env::var_os("HOME"), real);
+        let free_after = MOVING_HOME.try_lock().is_ok();
+        let _ = stop.send(());
+        poller.join().unwrap();
+
+        let observed = seen.lock().unwrap();
+        // The window is microseconds, so a 50us poller may well miss it
+        // entirely — what must never happen is an OBSERVED value that came
+        // from anywhere outside the real HOME or the fixture.
+        for value in observed.iter() {
+            assert!(
+                value.as_deref() == Some(dir.as_os_str()) || value == &real,
+                "HOME was observed as {value:?}: neither the fixture nor the real home — \
+                 something writes HOME outside with_home's locked window"
+            );
+        }
+        assert!(
+            free_outside && free_after,
+            "MOVING_HOME outlives with_home's window: two HOME movers would \
+             serialize forever and the marker stops meaning \"window active\""
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3749,8 +3725,11 @@ mod tests {
         unsafe { std::env::remove_var(&var) };
     }
 
-    /// A one answer TCP server, so `http_post` can be pointed at something
-    /// that behaves like a hostile TSA without leaving the machine.
+    /// A one answer TCP server, so the TSA transport both frontends share
+    /// (`openfirma_cades::tsa`) can be pointed at something that behaves like
+    /// a hostile TSA without leaving the machine. The CLI-side tests below
+    /// kept their cases when the transport moved into the crate: they are the
+    /// proof that the one shared copy refuses what the two old copies did.
     fn fake_tsa(answer: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("cannot bind");
@@ -3971,20 +3950,20 @@ mod tests {
     #[test]
     fn the_tsa_status_line_is_parsed_not_substring_matched() {
         let (addr, srv) = fake_tsa(b"HTTP/1.1 2006 evil\r\nContent-Length: 2\r\n\r\nhi".to_vec());
-        let err = http_post(&format!("http://{addr}/tsa"), b"query")
+        let err = openfirma_cades::tsa::http_post(&format!("http://{addr}/tsa"), b"query")
             .expect_err("2006 is not 200")
             .to_string();
         srv.join().unwrap();
         assert!(err.contains("expected an HTTP/1.x 200"), "{err}");
 
         let (addr, srv) = fake_tsa(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec());
-        let body = http_post(&format!("http://{addr}/tsa"), b"query")
+        let body = openfirma_cades::tsa::http_post(&format!("http://{addr}/tsa"), b"query")
             .expect("a real 200 answer must be accepted");
         srv.join().unwrap();
         assert_eq!(body, b"hi");
 
         let (addr, srv) = fake_tsa(b"HTTP/1.1 500 Internal Server Error\r\n\r\nx".to_vec());
-        let err = http_post(&format!("http://{addr}/tsa"), b"query")
+        let err = openfirma_cades::tsa::http_post(&format!("http://{addr}/tsa"), b"query")
             .expect_err("a 500 is not a timestamp")
             .to_string();
         srv.join().unwrap();
@@ -3996,13 +3975,13 @@ mod tests {
     #[test]
     fn the_tsa_answer_is_capped() {
         let mut answer = Vec::from(&b"HTTP/1.1 200 OK\r\n\r\n"[..]);
-        answer.resize(TSA_MAX_RESPONSE + 100, b'x');
+        answer.resize(openfirma_cades::tsa::TSA_MAX_RESPONSE + 100, b'x');
         let (addr, srv) = fake_tsa(answer);
-        let err = http_post(&format!("http://{addr}/tsa"), b"query")
+        let err = openfirma_cades::tsa::http_post(&format!("http://{addr}/tsa"), b"query")
             .expect_err("a megabyte of x is not a TimeStampResp")
             .to_string();
         srv.join().unwrap();
-        assert!(err.contains("1048576 bytes"), "{err}");
+        assert!(err.contains("megabyte"), "{err}");
     }
 
     // --------------------------------------------------------- compat (A-8)

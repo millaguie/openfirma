@@ -211,23 +211,22 @@ fn pdf_verdicts(
             for chunk in split_failures(&msg) {
                 // "signature N (object …): reason" — the label pades_verify
                 // stamps on every per-signature failure.
-                if let Some(rest) = chunk.strip_prefix("signature ") {
-                    if let Some(n) = rest
+                if let Some(rest) = chunk.strip_prefix("signature ")
+                    && let Some(n) = rest
                         .split_whitespace()
                         .next()
                         .and_then(|w| w.parse::<usize>().ok())
-                    {
-                        if (1..=signatures.len()).contains(&n) && lines[n - 1].is_none() {
-                            let reason = after_colon(&chunk);
-                            lines[n - 1] = Some(invalid_line(
-                                reason.clone(),
-                                &format!("{reason} ({chunk})"),
-                                false,
-                                tr,
-                            ));
-                            continue;
-                        }
-                    }
+                    && (1..=signatures.len()).contains(&n)
+                    && lines[n - 1].is_none()
+                {
+                    let reason = after_colon(&chunk);
+                    lines[n - 1] = Some(invalid_line(
+                        reason.clone(),
+                        &format!("{reason} ({chunk})"),
+                        false,
+                        tr,
+                    ));
+                    continue;
                 }
                 other_notes.push(chunk);
             }
@@ -506,15 +505,15 @@ fn first_sentence(t: &str) -> String {
 /// the label the library added ("signer 2: …") is what we have to say — and
 /// saying WHICH signature failed matters when a document carries several.
 fn extract_labelled_signer(technical: &str) -> String {
-    if let Some(rest) = technical.strip_prefix("signer ") {
-        if let Some(n) = rest.split(':').next() {
-            return n.trim().to_string();
-        }
+    if let Some(rest) = technical.strip_prefix("signer ")
+        && let Some(n) = rest.split(':').next()
+    {
+        return n.trim().to_string();
     }
-    if let Some(rest) = technical.strip_prefix("signature ") {
-        if let Some(n) = rest.split_whitespace().next() {
-            return format!("firma {n}");
-        }
+    if let Some(rest) = technical.strip_prefix("signature ")
+        && let Some(n) = rest.split_whitespace().next()
+    {
+        return format!("firma {n}");
     }
     String::new()
 }

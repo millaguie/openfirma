@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 repository.workspace = true
 description = "XAdES-B-B: XML-DSig with the ETSI EN 319 132-1 baseline qualifying properties, matching AutoFirma's output"
 

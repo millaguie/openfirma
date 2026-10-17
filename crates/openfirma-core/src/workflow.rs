@@ -1055,6 +1055,18 @@ mod tests {
         assert_eq!(Format::Data.supported_formats(), ["cades-b-b"]);
     }
 
+    /// The env is process-wide, and `$OPENFIRMA_TRUST` is read by production
+    /// code (`default_trust_anchors`) from both frontends' tests; H-17's rule
+    /// applies verbatim — mutate it only inside this lock (review 07).
+    static TRUST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn lock_quiet(lock: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+        match lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     #[test]
     fn trust_anchors_come_from_the_environment_and_default_to_none() {
         // The separator is the platform's, not a colon: on Windows
@@ -1063,6 +1075,13 @@ mod tests {
         // expected paths are built with the same join the rest of the file
         // uses, which makes this assert the loader on every platform instead
         // of asserting a string only Linux reads as a list.
+        //
+        // H-17 (review 07): the process-wide variable needs an exclusive
+        // window; sibling tests of this binary (and the GUI's own default
+        // reading) see any set_var from any thread, so env mutation without
+        // the lock is glibc UB. Every test here that touches OPENFIRMA_TRUST
+        // takes TRUST_LOCK through this guard.
+        let _trust_guard = lock_quiet(TRUST_LOCK.get_or_init(|| std::sync::Mutex::new(())));
         let joined = std::env::join_paths([
             std::ffi::OsStr::new("/tmp/a.pem"),
             std::ffi::OsStr::new("/tmp/b.der"),

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>openfirma — third-party licences</title>
+<style>
+  @media (prefers-color-scheme: dark) {
+    body { background: #333; color: white; }
+    a { color: skyblue; }
+  }
+  .container { font-family: sans-serif; max-width: 900px; margin: 0 auto; }
+  .intro { text-align: center; }
+  .license-text { max-height: 320px; overflow-y: scroll; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main class="container">
+  <div class="intro">
+    <h1>openfirma — third-party licences</h1>
+    <p>Every crate this binary statically links, its licence, and the licence
+    text with the copyright notices it requires you to receive. openfirma
+    itself is GPL-2.0-or-later OR EUPL-1.1 (see LICENSES/), and openfirma's
+    relationship with AutoFirma is in NOTICE.md.</p>
+  </div>
+
+  <h2>Components:</h2>
+  <table>
+  {{#each crates}}
+    <tr>
+      <td><a href="{{#if package.repository}} {{package.repository}} {{else}} https://crates.io/crates/{{package.name}} {{/if}}">{{package.name}}</a></td>
+      <td>{{package.version}}</td>
+      <td>{{license}}</td>
+    </tr>
+  {{/each}}
+  </table>
+
+  <h2>Licence texts:</h2>
+  {{#each overview}}
+    <h3 id="{{id}}">{{name}}</h3>
+    <pre class="license-text">{{text}}</pre>
+  {{/each}}
+</main>
+</body>
+</html>

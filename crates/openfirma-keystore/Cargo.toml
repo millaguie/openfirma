@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 repository.workspace = true
-description = "Certificate and key containers for openfirma: PKCS#12 today, system stores next"
+description = "Certificate and key stores for openfirma: PKCS#12 containers, PKCS#11 tokens, NSS databases, the Windows certificate store (the macOS keychain refuses until it can be tested)"
 
 [dependencies]
 openfirma-core.workspace = true
