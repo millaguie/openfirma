@@ -783,6 +783,12 @@ fn cades_options(opts: &PadesOptions) -> CadesOptions {
         signing_time: None,
         mime_type: None,
         content_hint: None,
+        signature_policy: None,
+        signature_policy_hash: Vec::new(),
+        commitment_type: None,
+        // PAdES follows the same conservative rule as plain CAdES signing.
+        algorithms: openfirma_cades::verify::AlgorithmPolicy::default(),
+        include_certificate_policies: false,
         signing_certificate_v2: true,
         include_issuer_serial: true,
         extra_certificates: Vec::new(),

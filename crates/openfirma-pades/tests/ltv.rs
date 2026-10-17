@@ -184,7 +184,7 @@ fn tsa_provider(captures: Captures) -> openfirma_cades::TimestampFn {
             .lock()
             .unwrap()
             .push((message.to_vec(), response.clone()));
-        let token = tsp::token_from_response(&response, digest, message)?;
+        let token = tsp::token_from_response(&response, digest, message, Some(&query))?;
         Ok(vec![tsp::unsigned_attribute(&token)?])
     })
 }
@@ -651,7 +651,7 @@ fn a_document_timestamp_with_a_wrong_imprint_is_refused() {
         );
         assert!(ok, "openssl ts -reply failed:\n{text}");
         let response = std::fs::read(&r).expect("the TSA wrote no response");
-        let token = tsp::token_from_response(&response, digest, other)?;
+        let token = tsp::token_from_response(&response, digest, other, Some(&query))?;
         Ok(vec![tsp::unsigned_attribute(&token)?])
     });
     let opts = PadesOptions {
