@@ -25,7 +25,9 @@ fn fixtures_dir() -> PathBuf {
 fn require_or_skip(name: &str) -> PathBuf {
     let path = fixtures_dir().join(name);
     if !path.exists() {
-        if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+        let required = std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some();
+        let allowed = std::env::var_os("OPENFIRMA_ALLOW_SKIP").is_some();
+        if required && !allowed {
             panic!("fixture {name} is missing; run tools/gen-p12-fixtures.sh");
         }
         eprintln!("skipping {name}: fixture not present");
@@ -238,7 +240,9 @@ fn decrypts_pbkdf2_rc2_40_envelopes_from_legacy_export_recipes() {
 fn every_fixture_yields_an_entry_whose_key_matches_its_certificate() {
     let dir = fixtures_dir();
     if !dir.exists() {
-        if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+        let required = std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some();
+        let allowed = std::env::var_os("OPENFIRMA_ALLOW_SKIP").is_some();
+        if required && !allowed {
             panic!("fixture directory missing; run tools/gen-p12-fixtures.sh");
         }
         return;

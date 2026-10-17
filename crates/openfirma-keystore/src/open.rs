@@ -9,7 +9,30 @@ use std::sync::Arc;
 
 use openfirma_core::workflow::StoreSpec;
 use openfirma_core::{Error, Result};
+use std::path::Path;
 use zeroize::Zeroizing;
+
+/// Opens a PKCS#11 module and picks one token in it — M4's other half: the
+/// path must be **absolute**. A bare name (`libsofthsm2.so`) goes through the
+/// OS loader's own search, which on Windows includes the current directory
+/// and PATH: an attacker who can plant `DNIe_P11.dll` in the folder the user
+/// last worked in (a Downloads directory openfirma was started from) gets
+/// their code loaded. A relative path resolves against whatever the process's
+/// working directory happens to be, which is a second way to get pointed at
+/// something other than what was typed. AutoFirma's helper uses absolute
+/// paths for every module it loads (`MozillaKeyStoreUtilities.java`); so does
+/// openfirma, and the descriptor says why.
+pub fn require_absolute_module(module: &Path) -> Result<()> {
+    if module.is_absolute() {
+        return Ok(());
+    }
+    Err(Error::Keystore(format!(
+        "PKCS#11 modules are loaded by absolute path only; {} is relative (a \
+         bare name would be searched for on PATH and the current directory, \
+         which is where planted copies wait — pass --store pkcs11:/full/path/to/module.so)",
+        module.display()
+    )))
+}
 
 /// Open a store descriptor behind one `Arc<dyn SystemStore>` (docs/adr-0004:
 /// the dyn erasure keeps every backend out of the callers, and the Arc keeps
@@ -18,6 +41,9 @@ pub fn open_store(
     spec: &StoreSpec,
     pin: Option<Zeroizing<String>>,
 ) -> Result<Arc<dyn crate::SystemStore>> {
+    if let StoreSpec::Pkcs11 { module, .. } = spec {
+        require_absolute_module(module)?;
+    }
     let store: Arc<dyn crate::SystemStore> = match spec {
         StoreSpec::Pkcs11 {
             module,
@@ -49,6 +75,20 @@ pub fn open_store(
                 return Err(e);
             }
         },
+        StoreSpec::NssFirefox { profile } => {
+            match crate::nss::open_firefox(profile.as_deref(), pin.map(|p| p.to_string())) {
+                Ok(store) => Arc::new(store),
+                Err(e) => {
+                    let text = e.to_string();
+                    if text.contains("OPENFIRMA_NSS_MODULE") {
+                        return Err(Error::Keystore(format!(
+                            "{text} (on Debian/Ubuntu: apt install libnss3)"
+                        )));
+                    }
+                    return Err(e);
+                }
+            }
+        }
         StoreSpec::Windows => {
             #[cfg(target_os = "windows")]
             {
@@ -112,5 +152,25 @@ mod tests {
             .err()
             .expect("a missing module cannot open");
         assert!(err.to_string().contains("/nonexistent/mod.so"), "{err}");
+    }
+
+    #[test]
+    fn a_relative_module_path_is_refused_before_any_loading() {
+        // M4: the loader's search path (PATH, and the current directory on
+        // Windows) is exactly where planted copies wait; openfirma never
+        // enters it, for either spelling of "not absolute".
+        for module in ["libsofthsm2.so", "./x.so", "../vendor/mod.dll"] {
+            let spec = StoreSpec::Pkcs11 {
+                module: std::path::PathBuf::from(module),
+                token: None,
+                wants_no_pin: false,
+            };
+            let err = open_store(&spec, None)
+                .err()
+                .unwrap_or_else(|| panic!("{module} must be refused"));
+            let text = err.to_string();
+            assert!(text.contains("absolute path only"), "{text}");
+            assert!(text.contains(module), "{text}");
+        }
     }
 }

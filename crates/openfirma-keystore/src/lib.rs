@@ -22,7 +22,7 @@ pub mod windows;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos;
 
-pub use open::open_store;
+pub use open::{open_store, require_absolute_module};
 pub use pkcs11::Pkcs11Store;
 pub use pkcs12::Pkcs12;
 pub use store::{

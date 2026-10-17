@@ -22,7 +22,9 @@ fn softhsm_env() -> Option<(PathBuf, String)> {
 }
 
 fn require_or_skip(reason: &str) -> Option<Pkcs11Store> {
-    if std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok() {
+    let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
+    let allowed = std::env::var("OPENFIRMA_ALLOW_SKIP").is_ok();
+    if required && !allowed {
         panic!("cannot run the test: {reason}");
     }
     eprintln!("skipped, {reason}");

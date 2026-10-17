@@ -121,6 +121,28 @@ fn looks_like_markup(body: &[u8]) -> bool {
     matches!(after, Some(c) if c.is_ascii_alphabetic() || matches!(c, b'!' | b'?' | b'/'))
 }
 
+/// Expands a leading `~` or `$HOME` in a path-shaped string against the
+/// person's home directory (review 04, B-9: both `StoreSpec::parse`'s default
+/// NSS database and openfirma-keystore's NSS location handling needed this,
+/// and they had drifted — one expanded only at parse time, the other only at
+/// open time, so a descriptor like `nss:~/db` produced `sql:~`, which is not
+/// an absolute path). Anything without the exact prefix travels unchanged;
+/// when HOME cannot be read, so does it.
+pub fn expand_home(path: &str) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for (needle, replacement) in [
+        ("~", home.as_deref().unwrap_or(Path::new("~"))),
+        ("$HOME", home.as_deref().unwrap_or(Path::new("$HOME"))),
+    ] {
+        if let Some(rest) = path.strip_prefix(needle) {
+            if rest.is_empty() || rest.starts_with('/') {
+                return format!("{}{rest}", replacement.display());
+            }
+        }
+    }
+    path.to_string()
+}
+
 /// The default trust anchors of the GUI's verify path, in this order:
 ///
 /// 1. `$OPENFIRMA_TRUST`, a `:`-separated list of PEM/DER files (the knob
@@ -281,6 +303,15 @@ pub enum StoreSpec {
     Nss {
         db: String,
     },
+    /// `nss:firefox[:profile name]` — the profile AutoFirma's `MOZ_UNI`
+    /// keystore picks the same way: the one Firefox itself uses (`Default=1`
+    /// or the `[Install…]` default of `profiles.ini`, snap and flatpak roots
+    /// included), or the named one. Resolved at open time, not parse time,
+    /// so a descriptor that names an install missing on this machine fails
+    /// with the places it looked instead of silently pointing elsewhere.
+    NssFirefox {
+        profile: Option<String>,
+    },
     Windows,
     Macos,
 }
@@ -312,6 +343,10 @@ impl StoreSpec {
                 None => format!("pkcs11:{}::", module.display()),
             },
             StoreSpec::Nss { db } => format!("nss:{db}"),
+            StoreSpec::NssFirefox {
+                profile: Some(name),
+            } => format!("nss:firefox:{name}"),
+            StoreSpec::NssFirefox { profile: None } => "nss:firefox".into(),
             StoreSpec::Windows => "windows".into(),
             StoreSpec::Macos => "macos".into(),
         }
@@ -333,6 +368,10 @@ impl StoreSpec {
                 let path = db.strip_prefix("sql:").unwrap_or(db);
                 format!("NSS database {path}")
             }
+            StoreSpec::NssFirefox {
+                profile: Some(name),
+            } => format!("Firefox profile {name}"),
+            StoreSpec::NssFirefox { profile: None } => "the Firefox default profile".into(),
             StoreSpec::Windows => "the Windows certificate store".into(),
             StoreSpec::Macos => "the macOS keychain".into(),
         }
@@ -368,6 +407,23 @@ impl StoreSpec {
                 })
             }
             "nss" => {
+                // `nss:firefox[:profile]` is a different store shape (review
+                // 04, A7): the profile is not a database path, and resolving
+                // it needs profiles.ini — so parse keeps it as its own variant
+                // and openfirma-keystore resolves it at open time.
+                if rest.eq_ignore_ascii_case("firefox") {
+                    return Ok(StoreSpec::NssFirefox { profile: None });
+                }
+                if let Some(profile) = rest.strip_prefix("firefox:") {
+                    if profile.is_empty() {
+                        return Err("--store nss:firefox: names a profile after the \
+                             colon, or nothing for the default one"
+                            .into());
+                    }
+                    return Ok(StoreSpec::NssFirefox {
+                        profile: Some(profile.to_string()),
+                    });
+                }
                 let db = if rest.is_empty() {
                     let home = std::env::var("HOME").map_err(|_| {
                         "the default NSS database is $HOME/.pki/nssdb and HOME is not set: \

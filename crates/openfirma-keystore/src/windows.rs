@@ -142,6 +142,11 @@ const CERT_STORE_READONLY_FLAG: u32 = 0x0000_8000;
 /// `PKCS_7_ASN_ENCODING | X509_ASN_ENCODING` — the encodings a MY store uses.
 const ENCODINGS: u32 = 0x0001_0001;
 /// Ask CAPI for whichever provider backs the key, legacy CSP or smart card.
+/// Both flags below carry the SDK's values (`wincrypt.h`, mirrored by
+/// windows-sys under Win32/Security/Cryptography): ALLOW is `0x00010000` and
+/// PREFER `0x00020000` — finding A6.2, an earlier revision had `0x100` and
+/// `0x200`, which CAPI ignores without complaining, so a CNG-only key (every
+/// EC key on a modern machine, every minidriver card) stayed invisible.
 const CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG: u32 = 0x0001_0000;
 /// Prefer the CNG handle when a key exists in both stores. Kept deliberately
 /// *off* on signing (see [`sign_prehash`]): openfirma's signer speaks PKCS#1
@@ -305,27 +310,64 @@ impl SystemStore for WindowsStore {
         }
         // Re-acquire the provider for this certificate's key and sign. The
         // index in the handle records which entry of the listing this is (the
-        // message on failure); the key itself is always freshly re-found from
-        // the certificate DER, so a concurrent store edit surfaces as a clean
-        // "no longer available" error instead of signing with a stale context.
+        // message on failure); finding A6.1: a context rebuilt from the DER
+        // carries no CERT_KEY_PROV_INFO property — the key association is a
+        // property of the *store's* contexts, so `CryptAcquireCertificatePrivateKey`
+        // on a hand-made one answers CRYPT_E_NO_MATCH/NO_KEY_PROPERTY every
+        // time. Re-enumerate MY and acquire on the store's own context; only
+        // when the entry is no longer in the store (edited between listing
+        // and signing) does the rebuilt context get tried, as a best effort.
         let der = cert.cert.der().to_vec();
-        let mut handle = 0usize;
-        let mut spec = 0u32;
-        let mut must_free = 0i32;
-        let ctx =
+        let owned =
             unsafe { CertCreateCertificateContext(ENCODINGS, der.as_ptr(), der.len() as u32) };
-        if ctx.is_null() {
+        if owned.is_null() {
             return Err(Error::Keystore(format!(
                 "the certificate at Windows store index {i} is no longer a valid context"
             )));
         }
-        // SAFETY: `ctx` was just created non-null and stays alive across the
-        // call; the out-pointers are locals. ALLOW (without PREFER) asks CAPI
-        // for the legacy provider when one exists, which is what this signer
-        // can drive; a key that only exists as CNG answers anyway — with
-        // CERT_NCRYPT_KEY_SPEC — and the branch below refuses it rather than
-        // misusing the handle. No SILENT here: signing is the moment the user
-        // may legitimately be asked for their card PIN.
+        let mut ctx = owned;
+        let mut duplicate = 0usize;
+        let mut seen = 0usize;
+        let mut probe: *const CertContext = ptr::null();
+        loop {
+            // SAFETY: the same enumeration contract as `certificates` — pass
+            // back what the previous call returned, NULL ends it. The store's
+            // contexts are owned by the store and live at least this long.
+            probe = unsafe { CertEnumCertificatesInStore(self.store, probe) };
+            if probe.is_null() {
+                break;
+            }
+            if seen != i {
+                seen += 1;
+                continue;
+            }
+            let (ptr, len) =
+                unsafe { ((*probe).pb_cert_encoded_info, (*probe).cb_cert_encoded_info) };
+            let store_der = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            if store_der == der.as_slice() {
+                // CertEnumCertificatesInStore's contract is "owned by the
+                // enum": Rust 2024 makes that a dangling pointer the moment
+                // this loop ends, so keep our own reference (the +1 refcount
+                // `CertFindCertificateInStore` would hand out; freed after
+                // the acquire below).
+                duplicate = unsafe { CertDuplicateCertificateContext(probe) };
+                if duplicate != 0 {
+                    ctx = duplicate;
+                }
+            }
+            break;
+        }
+        let mut handle = 0usize;
+        let mut spec = 0u32;
+        let mut must_free = 0i32;
+        // SAFETY: `ctx` is non-null (the store's own context, or the freshly
+        // created one); the out-pointers are locals alive across the call.
+        // ALLOW (without PREFER) asks CAPI for the legacy provider when one
+        // exists, which is what this signer can drive; a key that only
+        // exists as CNG answers anyway — with CERT_NCRYPT_KEY_SPEC — and the
+        // branch below refuses it rather than misusing the handle. No SILENT
+        // here: signing is the moment the user may legitimately be asked for
+        // their card PIN.
         let ok = unsafe {
             CryptAcquireCertificatePrivateKey(
                 ctx,
@@ -336,7 +378,14 @@ impl SystemStore for WindowsStore {
                 &mut must_free,
             )
         };
-        unsafe { CertFreeCertificateContext(ctx) };
+        unsafe {
+            // The duplicate's reference and the created one are ours to give
+            // back; the store's context is freed by the store.
+            if duplicate != 0 {
+                CertFreeCertificateContext(duplicate as *const CertContext);
+            }
+            CertFreeCertificateContext(owned);
+        }
         if ok == 0 {
             return Err(Error::Keystore(
                 "the private key for this certificate is no longer available".into(),

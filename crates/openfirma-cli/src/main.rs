@@ -1204,12 +1204,16 @@ fn main() -> Result<()> {
             let mut specs: Vec<StoreSpec> = Vec::new();
             if stores.is_empty() {
                 // With nothing named, show what this machine owns without a
-                // PIN: the platform store. PKCS#11 modules are never guessed
-                // at — every token deserves to be asked for by path.
+                // PIN. Firefox/Thunderbird profile databases and the shared
+                // NSS database are discovered by name (finding A7 — they are
+                // AutoFirma's two default Linux keystores); PKCS#11 modules
+                // are never guessed at — every token deserves to be asked for
+                // by path.
                 #[cfg(target_os = "windows")]
                 specs.push(StoreSpec::Windows);
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
                 specs.push(StoreSpec::Macos);
+                specs.extend(openfirma_keystore::nss::discover());
                 if specs.is_empty() {
                     println!(
                         "no keystore to show without being pointed at one: pass \
@@ -1235,6 +1239,10 @@ fn main() -> Result<()> {
                         None => format!("pkcs11:{}", module.display()),
                     },
                     StoreSpec::Nss { db } => format!("nss:{db}"),
+                    StoreSpec::NssFirefox {
+                        profile: Some(name),
+                    } => format!("nss:firefox:{name}"),
+                    StoreSpec::NssFirefox { profile: None } => "nss:firefox".into(),
                     StoreSpec::Windows => "windows".into(),
                     StoreSpec::Macos => "macos".into(),
                 };
