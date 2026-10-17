@@ -697,8 +697,6 @@ mod clock_tests {
         };
         let signer = openfirma_core::signer::SoftwareSigner::from_pkcs8_pem(&cert, &key)
             .expect("the test PKI is usable");
-        let signer = openfirma_core::signer::SoftwareSigner::from_pkcs8_pem(&cert, &key)
-            .expect("the test PKI is usable");
         // The same fixture every PAdES crosscheck signs (it has no /Info, so
         // the first signing writes the one whose /ModDate this pins).
         let Ok(pdf) = std::fs::read(dir.join("inputs/simple.pdf")) else {
