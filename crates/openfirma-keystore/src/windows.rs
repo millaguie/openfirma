@@ -326,7 +326,7 @@ impl SystemStore for WindowsStore {
             )));
         }
         let mut ctx = owned;
-        let mut duplicate = 0usize;
+        let mut duplicate: *const CertContext = ptr::null();
         let mut seen = 0usize;
         let mut probe: *const CertContext = ptr::null();
         loop {
@@ -351,7 +351,7 @@ impl SystemStore for WindowsStore {
                 // `CertFindCertificateInStore` would hand out; freed after
                 // the acquire below).
                 duplicate = unsafe { CertDuplicateCertificateContext(probe) };
-                if duplicate != 0 {
+                if !duplicate.is_null() {
                     ctx = duplicate;
                 }
             }
@@ -381,8 +381,8 @@ impl SystemStore for WindowsStore {
         unsafe {
             // The duplicate's reference and the created one are ours to give
             // back; the store's context is freed by the store.
-            if duplicate != 0 {
-                CertFreeCertificateContext(duplicate as *const CertContext);
+            if !duplicate.is_null() {
+                CertFreeCertificateContext(duplicate);
             }
             CertFreeCertificateContext(owned);
         }

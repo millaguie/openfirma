@@ -805,6 +805,13 @@ mod tests {
             b"synthetic",
         )
         .unwrap();
+        // The shared DB too: with HOME moved below, discovery's own candidate
+        // ($HOME/.pki/nssdb) lives under this directory, so the count is fully
+        // determined — one profile plus the shared DB, nothing else. Leaving
+        // it absent made the result depend on whether $HOME existed at all
+        // (GitHub macOS runners have no HOME set for a process).
+        std::fs::create_dir_all(dir.join(".pki/nssdb")).unwrap();
+        std::fs::write(dir.join(".pki/nssdb/cert9.db"), b"synthetic").unwrap();
         let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::var_os("HOME").map(PathBuf::from);
         // Discovery reads HOME through the real environment; a sibling test
@@ -825,6 +832,6 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
-        assert_eq!(specs.len(), 1, "{specs:?}");
+        assert_eq!(specs.len(), 2, "{specs:?}");
     }
 }
