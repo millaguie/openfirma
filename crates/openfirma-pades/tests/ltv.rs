@@ -464,6 +464,78 @@ fn a_second_b_lt_pass_merges_the_archive() {
     assert!(dss_report.uncovered.is_empty());
 }
 
+/// A signer that waits for the clock's next second before every signature: two
+/// passes through it can never share a whole-second timestamp, which is exactly
+/// the timing CI's macOS runner produced and local runners never reproduced.
+#[test]
+fn co_signing_across_a_second_boundary_still_verifies() {
+    let Some(signer) = rsa_signer() else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let Some(revocation) = crls() else {
+        require_or_skip("the test PKI has no CRLs, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signer = NextSecond { inner: signer };
+    // B-LT, then a co-sign in a different second (the CI failure): the archive
+    // pass must not refuse over the second signing's ModDate landing at a new
+    // timestamp — and with the whole-second clock that never happened before,
+    // because two timestamps also meant two fresh /Info copies under CI. The
+    // rewrite rule in revisions.rs is what makes the shared-number shape (the
+    // co-sign following the document's own /Info) safe across seconds.
+    let lt = pades_sign(
+        INPUT,
+        &signer,
+        &PadesOptions {
+            revocation,
+            ..PadesOptions::default()
+        },
+    )
+    .expect("B-LT signing failed");
+    let after = pades_sign(&lt, &signer, &PadesOptions::default()).expect("co-signing failed");
+    let report = pades_verify(&after, &anchors()).expect("B-LT then co-sign must verify");
+    assert_eq!(report.signatures.len(), 2);
+    // and a third pass in yet another second: the rule is not one-edge luck.
+    let three =
+        pades_sign(&after, &signer, &PadesOptions::default()).expect("third signing failed");
+    let report = pades_verify(&three, &anchors()).expect("three co-signs must verify");
+    assert_eq!(report.signatures.len(), 3);
+}
+
+/// Wrapper signer: sleeps until the raw clock leaves its current second, so each
+/// signature it makes carries a timestamp no earlier one shares.
+struct NextSecond {
+    inner: SoftwareSigner,
+}
+
+impl Signer for NextSecond {
+    fn certificate(&self) -> &CertificateHandle {
+        self.inner.certificate()
+    }
+    fn chain(&self) -> &[CertificateHandle] {
+        self.inner.chain()
+    }
+    fn sign_prehash(
+        &self,
+        digest: openfirma_core::alg::DigestAlg,
+        prehash: &[u8],
+    ) -> openfirma_core::Result<Vec<u8>> {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let now = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let at = now();
+        while now() == at {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        self.inner.sign_prehash(digest, prehash)
+    }
+}
+
 #[test]
 fn a_signature_added_after_the_archive_is_reported_uncovered() {
     let Some(signer) = rsa_signer() else {

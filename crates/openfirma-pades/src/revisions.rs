@@ -523,6 +523,21 @@ fn classify_one(
     if brand_new && pdf::items(newer).is_ok() && only_mod_and_creation_dates(newer) {
         return Change::SignaturePlumbing(*object);
     }
+    // A REWRITE of the date-carrying /Info dictionary itself: a signing pass
+    // re-stamped the existing object with a newer ModDate and nothing else
+    // (openfirma's own co-sign shape, which follows the document's current
+    // /Info reference instead of inventing a fresh number — measured on CI's
+    // macOS runner as B-LT then co-sign refusing over two ModDate copies of one
+    // object). The safety is entirely the shape, both sides: every key of the
+    // OLD bytes and the NEW ones is a date (/ModDate or /CreationDate), so no
+    // value any earlier signature covered can move behind this rule — there are
+    // no non-date values to move. A dictionary that hides content (a stream
+    // pointer, an author with meaning to a reader, anything) fails the test on
+    // either side and lands on the refusal floor. `brand_new` copies keep their
+    // own rule above; this one is only for bytes that already existed covered.
+    if !brand_new && only_date_keys(newer) && older_keys_are_dates(older) {
+        return Change::SignaturePlumbing(*object);
+    }
     // Pages: /Annots may only grow, and only with widgets of real signatures.
     // The two sides may spell their references differently (an archiving pass
     // copying the page dictionary writes it with its own padding), so compari-
@@ -659,6 +674,28 @@ fn only_mod_and_creation_dates(newer: &[u8]) -> bool {
         && items
             .iter()
             .all(|(k, _)| matches!(&newer[k.clone()][..], b"/ModDate" | b"/CreationDate"))
+}
+
+/// Whether a dictionary parses and every key it holds is a date. Same shape as
+/// [`only_mod_and_creation_dates`], kept separate because the rewrite rule also
+/// asks it of the COVERING state's copy: both sides must be pure timestamp
+/// dictionaries for one new /ModDate to count as plumbing. A malformed body (a
+/// parser error) is a refusal, as everywhere else on this gate; an empty dict
+/// changes nothing and passes.
+fn only_date_keys(body: &[u8]) -> bool {
+    let Ok(items) = pdf::items(body) else {
+        return false;
+    };
+    items.is_empty()
+        || items
+            .iter()
+            .all(|(k, _)| matches!(&body[k.clone()][..], b"/ModDate" | b"/CreationDate"))
+}
+
+/// The same question for the older side of a rewrite. `older` empty means the
+/// object did not exist then — that case is `brand_new`, handled by its own rule.
+fn older_keys_are_dates(older: &[u8]) -> bool {
+    !older.is_empty() && only_date_keys(older)
 }
 
 pub(crate) fn is_type(body: &[u8], name: &str) -> bool {
