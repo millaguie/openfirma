@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _; // the compat XML envelope's .encode()
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
@@ -169,6 +170,26 @@ enum Command {
         /// their own client code.
         #[arg(long, conflicts_with = "issue_token")]
         token_only: bool,
+    },
+    /// Speak AutoFirma's own command line: `openfirma autofirma sign -i f
+    /// -o f [-format auto|cades|pades|xades] [-store …] [-alias a]
+    /// [-password p]` and `openfirma autofirma listaliases [-store …]
+    /// [-password p]`. The flags are AutoFirma's single-dash spellings and
+    /// the exit code follows its convention (`STATUS_ERROR = -1`, which Unix
+    /// answers as 255) so a script or sede integration written against
+    /// AutoFirma's CLI keeps working pointed at openfirma. The password on
+    /// argv is AutoFirma's own habit and openfirma cannot make it safe; the
+    /// native `sign` command's --password-file stays the right way. An
+    /// existing output file is never replaced without OPENFIRMA_COMPAT_FORCE=1,
+    /// unlike AutoFirma's silent overwrite: a signature must not delete
+    /// somebody's file without being asked twice.
+    Autofirma {
+        /// The raw argv after `autofirma`, parsed by this command's own
+        /// rules — clap stays out of it so AutoFirma's single-dash flags and
+        /// exit-code convention pass through untouched (`allow_hyphen_values`
+        /// alone would still read `-format` as a flag of the wrapper).
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        args: Vec<String>,
     },
 }
 
@@ -917,7 +938,42 @@ fn parse_rect(text: &str) -> std::result::Result<[f64; 4], String> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // A-8 (review 06): AutoFirma answers a bad command line with its own
+    // exit code (`STATUS_ERROR = -1`, which Unix truncates to 255). When the
+    // argv speaks the compat dialect, clap's usage errors must answer it too
+    // — detected from raw argv before parsing, because after parsing a bad
+    // `Autofirma` line never reaches any code below at all. Every other
+    // command keeps clap's conventional exit 2 for usage errors.
+    let compat_mode = std::env::args().nth(1).as_deref() == Some("autofirma");
+    // clap answers --help and errors as Err(Help/DisplayHelp) or its Error
+    // kinds; `Cli::parse` handles both by exiting with ITS code. This wrapper
+    // re-implements that only to swap the usage-error number inside compat
+    // mode, so help and version must keep clap's exit 0 exactly as before:
+    // render and exit 0 for them, and the swapped code only for real errors.
+    let cli = Cli::try_parse().unwrap_or_else(|err| {
+        match err.kind() {
+            clap::error::ErrorKind::DisplayHelp
+            | clap::error::ErrorKind::DisplayVersion
+            // The built-in `help` subcommands print through this kind too.
+            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+                use std::io::Write;
+                // Help and version belong on stdout (clap writes them there);
+                // a wrapper that moved them to stderr would break the scripts
+                // that pipe `openfirma --help` somewhere.
+                let mut out = std::io::stdout();
+                let _ = out.write_all(err.to_string().as_bytes());
+                let _ = out.flush();
+                std::process::exit(0);
+            }
+            _ => {
+                // Real usage errors: the message on stderr, and compat mode's
+                // 255 in place of clap's own code (its default is 2).
+                let code = if compat_mode { EXIT_AUTOFIRMA_ERROR } else { err.exit_code() };
+                eprint!("{}", err.render());
+                std::process::exit(code);
+            }
+        }
+    });
     match cli.command {
         Command::Sign(args) => {
             // The M5 gate on the production side: `sign` refuses weak output
@@ -1007,7 +1063,9 @@ fn main() -> Result<()> {
             // One `Box<dyn Signer>` covers every source: the software paths
             // box up unchanged, and a system store's signer keeps its store
             // alive behind an Arc (see boxed_signer).
-            let password = p12_password(password, password_file)?;
+            // B-6: `sign` is the one command allowed to ask a terminal for the
+            // container's password when nothing else supplied it.
+            let password = p12_password_ask(password, password_file, PasswordAsk::sign())?;
             // The three sources are exclusive, checked before opening anything.
             let named: Vec<&str> = [
                 store.as_ref().map(|_| "--store"),
@@ -1587,6 +1645,7 @@ fn main() -> Result<()> {
                 ),
             }
         }
+        Command::Autofirma { args } => return run_autofirma_compat(args),
         Command::AfirmaServe {
             p12,
             password,
@@ -2012,12 +2071,270 @@ fn p12_password(
     flag: Option<std::ffi::OsString>,
     file: Option<PathBuf>,
 ) -> Result<Option<Zeroizing<String>>> {
+    p12_password_ask(flag, file, PasswordAsk::no_prompt())
+}
+
+/// The same resolution with a caller-chosen prompting policy; `sign` passes
+/// one that may ask (see `PasswordAsk`).
+fn p12_password_ask(
+    flag: Option<std::ffi::OsString>,
+    file: Option<PathBuf>,
+    ask: PasswordAsk,
+) -> Result<Option<Zeroizing<String>>> {
     // The resolution itself — file, then flag, then OPENFIRMA_PASSWORD — is a
     // shared rule (openfirma_core::workflow) because `sign`, `afirma-uri` and
     // `afirma-serve` all take a --p12 and must not drift on which inputs the
-    // password may come from; this wrapper only adapts the error type.
-    openfirma_core::workflow::p12_password(flag.as_deref(), file.as_deref())
-        .map_err(anyhow::Error::msg)
+    // password may come from; this wrapper only adapts the error type and
+    // adds B-6's fourth answer: when nothing was supplied AND the caller is
+    // allowed to ask (only `sign`), a terminal gets the question. A piped
+    // stdin never does — `sign < f > g` must not block on keys nobody is
+    // watching, and the browser endpoint has no human in front of it by
+    // design (A-3). The refusal None stands for every arm to phrase its own
+    // "needs its password" message.
+    let resolved = openfirma_core::workflow::p12_password(flag.as_deref(), file.as_deref())
+        .map_err(anyhow::Error::msg)?;
+    Ok(match resolved {
+        Some(secret) => Some(secret),
+        None => ask_secret(ask),
+    })
+}
+
+/// Which secret a missing password belongs to (B-6). Only `sign` reaches the
+/// prompt: the browser commands resolve their key from argv or the config
+/// file after this call returns, and an endpoint has no human in front of it
+/// by design (A-3's whole argument), so prompting there would interrupt calls
+/// whose password was never meant to be typed at a keyboard.
+struct PasswordAsk {
+    /// The command that reached here prompts at all (only `sign`).
+    prompt_allowed: bool,
+}
+
+impl PasswordAsk {
+    /// No prompting: the resolution answers by its three sources or not at
+    /// all — what the browser commands and every test need.
+    fn no_prompt() -> PasswordAsk {
+        PasswordAsk {
+            prompt_allowed: false,
+        }
+    }
+
+    /// `sign` may ask when a terminal is attached (B-6).
+    fn sign() -> PasswordAsk {
+        PasswordAsk {
+            prompt_allowed: true,
+        }
+    }
+}
+
+/// The interactive answer to a missing password (B-6): AutoFirma answers this
+/// case with its own dialog, and an attached terminal is the one place where
+/// asking IS the safe input — what gets asked goes to the screen, never into
+/// argv or the environment. Without a terminal (a script, a pipe) nothing is
+/// read from stdin: `sign < f > g` must never block on keys nobody is
+/// watching, and it keeps the arm's own refusal sentence.
+fn ask_secret(ask: PasswordAsk) -> Option<Zeroizing<String>> {
+    if !ask.prompt_allowed || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return None;
+    }
+    // The terminal attached past ask_secret's checks belongs to a human who
+    // ran `sign` at a keyboard — the person the container password is for.
+    let question = "Password of the certificate container (typed here): ";
+    // A broken terminal or an empty answer is reported where the refusal
+    // sentence belongs: every arm wraps this call with its own context, and
+    // for `sign` that message also names --password-file as the safe input to
+    // reach for instead. So any Err collapses to None — no secret half-read.
+    prompt_password(question).ok()
+}
+
+/// Read one line with echoing turned off, std-only (no new dependency for a
+/// prompt). The mode flips through `stty` — a coreutils call, not a link-time
+/// dependency — over descriptors this function owns and closes itself; where
+/// stty is absent or no handle reaches the terminal being typed into, the
+/// line still reads, and one warning says the typing was visible: a password
+/// shown on screen deserves to be warned about, not assumed.
+fn prompt_password(question: &str) -> Result<Zeroizing<String>> {
+    use std::io::Write;
+    // Echo flips on this process's stdin — the descriptor the line is typed
+    // into (ask_secret proved it is a terminal). `stty` gets its OWN fresh
+    // handle on it, never a borrowed number: Linux's /proc/self/fd/0 re-opens
+    // whatever fd 0 names — and when stdio has not been redirected at all,
+    // that path resolves to /dev/null (Rust hides this redirecting the first
+    // File::stdin() over an uninheritable fd), so a second handle opens the
+    // re-opened target itself. Neither handle ever wraps a descriptor std
+    // owns: no fd race, and no "owned file descriptor already closed" abort.
+    let toggle = EchoToggler::new();
+    let hidden = toggle.disable_and_confirm();
+    if !hidden {
+        // The degraded path is still an answer — visible typing with a
+        // warning that arrives BEFORE any key is pressed beats pretending the
+        // terminal cannot do this, and beats discovering typed-out secrets.
+        eprintln!(
+            "warning: this terminal cannot hide what you type; the password will \
+             be visible as you enter it"
+        );
+    }
+    eprint!("{question}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    toggle.restore();
+    drop(toggle);
+    if hidden {
+        // The Enter the user pressed was swallowed with echo off; a newline
+        // keeps the next output of this program from starting on the prompt's.
+        eprintln!();
+    }
+    read.with_context(|| "reading the password from the terminal")?;
+    if line.is_empty() {
+        anyhow::bail!("the terminal gave no password (its input closed)");
+    }
+    let line = line.trim_end_matches(['\n', '\r']);
+    if line.is_empty() {
+        // Enter on an empty prompt is "I don't have it", not a password: the
+        // answer None turns into each arm's refusal, which names --password-file.
+        anyhow::bail!("no password was entered");
+    }
+    Ok(Zeroizing::new(line.to_string()))
+}
+
+/// The two `stty` calls around a password read, over descriptors this type
+/// owns. Where /proc does not exist (Windows, some BSDs) or no terminal is to
+/// be found, the handles are absent and every toggle is a no-op: the prompt
+/// degrades to visible typing with its warning, never to a wrong answer.
+struct EchoToggler {
+    /// A handle on the SAME target fd 0 currently points at (its /proc
+    /// re-open). None when /proc cannot say what fd 0 is.
+    stdin_handle: Option<OwnedFd>,
+    /// /dev/tty, for a process whose fd 0 is a pipe while a screen and
+    /// keyboard remain — the script-under-launcher case AutoFirma's dialog
+    /// still answers with its window.
+    tty: Option<OwnedFd>,
+}
+
+/// An owned descriptor handed to `stty` only through dups of its own: std's
+/// `From<File> for Stdio` MOVES ownership into the spawn
+/// machinery (the pre-spawn dup is what the child inherits) and never closes
+/// what the parent owns. `from_raw_fd`, by contrast, CLOSES its fd in the
+/// parent after a successful spawn — measured, not folklore: a probe handle
+/// handed that way was gone on the next call. Ownership through `From` is the
+/// only shape std documents as safe here, and this struct keeps one owner per
+/// descriptor for its whole life.
+struct OwnedFd(std::fs::File);
+
+impl OwnedFd {
+    fn as_stdio(&self) -> Option<std::process::Stdio> {
+        // A fresh dup (F_DUPFD) per round, owned by the Stdio that consumes
+        // it: spawn inherits THAT fd, and its drop closes it — self keeps
+        // owning the original for every later round, and Drop closes the
+        // original exactly once. The pre-spawn-dup semantics of std make this
+        // safe; from_raw_fd's post-spawn close (measured) makes that shape not.
+        self.0.try_clone().map(std::process::Stdio::from).ok()
+    }
+}
+
+impl EchoToggler {
+    fn new() -> EchoToggler {
+        // The FIRST std call may itself have redirected fd 0, so the probe
+        // order matters: open /proc/self/fd/0 twice — the first open resolves
+        // (and possibly performs) the redirect, the second lands on whatever
+        // it became. Both handles are kept; `run` tries each until one acts.
+        let _ = std::io::stdin();
+        EchoToggler {
+            stdin_handle: dup_fd(0).or_else(|| dup_fd(0)).map(OwnedFd),
+            tty: std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .ok()
+                .map(OwnedFd),
+        }
+    }
+
+    /// Turn echo off and PROVE it: `stty -a` reads the live flag before and
+    /// after, so a silent failure (non-tty handle, missing stty) still earns
+    /// the visible-typing warning instead of leaving typed secrets on screen.
+    fn disable_and_confirm(&self) -> bool {
+        let before = self.echo_state();
+        self.run("-echo");
+        match (before, self.echo_state()) {
+            // Was ON, now OFF: hidden typing, confirmed by the terminal itself.
+            (Some(true), Some(false)) => true,
+            // Already OFF when we arrived — hidden without our doing (a harness
+            // or shell that turned echo off needs no warning either).
+            (Some(false), Some(false)) => true,
+            _ => false,
+        }
+    }
+
+    fn restore(&self) {
+        self.run("echo");
+    }
+
+    /// `stty MODE` over each owned handle until one succeeds. stty acts on
+    /// its stdin when it can read it (a tty answers; a non-tty makes the CALL
+    /// fail, which is how failures present), and some implementations query
+    /// stdout instead, so both are pinned to the same fd. A failed round over
+    /// every handle is silence: the caller's warning already told the user
+    /// what that means.
+    fn run(&self, mode: &str) {
+        for handle in [&self.stdin_handle, &self.tty] {
+            let Some(file) = handle else { continue };
+            let (Some(stdin_io), Some(stdout_io)) = (file.as_stdio(), file.as_stdio()) else {
+                continue;
+            };
+            let spawned = std::process::Command::new("stty")
+                .arg(mode)
+                .stdin(stdin_io)
+                .stdout(stdout_io)
+                .stderr(std::process::Stdio::null())
+                .status();
+            if spawned.is_ok_and(|s| s.success()) {
+                return;
+            }
+        }
+    }
+
+    /// The live ECHO flag, read through each owned handle in turn; None when
+    /// no handle answers (non-tty, or stty missing). `stty -a` prints the
+    /// flags space separated; "-echo" is not "echo".
+    fn echo_state(&self) -> Option<bool> {
+        for handle in [&self.stdin_handle, &self.tty] {
+            let Some(file) = handle else { continue };
+            let Some(stdin_io) = file.as_stdio() else {
+                continue;
+            };
+            // Brief and synchronous: nothing may be typed between a probe and
+            // the prompt its answer judges (two probes per password ask).
+            let out = std::process::Command::new("stty")
+                .arg("-a")
+                .stdin(stdin_io)
+                .stderr(std::process::Stdio::null())
+                .output();
+            let Ok(out) = out else { continue };
+            if !out.status.success() {
+                continue;
+            }
+            for token in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                if token == "echo" {
+                    return Some(true);
+                }
+                if token == "-echo" {
+                    return Some(false);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// A fresh readable+writable handle on the process's own fd `number`, via
+/// Linux's /proc/self/fd (see `EchoToggler`). None where /proc is absent.
+fn dup_fd(number: u32) -> Option<std::fs::File> {
+    std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(format!("/proc/self/fd/{number}"))
+        .ok()
 }
 
 /// The consent prompter for a terminal session (finding A-3): shows exactly
@@ -2415,6 +2732,552 @@ fn fmt_system_time(t: std::time::SystemTime) -> String {
         (rem % 3600) / 60,
         rem % 60
     )
+}
+
+// ---------------------------------------------------------------------------
+// A-8 (review 06): AutoFirma's own command line.
+
+/// The exit code AutoFirma's console answers errors with: `closeApp` prints
+/// its message and exits `STATUS_ERROR = -1` (`CommandLineLauncher`), which
+/// Unix truncates to 255 — the number a sede script checks. Every failure
+/// reached through the `autofirma` subcommand ends at [`compat_fail`], and
+/// only there: the native commands keep their ordinary `anyhow` exit 1 so
+/// nothing an existing script already parses changes meaning.
+const EXIT_AUTOFIRMA_ERROR: i32 = 255;
+
+/// One parsed compat invocation: every parameter of AutoFirma's
+/// `CommandLineParameters` whose value openfirma can act on, after exactly
+/// the checks its constructor and `checkParams()` run — a repeated flag is
+/// an error, a flag without its value is an error, `-format` outside the
+/// accepted names is an error, a missing input file is an error. The flags
+/// it understands but cannot honour (`-gui`, `-filter`, plugins…) are refused
+/// by name rather than ignored: silently dropping a flag in a compatibility
+/// layer signs something the caller did not ask for.
+#[derive(Default)]
+struct CompatParams {
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    format: Option<String>,
+    store: Option<String>,
+    alias: Option<String>,
+    password: Option<String>,
+    xml: bool,
+}
+
+/// The value-taking flags of AutoFirma's parser, in its own spellings
+/// (`CommandLineParameters.PARAM_*`). A repeated or valueless flag answers
+/// with the Java parser's own rule. Slots are positional (input, output,
+/// format, store, alias, password) so `checkParams` below destructures them
+/// without a struct of its own.
+fn compat_parse_flags(args: &[String]) -> Result<CompatParams, String> {
+    let mut p = CompatParams::default();
+    // File flags collect into strings first: the same `take` rule serves all
+    // six value-taking flags, and the two file slots convert at the end.
+    let mut input_s = None;
+    let mut output_s = None;
+    let mut i = 0;
+    while i < args.len() {
+        // Every value-taking flag behaves the same way, so one local function
+        // carries the shared rule: consume the next token, refuse a repeat.
+        fn take(
+            slot: &mut Option<String>,
+            name: &str,
+            args: &[String],
+            i: usize,
+        ) -> Result<(), String> {
+            if slot.is_some() {
+                return Err(format!("the parameter {name} is used more than once"));
+            }
+            if i + 1 >= args.len() {
+                return Err(format!("the parameter {name} needs a value"));
+            }
+            *slot = Some(args[i + 1].clone());
+            Ok(())
+        }
+        match args[i].as_str() {
+            "-xml" => p.xml = true,
+            "-i" => {
+                take(&mut input_s, "-i", args, i)?;
+                // Java's parser skips the consumed value (`i++` on the flag
+                // branch); without this the next token would parse as a flag.
+                i += 1;
+            }
+            "-o" => {
+                take(&mut output_s, "-o", args, i)?;
+                i += 1;
+            }
+            "-format" => {
+                take(&mut p.format, "-format", args, i)?;
+                i += 1;
+            }
+            "-store" => {
+                take(&mut p.store, "-store", args, i)?;
+                i += 1;
+            }
+            "-alias" => {
+                take(&mut p.alias, "-alias", args, i)?;
+                i += 1;
+            }
+            "-password" => {
+                take(&mut p.password, "-password", args, i)?;
+                i += 1;
+            }
+            other if matches!(other, "-gui" | "-certgui") => {
+                return Err(format!(
+                    "{other} opens AutoFirma's own dialogs; openfirma answers the compat \
+                     command headless — run `openfirma` with no arguments for its window"
+                ));
+            }
+            other
+                if matches!(
+                    other,
+                    "-filter"
+                        | "-algorithm"
+                        | "-config"
+                        | "-operation"
+                        | "-preurl"
+                        | "-posturl"
+                        | "-hformat"
+                        | "-halgorithm"
+                        | "-r"
+                ) =>
+            {
+                return Err(format!(
+                    "{other} names an AutoFirma capability openfirma's compat layer does not \
+                     implement (there is no honest translation for it); the native `openfirma \
+                     sign` covers what overlaps, with its own flags"
+                ));
+            }
+            other => {
+                return Err(format!("unknown parameter: {other}"));
+            }
+        }
+        i += 1;
+    }
+    p.input = input_s.map(PathBuf::from);
+    p.output = output_s.map(PathBuf::from);
+    Ok(p)
+}
+
+/// The compat parser proper: AutoFirma's flag grammar, then `checkParams()`'s
+/// checks over what it collected, in the Java order — format first (a bad
+/// name is refused even when a file argument is missing too), then the store
+/// shape, then the files.
+fn parse_compat_params(args: &[String]) -> Result<CompatParams, String> {
+    let mut p = compat_parse_flags(args)?;
+    if let Some(f) = &p.format {
+        let f = f.to_ascii_lowercase();
+        if !matches!(f.as_str(), "auto" | "cades" | "pades" | "xades") {
+            return Err(format!("unsupported signature format: {f}"));
+        }
+        p.format = Some(f);
+    }
+    // The store's shape is checked here, not at open time, so a mistake says
+    // `autofirma`'s spelling back rather than openfirma's native descriptor
+    // grammar (the translation table lives in `compat_store`).
+    if let Some(s) = &p.store {
+        compat_store(s)?;
+    }
+    if let Some(f) = &p.input {
+        if !f.exists() {
+            return Err(format!("the input file does not exist: {}", f.display()));
+        }
+    }
+    Ok(p)
+}
+
+/// Translate AutoFirma's `-store` value into openfirma's store vocabulary,
+/// the two mappings of `getKsm`: `windows`, `mac`/`macos`, `mozilla`, `auto`,
+/// `pkcs12:<file>` (a container, not a descriptor — its own shape below), and
+/// `pkcs11:<module>`. Bare `pkcs12`/`pkcs11` without the colon are AutoFirma
+/// errors too (`getKsm` only matches the prefixed forms). An absent `-store`
+/// is AUTO: Windows/macOS platform stores, the SHARED_NSS database elsewhere
+/// — the same defaults, mapped to the descriptors `open_store` opens.
+enum CompatStore {
+    /// A PKCS#12 file named inside `-store pkcs12:<path>`.
+    Pkcs12(PathBuf),
+    Spec(StoreSpec),
+}
+
+fn compat_store(value: &str) -> Result<CompatStore, String> {
+    let lower = value.to_ascii_lowercase();
+    if let Some(rest) = value.strip_prefix("pkcs12:") {
+        // AutoFirma's cleanupPathFile trims quotes and whitespace around the
+        // path before its existence check; the same courtesy here means a
+        // Windows launcher that quoted the argument still opens.
+        let path = PathBuf::from(rest.trim().trim_matches('"').trim_matches('\''));
+        if !path.is_file() {
+            return Err(format!(
+                "the PKCS#12 file indicated does not exist: {}",
+                path.display()
+            ));
+        }
+        return Ok(CompatStore::Pkcs12(path));
+    }
+    if let Some(rest) = value.strip_prefix("pkcs11:") {
+        // getKsm checks the module's existence; openfirma's own spec parse
+        // additionally carries the token-label spelling, which compat callers
+        // do not use — AutoFirma takes a bare library path and no token.
+        let module = PathBuf::from(rest.trim().trim_matches('"').trim_matches('\''));
+        if !module.is_file() {
+            return Err(format!(
+                "the PKCS#11 library indicated does not exist: {}",
+                module.display()
+            ));
+        }
+        return Ok(CompatStore::Spec(StoreSpec::Pkcs11 {
+            module,
+            token: None,
+            wants_no_pin: false,
+        }));
+    }
+    match lower.as_str() {
+        "windows" => Ok(CompatStore::Spec(StoreSpec::Windows)),
+        "mac" | "macos" => Ok(CompatStore::Spec(StoreSpec::Macos)),
+        "mozilla" => Ok(CompatStore::Spec(StoreSpec::NssFirefox { profile: None })),
+        "auto" => Ok(CompatStore::Spec(if cfg!(target_os = "windows") {
+            StoreSpec::Windows
+        } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+            StoreSpec::Macos
+        } else {
+            // AutoFirma's AUTO on Linux is SHARED_NSS — the same database
+            // openfirma spells `nss` (its $HOME/.pki/nssdb default).
+            StoreSpec::Nss {
+                db: "$HOME/.pki/nssdb".into(),
+            }
+        })),
+        "pkcs12" | "pkcs11" => Err(format!(
+            "-store {value} needs AutoFirma's own suffix ({}); openfirma reads it exactly \
+             the way getKsm does",
+            if lower == "pkcs12" {
+                "pkcs12:/path/to/keystore.p12"
+            } else {
+                "pkcs11:/path/to/module.so"
+            }
+        )),
+        "dni" | "dnie" => Err(
+            "-store dni names AutoFirma's built-in DNIe driver, which openfirma does not \
+             ship (its pure-Rust rule keeps the card reads in PKCS#11): point \
+             -store pkcs11:<opensc-pkcs11.so> at the driver instead"
+                .to_string(),
+        ),
+        _ => Err(format!("unknown keystore type: {value}")),
+    }
+}
+
+/// AutoFirma's file-magic format selection (`selectFormatByData`: MimeHelper
+/// on the bytes, never the extension) mapped onto openfirma's dispatcher.
+/// The formats its CLI lists but whose signers this layer has no honest
+/// equivalent for (`facturae`, `ooxml`, `odf` — off by default even in
+/// AutoFirma's own auto-detection) are refused by the parser, never
+/// approximated.
+fn compat_format(requested: Option<&str>, content: &[u8]) -> &'static str {
+    let detected = match openfirma_core::workflow::Format::detect(content) {
+        openfirma_core::workflow::Format::Pdf => "pades-b-b",
+        openfirma_core::workflow::Format::Xml => "xades-b-b",
+        openfirma_core::workflow::Format::Data => "cades-b-b",
+    };
+    match requested.unwrap_or("auto") {
+        "auto" => detected,
+        // An explicitly named format is honoured even when the bytes prefer
+        // another (an XML file signed `-format cades` is AutoFirma's detached
+        // CMS over the XML bytes too); a mismatch the dispatcher cannot sign
+        // at all answers there, with its own "cannot hold this file" reason.
+        "cades" => "cades-b-b",
+        "pades" => "pades-b-b",
+        "xades" => "xades-b-b",
+        // Unreachable: the parser refused the name before here.
+        other => unreachable!("compat format {other:?} passed the parser's list"),
+    }
+}
+
+/// `<afirma><result>true</result><response>…</response></afirma>` — AutoFirma's
+/// `-xml` wire shape verbatim (`buildXmlResponse`). The message is escaped
+/// because openfirma's sentences carry quotes and ampersands Java's never saw.
+fn compat_xml(ok: bool, msg: Option<&str>, payload: Option<&[u8]>) -> String {
+    let mut sb = format!("<afirma><result>{ok}</result>");
+    if msg.is_some() || payload.is_some() {
+        sb.push_str("<response>");
+        if let Some(m) = msg {
+            sb.push_str(&format!("<msg>{}</msg>", compat_xml_escape(m)));
+        }
+        if let Some(bytes) = payload {
+            sb.push_str(&format!(
+                "<sign>{}</sign>",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            ));
+        }
+        sb.push_str("</response>");
+    }
+    sb.push_str("</afirma>");
+    sb
+}
+
+fn compat_xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The compat `sign`: pick the key exactly like `getKsm` + `getKeyEntry`,
+/// sign through the shared dispatcher, write `-o`. Errors go to the console
+/// with AutoFirma's exit code; success prints AutoFirma's sentence on stdout.
+fn autofirma_sign(p: CompatParams) {
+    // signByCommandLine's guards, in its order: -i (existence checked by the
+    // parser already), then the certificate choice — this layer has no
+    // -certgui, so an absent -alias is a refusal with the flag that works —
+    // then the output-or-xml rule.
+    let input = p.input.clone().unwrap_or_else(|| {
+        compat_fail("no input file was indicated (-i)");
+    });
+    let Some(alias) = p.alias.clone() else {
+        compat_fail(
+            "no certificate was selected: -alias names it (openfirma's compat layer has \
+             no certificate dialog)",
+        );
+    };
+    if p.output.is_none() && !p.xml {
+        compat_fail("an output file is needed (-o) or the result must be requested as -xml");
+    }
+    // The overwrite rule of review 06 (A-3) applies here too: AutoFirma's
+    // FileOutputStream truncates without asking, and a compat layer that
+    // reproduced THAT would reproduce the data loss too. --force is openfirma's
+    // documented yes; on this surface it arrives as the environment variable
+    // OPENFIRMA_COMPAT_FORCE=1, so no extra flag enters AutoFirma's grammar.
+    let force = std::env::var("OPENFIRMA_COMPAT_FORCE").is_ok_and(|v| v == "1");
+    if let Some(out) = &p.output {
+        if let Err(e) = openfirma_core::workflow::check_not_overwrite(out, force) {
+            compat_fail(&e);
+        }
+    }
+    let content = match std::fs::read(&input) {
+        Ok(c) => c,
+        Err(e) => compat_fail(&format!("cannot read the input file: {e}")),
+    };
+    let format = compat_format(p.format.as_deref(), &content);
+    let signer: Box<dyn Signer> = match compat_store(p.store.as_deref().unwrap_or("auto")) {
+        Err(e) => compat_fail(&e),
+        Ok(CompatStore::Pkcs12(path)) => {
+            // getKsm(PKCS12) + getKeyEntry(alias): the -password opens the
+            // container. AutoFirma falls back to a cached "dummy" password
+            // when none was given, which fails on any real container anyway;
+            // saying so upfront is the same outcome with a reason attached.
+            let Some(password) = &p.password else {
+                compat_fail("-store pkcs12:… needs -password to open the container");
+            };
+            match load_p12(&path, &Zeroizing::new(password.clone()), Some(&alias)) {
+                Ok(s) => Box::new(s),
+                Err(e) => compat_fail(&format!("{e:#}")),
+            }
+        }
+        Ok(CompatStore::Spec(spec)) => {
+            // A token or database takes its PIN from the environment (the
+            // native rule). AutoFirma's -password IS its keystore password
+            // here (CachePasswordCallback), so accepting it as the PIN is
+            // the one honest mapping for mozilla/pkcs11 stores; absent, the
+            // store's own no-PIN or OPENFIRMA_PIN paths stay open to try.
+            let pin = p.password.clone().map(Zeroizing::new);
+            let store = match open_store(&spec, pin) {
+                Ok(s) => s,
+                Err(e) => compat_fail(&format!("{e:#}")),
+            };
+            match store_signer(store, Some(&alias)) {
+                Ok(s) => s,
+                Err(e) => compat_fail(&format!("{e:#}")),
+            }
+        }
+    };
+    let mut request = openfirma_browser::signing::SignRequest::new(
+        format,
+        // AutoFirma's CLI defaults to SHA512 (DEFAULT_ALGO); this layer has
+        // no -algorithm flag yet, and SHA256 — the native default both
+        // frontends share — is what it signs with. Naming that here keeps
+        // the difference from a documented choice rather than an accident.
+        openfirma_core::DigestAlg::Sha256,
+    );
+    let signature = match openfirma_browser::signing::execute_with_detection(
+        &mut request,
+        &content,
+        signer.as_ref(),
+    ) {
+        Ok(sig) => sig,
+        Err(e) => compat_fail(&e.to_string()),
+    };
+    if let Some(out) = &p.output {
+        if let Err(e) = std::fs::write(out, &signature) {
+            compat_fail(&format!(
+                "the signature could not be saved to {}: {e}",
+                out.display()
+            ));
+        }
+    }
+    // AutoFirma prints its closing message either way; -xml adds the payload
+    // when no file took it. Same shapes, same order.
+    if p.xml {
+        let payload = if p.output.is_some() {
+            None
+        } else {
+            Some(signature.as_slice())
+        };
+        println!(
+            "{}",
+            compat_xml(true, Some("The operation completed successfully"), payload)
+        );
+    } else {
+        println!("The operation completed successfully");
+    }
+}
+
+/// The compat `listaliases`: every alias of the store, one per line (or in
+/// AutoFirma's `-xml` envelope). getKsm(null)+getAliases(), with openfirma's
+/// honest failures.
+fn autofirma_list_aliases(p: CompatParams) {
+    let aliases: Vec<String> = match compat_store(p.store.as_deref().unwrap_or("auto")) {
+        Err(e) => compat_fail(&e),
+        Ok(CompatStore::Pkcs12(path)) => {
+            // AutoFirma opens a PKCS#12 store through its password callback;
+            // an absent -password means the empty one it caches, so the same
+            // probe runs here — a container that needs more says so.
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => compat_fail(&format!("cannot read the PKCS#12 file: {e}")),
+            };
+            let password = p.password.clone().unwrap_or_default();
+            match openfirma_keystore::Pkcs12::load(&bytes, &password) {
+                Ok(container) => container.aliases(),
+                Err(e) => compat_fail(&format!("{e:#}")),
+            }
+        }
+        Ok(CompatStore::Spec(spec)) => {
+            let pin = p.password.clone().map(Zeroizing::new);
+            let store = match open_store(&spec, pin) {
+                Ok(s) => s,
+                Err(e) => compat_fail(&format!("{e:#}")),
+            };
+            // The filtered listing — what the AutoFirma dialog and `openfirma
+            // keystores list` show: entries somebody could actually sign with.
+            let filtered: DynStore = Arc::new(openfirma_keystore::FilteredStore::new(
+                store,
+                std::time::SystemTime::now(),
+            ));
+            match filtered.certificates() {
+                Ok(certs) => certs
+                    .iter()
+                    .map(|c| {
+                        c.label.clone().unwrap_or_else(|| {
+                            c.cert.subject_cn().unwrap_or_else(|| "<unlabeled>".into())
+                        })
+                    })
+                    .collect(),
+                Err(e) => compat_fail(&format!("{e:#}")),
+            }
+        }
+    };
+    if p.xml {
+        let mut sb = String::from("<afirma><result>ok</result><response>");
+        for a in &aliases {
+            sb.push_str(&format!("<alias>{}</alias>", compat_xml_escape(a)));
+        }
+        sb.push_str("</response></afirma>");
+        println!("{sb}");
+    } else {
+        // One alias per line, AutoFirma's shape; its blank for an empty store
+        // is kept (print the loop, then nothing extra) because a caller that
+        // counts lines must count the same thing both programs print.
+        for a in &aliases {
+            println!("{a}");
+        }
+    }
+}
+
+/// Which compat operation the argv asks for (`CommandLineCommand.parse`, the
+/// subset openfirma implements). Unimplemented commands are refused by name;
+/// an unknown command is AutoFirma's general-syntax error, exit -1 too.
+enum CompatCommand {
+    Sign,
+    ListAliases,
+}
+
+fn parse_compat_command(name: &str) -> Result<CompatCommand, String> {
+    match name.to_ascii_lowercase().as_str() {
+        "sign" => Ok(CompatCommand::Sign),
+        "listaliases" => Ok(CompatCommand::ListAliases),
+        other @ ("cosign" | "countersign" | "verify" | "batchsign") => Err(format!(
+            "`{other}` is part of AutoFirma's command line that openfirma's compat layer \
+             does not implement; the native commands cover what overlaps (`openfirma verify`)"
+        )),
+        other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// Print one compat failure exactly the way AutoFirma's console answers — its
+/// message on the console stream — and exit with its code. The whole layer
+/// funnels through here, so "exit 255 on error" is a property of the function
+/// every error path calls, not of each arm remembering.
+fn compat_fail(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(EXIT_AUTOFIRMA_ERROR);
+}
+
+/// The `autofirma` subcommand's entry point (main hands it everything after
+/// the subcommand name). `-help` answers with the syntax text in either
+/// position AutoFirma accepts it (`processCommand` checks args[1], the top
+/// level checks args[0]).
+fn run_autofirma_compat(args: Vec<String>) -> Result<()> {
+    let Some(first) = args.first() else {
+        eprint!("{}", compat_syntax(None));
+        std::process::exit(EXIT_AUTOFIRMA_ERROR);
+    };
+    if first.eq_ignore_ascii_case("-help") || first == "--help" {
+        println!("{}", compat_syntax(None));
+        return Ok(());
+    }
+    let command = match parse_compat_command(first) {
+        Ok(c) => c,
+        Err(e) => {
+            eprint!("{}", compat_syntax(Some(&e)));
+            std::process::exit(EXIT_AUTOFIRMA_ERROR);
+        }
+    };
+    let params = match parse_compat_params(&args[1..]) {
+        Ok(p) => p,
+        Err(e) => compat_fail(&e),
+    };
+    match command {
+        CompatCommand::Sign => autofirma_sign(params),
+        CompatCommand::ListAliases => autofirma_list_aliases(params),
+    }
+    Ok(())
+}
+
+/// The syntax text, modeled on `buildGeneralSyntax`: the error that prompted
+/// it (when one did), the commands this layer implements, and a line per flag
+/// it honors — everything refused at parse time is named there too, so the
+/// help never promises more than the parser accepts.
+fn compat_syntax(error: Option<&str>) -> String {
+    let mut sb = match error {
+        Some(e) => format!("{e}\n\n"),
+        None => String::from("openfirma — AutoFirma-compatible command line.\n\n"),
+    };
+    sb.push_str(
+        "usage: openfirma autofirma <command> [parameters]\n\n\
+         commands:\n\
+         \x20 sign         sign a file (headless; -o or -xml required, like AutoFirma)\n\
+         \x20 listaliases  list the certificates of a keystore\n\n\
+         parameters:\n\
+         \x20 -i <file>          input file\n\
+         \x20 -o <file>          output file (existing files are kept: openfirma's guard,\n\
+         \x20                    not AutoFirma's silent overwrite; OPENFIRMA_COMPAT_FORCE=1\n\
+         \x20                    is this surface's equivalent of --force)\n\
+         \x20 -format auto|cades|pades|xades   (default auto, chosen from the bytes)\n\
+         \x20 -store windows|mac|mozilla|auto|pkcs12:<file>|pkcs11:<module>\n\
+         \x20                    (default auto, like AutoFirma's getKsm; dni is not\n\
+         \x20                    implemented — use the card's PKCS#11 module)\n\
+         \x20 -alias <name>      certificate alias within the store\n\
+         \x20 -password <pw>     container password / keystore PIN\n\
+         \x20 -xml               answer in AutoFirma's XML envelope\n",
+    );
+    sb
 }
 
 #[cfg(test)]
@@ -3073,5 +3936,93 @@ mod tests {
             .to_string();
         srv.join().unwrap();
         assert!(err.contains("1048576 bytes"), "{err}");
+    }
+
+    // --------------------------------------------------------- compat (A-8)
+
+    #[test]
+    fn a_repeated_compat_flag_is_refused() {
+        // Java's rule ("the parameter X is used more than once") lives in the
+        // parser, not in any arm: it must answer before a file is opened.
+        let err = parse_compat_params(&["-i".into(), "a.pdf".into(), "-i".into(), "b.pdf".into()])
+            .err()
+            .expect("two -i flags are refused");
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn compat_formats_follow_autofirmas_selection_and_its_names() {
+        // auto maps onto detection exactly like selectFormatByData.
+        assert_eq!(compat_format(Some("auto"), b"%PDF-1.4"), "pades-b-b");
+        assert_eq!(compat_format(Some("auto"), b"<?xml v?>"), "xades-b-b");
+        assert_eq!(compat_format(None, b"octets"), "cades-b-b");
+        // The names AutoFirma's checkParams accepts survive the parser…
+        for name in ["auto", "cades", "pades", "xades", "CADES"] {
+            parse_compat_params(&["-format".into(), name.into()])
+                .unwrap_or_else(|e| panic!("{name} is AutoFirma's own format name: {e}"));
+        }
+        // …and every other name (facturae/ooxml/odf included) dies there.
+        let err = parse_compat_params(&["-format".into(), "facturae".into()])
+            .err()
+            .expect("facturae is not openfirma's compat format");
+        assert!(err.contains("unsupported signature format"), "{err}");
+    }
+
+    #[test]
+    fn compat_stores_translate_and_refuse_by_name() {
+        assert!(matches!(
+            compat_store("windows").unwrap(),
+            CompatStore::Spec(StoreSpec::Windows)
+        ));
+        // AUTO on this machine (Linux under test): AutoFirma's SHARED_NSS.
+        if cfg!(target_os = "linux") {
+            assert!(matches!(
+                compat_store("auto").unwrap(),
+                CompatStore::Spec(StoreSpec::Nss { .. })
+            ));
+        }
+        // A bare pkcs12 without its file answers with the spelling that works.
+        let err = compat_store("pkcs12")
+            .err()
+            .expect("the suffix is required");
+        assert!(err.contains("pkcs12:/path"), "{err}");
+        let err = compat_store("dni").err().expect("no DNIe driver here");
+        assert!(err.contains("pkcs11:"), "{err}");
+        // A module file that does not exist is refused before any opening —
+        // getKsm's existence check, in its own words.
+        let err = compat_store("pkcs11:/nonexistent/mod.so")
+            .err()
+            .expect("a missing module is named before opening");
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn the_compat_xml_envelope_is_autofirmas_with_openfirmas_sentences_inside() {
+        let xml = compat_xml(false, Some("no entry named \"x\"; <b> & c"), Some(b"ab"));
+        assert!(xml.starts_with("<afirma><result>false</result><response>"));
+        // The payload is AutoFirma's base64 of the raw signature.
+        assert!(xml.contains("<sign>YWI=</sign>"), "{xml}");
+        assert!(xml.contains("&lt;b&gt; &amp; c"), "{xml}");
+        assert!(xml.ends_with("</response></afirma>"));
+    }
+
+    #[test]
+    fn a_gui_flag_names_the_window_it_cannot_open() {
+        let err = parse_compat_params(&["-gui".into()])
+            .err()
+            .expect("headless cannot promise a dialog");
+        assert!(err.contains("openfirma"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_compat_command_is_the_syntax_error_exit_255_promises() {
+        let err = parse_compat_command("countersign")
+            .err()
+            .expect("no countersign here");
+        assert!(err.contains("does not implement"), "{err}");
+        let err = parse_compat_command("frobnicate")
+            .err()
+            .expect("not a command");
+        assert!(err.contains("unknown command"), "{err}");
     }
 }

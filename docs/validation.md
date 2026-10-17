@@ -351,8 +351,8 @@ wording, a real certificate that never enters the repository.
       sessions both), title «openfirma», Spanish throughout.
 - [ ] drag a PDF from the file manager onto the window → it detects and names
       the format; dropping over the *Done* screen does not disturb the result.
-- [ ] "Examinar…" opens the real OS picker (rfd) on all three platforms, and
-      cancels cleanly (drop zone stays where it was).
+- [ ] "Examinar…" opens the real OS picker (the `gui` feature's rfd) on all
+      three platforms, and cancels cleanly (drop zone stays where it was).
 - [ ] ".p12" button → picker → password field → Firmar; a wrong password is
       one plain sentence plus details, never a dialog storm; the right one
       writes `documento.signed.pdf` next to the original before ✓ appears.
@@ -370,6 +370,36 @@ wording, a real certificate that never enters the repository.
       exists, the failure is a red sentence on the screen.
 - [ ] CLI parity spot-check: every action above reproduces with the
       equivalent `openfirma sign/verify` line from the README.
+- [ ] screen reader (A-2): with Orca (or NVDA under Windows) running, the
+      window's texts arrive as ACCESSIBLE TEXT — labels, buttons, the verdict
+      lines and the error sentences. AccessKit is on for eframe exactly for
+      this; kittest asserts the tree exists but only a real reader says
+      whether it reads well.
+- [ ] clipboard (A-4): the Done screen's copy-path button and any "copy" text
+      land in the system clipboard through egui's own OutputCommand (the
+      `accesskit` feature without `clipboard`: the Linux half of that feature
+      needs smithay-clipboard, absent from the offline registry, so the copy
+      goes through the context). Paste into a text editor to confirm.
+- [ ] the terminal password prompt (B-6): in a real terminal, `openfirma sign
+      … --p12 f.p12` with nothing in the environment asks on stderr and hides
+      the typing (check by pressing keys: nothing shows); typing into `cat`
+      afterwards proves echo came back. Through a pipe (`| cat`) it must NOT
+      prompt — same refusal as ever, no hang.
+
+## 5a. Compat CLI manual checks (A-8)
+
+The compat parser's rules are unit-tested and its success/error paths are
+integration-tested (`crates/openfirma-cli/tests/cli.rs`, exit 255 pinned); the
+items below need a person because they involve AutoFirma itself:
+
+- [ ] side by side, the same `-i/-o/-format/-store/-alias/-password` line run
+      against `AutoFirma.sh` and `openfirma autofirma`: same success sentence
+      (locale aside), same written shape, and on a deliberate mistake the same
+      255.
+- [ ] one scripted sede-style call end to end: a small shell script written
+      for AutoFirma's console that checks `$?` after sign and listaliases; it
+      must not need editing beyond the program name (openfirma's overwrite
+      guard is the one behaviour change, documented in the README).
 
 ## 6. Keystore interoperability manual checklist (wave 4a)
 

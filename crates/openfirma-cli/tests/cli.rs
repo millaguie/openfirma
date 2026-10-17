@@ -578,3 +578,267 @@ fn openfirma_trust_answers_for_verify_without_the_flag() {
     );
     std::fs::remove_file(&signed).ok();
 }
+
+// ---------------------------------------------------------------- autofirma compat (A-8)
+
+/// The one number a sede script written against AutoFirma's CLI checks on a
+/// failed run: `STATUS_ERROR = -1` printed by `closeApp`, which Unix answers
+/// as 255. Every compat error path — bad flag, bad store, missing input —
+/// must land there while the native commands keep clap's exit 2 and anyhow's
+/// exit 1 (both asserted here too, so the boundary of the convention is
+/// pinned from both sides).
+#[test]
+fn compat_errors_exit_255_like_autofirmas_console() {
+    let bin = env!("CARGO_BIN_EXE_openfirma");
+    // A repeated flag: AutoFirma's parser error, compat exit code.
+    let out = Command::new(bin)
+        .args(["autofirma", "sign", "-i", "a.pdf", "-i", "b.pdf"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(255), "repeat of -i: {out:?}");
+    // An unknown store type — getKsm's own refusal class.
+    let out = Command::new(bin)
+        .args(["autofirma", "listaliases", "-store", "ie"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(255), "bad store: {out:?}");
+    // A clap usage error INSIDE compat mode (the subcommand with nothing to
+    // run) answers 255 too — the mode is decided from argv, before parsing.
+    let out = Command::new(bin)
+        .args(["autofirma", "--not-a-flag"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(255),
+        "clap error in compat mode: {out:?}"
+    );
+    // And the native commands keep their own numbers unchanged: clap usage
+    // errors stay exit 2.
+    let out = Command::new(bin)
+        .args(["sign", "--nonsense"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "native usage error stays 2");
+}
+
+/// The compat `sign` end to end, the way a script calls it: AutoFirma's flag
+/// spellings in, its success sentence out, and the signature on disk is a
+/// real one — verified through the native command afterwards.
+#[test]
+fn compat_signs_with_autofirmas_own_flags() {
+    let Some(pki) = test_certs() else {
+        if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+            panic!("OPENFIRMA_REQUIRE_TESTS is set and testdata/certs is missing");
+        }
+        eprintln!("skipped: the test PKI is absent, run tools/gen-testcert.sh");
+        return;
+    };
+    // A REAL PDF: format auto detects it and the PAdES writer parses it, so this
+    // fixture copies the test document rather than inventing a header.
+    let doc = write_tmp("compat.pdf", b"placeholder");
+    std::fs::copy(pki.join("../inputs/simple.pdf"), &doc).expect("the test input PDF");
+    let out = write_tmp("compat-out.pdf", b"");
+    std::fs::remove_file(&out).ok(); // the guard treats an existing output as data
+    let bin = env!("CARGO_BIN_EXE_openfirma");
+    let run = Command::new(bin)
+        .args(["autofirma", "sign"])
+        .arg("-i")
+        .arg(&doc)
+        .arg("-o")
+        .arg(&out)
+        .arg("-format")
+        .arg("auto")
+        .args([
+            "-store",
+            &format!("pkcs12:{}", pki.join("signer-rsa.p12").display()),
+        ])
+        .arg("-alias")
+        // The fixture container's friendlyName (the CN AutoFirma would show as
+        // an alias too): listaliases and sign must agree on this one name.
+        .arg("PEREZ GARCIA, ANA")
+        .arg("-password")
+        .arg("openfirma")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    assert!(
+        run.status.success(),
+        "the compat sign must succeed: {stderr}"
+    );
+    // AutoFirma's exact closing message (en_US locale, buildSyntaxError's ok
+    // sentence; the trailing space of the .properties file is not reproduced).
+    assert!(
+        stdout.contains("The operation completed successfully"),
+        "{stdout}"
+    );
+    assert!(out.is_file(), "the signature landed at -o");
+    // The native verifier says the same document, signed by the same signer.
+    let verify = Command::new(bin)
+        .args(["verify", "-i"])
+        .arg(&out)
+        .arg("--trust")
+        .arg(pki.join("ca.crt"))
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "the compat signature verifies: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    // -xml with no -o carries the payload base64'd inside the envelope.
+    let xml_out = write_tmp("compat-xml.pdf", b"");
+    std::fs::remove_file(&xml_out).ok();
+    let run = Command::new(bin)
+        .args(["autofirma", "sign", "-xml"])
+        .arg("-i")
+        .arg(&doc)
+        // -o deliberately absent: the envelope takes the signature.
+        .args([
+            "-store",
+            &format!("pkcs12:{}", pki.join("signer-rsa.p12").display()),
+        ])
+        .arg("-alias")
+        .arg("PEREZ GARCIA, ANA")
+        .arg("-password")
+        .arg("openfirma")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.starts_with("<afirma><result>true</result><response>"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("<sign>"),
+        "the payload rides in the envelope: {stdout}"
+    );
+    assert!(stdout.ends_with("</response></afirma>\n") || stdout.ends_with("</response></afirma>"));
+
+    // And the overwrite guard is compat too: the same command again onto the
+    // now-existing output refuses with AutoFirma's exit code, not a silent
+    // truncation (AutoFirma itself would overwrite; openfirma keeps the file).
+    let again = Command::new(bin)
+        .args(["autofirma", "sign"])
+        .arg("-i")
+        .arg(&doc)
+        .arg("-o")
+        .arg(&out)
+        .args([
+            "-store",
+            &format!("pkcs12:{}", pki.join("signer-rsa.p12").display()),
+        ])
+        .arg("-alias")
+        .arg("PEREZ GARCIA, ANA")
+        .arg("-password")
+        .arg("openfirma")
+        .output()
+        .unwrap();
+    assert_eq!(
+        again.status.code(),
+        Some(255),
+        "overwrite must refuse like AutoFirma errors"
+    );
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(stderr.contains("already exists"), "{stderr}");
+    // OPENFIRMA_COMPAT_FORCE=1 is this surface's --force: it proceeds.
+    let forced = Command::new(bin)
+        .args(["autofirma", "sign"])
+        .arg("-i")
+        .arg(&doc)
+        .arg("-o")
+        .arg(&out)
+        .args([
+            "-store",
+            &format!("pkcs12:{}", pki.join("signer-rsa.p12").display()),
+        ])
+        .arg("-alias")
+        .arg("PEREZ GARCIA, ANA")
+        .arg("-password")
+        .arg("openfirma")
+        .env("OPENFIRMA_COMPAT_FORCE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        forced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+
+    std::fs::remove_file(&doc).ok();
+    std::fs::remove_file(&out).ok();
+}
+
+/// `listaliases` on a PKCS#12 store prints the aliases one per line, like
+/// AutoFirma's console listing; `-xml` wraps them in its envelope. The test
+/// container carries the friendlyName the fixture script wrote, and that is
+/// exactly what both listings print.
+#[test]
+fn compat_list_aliases_prints_one_alias_per_line() {
+    let Some(pki) = test_certs() else {
+        if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+            panic!("OPENFIRMA_REQUIRE_TESTS is set and testdata/certs is missing");
+        }
+        eprintln!("skipped: the test PKI is absent, run tools/gen-testcert.sh");
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_openfirma");
+    let store = format!("pkcs12:{}", pki.join("signer-rsa.p12").display());
+    let out = Command::new(bin)
+        .args(["autofirma", "listaliases"])
+        .arg("-store")
+        .arg(&store)
+        .arg("-password")
+        .arg("openfirma")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["PEREZ GARCIA, ANA"],
+        "one alias per line: {lines:?}"
+    );
+
+    let out = Command::new(bin)
+        .args(["autofirma", "listaliases", "-xml"])
+        .arg("-store")
+        .arg(&store)
+        .arg("-password")
+        .arg("openfirma")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("<afirma><result>ok</result><response><alias>PEREZ GARCIA, ANA</alias>"),
+        "{stdout}"
+    );
+
+    // A wrong password is getKsm's failure: exit 255, never a listing.
+    let out = Command::new(bin)
+        .args(["autofirma", "listaliases"])
+        .arg("-store")
+        .arg(&store)
+        .arg("-password")
+        .arg("wrong")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(255));
+}

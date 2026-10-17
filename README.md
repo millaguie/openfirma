@@ -179,6 +179,25 @@ cargo run -- afirma-uri "afirma://sign?op=sign&format=CAdES&algorithm=SHA256&dat
 `tools/fetch-autofirma.sh` downloads the official AutoFirma so its output can
 be diffed against ours, see `docs/validation.md`.
 
+Scripts written for AutoFirma's console (`AutoFirma.bat sign -i … -o …`) run
+against openfirma through its own spelling:
+
+```
+openfirma autofirma sign -i doc.pdf -o doc.signed.pdf -format auto \
+    -store pkcs12:certificado.p12 -alias "PEREZ GARCIA, ANA" -password secreto
+openfirma autofirma listaliases -store pkcs12:certificado.p12 -password secreto
+```
+
+The flags are AutoFirma's single-dash spellings (`-i`, `-o`, `-format`,
+`-store windows|mac|mozilla|auto|pkcs12:…|pkcs11:…`, `-alias`, `-password`,
+`-xml`) and a failure exits with its code, 255 — what a calling script checks.
+Two deliberate differences: an existing output is kept unless
+`OPENFIRMA_COMPAT_FORCE=1` says otherwise (AutoFirma truncates without asking;
+openfirma asks), and the flags whose capability openfirma does not implement
+(`-gui`, `-filter`, `-dni`, …) are refused by name instead of ignored. The
+`-password` on argv is AutoFirma's habit, not one a compat layer can make
+safe — its own help says so; every other command takes `--password-file`.
+
 ## Layout
 
 ```
