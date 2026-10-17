@@ -491,13 +491,3 @@ fn last_error(what: &str) -> Error {
         .unwrap_or_default();
     Error::Keystore(format!("{what} failed with Win32 error {code:#010x}"))
 }
-
-// Probe: a symbol exported by crypt32 on every supported Windows.
-#[link(name = "crypt32", kind = "raw-dylib")]
-unsafe extern "system" {
-    fn CertDuplicateStore(h_cert_store: usize) -> usize;
-}
-#[allow(dead_code)]
-pub fn probe_export_present() -> usize {
-    unsafe { CertDuplicateStore(0) }
-}

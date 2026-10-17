@@ -217,32 +217,6 @@ jobs:
         shell: bash
       - name: build every member without the GUI (no 32-bit windowing stack here)
         run: cargo build --workspace --exclude openfirma-gui --target i686-pc-windows-msvc
-      # Diagnostic for the STATUS_ENTRYPOINT_NOT_FOUND this job's keystore lib
-      # tests take since CertDuplicateCertificateContext joined the crypt32
-      # import table, while x64/arm64 build clean: walk the freshly built test
-      # binary for each imported symbol and scan System32\crypt32.dll's export
-      # strings. Remove once diagnosed. The PKI step that follows stays exactly
-      # as it was.
-      - name: diagnose crypt32 imports of the failing test binary
-        shell: pwsh
-        run: |
-          $exe = Get-ChildItem -Recurse target\i686-pc-windows-msvc\debug\deps -Filter openfirma_keystore-*.exe |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          "binary: $($exe.FullName)"
-          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
-          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-          foreach ($sym in @('CertDuplicateCertificateContext','CertCreateCertificateContext','CryptAcquireCertificatePrivateKey','NCryptFreeObject')) {
-            $hit = $text.Contains($sym)
-            "symbol $($sym): $(if ($hit) { 'present in binary' } else { 'ABSENT' })"
-          }
-          $c32 = "$env:SystemRoot\System32\crypt32.dll"
-          "crypt32.dll size: $((Get-Item $c32).Length)"
-          # dumpbin-free export list: scan crypt32's export name strings out of the file
-          $cb = [System.IO.File]::ReadAllBytes($c32)
-          $ctext = [System.Text.Encoding]::ASCII.GetString($cb)
-          foreach ($sym in @('CertDuplicateCertificateContext','CertCreateCertificateContext')) {
-            "crypt32.dll exports '$sym' string: $(if ($ctext.Contains($sym)) { 'yes' } else { 'NO' })"
-          }
       # The PKI this step's Git Bash can generate is cheap and lets the pure
       # parsing tests (PKCS#12 fixtures, CMS crosschecks that don't shell out)
       # run for real on the 32-bit ABI instead of skipping.
@@ -263,7 +237,41 @@ jobs:
             echo "no openssl on this runner; fixture tests will skip"
           fi
       - name: keystore tests on the 32-bit ABI (ABI asserts execute natively)
-        run: cargo test -p openfirma-keystore -p openfirma-core --target i686-pc-windows-msvc
+        run: cargo test -p openfirma-keystore -p openfirma-core --target i686-pc-windows-msvc --no-run
+      # Diagnostic for the STATUS_ENTRYPOINT_NOT_FOUND this job's keystore lib
+      # test takes since CertDuplicateCertificateContext joined the crypt32
+      # import table, while x64/arm64 build clean: walk the freshly built test
+      # binary's own strings for each imported symbol (a raw-dylib binding
+      # emits `__imp_<name>` thunks and plain names alike) and scan
+      # System32\crypt32.dll for its export name strings. Remove once diagnosed.
+      - name: diagnose crypt32 imports of the keystore test binary
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse target\i686-pc-windows-msvc\debug\deps -Filter openfirma_keystore-*.exe -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $exe) { "no keystore test binary found"; exit 0 }
+          "binary: $($exe.FullName)"
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          foreach ($sym in @('CertDuplicateCertificateContext','CertCreateCertificateContext','CryptAcquireCertificatePrivateKey','NCryptFreeObject')) {
+            "symbol '$sym': $(if ($text.Contains($sym)) { 'referenced by the binary' } else { 'not mentioned' })"
+            "thunk  '__imp_$sym': $(if ($text.Contains("__imp_$sym")) { 'present' } else { 'absent' })"
+          }
+          $c32 = "$env:SystemRoot\System32\crypt32.dll"
+          "crypt32.dll size: $((Get-Item $c32).Length)"
+          $cb = [System.IO.File]::ReadAllBytes($c32)
+          $ctext = [System.Text.Encoding]::ASCII.GetString($cb)
+          foreach ($sym in @('CertDuplicateCertificateContext','CertCreateCertificateContext')) {
+            "crypt32.dll export-string '$sym': $(if ($ctext.Contains($sym)) { 'yes' } else { 'NO' })"
+          }
+          $n = "$env:SystemRoot\System32\ncrypt.dll"
+          $ntext = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($n))
+          "ncrypt.dll export-string 'NCryptFreeObject': $(if ($ntext.Contains('NCryptFreeObject')) { 'yes' } else { 'NO' })"
+      # A serial run: the lib tests swap process-wide HOME (under an in-crate
+      # lock), and on a 1-core runner thread overlap plus env mutation is where
+      # a load-time failure would otherwise hide between tests.
+      - name: keystore tests on the 32-bit ABI (ABI asserts execute natively)
+        run: cargo test -p openfirma-keystore -p openfirma-core --target i686-pc-windows-msvc -- --test-threads=1
 
   no-real-certs:
     runs-on: ubuntu-latest
