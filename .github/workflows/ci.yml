@@ -235,6 +235,31 @@ jobs:
           else
             echo "no openssl on this runner; fixture tests will skip"
           fi
+      # Diagnostic for the STATUS_ENTRYPOINT_NOT_FOUND this job's keystore lib
+      # tests take since CertDuplicateCertificateContext joined the crypt32
+      # import table: walk the test binary's real import list and print which
+      # crypt32 symbols resolve on this runner image. Remove once diagnosed.
+      - name: diagnose crypt32 imports of the failing test binary
+        if: failure()
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse target\i686-pc-windows-msvc\debug\deps -Filter openfirma_keystore-*.exe |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          "binary: $($exe.FullName)"
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          foreach ($sym in @('CertDuplicateCertificateContext','CertCreateCertificateContext','CertEnumCertificatesInStore','CertOpenStore','CertCloseStore','CryptAcquireCertificatePrivateKey','NCryptFreeObject')) {
+            $hit = $text.Contains($sym)
+            "symbol $($sym): $(if ($hit) { 'present in binary' } else { 'ABSENT' })"
+          }
+          $c32 = "$env:SystemRoot\System32\crypt32.dll"
+          "crypt32.dll size: $((Get-Item $c32).Length) version: $((Get-Item $c32).VersionInfo.FileVersion)"
+          # dumpbin-free export list: scan crypt32's export name strings out of the file
+          $cb = [System.IO.File]::ReadAllBytes($c32)
+          $ctext = [System.Text.Encoding]::ASCII.GetString($cb)
+          foreach ($sym in @('CertDuplicateCertificateContext','CertCreateCertificateContext')) {
+            "crypt32.dll exports '$sym' string: $(if ($ctext.Contains($sym)) { 'yes' } else { 'NO' })"
+          }
       - name: keystore tests on the 32-bit ABI (ABI asserts execute natively)
         run: cargo test -p openfirma-keystore -p openfirma-core --target i686-pc-windows-msvc
 

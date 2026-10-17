@@ -80,9 +80,10 @@ pub fn discover() -> Vec<openfirma_core::workflow::StoreSpec> {
         // browser keeps beside them can hold files too (a stray cert9.db in
         // one made this very listing offer a non-profile as a keystore). An
         // ini that exists but names no profile is therefore the strictest
-        // answer — list nothing, ask for the path by name. Only an *unreadable*
-        // ini falls back to the database files themselves: snap mirror roots
-        // genuinely have none, and there the files are all there is to go by.
+        // answer — list nothing, ask for the path by name. Only where there
+        // is no ini at all falls back to the database files themselves: snap
+        // mirror roots genuinely have none, and there the files are all
+        // there is to go by.
         let listed = profile_paths(&dir.join("profiles.ini"));
         let fallback = listed.is_empty() && !dir.join("profiles.ini").is_file();
         for entry in entries.flatten() {

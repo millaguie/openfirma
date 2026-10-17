@@ -317,6 +317,10 @@ impl SystemStore for WindowsStore {
         // time. Re-enumerate MY and acquire on the store's own context; only
         // when the entry is no longer in the store (edited between listing
         // and signing) does the rebuilt context get tried, as a best effort.
+        // The match is by DER bytes, never by position: the listing counts
+        // only what it showed the user — certificates that failed to parse or
+        // had no private key were skipped — so store position #n is not list
+        // position #n whenever either list skipped anything.
         let der = cert.cert.der().to_vec();
         let owned =
             unsafe { CertCreateCertificateContext(ENCODINGS, der.as_ptr(), der.len() as u32) };
@@ -327,7 +331,6 @@ impl SystemStore for WindowsStore {
         }
         let mut ctx = owned;
         let mut duplicate: *const CertContext = ptr::null();
-        let mut seen = 0usize;
         let mut probe: *const CertContext = ptr::null();
         loop {
             // SAFETY: the same enumeration contract as `certificates` — pass
@@ -336,10 +339,6 @@ impl SystemStore for WindowsStore {
             probe = unsafe { CertEnumCertificatesInStore(self.store, probe) };
             if probe.is_null() {
                 break;
-            }
-            if seen != i {
-                seen += 1;
-                continue;
             }
             let (ptr, len) =
                 unsafe { ((*probe).pb_cert_encoded_info, (*probe).cb_cert_encoded_info) };
@@ -354,8 +353,8 @@ impl SystemStore for WindowsStore {
                 if !duplicate.is_null() {
                     ctx = duplicate;
                 }
+                break;
             }
-            break;
         }
         let mut handle = 0usize;
         let mut spec = 0u32;
