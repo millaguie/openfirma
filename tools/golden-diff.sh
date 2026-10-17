@@ -5,6 +5,10 @@
 # Raw bytes can never match, the signing time and therefore the signature
 # differ on every run. What must match is the structure: which attributes are
 # present, how each value is encoded, the certificate set, the versions.
+# ECDSA adds one more class of volatile: BouncyCastle draws s with a fixed
+# bit length (64 bytes for P-256) while RustCrypto writes it minimal per SEC
+# 1, so signature values that differ only in leading zero bytes are the same
+# shape and must not look like a diff. The normalizer below pins lengths.
 #
 # Needs: tools/gen-testcert.sh run first, and autofirma.jar, which
 # tools/fetch-autofirma.sh downloads. Override its location with AUTOFIRMA_JAR.
@@ -32,7 +36,40 @@ cargo build -q --bin openfirma
 # hashes are deliberately kept: those must match exactly.
 normalize() {
   sed -E -e 's/(UTCTime|GeneralizedTime) .*/\1 <TIME>/' \
-         -e 's/[0-9A-F]{48}\.\.\.\(([0-9]+) bytes\)/<hex \1 bytes>/'
+         -e 's/[0-9A-F]{48}\.\.\.\(([0-9]+) bytes\)/<hex \1 bytes>/' \
+         -e 's/^(OCTET STRING) <hex (7[0-2]) bytes>/\1 <ec signature>/' \
+         -e 's/^(OCTET STRING) [0-9A-F]{132,}/\1 <ec signature>/' |
+    # Second pass, and the reason it must be a second pass: an ECDSA blob is
+    # 1-2 bytes longer (or shorter) depending on how the random s value falls,
+    # so every container SEQUENCE/SET/[0] between it and the root carries a
+    # length that differs by the same amount. The dump prints containers
+    # top-down, so those lines come *before* the blob line proves them. Walk
+    # the indentation stack: containers open at strictly deeper levels; when a
+    # line confirms an EC signature, everything still on the stack shallower
+    # than it — its ancestors, and nothing else — gets <ec-len>. The nesting
+    # SHAPE stays under test: placeholders attach to a level, so one extra or
+    # missing SEQUENCE cannot hide behind them, and RSA dumps carry no EC blob
+    # line and never trigger this at all.
+    sed -E 's/^(SEQUENCE|SET) \(([0-9]+)\)$/\1 (\2)/' | awk '
+      { lines[NR] = $0 }
+      /<ec signature>/ { blob = NR }
+      END {
+        if (!blob) { for (i = 1; i <= NR; i++) print lines[i]; exit }
+        # ancestor levels: strictly decreasing indents before the blob line
+        split("", keep);
+        level = 1000000;
+        for (i = blob - 1; i >= 1; i--) {
+          line = lines[i]; rest = line; sub(/[^ ].*$/, "", rest); ind = length(rest);
+          if (substr(line, ind + 1) ~ /^(SEQUENCE|SET) \(/ || substr(line, ind + 1) ~ /^\[0\] \(/ || substr(line, ind + 1) ~ /^\[4\] \(/ ) {
+            if (ind < level) { keep[i] = 1; level = ind }
+          }
+        }
+        for (i = 1; i <= NR; i++) {
+          if (keep[i]) { sub(/ \(.*\)$/, " (<ec-len>)", lines[i]) }
+          print lines[i]
+        }
+      }
+    '
 }
 
 # run_case <name> <input> <autofirma key=value...>
@@ -96,19 +133,32 @@ run_case() {
 # contentHint description — is passed to openfirma explicitly. What stays under
 # test is exactly what CAdESParameters.load derives from the digest: v1 for
 # SHA-1, V2 for SHA-2, and no hashAlgorithm inside a SHA-256 ESSCertIDv2.
+# The trailing arguments go to AutoFirma as extraParams, except --flag words:
+# those belong to openfirma's side only (the jar takes key=value pairs and its
+# driver refuses anything else), which is how the SHA-1 case keeps the M5
+# opt-out on our side without polluting the reference invocation.
 run_alg_case() {
   local name="$1" input="$2" base="$3" sha="$4"; shift 4
+  local af_params=() of_extra=()
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --*) of_extra+=("$a") ;;
+      *) af_params+=("$a") ;;
+    esac
+  done
   local af="$OUT/$name.autofirma.csig" ours="$OUT/$name.openfirma.csig"
   local dump="$OUT/$name.autofirma.dump"
   # AutoFirma runs with these defaults plus any extraParams the caller passes
   # as trailing arguments; openfirma mirrors from the dump whatever shape came
   # out — encapsulation, signingTime, issuerAndSerialNumber, the contentHint
-  # text — and appends EXTRA_OF, the flags array its side needs beyond them.
-  # The finding under test stays unhidden either way: the v1 vs V2 choice
+  # text — and appends of_extra, the --flags its side needs beyond them. The
+  # finding under test stays unhidden either way: the v1 vs V2 choice
   # CAdESParameters.load derives from the digest is in the dump.
 
   java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
-    "$CERTS/$base.p12" "$PASS" "$input" "$af" "${sha}withRSA" "$@" >/dev/null 2>&1 \
+    "$CERTS/$base.p12" "$PASS" "$input" "$af" "${sha}withRSA" \
+    "${af_params[@]+"${af_params[@]}"}" >/dev/null 2>&1 \
     || { echo "SKIP   $name (AutoFirma refused to sign it)"; return 0; }
 
   ./target/debug/openfirma inspect -i "$af" | normalize >"$dump"
@@ -140,7 +190,7 @@ run_alg_case() {
   grep -qE '^ +INTEGER [0-9A-F]+$' "$dump" || of+=(--no-issuer-serial)
   [ -n "$hint" ] && of+=(--content-hint "$hint")
   # openfirma-side flags beyond the dump-derived ones, set by the caller
-  of+=("${EXTRA_OF[@]+"${EXTRA_OF[@]}"}")
+  of+=("${of_extra[@]+"${of_extra[@]}"}")
 
   ./target/debug/openfirma sign -i "$input" -o "$ours" \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
@@ -163,9 +213,10 @@ run_case simple "$INPUTS/simple.txt" signer-rsa
 # signingCertificate (its CAdESParameters.load picks v1 whenever the digest is
 # not SHA-2), and openfirma must produce the identical shape.
 # openfirma refuses weak output by default (finding M5), so the golden side
-# that must reproduce AutoFirma's SHA-1 shape opts out explicitly.
-EXTRA_OF=(--allow-weak-algorithms) run_alg_case sha1 "$INPUTS/simple.txt" signer-rsa SHA1
-EXTRA_OF=()
+# that must reproduce AutoFirma's SHA-1 shape opts out explicitly. The env
+# form matters: VAR=(…) cmd only exports a string, and the array would reach
+# run_alg_case as its literal "(--allow-weak-algorithms)".
+run_alg_case sha1 "$INPUTS/simple.txt" signer-rsa SHA1 --allow-weak-algorithms
 
 # Finding B1: AutoFirma's ECDSA signatureAlgorithm carries an explicit NULL
 # parameter (BouncyCastle's shape; RFC 5758 would leave it absent), and the
