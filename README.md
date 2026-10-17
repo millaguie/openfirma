@@ -130,7 +130,11 @@ its help text says what it is: insecure.
 
 A key held by the system or a token — smartcard, DNIe, NSS database — signs
 without ever leaving its holder. The PIN travels in an environment variable,
-same rule as above:
+same rule as above. `--pin-env` names a variable that must exist: an unset
+one is refused before the token is touched, because trying an empty PIN
+costs lockout tries on real cards. A keystore with genuinely no password is
+the descriptor's own `::` marker (`--store pkcs11:/path/module.so::`), and a
+plain `--store nss` needs nothing:
 
 ```
 cargo run -- keystores list \

@@ -648,13 +648,30 @@ fn parse_store_spec(text: &str) -> Result<StoreSpec> {
 }
 
 /// The PIN for a keystore, read from the environment variable named by
-/// `--pin-env`. An unset variable is an empty PIN — that is how NSS shared
-/// databases (no password) are expressed. The copy comes back already
-/// zeroizing: from this line on, every buffer that held it zeroes on drop
-/// (finding B-2: the p12 password had this posture and the token PIN did not).
+/// `--pin-env`. A variable that is not set is an error before anything opens:
+/// sending an empty PIN because of a typo in the name spends a real token's
+/// lockout tries (measured on SoftHSM; the DNIe locks after three failures
+/// and needs a police station to reopen — finding M2). The truly empty PIN —
+/// an NSS shared database or a passwordless token — is spelled by the
+/// descriptor itself (`pkcs11:module::`), which `open_store` turns into the
+/// explicit no-PIN login without ever coming through here. The copy that
+/// does come back arrives already zeroizing: from this line on, every buffer
+/// that held it zeroes on drop (finding B-2: the p12 password had this
+/// posture and the token PIN did not).
 fn store_pin(pin_env: Option<&String>) -> Result<Option<Zeroizing<String>>> {
     match pin_env {
-        Some(var) => Ok(Some(Zeroizing::new(std::env::var(var).unwrap_or_default()))),
+        Some(var) => match std::env::var(var) {
+            Ok(value) => Ok(Some(Zeroizing::new(value))),
+            Err(std::env::VarError::NotPresent) => anyhow::bail!(
+                "--pin-env names {var}, and {var} is not set; refusing to try the token \
+                 with an empty PIN (a wrong guess costs a lockout try on real cards — a \
+                 keystore that genuinely needs no PIN is spelled with the :: marker, e.g. \
+                 --store pkcs11:/path/to/module.so::)"
+            ),
+            Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+                "{var} does not hold text; a PIN must be a UTF-8 string in the environment"
+            ),
+        },
         None => Ok(None),
     }
 }
@@ -2273,7 +2290,7 @@ mod tests {
     }
 
     #[test]
-    fn store_pin_reads_the_named_variable_and_treats_absence_as_empty() {
+    fn store_pin_reads_the_named_variable_and_refuses_its_absence() {
         // Same thread-safety rule as the HOME test: the variable name carries
         // this test's name, so no concurrent test can collide with it.
         let var = format!(
@@ -2282,12 +2299,13 @@ mod tests {
         );
         unsafe { std::env::set_var(&var, "1234") };
         assert_eq!(&*store_pin(Some(&var)).unwrap().unwrap(), "1234");
-        // An unset variable is an empty PIN: that is how an NSS database with
-        // no password travels, and it must not be a hard error here.
-        assert_eq!(
-            &*store_pin(Some(&format!("{var}-absent"))).unwrap().unwrap(),
-            ""
-        );
+        // An unset variable is a refusal, not an empty PIN (finding M2): the
+        // token must never see a guess born of a typo.
+        let absent = store_pin(Some(&format!("{var}-absent")))
+            .unwrap_err()
+            .to_string();
+        assert!(absent.contains("is not set"), "{absent}");
+        assert!(absent.contains("--pin-env"), "{absent}");
         assert_eq!(store_pin(None).unwrap(), None);
         unsafe { std::env::remove_var(&var) };
     }

@@ -97,7 +97,12 @@ pub trait SystemStore {
   r||s converted to the DER CMS expects. Anything else is refused by name.
 - **PIN policy.** The PIN comes from the environment (`--pin-env VAR`) or a
   descriptor marker (`::`), never the command line — same rule as
-  `--password` for PKCS#12, and the same reason (`ps`). Login happens at open
+  `--password` for PKCS#12, and the same reason (`ps`). An unset `--pin-env`
+  variable is refused before anything opens: it means a typo in the name,
+  and an empty PIN sent on such a guess spends one of the three tries a DNIe
+  counts before locking (measured on SoftHSM; finding M2). The `::` marker —
+  not the absence of a variable — is what spells "this keystore has no
+  password". Login happens at open
   time so a wrong PIN fails while the reader is still in hand; token flags
   (`CKF_USER_PIN_COUNT_LOW`/`FINAL_TRY`/`LOCKED`) are read before wording the
   error so "last try" is said before the lock, not after.
