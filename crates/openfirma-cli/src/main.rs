@@ -684,64 +684,11 @@ fn store_pin(pin_env: Option<&String>) -> Result<Option<Zeroizing<String>>> {
 /// generics; see `boxed_signer`.
 type DynStore = Arc<dyn openfirma_keystore::SystemStore>;
 
-/// Opens a descriptor behind one `Arc`. The PIN arrives zeroizing because it
-/// comes from the environment through `store_pin`; opening a store takes the
-/// plain string only for the moment of the login call, and every copy the
-/// store keeps wraps itself back up (see openfirma-keystore's Pkcs11Store).
+/// Opens a descriptor through the keystore crate's single implementation
+/// (finding B8): the GUI calls the same `open_store`, so no platform refusal,
+/// NSS hint or no-PIN marker can differ between the frontends.
 fn open_store(spec: &StoreSpec, pin: Option<Zeroizing<String>>) -> Result<DynStore> {
-    let store: DynStore = match spec {
-        StoreSpec::Pkcs11 {
-            module,
-            token,
-            wants_no_pin,
-        } => Arc::new(openfirma_keystore::Pkcs11Store::open(
-            module,
-            token.as_deref(),
-            if *wants_no_pin && pin.is_none() {
-                // The descriptor said "no PIN": log in with an empty one, the
-                // shape a SoftHSM token initialized --pin '' accepts.
-                Some(String::new())
-            } else {
-                pin.map(|p| p.to_string())
-            },
-        )?),
-        StoreSpec::Nss { db } => {
-            match openfirma_keystore::nss::open(db, None, pin.map(|p| p.to_string())) {
-                Ok(store) => Arc::new(store),
-                Err(e) => {
-                    // `nss` and `nspr` are separate packages on every Linux that
-                    // ships the library anywhere a browser needs it; telling the
-                    // user which to install beats "library not found".
-                    let text = e.to_string();
-                    if text.contains("OPENFIRMA_NSS_MODULE") {
-                        anyhow::bail!("{text} (on Debian/Ubuntu: apt install libnss3)");
-                    }
-                    return Err(e.into());
-                }
-            }
-        }
-        StoreSpec::Windows => {
-            #[cfg(target_os = "windows")]
-            {
-                Arc::new(openfirma_keystore::windows::WindowsStore::open()?)
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                anyhow::bail!("--store windows is the Windows certificate store; run it on Windows")
-            }
-        }
-        StoreSpec::Macos => {
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            {
-                Arc::new(openfirma_keystore::macos::MacStore::open()?)
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            {
-                anyhow::bail!("--store macos is the macOS keychain; run it on macOS")
-            }
-        }
-    };
-    Ok(store)
+    Ok(openfirma_keystore::open_store(spec, pin)?)
 }
 
 /// Picks the signing certificate of a keystore for `sign --store`: by label

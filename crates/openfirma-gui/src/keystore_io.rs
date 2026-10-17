@@ -12,76 +12,16 @@ use openfirma_core::{CertificateHandle, Error, Result};
 use openfirma_keystore::{Pkcs12, StoreCertificate, SystemStore};
 use zeroize::Zeroizing;
 
-/// Open a store descriptor behind one `Arc<dyn SystemStore>` (docs/adr-0004:
-/// the dyn erasure keeps every backend out of the callers, and the Arc keeps
-/// the store alive past every signer borrowed from it). The failure text is
-/// what `openfirma sign --store` produces for the same mistake — including
-/// the NSS install hint — because both frontends call this function.
+/// Open a store descriptor behind one `Arc<dyn SystemStore>`. The work lives
+/// in openfirma-keystore's [`openfirma_keystore::open_store`] — the CLI's
+/// `--store` runs the same function (finding B8), so the two frontends' key
+/// sources cannot drift. This thin wrapper only keeps the GUI's import list
+/// pointing at its own bridge module.
 pub fn open_store(
     spec: &StoreSpec,
     pin: Option<Zeroizing<String>>,
 ) -> Result<Arc<dyn SystemStore>> {
-    let store: Arc<dyn SystemStore> = match spec {
-        StoreSpec::Pkcs11 {
-            module,
-            token,
-            wants_no_pin,
-        } => Arc::new(openfirma_keystore::Pkcs11Store::open(
-            module,
-            token.as_deref(),
-            if *wants_no_pin && pin.is_none() {
-                // The descriptor said "no PIN": log in with an empty one, the
-                // shape a SoftHSM token initialized --pin '' accepts.
-                Some(String::new())
-            } else {
-                pin.map(|p| p.to_string())
-            },
-        )?),
-        StoreSpec::Nss { db } => {
-            match openfirma_keystore::nss::open(db, None, pin.map(|p| p.to_string())) {
-                Ok(store) => Arc::new(store),
-                Err(e) => {
-                    // `nss` and `nspr` are separate packages on every Linux that
-                    // ships the library anywhere a browser needs it; telling the
-                    // user which to install beats "library not found". The CLI's
-                    // main used to own this sentence; now both frontends get it
-                    // from here.
-                    let text = e.to_string();
-                    if text.contains("OPENFIRMA_NSS_MODULE") {
-                        return Err(Error::Keystore(format!(
-                            "{text} (on Debian/Ubuntu: apt install libnss3)"
-                        )));
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        StoreSpec::Windows => {
-            #[cfg(target_os = "windows")]
-            {
-                Arc::new(openfirma_keystore::windows::WindowsStore::open()?)
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                return Err(Error::Keystore(
-                    "--store windows is the Windows certificate store; run it on Windows".into(),
-                ));
-            }
-        }
-        StoreSpec::Macos => {
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            {
-                Arc::new(openfirma_keystore::macos::MacStore::open()?)
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            {
-                return Err(Error::Keystore(
-                    "--store macos is the macOS keychain; run it on macOS".into(),
-                ));
-            }
-        }
-    };
-    Ok(store)
+    openfirma_keystore::open_store(spec, pin)
 }
 
 /// Read a certificate from PEM or DER bytes (the CLI's loader, verbatim in
