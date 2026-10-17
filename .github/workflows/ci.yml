@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: ['w4-bisect-*']
   workflow_dispatch:
 
 env:
@@ -229,7 +230,19 @@ jobs:
               if [ -x "$candidate/openssl.exe" ]; then openssl_bin="$candidate/openssl.exe"; break; fi
             done
           fi
+          # The PKI this step's Git Bash can generate is cheap and lets the pure
+          # parsing tests (PKCS#12 fixtures, CMS crosschecks that don't shell out)
+          # run for real on the 32-bit ABI instead of skipping.
+          #
+          # One more thing rides on this step: if no openssl was found, the job
+          # would have set OPENFIRMA_ALLOW_SKIP and exited above; a PKI means the
+          # runner is complete, so REQUIRE_TESTS must stay in force for the core
+          # tests below — the earlier of these two steps switched it off on the
+          # way past, and openfirma-core's keystore tests honour whichever flag
+          # is set last (2ba4b3f's i686 failures were that flip: every PKI test
+          # skipped when REQUIRE_TESTS was supposed to gate this job).
           if [ -n "$openssl_bin" ]; then
+            echo "OPENFIRMA_REQUIRE_TESTS=1" >> "$GITHUB_ENV"
             export PATH="$(dirname "$openssl_bin"):$PATH"
             ./tools/gen-testcert.sh
             ./tools/gen-p12-fixtures.sh
