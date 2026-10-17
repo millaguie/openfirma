@@ -2572,12 +2572,20 @@ mod tests {
     #[test]
     fn register_without_any_key_source_names_the_refusal_it_cannot_sign_with() {
         let _home_guard = lock_quiet(&HOME_LOCK);
+        // Some CI images (aarch64) ship no xdg-utils, and --register's honest
+        // "instala xdg-utils" refusal is NOT what this test pins: every key
+        // refusal below fires independently of it. Promise the tool on such
+        // images (the same env the browser crate honors; linux_install_and_
+        // register skips its association step when it is set and the binary
+        // is really absent) so the tested rules decide pass or fail here too.
+        let _xdg_guard = lock_quiet(&XDG_MIME_OVERRIDE);
+        unsafe { std::env::set_var("OPENFIRMA_ASSUME_XDG_MIME", "1") };
         // The refusal a fresh `--register` (no --p12 anywhere) must print:
         // naming the fix, not just the missing flag — the whole point of the
         // round-two finding was an install step that "succeeded" into a
-        // handler that always failed. No xdg-mime promise here: every refusal
-        // this test pins fires long before the association step, so it fails
-        // for the tested reason on images with and without xdg-utils.
+        // handler that always failed. (The xdg-mime promise above covers the
+        // legs below: with --p12 present, registration runs first and needs
+        // it on images without xdg-utils.)
         let dir =
             std::env::temp_dir().join(format!("openfirma-register-empty-{}", std::process::id()));
         // The refusal must arrive BEFORE any file exists — the round-two state
