@@ -217,9 +217,12 @@ jobs:
         shell: bash
       - name: build every member without the GUI (no 32-bit windowing stack here)
         run: cargo build --workspace --exclude openfirma-gui --target i686-pc-windows-msvc
-      # The PKI this step's Git Bash can generate is cheap and lets the pure
-      # parsing tests (PKCS#12 fixtures, CMS crosschecks that don't shell out)
-      # run for real on the 32-bit ABI instead of skipping.
+      # Diagnostic for the STATUS_ENTRYPOINT_NOT_FOUND this job's keystore lib
+      # tests take since CertDuplicateCertificateContext joined the crypt32
+      # import table, while x64/arm64 build clean: walk the freshly built test
+      # binary for each imported symbol and scan System32\crypt32.dll's export
+      # strings. Remove once diagnosed. The PKI step that follows stays exactly
+      # as it was.
       - name: diagnose crypt32 imports of the failing test binary
         shell: pwsh
         run: |
@@ -240,7 +243,9 @@ jobs:
           foreach ($sym in @('CertDuplicateCertificateContext','CertCreateCertificateContext')) {
             "crypt32.dll exports '$sym' string: $(if ($ctext.Contains($sym)) { 'yes' } else { 'NO' })"
           }
-      - name: generate test PKI
+      # The PKI this step's Git Bash can generate is cheap and lets the pure
+      # parsing tests (PKCS#12 fixtures, CMS crosschecks that don't shell out)
+      # run for real on the 32-bit ABI instead of skipping.
       - name: generate test PKI
         shell: bash
         run: |
