@@ -167,9 +167,10 @@ jobs:
         run: ls -lh dist
 
       - name: state what the window ships on
-        # The GUI binary rides every `gui: true` artifact (x86_64 Linux,
-        # both Windows 64-bit families where MSVC builds it, both macOS);
-        # i686 Windows, musl and aarch64-linux-from-cross carry the CLI only.
+        # Keep this list in step with the matrix above: the GUI rides exactly
+        # the `gui: true` entries, nothing else. (H-21, review 07: these notes
+        # once claimed aarch64 Windows carried the window and called the arm64
+        # Linux runner "cross"; both were false.)
         run: |
           {
             echo ""
@@ -178,8 +179,14 @@ jobs:
             echo "Ships inside the artifacts for \`x86_64-unknown-linux-gnu\`,"
             echo "\`x86_64-pc-windows-msvc\`, \`aarch64-pc-windows-msvc\`,"
             echo "\`x86_64-apple-darwin\` and \`aarch64-apple-darwin\`."
-            echo "The other artifacts (i686 Windows, musl, aarch64 Linux via cross)"
-            echo "carry the CLI only: their toolchain has no windowing system to link."
+            echo "The other artifacts (i686 Windows, x86_64 musl, aarch64 Linux)"
+            echo "carry the CLI only: their build has no windowing system to link"
+            echo "(the GUI needs its target's native OpenGL/X11 client libraries)."
+            echo ""
+            echo "\`x86_64-unknown-linux-musl\` is a static binary: PKCS#11 and"
+            echo "NSS modules load with \`dlopen\`, which a static musl binary"
+            echo "cannot do - that artifact signs with PKCS#12 files; for"
+            echo "\`--store pkcs11:\`/\`nss\` use the glibc build."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: softprops/action-gh-release@62c96d0c4e8a889135c1f3a25910db8dbe0e85f7 # v2.3.4
