@@ -448,6 +448,13 @@ fn find_softokn() -> Result<PathBuf> {
 /// expansion only.
 fn expand_db_location(db: &str) -> String {
     let trimmed = db.trim();
+    // B5's counterpart in the parameter string: only something that already
+    // carries an NSS key (`configDir=`/`parameters=`) is a spelling to pass
+    // through. No default flags ride along on it: softokn3's own
+    // `sftk_parseParameters` treats any unquoted value after the first
+    // space-separated key as garbage and answers its vendor "did not parse"
+    // (measured with this library), so a caller who writes their own
+    // parameter string owns it verbatim.
     if trimmed.contains('=') || trimmed.starts_with('\'') || trimmed.starts_with('"') {
         return openfirma_core::workflow::expand_home(trimmed);
     }
@@ -465,7 +472,11 @@ fn expand_db_location(db: &str) -> String {
     } else {
         format!("sql:{location}")
     };
-    format!("configDir='{location}'")
+    // B4: AutoFirma's NSS helper adds the same flag (MozillaKeyStoreUtilities
+    // passes flags='readOnly'). Signing only ever reads, and opening a
+    // browser's live profile in writing lets a *different* NSS version decide
+    // to migrate its database under the browser's feet.
+    format!("configDir='{location}' flags=readOnly")
 }
 
 #[cfg(test)]
@@ -574,47 +585,49 @@ mod tests {
         let spaced = dir.join("dir con espacio").join("nssdb");
         std::fs::create_dir_all(&spaced).unwrap();
         let got = config_string(&format!("sql:{}", spaced.display())).unwrap();
-        assert_eq!(got, format!("configDir='sql:{}'", spaced.display()));
+        assert_eq!(
+            got,
+            format!("configDir='sql:{}' flags=readOnly", spaced.display())
+        );
         // The spelling the module parses from here on is exactly this quoted
-        // form, and a real softokn3 accepts it. That proves more than "opens":
-        // an *empty* spaced directory makes NSS initialise the database (its
-        // sql layer then refuses to log into the half-built token — an error
-        // from after C_Initialize); the same directory imported as a real one
-        // lists its certificates through the very same spelling. The two
-        // answers together say the spaced configDir is not what fails.
+        // form, and a real softokn3 accepts it — proven end to end, not by
+        // string shape: copy the real fixture database (OPENFIRMA_TEST_NSS_DB)
+        // into a directory whose name has spaces and list through *this* code
+        // path. A spaced, freshly created directory makes NSS answer its
+        // unusable-database error before any query runs (softokn3 does not
+        // create sql databases inside an empty directory), which is exactly
+        // why the proof below uses a database that exists.
         if let Ok(module) = find_softokn() {
-            let empty_is_spaced_failure = match crate::pkcs11::Pkcs11Store::open_nss(
-                &module,
-                &format!("sql:{}", spaced.display()),
-                None,
-                Some(String::new()),
-            ) {
-                Ok(_) => String::new(),
-                Err(e) => e.to_string(),
-            };
-            assert!(
-                !empty_is_spaced_failure.contains("rejected the database"),
-                "softokn3 blamed the spaced configDir itself: {empty_is_spaced_failure}"
-            );
-            if let Ok(real) = std::env::var("OPENFIRMA_TEST_NSS_DB") {
-                // Same argument for the reference fixture: the quoted form is
-                // whatever softokn3 answers to, never its configuration
-                // parser. (A freshly initialised database logs into nothing —
-                // no password exists yet — which is a different answer from
-                // "the spaced path did not parse".)
-                let outcome =
-                    crate::pkcs11::Pkcs11Store::open_nss(&module, &real, None, Some(String::new()));
-                if let Err(e) = &outcome {
-                    // `NSS rejected the database configuration` is softokn3's
-                    // own vendor message for a parameter string that did not
-                    // parse; anything else comes from *inside* an accepted
-                    // database. (The exact substring is NSS's sftk faithfulness
-                    // check — see describe()/NSS_BAD_DATABASE_CONFIG above.)
-                    let blamed_config = e.to_string().contains("rejected the database");
-                    assert!(!blamed_config, "softokn3 blamed the quoted configDir: {e}");
-                } else {
-                    assert!(outcome.unwrap().certificates().is_ok());
+            let real = std::env::var("OPENFIRMA_TEST_NSS_DB")
+                .unwrap_or_default()
+                .strip_prefix("sql:")
+                .unwrap_or_default()
+                .to_string();
+            if !real.is_empty() && Path::new(&real).is_dir() {
+                let spaced_real = dir.join("db with spaces");
+                std::fs::create_dir_all(&spaced_real).unwrap();
+                for entry in std::fs::read_dir(&real).unwrap().flatten() {
+                    let to = spaced_real.join(entry.file_name());
+                    std::fs::copy(entry.path(), &to).unwrap();
                 }
+                // The copy's pkcs11.txt still names the old configdir; NSS
+                // reads its internal module from the string we pass, so a
+                // stale path inside that file is what the shared-DB flow must
+                // survive. Remove it anyway: its absence makes softokn3 use
+                // the parameters we hand C_Initialize verbatim.
+                let _ = std::fs::remove_file(spaced_real.join("pkcs11.txt"));
+                let store = crate::pkcs11::Pkcs11Store::open_nss(
+                    &module,
+                    &spaced_real.display().to_string(),
+                    None,
+                    Some(String::new()),
+                )
+                .expect("softokn3 opens a database whose directory has spaces");
+                assert_eq!(
+                    store.certificates().expect("listing").len(),
+                    2,
+                    "the copied fixture holds both signers"
+                );
             }
         }
     }
@@ -627,11 +640,11 @@ mod tests {
         unsafe { std::env::set_var("HOME", "/home/openfirma-nss-test") };
         assert_eq!(
             config_string("~/db").unwrap(),
-            "configDir='sql:/home/openfirma-nss-test/db'"
+            "configDir='sql:/home/openfirma-nss-test/db' flags=readOnly"
         );
         assert_eq!(
             config_string("$HOME/db").unwrap(),
-            "configDir='sql:/home/openfirma-nss-test/db'"
+            "configDir='sql:/home/openfirma-nss-test/db' flags=readOnly"
         );
         unsafe {
             match home {

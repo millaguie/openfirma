@@ -1392,17 +1392,27 @@ fn describe(rv: CkRv) -> String {
     if name.starts_with("CKR_") {
         format!("{name} ({rv:#x})")
     } else if rv == NSS_BAD_DATABASE_CONFIG {
-        // NSS's own code for "your LibraryParameters did not parse" (defined
-        // by SECMOD as a vendor value). Naming it turns an opaque hex dump
-        // into the real diagnosis.
-        format!("NSS rejected the database configuration ({rv:#x})")
+        // What NSS's SECMOD_ERROR_BASE range actually holds, by its own
+        // headers (seccmod.h): this vendor value is
+        // SEC_ERROR_BAD_DATABASE — the *database directory* is unusable,
+        // not your parameter string. Measured against this libsoftokn3: an
+        // empty fresh directory answers it on C_Initialize (NSS only creates
+        // its sql files inside a directory whose token has been initialised
+        // before), and it also answers unparseable parameters with it, so the
+        // message names the database first and points at both causes. Getting
+        // this wording right is not pedantry: "your configuration did not
+        // parse" once sent a reviewer chasing quoting bugs in paths that were
+        // fine (finding M3's investigation).
+        format!("NSS cannot use the database behind this configuration ({rv:#x})")
     } else {
         format!("unknown Cryptoki return value {rv:#x}")
     }
 }
 
-/// `SECMOD_ERROR_BASE | (-0x12ab)`-style vendor code softokn3 answers when
-/// its parameter string does not parse (observed directly: 0xce534351).
+/// The vendor value NSS's SECMOD layer answers for a database it cannot use
+/// (`SECMOD_ERROR_BASE | SEC_ERROR_BAD_DATABASE`, observed directly against
+/// this library: 0xce534351). Both causes — an unusable directory and an
+/// unparseable parameter string — arrive through it.
 const NSS_BAD_DATABASE_CONFIG: CkRv = 0xce53_4351;
 
 #[cfg(test)]
