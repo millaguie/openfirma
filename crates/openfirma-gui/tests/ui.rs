@@ -53,6 +53,11 @@ fn harness_for(app: App) -> Harness<'static, App> {
 
 fn fixture_app(open: Option<PathBuf>) -> App {
     let mut a = App::default();
+    // Spanish is what every assertion below quotes ("Firmar", the verdict
+    // sentences); `$LANG` belongs to whoever runs cargo, not to the test, so
+    // the language is pinned here rather than inherited (the macOS CI runners
+    // answer LANG=en_US and would otherwise drive an English window).
+    a.set_locale_for_test(openfirma_gui::strings::Tr::es());
     a.with_dialogs(Dialogs {
         gui_test: true,
         fixture_open: open,
@@ -484,6 +489,10 @@ fn a_drop_while_a_result_stands_unseen_is_refused_out_loud() {
         signer_display: "ANA".into(),
         saved: true,
     });
+    // The locale pin belongs to the app's construction, which this fixture
+    // shows at its default; the refusal sentence asserted below is Spanish
+    // like every other text in this file, so say whose strings these are.
+    app.set_locale_for_test(openfirma_gui::strings::Tr::es());
     app.load_path_from_cli(PathBuf::from("/nonexistent/otro.pdf"));
     assert!(
         matches!(app.screen_ref_for_test(), Screen::Done { .. }),

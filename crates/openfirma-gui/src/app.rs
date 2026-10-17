@@ -733,6 +733,12 @@ impl App {
         self.screen = screen;
     }
 
+    /// Pin the window's language (the tests assert Spanish sentences and
+    /// labels, and `$LANG` is the CI runner's, not the test author's).
+    pub fn set_locale_for_test(&mut self, tr: Tr) {
+        self.tr = tr;
+    }
+
     pub fn close_question_for_test(&self) -> bool {
         self.close_question.is_some()
     }
