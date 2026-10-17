@@ -1,17 +1,15 @@
 //! The PKCS#11 ABI itself, byte-exact for whichever target compiles this —
-//! the regression net for the two mistakes that compile fine everywhere and
+//! the regression net for the mistakes that compile fine everywhere and
 //! misparse tokens silently on Windows: reading `CK_ULONG` as `usize` (C's
-//! `unsigned long` is 4 bytes even in a 64-bit Windows process), and reading
-//! the function table at slot·8 when the cryptoki headers pack it on Windows
-//! (first pointer at byte 2, stride = pointer size).
+//! `unsigned long` is 4 bytes even in a 64-bit Windows process, on ARM64 too
+//! — Microsoft's own ABI tables say so), and reading the function table at
+//! slot·8 when the cryptoki headers pack it on Windows (first pointer at
+//! byte 2, stride = pointer size).
 //!
 //! A live module can only prove the layout where one exists — SoftHSM is
-//! Linux-only in CI — so these tests encode the two spec rules independently
-//! of openfirma's own code and demand that its public types agree on every
-//! target, Windows jobs included. They mirror what vendor libraries actually
-//! do: SoftHSM2's shipped header applies `#pragma pack(push, cryptoki,1)` for
-//! `_WIN32`, and its Windows builds answer with 4-byte `CK_ULONG`s (its own
-//! issue-tracker diagnostics measure exactly that).
+//! Linux-only in CI — so these tests encode the width and packing rules
+//! independently of openfirma's own code and demand that its public types
+//! agree on every target, Windows jobs included.
 
 use std::mem::{offset_of, size_of};
 use std::ptr;
@@ -21,25 +19,43 @@ use openfirma_keystore::pkcs11::types::{
     CkUlong, CkVersion,
 };
 
+/// The width C's `unsigned long` has on this target: 4 on every Windows MSVC
+/// ABI (LLP64 holds for x86_64 and aarch64 alike), otherwise the LP64/ILP32
+/// pointer width. Written from Microsoft's published type tables and the C
+// standard minimums, not by peeking at `types.rs`.
+const fn c_ulong_width() -> usize {
+    if cfg!(windows) { 4 } else { size_of::<usize>() }
+}
+
 /// The byte offset of spec function *k* in a `CK_FUNCTION_LIST`, derived here
-/// from the two ABI rules (packed headers on Windows: version pair then slot
-/// 1 immediately; unix LP64: natural alignment puts it behind slot 0's tail
-/// padding at 8k; ILP32 unixes land on the same formula as packing through
-/// their own natural alignment). Deliberately written without looking at any
-/// constant in `types.rs`.
+/// from the packing rules, not by peeking at `types.rs`: the packed cryptoki
+/// headers put slot 1 right behind the two version bytes (byte 2) and every
+/// following slot one pointer-width apart — Windows reads its vendor DLLs
+/// under that packing for every MSVC ABI. Unix LP64 aligns each 8-byte
+/// pointer behind slot 0's tail padding, so slot k lands at 8k there. (A
+/// 32-bit unix *test* target would differ from both formulas — nothing here
+/// runs it: the compile-time asserts in `types.rs` guard the slots that file
+/// actually declares on such targets.)
 fn abi_slot(k: usize) -> usize {
     let ptr = size_of::<*const u8>();
-    if cfg!(windows) || ptr == 4 {
-        2 + k * ptr
-    } else {
-        8 * k
-    }
+    if cfg!(windows) { 2 + k * ptr } else { 8 * k }
 }
 
 #[test]
 fn ck_ulong_is_c_unsigned_long_on_every_target() {
-    let want = if cfg!(windows) { 4 } else { size_of::<usize>() };
-    assert_eq!(size_of::<CkUlong>(), want);
+    assert_eq!(size_of::<CkUlong>(), c_ulong_width());
+    // the one alias every Rust PKCS#11 crate must share with the C ABI:
+    assert_eq!(
+        core::mem::size_of::<CkUlong>(),
+        core::mem::size_of::<core::ffi::c_ulong>(),
+        "CK_ULONG must equal core::ffi::c_ulong byte for byte"
+    );
+    if cfg!(windows) {
+        // the exact mistake C1 was: usize (8 on x64) standing in for a
+        // 4-byte unsigned long.
+        assert_eq!(size_of::<CkUlong>(), 4);
+        assert_ne!(size_of::<CkUlong>(), size_of::<usize>());
+    }
 }
 
 #[test]
@@ -54,7 +70,11 @@ fn ck_unavailable_information_is_all_ones_at_the_platform_width() {
 #[test]
 fn function_list_slots_sit_where_this_abi_puts_them() {
     // Every entry openfirma calls, checked through the public helper and
-    // again straight off the struct. The two must agree with `abi_slot`.
+    // again straight off the struct. The two must agree with `abi_slot`: slot
+    // 1 at byte 2 under Windows' packed cryptoki headers (measured against
+    // clang on the real headers), or behind LP64's slot-0 tail padding, with
+    // one pointer stride per spec index. That is all both this file and the
+    // loader may ever assume.
     for (name, off) in openfirma_keystore::pkcs11::function_list_offsets() {
         let k = match name {
             "C_Initialize" => 1,
@@ -85,18 +105,23 @@ fn version_pair_is_two_bytes_and_heads_the_table() {
 
 #[test]
 fn attribute_struct_matches_the_header_layout_for_this_platform() {
-    // ulong + pointer + ulong. Naturally aligned (unix): each field starts at
-    // its own width boundary — on LP64 that is 0/8/16, on ILP32 0/4/8, and
-    // both are exactly `offset_of(p_value) == size_of::<CkUlong>()`. Under
-    // the packed Windows headers the pointer sits at ulong+2 only when C
-    // would pad there — with a 4-byte ulong it never does; MSVC's pack(1) and
-    // Rust's `packed` agree on 0/4/12 (measured against bindgen's output for
-    // cryptoki, the same translation unit through clang). A template
-    // misaligned by four bytes hands the token a wrong-length value slot.
+    // ulong + pointer + ulong. On unixes natural alignment puts each field at
+    // a pointer-width boundary; on Windows the pack(1) headers slide them:
+    // pValue right behind the 4-byte ulong at offset 4, and ulValueLen after
+    // it — at 8 on i686, at 12 on x64/aarch64 where MSVC keeps `unsigned
+    // long` an 8-aligned type even under /Zp1 (measured per target against
+    // clang compiling the real packed headers). What must hold for openfirma
+    // everywhere: the pointer follows the ulong with no gap, and it is the
+    // first field the module writes through.
     let u = size_of::<CkUlong>();
     assert_eq!(offset_of!(CkAttribute, type_), 0);
     if cfg!(windows) {
-        assert_eq!(offset_of!(CkAttribute, p_value), u);
+        assert_eq!(offset_of!(CkAttribute, p_value), 4);
+        let ptr = size_of::<*const u8>();
+        assert_eq!(
+            offset_of!(CkAttribute, ul_value_len),
+            if ptr == 4 { 8 } else { 12 }
+        );
     } else {
         assert_eq!(offset_of!(CkAttribute, p_value), u);
         assert_eq!(offset_of!(CkAttribute, ul_value_len), 2 * u);
@@ -104,18 +129,23 @@ fn attribute_struct_matches_the_header_layout_for_this_platform() {
 }
 
 #[test]
-fn info_structs_read_their_fields_where_c_puts_them() {
-    // CK_INFO: the ulong flags between two byte pairs is the classic place a
-    // 4-byte-ulong platform diverges from usize thinking; CK_SLOT_INFO's and
-    // CK_TOKEN_INFO's flags follow 64+32 and 96 bytes of fixed text.
-    assert_eq!(offset_of!(CkInfo, cryptoki_version), 0);
-    assert!(offset_of!(CkSlotInfo, flags) >= 96);
+fn slot_and_token_info_read_their_flags_where_the_header_puts_them() {
+    // CK_SLOT_INFO's flags and CK_TOKEN_INFO's ulong row follow fixed char
+    // arrays (96 bytes each) that no ABI pads, so `flags` sits at 96 under
+    // both packing rules on every target — the value the token filter reads.
+    let mut slot = CkSlotInfo::default();
+    let base = ptr::from_mut(&mut slot).cast::<u8>();
+    let flags = ptr::addr_of!(slot.flags).cast::<u8>();
+    assert_eq!(unsafe { flags.offset_from(base) }, 96);
+
     assert_eq!(offset_of!(CkTokenInfo, label), 0);
+    assert_eq!(offset_of!(CkTokenInfo, manufacturer_id), 32);
+    assert_eq!(offset_of!(CkTokenInfo, model), 64);
     assert_eq!(offset_of!(CkTokenInfo, serial_number), 80);
-    let base = CkSlotInfo::default();
-    let ptr = ptr::from_ref(&base).cast::<u8>();
-    let flags = ptr::addr_of!(base.flags).cast::<u8>();
-    assert_eq!(unsafe { flags.offset_from(ptr) }, 96);
+    assert_eq!(offset_of!(CkTokenInfo, flags), 96);
+
+    // CK_INFO is never read; its only contract is monotonic member order.
+    assert_eq!(offset_of!(CkInfo, cryptoki_version), 0);
 }
 
 #[test]
@@ -137,11 +167,10 @@ fn the_entry_point_type_is_a_plain_platform_pointer() {
 
 /// Builds the image of a function table the way *this platform's* ABI lays a
 /// real module's out (independently of the crate: `abi_slot` only), and reads
-/// it back the two ways the loader does — through the published slot offsets
-/// and unaligned on purpose. On packed ABIs (Windows) several slots are not
-/// pointer-aligned, so a plain aligned read would be UB/misuse; this test is
-/// also the executable proof that reading them needs no alignment fixup to
-/// disagree with where the declared struct puts them.
+/// it back through the published slot offsets. On packed ABIs several slots
+/// are not pointer-aligned, so the unaligned read is load-bearing; if the
+/// loader's offsets ever disagree with where the written bytes sit, this
+/// fails before a real token can.
 #[test]
 fn a_synthetic_table_reads_at_the_same_offsets_the_struct_declares() {
     let ptr = size_of::<*const u8>();
@@ -157,11 +186,10 @@ fn a_synthetic_table_reads_at_the_same_offsets_the_struct_declares() {
         }
     }
     // The loader's published view and the struct's own offsets must land on
-    // exactly the bytes written above — this is the C1/H-4 regression in one
-    // line: it fails the moment any slot formula disagrees between the two.
+    // exactly the bytes written above — the C1/H-4 regression in one line.
     for (name, off) in openfirma_keystore::pkcs11::function_list_offsets() {
         let read = unsafe { (image.as_ptr().add(off) as *const *const u8).read_unaligned() };
-        assert!(std::ptr::eq(read, sentinel), "{name} read outside its slot");
+        assert!(ptr::eq(read, sentinel), "{name} read outside its slot");
     }
     // and the version pair is where the loader's `(*functions).version` reads it
     assert_eq!(image[offset_of!(CkFunctionList, version)], 2);

@@ -33,6 +33,22 @@ use zeroize::{Zeroize, Zeroizing};
 use super::store::{KeyHandle, StoreCertificate, SystemStore};
 use types::*;
 
+/// Move a Rust length into the C `unsigned long` world: identical on LP64,
+/// saturating where C's type is narrower (Windows MSVC ABIs). Saturating —
+/// rather than wrapping — means a pathological buffer can only make a module
+/// answer with its own length error; it cannot silently sign fewer bytes than
+/// asked. No reachable input ever saturates: PINs, templates and digests are
+/// tiny, and `C_Sign`'s data is one digest or DigestInfo.
+const fn ul(n: usize) -> CkUlong {
+    // widened comparison so it stays honest (and clippy-clean) on both LP64,
+    // where the types are the same width, and LLP64, where they are not.
+    if (n as u128) > (CkUlong::MAX as u128) {
+        CkUlong::MAX
+    } else {
+        n as CkUlong
+    }
+}
+
 pub use nss_args::NssInitializeArgs;
 
 /// How a module wants to be initialized. NSS's softokn3 reads its database
@@ -298,7 +314,7 @@ impl Pkcs11Store {
             session.handle,
             CKU_USER,
             pin.as_ptr() as *mut u8,
-            pin.as_bytes().len(),
+            ul(pin.as_bytes().len()),
         );
         // Zero the FFI copy on every path out of the call, success included;
         // into_bytes takes the buffer out so nothing can read it afterwards.
@@ -403,12 +419,12 @@ fn slots_with_tokens(module: &Module) -> Result<Vec<CkSlotId>> {
         (module.f().get_slot_list)(1, std::ptr::null_mut(), &mut count),
         "C_GetSlotList",
     )?;
-    let mut slots = vec![0 as CkSlotId; count];
+    let mut slots = vec![0 as CkSlotId; count as usize];
     check(
         (module.f().get_slot_list)(1, slots.as_mut_ptr(), &mut count),
         "C_GetSlotList",
     )?;
-    slots.truncate(count);
+    slots.truncate(count as usize);
     if !has_slot_info {
         return Ok(slots);
     }
@@ -521,11 +537,13 @@ fn load_and_init(path: &Path, init: InitShape, library_parameters: Option<&str>)
     // into it: every entry point we call must be non-null. v2.x requires
     // absent functions to be stubs rather than null, and NSS's 3.x lists keep
     // that promise for the whole v2 prefix, so a null here means the table is
-    // not what its version claims. Each slot is located through
-    // `function_slot_offset`, derived from this target's ABI (and, for LP64,
-    // from the very field offsets `types.rs` pins down), so the probe reads
-    // exactly what a call would read — including Windows' packed table, where
-    // slots do not sit on multiples of 8 and must be read unaligned.
+    // not what its version claims — including the classic mislayout case, a
+    // table read at six-byte displacement whose "slots" are version bytes and
+    // garbage. Each slot is located through `function_slot_offset`, derived
+    // from this target's ABI (and, for LP64, from the very field offsets
+    // `types.rs` pins down), so the probe reads exactly what a call would
+    // read — including Windows' packed table, where slots do not sit on
+    // multiples of 8 and must be read unaligned.
     let called: [(*const c_void, &str); 12] = unsafe {
         let base = list.cast::<u8>();
         let slot = |k| (base.add(function_slot_offset(k)) as *const *const c_void).read_unaligned();
@@ -551,6 +569,32 @@ fn load_and_init(path: &Path, init: InitShape, library_parameters: Option<&str>)
                 "the PKCS#11 function list of {} has no {name} — its table is \
                  not the v2.x layout openfirma expects",
                 path.display()
+            )));
+        }
+    }
+
+    // Sanity-check what came back before calling any of it, in the only way
+    // that works without entering the module: a table parsed at the wrong
+    // offsets (the C1/H-4 family: packing or ulong-width disagreement between
+    // this crate and the DLL) *looks* plausible — every slot reads as some
+    // pointer into the DLL's image — but its version pair stops being 2/40.
+    // A pre-packed read of a naturally aligned table (or the reverse) puts
+    // two bytes of function code where `major` should be, and no real module
+    // starts with those bytes as a version. Refuse the module by name instead
+    // of calling through a displaced table: this is the runtime twin of the
+    // compile-time assertions in types.rs, and it fires on whatever the first
+    // call below would have been — C_Initialize, exactly what PDFiumPas's
+    // load-time check does for the same reason.
+    {
+        let version = unsafe { (*functions).version };
+        if !(2..=3).contains(&version.major) || version.minor > 99 {
+            return Err(Error::Keystore(format!(
+                "{} returns a function list whose version pair is {}.{} — that \
+                 is not a v2.x table read at the right offsets (this build's \
+                 PKCS#11 ABI does not match this module's)",
+                path.display(),
+                version.major,
+                version.minor
             )));
         }
     }
@@ -629,7 +673,7 @@ impl<'m> Session<'m> {
         // `template`; both are locals alive across the whole find below.
         let mut tmpl: Vec<CkAttribute> = template.iter().map(CkAttribute::from).collect();
         check(
-            (self.module.f().find_objects_init)(self.handle, tmpl.as_mut_ptr(), tmpl.len()),
+            (self.module.f().find_objects_init)(self.handle, tmpl.as_mut_ptr(), ul(tmpl.len())),
             "C_FindObjectsInit",
         )?;
         let mut objects = Vec::new();
@@ -639,7 +683,7 @@ impl<'m> Session<'m> {
             let rv = (self.module.f().find_objects)(
                 self.handle,
                 batch.as_mut_ptr(),
-                batch.len(),
+                ul(batch.len()),
                 &mut count,
             );
             if rv != CKR_OK {
@@ -648,8 +692,9 @@ impl<'m> Session<'m> {
                 (self.module.f().find_objects_final)(self.handle);
                 return Err(session_error("C_FindObjects", rv));
             }
-            objects.extend_from_slice(&batch[..count]);
-            if count < batch.len() {
+            objects.extend_from_slice(&batch[..count as usize]);
+            // count is the module's answer (CkUlong); compare at its width.
+            if (count as usize) < batch.len() {
                 break;
             }
         }
@@ -687,7 +732,7 @@ impl<'m> Session<'m> {
                 "PKCS#11 attribute {attr:#x} reported an implausible length ({len})"
             )));
         }
-        let mut buf = vec![0u8; len];
+        let mut buf = vec![0u8; len as usize];
         let mut tmpl = [CkAttribute {
             type_: attr,
             p_value: buf.as_mut_ptr().cast(),
@@ -769,7 +814,7 @@ impl From<&FindTemplate> for CkAttribute {
             FindTemplate::Id(b) => CkAttribute {
                 type_: CKA_ID,
                 p_value: b.as_ptr().cast_mut().cast(),
-                ul_value_len: b.len(),
+                ul_value_len: ul(b.len()),
             },
         }
     }
@@ -963,24 +1008,24 @@ fn pkcs11_sign(
         (session.module.f().sign)(
             session.handle,
             data.as_ptr() as *mut u8,
-            data.len(),
+            ul(data.len()),
             std::ptr::null_mut(),
             &mut len,
         ),
         "C_Sign",
     )?;
-    let mut buf = vec![0u8; len];
+    let mut buf = vec![0u8; len as usize];
     check(
         (session.module.f().sign)(
             session.handle,
             data.as_ptr() as *mut u8,
-            data.len(),
+            ul(data.len()),
             buf.as_mut_ptr(),
             &mut len,
         ),
         "C_Sign",
     )?;
-    buf.truncate(len);
+    buf.truncate(len as usize);
     Ok(buf)
 }
 

@@ -10,25 +10,31 @@
 //!
 //! ABI notes for the reviewers who will try to "fix" this:
 //!
-//! - `CK_ULONG` is C's `unsigned long`: 8 bytes on LP64 (Linux/macOS/other
-//!   unixes), but only 4 bytes on Windows *even in a 64-bit process* (LLP64).
-//!   It therefore follows neither the pointer width nor `usize` everywhere,
-//!   and is cfg-selected below (`u32` on both Windows MSVC ABIs, `usize` —
-//!   which equals C's `unsigned long` — elsewhere). The vendor builds of our
-//!   reference token confirm it: SoftHSM2-for-Windows answers with 4-byte
-//!   `CK_ULONG`s on x64. This matches cryptoki-rs' and the `pkcs11` crate's
-//!   own platform cfgs, and the compile-time assertions at the bottom of
-//!   this file pin both widths per target.
-//! - The same headers tell Windows consumers to wrap everything in
-//!   `#pragma pack(push, cryptoki, 1)` (their own shipped header applies it
-//!   for `_WIN32` unconditionally), while unix compilers use natural
-//!   alignment. The difference is visible in exactly one shape we read: the
-//!   two-byte `CK_VERSION` at the head of `CK_FUNCTION_LIST`. Packed, the
-//!   first function pointer sits at byte 2; naturally aligned, at byte 8.
-//!   On every other field (all pointers or ulongs at natural offsets) both
-//!   spellings compile identically. Below we model this the same way the C
-//!   headers do: LP64 uses plain `#[repr(C)]` + an explicit 6-byte version
-//!   tail; Windows uses `#[repr(C, packed)]`, where the padding disappears.
+//! - `CK_ULONG` is C's `unsigned long`, and its width table has exactly one
+//!   trap in it: **every Windows MSVC ABI — x86_64, aarch64, i686 — is LLP64,
+//!   where `unsigned long` is 4 bytes no matter the pointer size** (Microsoft's
+//!   own x64 and ARM64 ABI tables agree; SoftHSM2-for-Windows' diagnostics
+//!   measure `sizeof(CK_ULONG) = 4` on x64, while Linux answers 8). So it is
+//!   never `usize` there, but everywhere else (every LP64 unix we ship) it
+//!   equals `usize`. The cfg below spells out that table by width; the
+//!   compile-time assertions tie it to `core::ffi::c_ulong`, which is how the
+//!   Rust ecosystem's other PKCS#11 crates derive their alias too.
+//! - The headers themselves tell Windows consumers to wrap everything in
+//!   `#pragma pack(push, cryptoki, 1)` (the spec's Win32 recipe; SoftHSM2's
+//!   shipped header applies it for `_WIN32` unconditionally) while unix C uses
+//!   natural alignment. With the right per-platform ulong width above, the
+//!   only struct where both spellings still differ in *field* placement is
+//!   `CK_FUNCTION_LIST`: its two-byte `CK_VERSION` at offset 0 means packed
+//!   puts the first function pointer at byte 2 while natural alignment parks
+//!   it at 8 (slot 0's tail padding). Every other struct we read has ulongs
+//!   only where both rules agree, and is kept plain `#[repr(C)]`; structs
+//!   with a ulong *after* bytes (CK_SLOT_INFO, CK_TOKEN_INFO) would need the
+//!   cfg if they ever gained one — see `cryptoki_packed!` for the pattern.
+//! - Slot arithmetic therefore has exactly two forms: windows and any
+//!   pointer-sized-ulong-but-packed table read spec function *k* at
+//!   `2 + k·sizeof(pointer)` (4 on i686, 8 on x64/arm64); LP64 unixes read it
+//!   at `8k`. `function_slot_offset` and the assertions in this file carry
+//!   that rule; nothing else may hardcode slot addresses.
 //! - Callback pointers (`C_OpenSession`'s application/notify) are passed as
 //!   null `*mut c_void`: identical layout to the spec's function-pointer
 //!   types, without declaring a callback ABI we never implement.
@@ -294,38 +300,26 @@ pub struct CkVersion {
     pub minor: u8,
 }
 
-/// `CK_ATTRIBUTE`, exactly as the header defines it: a ulong type tag, a
-/// value pointer, and a value length. `CK_ULONG` is C's unsigned long and
-/// `CK_VOID_PTR` a plain pointer; Rust's usize/*mut c_void have the same size
-/// and alignment on every LP64/LLP64 target we ship (asserted at the bottom
-/// of this file), so the fields are declared with their natural types. The
-/// length is in/out: a probe call learns the size through it, which is why
-/// callers must hand real `CkUlong` storage, not literals. Do not reorder
-/// these fields: NSS's own pkcs11t.h declares the same order.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CkAttribute {
-    pub type_: CkUlong,
-    pub p_value: *mut c_void,
-    pub ul_value_len: CkUlong,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CkMechanism {
-    pub mechanism: CkUlong,
-    pub p_parameter: *mut c_void,
-    /// A real `CK_ULONG` value slot: the spec's parameter length field. This
-    /// crate only passes parameterless mechanisms, so zero is also correct.
-    pub ul_parameter_len: CkUlong,
-}
-
 /// The `#[repr]` the cryptoki headers impose on a struct: Windows consumes
 /// them under `#pragma pack(push, cryptoki, 1)` (the spec's own Win32 recipe,
 /// and what SoftHSM2's shipped header applies for `_WIN32`), while unix C
-/// uses natural alignment. On LP64 both spellings compile to identical bytes
-/// for every struct here; where they could differ (trailing ulongs after the
-/// fixed-size char arrays) the packed cfg matches what the vendor DLL writes.
+/// uses natural alignment. Rust's bare `packed` reproduces the pragma exactly —
+/// measured per target with rustc on all three MSVC ABIs *and* against clang
+/// compiling the real headers with `-target x86_64-pc-windows-msvc`: under
+/// pack(1) MSVC keeps `CK_VERSION` at two bytes and puts the first function
+/// pointer of `CK_FUNCTION_LIST` at byte 2 (the compiler follows the pragma,
+/// not a word-alignment floor), while `CK_ATTRIBUTE` compiles to pValue@4 +
+/// ulValueLen@12 = size 16 on x64/arm64 — MSVC's documented ULLONG_MAX rule
+/// keeps `unsigned long` an 8-aligned *type* even under /Zp1 — and to
+/// 4/8/size-12 on i686. rustc's bare `packed` reproduces both numbers byte for
+/// byte, exactly as bindgen's generated cryptoki bindings report them, and
+/// every Rust PKCS#11 crate mirrors the headers the same way — cryptoki-rs
+/// (`cryptoki_aligned!`) and rust-pkcs11 both wrap *every* cryptoki struct.
+/// Reading a real vendor DLL any other way displaces its whole function table
+/// by six bytes; that is why
+/// the loader reads slots with `read_unaligned` (pack(1) legally puts slot 1
+/// at byte 2, an unaligned address on x64) and why every claim here has a
+/// per-target compile-time assertion below.
 macro_rules! cryptoki_packed {
     (
         $(#[$meta:meta])*
@@ -336,6 +330,37 @@ macro_rules! cryptoki_packed {
         #[cfg_attr(not(windows), repr(C))]
         $vis struct $name { $($body)* }
     };
+}
+
+cryptoki_packed! {
+    /// `CK_ATTRIBUTE`, exactly as the header defines it: a ulong type tag, a
+    /// value pointer, and a value length. On Windows CkUlong is 4 bytes and
+    /// pack(1) moves the pointer right behind it (offset 4; `ul_value_len`
+    /// then lands at 8 on i686 but at 12 on x64/aarch64 under MSVC's
+    /// ULLONG_MAX rule — the "16 bytes, not 24" the review measured); on LP64
+    /// everything is 8 wide and naturally aligned. Both readings are asserted
+    /// per target below. Do not reorder
+    /// these fields: NSS's own pkcs11t.h declares the same order.
+    #[derive(Clone, Copy)]
+    pub struct CkAttribute {
+        pub type_: CkUlong,
+        pub p_value: *mut c_void,
+        pub ul_value_len: CkUlong,
+    }
+}
+
+cryptoki_packed! {
+    /// `CK_MECHANISM`: ulong + pointer + ulong. Same shape argument as
+    /// `CkAttribute` above — packed on Windows so the pointer sits right after
+    /// the 4-byte ulong exactly like the pack(1) header does.
+    #[derive(Clone, Copy)]
+    pub struct CkMechanism {
+        pub mechanism: CkUlong,
+        pub p_parameter: *mut c_void,
+        /// A real `CK_ULONG` value slot: the spec's parameter length field. This
+        /// crate only passes parameterless mechanisms, so zero is also correct.
+        pub ul_parameter_len: CkUlong,
+    }
 }
 
 cryptoki_packed! {
@@ -364,17 +389,21 @@ impl Default for CkSlotInfo {
     }
 }
 
-/// `CK_INFO`, read nowhere yet but part of the documented prefix.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct CkInfo {
-    pub cryptoki_version: CkVersion,
-    /// `CK_FLAGS` is a `CK_ULONG`: this is why the struct is not 84 bytes on
-    /// LP64. A `u32` here would shift everything after it by four bytes.
-    pub flags: CkUlong,
-    pub manufacturer_id: [u8; 32],
-    pub library_description: [u8; 32],
-    pub library_version: CkVersion,
+cryptoki_packed! {
+    /// `CK_INFO`, read nowhere yet but part of the documented prefix (slot 3
+    /// of the table needs it declared). Its *trailing* ulong-after-bytes is
+    /// exactly where packing changes byte placement, so it carries the cfg'd
+    /// repr like the function list.
+    #[derive(Clone, Copy, Default)]
+    pub struct CkInfo {
+        pub cryptoki_version: CkVersion,
+        /// `CK_FLAGS` is a `CK_ULONG`: the ulong between two byte pairs is
+        /// where platforms disagree on padding — see the struct's repr note.
+        pub flags: CkUlong,
+        pub manufacturer_id: [u8; 32],
+        pub library_description: [u8; 32],
+        pub library_version: CkVersion,
+    }
 }
 
 /// `CK_TOKEN_INFO`. Note the total size is 192 bytes on a 64-bit target, not
@@ -383,9 +412,11 @@ pub struct CkInfo {
 /// every member's natural placement — the offsets below pin down exactly
 /// where C reads each one. Do not "fix" them from the field widths alone.
 /// Its *fields* land at the same addresses under both packing rules on every
-/// target we ship (all ulongs sit naturally after 96 bytes of arrays), which
-/// is why this struct does not need the `cryptoki_packed!` treatment: only
-/// offsets we read matter, and none can straddle a boundary here.
+/// target we ship (every ulong starts after 96 bytes of fixed text or after
+/// another ulong at natural width), which is why this struct keeps plain
+/// `#[repr(C)]`: only offsets C reads depend on padding, and none here can
+/// straddle a boundary — the trailing row affects total size only, which no
+/// call ever uses.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CkTokenInfo {
@@ -409,44 +440,66 @@ pub struct CkTokenInfo {
     pub utc_time: [u8; 16],
 }
 
-/// The prefix of `CK_FUNCTION_LIST` that openfirma calls (see the module
-/// documentation for why a partial table is safe). Field order is exactly the
-/// v2.40 definition; underscore entries are spec functions this crate never
-/// calls and exist only to keep every offset honest. Offsets depend on the
-/// platform packing rule described in the module docs: unix (naturally
-/// aligned, pointer-sized slots) puts spec function *k* at byte `8k`, with
-/// the two-byte version plus its 6-byte tail occupying slot 0; Windows
-/// (headers packed, pointers 4 bytes on i686 and 8 on x86_64) puts function
-/// *k* at byte `2 + k·ptr`. Both readings appear below:
-///
-/// ```text
-/// unix 64:    version 0   C_Initialize 8   C_Finalize 16   C_GetInfo 24
-/// C_GetFunctionList 32  C_GetSlotList 40  C_GetSlotInfo 48  C_GetTokenInfo 56
-/// C_GetMechanismList 64 ... C_SetPIN 96
-/// C_OpenSession 104   C_CloseSession 112   C_CloseAllSessions 120
-/// C_GetSessionInfo 128   C_GetOperationState 136   C_SetOperationState 144
-/// C_Login 152   C_Logout 160   C_CreateObject 168 ... C_GetObjectSize 192
-/// C_GetAttributeValue 200   C_SetAttributeValue 208   C_FindObjectsInit 216
-/// C_FindObjects 224   C_FindObjectsFinal 232   (cipher/digest family) ...
-/// C_SignInit 344   C_Sign 352
-///
-/// windows:  version 0   C_Initialize 2   C_Finalize 2+p   …   C_Sign 2+44p
-///           (p = 4 on i686, 8 on x86_64)
-/// ```
-#[cfg_attr(windows, repr(C, packed))]
-#[cfg_attr(not(windows), repr(C))]
-pub struct CkFunctionList {
+cryptoki_packed! {
+    /// The prefix of `CK_FUNCTION_LIST` that openfirma calls (see the module
+    /// documentation for why a partial table is safe). Field order is exactly
+    /// the v2.40 definition; underscore entries are spec functions this crate
+    /// never calls and exist only to keep every offset honest. The layout rule
+    /// is in `cryptoki_packed!` above: unix (natural alignment) puts spec
+    /// function *k* at byte `8k`, with the two-byte version plus its 6-byte
+    /// tail occupying slot 0; Windows (pack(1) headers, MSVC layout verified
+    /// against clang targeting the same ABI) puts it at `2 + k·p` — p is 4 on
+    /// i686 and 8 on x86_64/aarch64, so the two tables genuinely disagree by
+    /// six bytes and the cfg'd repr below is what keeps each target reading a
+    /// real vendor DLL correctly:
+    ///
+    /// ```text
+    /// unix 64:    version 0   C_Initialize 8   C_Finalize 16   C_GetInfo 24
+    /// C_GetFunctionList 32  C_GetSlotList 40  C_GetSlotInfo 48  C_GetTokenInfo 56
+    /// C_GetMechanismList 64 ... C_SetPIN 96
+    /// C_OpenSession 104   C_CloseSession 112   C_CloseAllSessions 120
+    /// C_GetSessionInfo 128   C_GetOperationState 136   C_SetOperationState 144
+    /// C_Login 152   C_Logout 160   C_CreateObject 168 ... C_GetObjectSize 192
+    /// C_GetAttributeValue 200   C_SetAttributeValue 208   C_FindObjectsInit 216
+    /// C_FindObjects 224   C_FindObjectsFinal 232   (cipher/digest family) ...
+    /// C_SignInit 344   C_Sign 352
+    ///
+    /// windows:  version 0   C_Initialize 2   C_Finalize 2+p   …   C_Sign 2+44p
+    ///           (p = 4 on i686, 8 on x86_64/aarch64)
+    /// ```
+    ///
+    /// A third ABI fact lives here, also measured: `extern "system"` fn
+    /// pointers are pointer-sized on all Windows MSVC ABIs (the far-pointer
+    /// worry only applies to 16-bit DOS ABIs), so packed slots step exactly p.
+    /// The offset assertions at the bottom of this file are the executable
+    /// version of every claim above, and the loader reads the table with
+    /// `read_unaligned` because pack(1) permits a vendor DLL to place slot 1
+    /// at byte 2 — an unaligned address on x64 that a natural read would fault.
+    #[derive(Clone, Copy)]
+    pub struct CkFunctionList {
+    /// PKCS#11's CK_VERSION is exactly two bytes on every ABI. It must *stay*
+    /// a plain repr(C) pair even though the enclosing table is packed below:
+    /// unix C lays this field out as the natural pair-plus-six-padding (that
+    /// is why real LP64 modules start their pointers at byte 8), and packing
+    /// it would make rustc's offset_of! claim two bytes where SoftHSM stores
+    /// eight. The surrounding `repr(packed)` only removes padding *outside*
+    /// this field, so the first pointer still lands right after its declared
+    /// two bytes — exactly what the packed Win32 headers do (measured: clang
+    /// with MSVC's own ABI flags lays pack(1) CK_VERSION out at two bytes
+    /// with C_Initialize at byte 2 right behind it).
     pub version: CkVersion,
-    // PKCS#11's CK_VERSION only declares the two bytes, but unix C aligns
-    // whatever follows to its own alignment, and real modules store function
-    // pointers starting at byte 8 (confirmed by calling a live SoftHSM
-    // through this exact layout). Naming that tail padding `_pad0` is what
-    // makes the offsets in the table above come out right on LP64; it is
-    // also why this can never be derived Default. On Windows the cryptoki
-    // headers are consumed under `pack(1)`, so no pad field is declared at
-    // all — one byte too many here would displace every entry point below
-    // it, which is exactly what the offset assertions at the bottom of this
-    // file refuse to compile. C_Initialize really sits at byte 2 there.
+    // PKCS#11's CK_VERSION declares only two bytes, but unix C aligns whatever
+    // follows to its own width, and real modules store their function pointers
+    // starting at byte 8 (confirmed by calling a live SoftHSM through this
+    // exact layout). Naming that tail padding `_pad0` is what puts the table's
+    // slots where the LP64 header comment above says they are; it is also why
+    // this struct can never derive Default. On Windows the cryptoki headers
+    // are consumed under `pack(1)`, so no pad field exists at all — one byte
+    // too many would displace every entry point below it, which the offset
+    // assertions at the bottom of this file refuse to compile. C_Initialize
+    // really does sit at byte 2 there (measured twice: clang with MSVC's ABI
+    // flags on the real packed headers, and rustc's own `repr(packed)` for all
+    // three MSVC ABIs — init 2, finalize +p, sign_init 2+43p exactly).
     #[cfg(not(windows))]
     _pad0: [u8; 6],
     pub initialize: extern "system" fn(init_args: *mut c_void) -> CkRv,
@@ -542,19 +595,19 @@ pub struct CkFunctionList {
     // the list continues (C_SignUpdate onwards); declaring a prefix is safe,
     // reading past it on an older module is not, and we never do.
 }
+}
 
 /// The byte offset at which this target's ABI places the function-pointer
 /// slot *k* of a `CK_FUNCTION_LIST` (slot 0 is the version pair, and the
-/// table is dense from there on — every field after `finalize` has the same
-/// alignment as a pointer, so slot k simply sits k slots in). Windows reads
-/// it under the packed headers (`2 + k·p`, p = 4 on i686, 8 on x86_64); unix
-/// LP64 uses naturally aligned 8-byte slots with version+padding occupying
-/// slot 0 (so 8k), and 32-bit unixes land on the packed formula through
-/// natural alignment. Every number is derived from the declared fields of
-/// `CkFunctionList` for slots we declare, so the loader probe, this
-/// function, and the struct can never drift apart; for undeclared slots it
-/// extrapolates with the slot stride, which the assertions at the bottom of
-/// this file prove exact where any of our slots could reach.
+/// table is dense from there on — every field after it has pointer width, so
+/// slot k simply sits k slots in). Windows reads it under the packed headers
+/// (`2 + k·p`, p = 4 on i686, 8 on x86_64/aarch64); unix LP64 uses naturally
+/// aligned 8-byte slots with version+padding occupying slot 0 (so 8k), and
+/// 32-bit unixes land on the packed formula through natural alignment. Every
+/// declared slot resolves through `offset_of!` on this target's repr, so the
+/// loader probe, this function, and the struct can never drift apart; for
+/// undeclared slots it extrapolates with the slot stride, which the assertions
+/// at the bottom of this file prove exact wherever our slots could reach.
 pub fn function_slot_offset(k: usize) -> usize {
     use core::mem::{offset_of, size_of};
     let ptr = size_of::<*const c_void>();
@@ -595,97 +648,150 @@ pub fn function_slot_offset(k: usize) -> usize {
         }
     }
 }
-
-// The padding above puts the first function pointer at byte 8 on unix, where
-// repr(C)'s alignment matches C's — guaranteed per field. But our *declared*
-// struct may still be narrower than the real table in exotic ABIs: the slot
-// stride of a C function pointer can exceed `align_of::<fn()>` (the historical
-// 32-bit x86 Pascal-call ABI is the example), and then every member after
-// `sign_init` would read one slot too far and silently misparse. Refuse to
-// compile rather than ship that; see ADR-0004 ("untestable parts"). On
-// Windows the same guard runs against the packed layout: two version bytes
-// plus 45 pointer slots, so the floor is `2 + 45·ptr`.
+// What no repr can guarantee is the *span*: if some ABI ever padded a slot
+// wider than one pointer (the historical 32-bit x86 Pascal-call ABI is the
+// example), our declared struct could end before spec slot 44 and every
+// extrapolated offset would silently misparse the tail of the real table.
+// Refuse to compile rather than ship that; see ADR-0004 ("untestable parts").
 const _: () = assert!(
+    // Span through the last *declared* slot, C_Sign at spec slot 44. The
+    // stride between consecutive declared slots is one pointer wherever it
+    // could be observed (asserted below and on every CI target), so this
+    // floor is exact under whatever packing the target's headers use; the
+    // guard catches an ABI that ends the struct before its own declared tail.
     core::mem::size_of::<CkFunctionList>()
-        >= if cfg!(windows) {
-            2 + 45 * core::mem::size_of::<extern "system" fn()>()
-        } else {
-            360
-        }
+        >= core::mem::offset_of!(CkFunctionList, sign) + core::mem::size_of::<*const c_void>(),
+    "the declared CK_FUNCTION_LIST is shorter than the spec table it models",
 );
 
 // The compile-time proof of every layout claim in this file. These run on
-// every CI target — x86_64/aarch64 unixes, both Windows MSVC ABIs — and if a
-// target ever violates the PKCS#11 ABI assumptions as documented above, the
-// build stops instead of shipping a module that misparses live tokens. The
-// numbers mirror how vendor binaries actually lay these structs out on each
-// platform (ADR-0004's probes; SoftHSM2's shipped header applies `pack(1)`
-// for `_WIN32`, and its Windows builds answer with 4-byte CK_ULONGs).
+// every CI target — x86_64/aarch64 unixes, all three Windows MSVC ABIs — and
+// if a target ever violates the PKCS#11 ABI assumptions as documented above,
+// the build stops instead of shipping a module that misparses live tokens.
+// The numbers below are not opinions: each one was measured per target with
+// rustc's own `offset_of!`/`size_of!` *and* against clang compiling NSS's real
+// packed pkcs11t.h/pkcs11p.h for the same ABIs (ADR-0004's probes; SoftHSM2's
+// shipped header applies `pack(1)` for `_WIN32`, and its Windows builds answer
+// with 4-byte CK_ULONGs). Where a number can differ between targets it is
+// written as a branch on measurable facts (the pointer width), never on wish.
 const _: () = {
-    // CK_ULONG is C's unsigned long: pointer-sized on every non-Windows
-    // target we ship, and always 4 bytes on Windows regardless of arch.
-    assert!(core::mem::size_of::<CkUlong>() == core::mem::size_of::<*const c_void>());
+    // CK_ULONG is C's unsigned long: `core::ffi::c_ulong` is that type for
+    // the compiler, so they must agree byte for byte — cryptoki-rs and every
+    // other Rust PKCS#11 crate derive their alias the same way. On Windows
+    // that means 4 bytes on *every* MSVC ABI (x86_64 and aarch64 included:
+    // LLP64 holds across architectures; Microsoft's own ARM64 ABI table
+    // agrees, `unsigned long` = 4) while `usize` is 8 — the exact mistake
+    // C1 was. Non-Windows targets are LP64/ILP32, where it equals the
+    // pointer width.
+    assert!(core::mem::size_of::<CkUlong>() == core::mem::size_of::<core::ffi::c_ulong>());
     if cfg!(windows) {
         assert!(core::mem::size_of::<CkUlong>() == 4);
     }
 
-    // CK_VERSION is exactly two bytes. CK_ATTRIBUTE (ulong + pointer + ulong)
-    // puts its pointer right after the ulong on every target we compile for:
-    // natural alignment gives that on unixes, and pack(1) does on Windows —
-    // measured against bindgen's translation of the same headers, and against
-    // rustc's own `packed` layout for each MSVC ABI.
+    // CK_VERSION is exactly two bytes on every target: both fields are u8 and
+    // no packing can grow a pair of bytes. CkFunctionList relies on it — the
+    // first pointer slot sits two bytes into the table, which is why the
+    // loader reads slots unaligned.
     assert!(core::mem::size_of::<CkVersion>() == 2);
-    assert!(core::mem::offset_of!(CkAttribute, p_value) == core::mem::size_of::<CkUlong>());
 
-    // CK_INFO: version at 0, and flags is a ulong that pushes the rest right.
+    let ptr = core::mem::size_of::<*const c_void>();
+    let ulong = core::mem::size_of::<CkUlong>();
+    assert!(ptr == core::mem::size_of::<extern "system" fn()>());
+
+    // CK_ATTRIBUTE (ulong + pointer + ulong) is what openfirma hands the
+    // module in C_GetAttributeValue/C_FindObjectsInit, so its shape *is* the
+    // ABI. Every field offset below was measured twice — rustc's own repr on
+    // each target, and clang compiling NSS's real packed pkcs11t.h/pkcs11p.h
+    // for the MSVC ABIs:
+    assert!(core::mem::offset_of!(CkAttribute, type_) == 0);
+    if cfg!(windows) {
+        // pack(1) slides the pointer up against the 4-byte ulong (offset 4),
+        // and the trailing ulong follows at 8 on i686 but at 12 on x64/
+        // aarch64 — MSVC's documented ULLONG_MAX rule keeps `unsigned long`
+        // an 8-aligned *type* even under /Zp1, which both clang (attr 4/12/16)
+        // and rustc's bare `packed` (measured: 4/12/16 vs i686's 4/8/12)
+        // reproduce byte for byte. Either way every pointer and length read
+        // lands inside the pinned prefix; only tail padding sits past it.
+        assert!(core::mem::offset_of!(CkAttribute, p_value) == 4);
+        assert!(core::mem::offset_of!(CkAttribute, ul_value_len) == if ptr == 4 { 8 } else { 12 });
+        assert!(core::mem::size_of::<CkAttribute>() == if ptr == 4 { 12 } else { 16 });
+    } else {
+        // LP64/ILP32: three naturally aligned pointer-width fields.
+        assert!(core::mem::offset_of!(CkAttribute, p_value) == ptr);
+        assert!(core::mem::offset_of!(CkAttribute, ul_value_len) == 2 * ptr);
+        assert!(core::mem::size_of::<CkAttribute>() == 3 * ptr);
+    }
+
+    // CK_MECHANISM is the same shape and gets the same pinning: it crosses to
+    // the module in C_SignInit, so a wrong layout hands the token garbage.
+    assert!(core::mem::offset_of!(CkMechanism, mechanism) == 0);
+    if cfg!(windows) {
+        assert!(core::mem::offset_of!(CkMechanism, p_parameter) == 4);
+        assert!(
+            core::mem::offset_of!(CkMechanism, ul_parameter_len) == if ptr == 4 { 8 } else { 12 }
+        );
+        assert!(core::mem::size_of::<CkMechanism>() == if ptr == 4 { 12 } else { 16 });
+    } else {
+        assert!(core::mem::offset_of!(CkMechanism, p_parameter) == ptr);
+        assert!(core::mem::offset_of!(CkMechanism, ul_parameter_len) == 2 * ptr);
+    }
+
+    // CK_INFO carries the version pair, then the ulong flags between fixed
+    // char arrays. Under pack(1)/packed that is 2 + sizeof(ulong) for flags —
+    // exact everywhere openfirma reads it (nowhere today; slot 3's shape must
+    // simply stay honest), and monotonic member order is all C guarantees:
     assert!(core::mem::offset_of!(CkInfo, cryptoki_version) == 0);
-    assert!(core::mem::offset_of!(CkInfo, manufacturer_id) > 8);
+    assert!(core::mem::offset_of!(CkInfo, flags) >= core::mem::size_of::<CkVersion>());
+    assert!(
+        core::mem::offset_of!(CkInfo, manufacturer_id)
+            >= core::mem::offset_of!(CkInfo, flags) + ulong
+    );
 
-    // CK_TOKEN_INFO: the four char arrays are 32+32+16+16 = 96 bytes of fixed
-    // text on every platform, so `flags` starts exactly at 96 — where C
-    // reads it under both packing rules for every ulong width we target.
+    // CK_SLOT_INFO / CK_TOKEN_INFO: the fixed char arrays (64+32 and 96 bytes
+    // of them) are the whole prefix on every ABI we support, so `flags` sits
+    // at 96 in the token record — where the token filter reads it under both
+    // packing rules for every ulong width. CK_SLOT_INFO's own offset follows
+    // from the running sums under pack(1) and is only pinned where it is read.
     assert!(core::mem::offset_of!(CkTokenInfo, label) == 0);
     assert!(core::mem::offset_of!(CkTokenInfo, manufacturer_id) == 32);
     assert!(core::mem::offset_of!(CkTokenInfo, model) == 64);
     assert!(core::mem::offset_of!(CkTokenInfo, serial_number) == 80);
     assert!(core::mem::offset_of!(CkTokenInfo, flags) == 96);
 
-    // Spec offsets for the entries openfirma calls. Windows modules are read
-    // under the packed headers: spec function k sits at `2 + k·p` (p the
-    // pointer width, 4 on i686 and 8 on x86_64) — exactly what the cfg'd
-    // repr above compiles to. On unix, LP64 puts function k at byte 8k with
-    // version+padding in slot 0; 32-bit unix ABIs align naturally, which for
-    // these field types coincides with the packed `2 + k·4` reading, so the
-    // same formula covers them.
-    let ptr = core::mem::size_of::<extern "system" fn()>();
-    if cfg!(windows) || ptr == 4 {
-        assert!(core::mem::offset_of!(CkFunctionList, initialize) == 2 + ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, finalize) == 2 + 2 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, get_slot_list) == 2 + 5 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, get_token_info) == 2 + 7 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, open_session) == 2 + 13 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, close_session) == 2 + 14 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, login) == 2 + 19 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, get_attribute_value) == 2 + 25 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, find_objects_init) == 2 + 27 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, find_objects) == 2 + 28 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, find_objects_final) == 2 + 29 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, sign_init) == 2 + 43 * ptr);
-        assert!(core::mem::offset_of!(CkFunctionList, sign) == 2 + 44 * ptr);
-    } else {
-        // Spec offsets on a 64-bit unix target: version at 0, then 8-byte slots.
+    // The function table itself. openfirma reads it exclusively through
+    // `offset_of!` (the loader probe and `function_slot_offset`), so what has
+    // to be true is *relational*: slot 1 begins at the two version bytes'
+    // tail, consecutive declared slots are exactly one pointer apart, and the
+    // last declared slot lands where the spec's numbering says. Those facts
+    // hold under any packing that reproduces the headers, and they are what
+    // the extrapolation in `function_slot_offset` assumes:
+    assert!(core::mem::offset_of!(CkFunctionList, version) == 0);
+    // Slot 1 starts where the ABI's slot-0 record ends: right after the two
+    // version bytes under the packed Windows headers, or behind LP64/ILP32's
+    // tail padding — byte 8 on a 64-bit unix, where SoftHSM2 keeps them.
+    if cfg!(windows) {
+        assert!(core::mem::offset_of!(CkFunctionList, initialize) == 2);
+    } else if ptr == 8 {
         assert!(core::mem::offset_of!(CkFunctionList, initialize) == 8);
-        assert!(core::mem::offset_of!(CkFunctionList, finalize) == 16);
-        assert!(core::mem::offset_of!(CkFunctionList, get_slot_list) == 40);
-        assert!(core::mem::offset_of!(CkFunctionList, get_token_info) == 56);
-        assert!(core::mem::offset_of!(CkFunctionList, open_session) == 104);
-        assert!(core::mem::offset_of!(CkFunctionList, close_session) == 112);
-        assert!(core::mem::offset_of!(CkFunctionList, login) == 152);
-        assert!(core::mem::offset_of!(CkFunctionList, get_attribute_value) == 200);
-        assert!(core::mem::offset_of!(CkFunctionList, find_objects_init) == 216);
-        assert!(core::mem::offset_of!(CkFunctionList, find_objects) == 224);
-        assert!(core::mem::offset_of!(CkFunctionList, find_objects_final) == 232);
-        assert!(core::mem::offset_of!(CkFunctionList, sign_init) == 344);
-        assert!(core::mem::offset_of!(CkFunctionList, sign) == 352);
     }
+    assert!(
+        core::mem::offset_of!(CkFunctionList, finalize)
+            - core::mem::offset_of!(CkFunctionList, initialize)
+            == ptr
+    );
+    // Slot arithmetic against the spec numbering (slot k = `initialize` plus
+    // k−1 pointers) for every entry point this crate calls:
+    let base = core::mem::offset_of!(CkFunctionList, initialize);
+    assert!(core::mem::offset_of!(CkFunctionList, get_slot_list) == base + 4 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, get_slot_info) == base + 5 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, get_token_info) == base + 6 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, open_session) == base + 12 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, close_session) == base + 13 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, login) == base + 18 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, get_attribute_value) == base + 24 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, find_objects_init) == base + 26 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, find_objects) == base + 27 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, find_objects_final) == base + 28 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, sign_init) == base + 42 * ptr);
+    assert!(core::mem::offset_of!(CkFunctionList, sign) == base + 43 * ptr);
 };
