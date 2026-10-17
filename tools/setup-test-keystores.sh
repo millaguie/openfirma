@@ -54,6 +54,27 @@ pkcs11-tool --module "$P11" --login --pin "$PIN" \
   --write-object "$TESTDIR/rsa.pk8.der" --type privkey \
   --id 0c --label "openfirma always-auth key" --always-auth >/dev/null
 
+# Two DNIe-shaped pairs (finding A5): certificates carrying the exact issuer
+# AutoFirma's SkipAuthDNIeFilter matches (cn=AC DNIE *, ou=DNIE, o=DIRECCION
+# GENERAL DE LA POLICIA). One has keyUsage digitalSignature alone (the
+# authentication certificate: it must be hidden by default and only signable
+# by explicit alias); the other adds nonRepudiation (the signing twin that
+# stays visible) — both shapes tests/dnie_filter.rs pins against SoftHSM.
+# Generated fresh into $TESTDIR by tools/gen-dnie-pair.sh (openssl CLI).
+tools/gen-dnie-pair.sh "$TESTDIR/dnie" >/dev/null
+for pair in "0d:$TESTDIR/dnie/auth.crt.der:DNIE auth" \
+            "0e:$TESTDIR/dnie/sign.crt.der:DNIE sign"; do
+  id=${pair%%:*}; rest=${pair#*:}; crt=${rest%%:*}; lbl=${rest##*:}
+  pkcs11-tool --module "$P11" --login --pin "$PIN" \
+    --write-object "$crt" --type cert --id "$id" --label "$lbl" >/dev/null
+done
+pkcs11-tool --module "$P11" --login --pin "$PIN" \
+  --write-object "$TESTDIR/dnie/marta.pk8" --type privkey \
+  --id 0d --label "DNIE auth key" >/dev/null
+pkcs11-tool --module "$P11" --login --pin "$PIN" \
+  --write-object "$TESTDIR/dnie/marta.pk8" --type privkey \
+  --id 0e --label "DNIE sign key" >/dev/null
+
 # NSS shared DB (empty password) with the same signers as PKCS#12.
 rm -f "$TESTDIR/nssdb"/*
 for who in rsa ec; do

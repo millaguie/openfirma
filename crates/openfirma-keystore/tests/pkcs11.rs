@@ -142,12 +142,14 @@ fn softhsm_lists_pairs_and_signs_both_keys() {
     assert_eq!(store.token_label(), "openfirma test");
 
     let certs = store.certificates().expect("listing must succeed");
-    // Three certificates with a signable key each; nothing without a key.
-    // (The third one, id 0c, exists for tests/pkcs11_always_auth.rs.)
+    // Every certificate on the token carries a signable key: rsa, ec,
+    // always-auth, and the two DNIe shapes the A5 filter test needs. (The
+    // always-auth pair exists for tests/pkcs11_always_auth.rs; the DNIE pair
+    // for tests/dnie_filter.rs.)
     assert_eq!(
         certs.len(),
-        3,
-        "expected rsa + ec + always-auth, got {certs:?}"
+        5,
+        "expected rsa + ec + always-auth + DNIE auth/sign, got {certs:?}"
     );
     let labels: Vec<&str> = certs.iter().filter_map(|c| c.label.as_deref()).collect();
     assert!(labels.contains(&"openfirma rsa"), "{labels:?}");

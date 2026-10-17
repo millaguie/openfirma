@@ -719,7 +719,7 @@ fn value_len_after_header(bytes: &[u8]) -> Option<usize> {
 /// that appear in subjects. Printable/IA5/Teletex/Videotex are ASCII-range;
 /// BMPString is UTF-16BE. NumericString is digits and spaces only (a real
 /// one — DIT rules forbid others); anything else returns None.
-fn decode_directory_string(tag: u8, value: &[u8]) -> Option<String> {
+pub(crate) fn decode_directory_string(tag: u8, value: &[u8]) -> Option<String> {
     match tag {
         // PrintableString | IA5String | TeletexString | VideotexString | NumericString
         0x12..=0x16 => std::str::from_utf8(value).ok().map(|s| s.to_string()),

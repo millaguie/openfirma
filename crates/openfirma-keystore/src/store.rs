@@ -181,3 +181,153 @@ pub fn boxed_signer(
     }
     Box::new(ArcSigner(store, cert))
 }
+
+/// Whether the AutoFirma default view would hide this entry (finding A5) —
+/// the shared rule from [`openfirma_core::filter`] lifted to the store entry
+/// it decorates. `SkipAuthDNIeFilter` (`skipAuthCertDnie = true`) hides the
+/// DNIe's authentication certificate, and `showExpiredCerts = false` hides
+/// anything past its expiry. Both rules read the certificate itself, so they
+/// apply identically to every backend — which is why they live here rather
+/// than in each one. A listing that runs this filter shows exactly what
+/// AutoFirma's default configuration would show: nothing less can be assumed
+/// by someone comparing the two programs' pickers.
+pub fn hidden_by_default(cert: &StoreCertificate, now: std::time::SystemTime) -> bool {
+    openfirma_core::filter::hidden_by_default(&cert.cert, now)
+}
+
+/// A store whose listing has [`hidden_by_default`] applied. The private key
+/// operations pass through untouched: the filter decides what is *offered*,
+/// never what the token is allowed to sign — an explicitly named entry (the
+/// CLI's `--store-alias`) stays reachable, with a warning.
+pub struct FilteredStore {
+    inner: std::sync::Arc<dyn SystemStore>,
+    now: std::time::SystemTime,
+}
+
+impl FilteredStore {
+    pub fn new(inner: std::sync::Arc<dyn SystemStore>, now: std::time::SystemTime) -> Self {
+        Self { inner, now }
+    }
+}
+
+// `dyn SystemStore` carries no auto traits of its own, so the wrapper would
+// not be Send/Sync without this line — yet every real backend is shared
+// through `Arc<dyn SystemStore>` across threads already (the CLI builds that
+// very type for its signers in `boxed_signer`), and FilteredStore only ever
+// forwards to such an Arc.
+unsafe impl Send for FilteredStore {}
+unsafe impl Sync for FilteredStore {}
+
+impl SystemStore for FilteredStore {
+    fn certificates(&self) -> openfirma_core::Result<Vec<StoreCertificate>> {
+        Ok(self
+            .inner
+            .certificates()?
+            .into_iter()
+            .filter(|c| !hidden_by_default(c, self.now))
+            .collect())
+    }
+
+    fn sign_prehash(
+        &self,
+        cert: &StoreCertificate,
+        alg: openfirma_core::alg::DigestAlg,
+        prehash: &[u8],
+    ) -> openfirma_core::Result<Vec<u8>> {
+        self.inner.sign_prehash(cert, alg, prehash)
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::KeyHandle;
+    use openfirma_core::CertificateHandle;
+    use openfirma_core::filter::{dnie_shaped_pair, shape_cert};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    fn entry(cert: CertificateHandle, label: &str) -> StoreCertificate {
+        StoreCertificate {
+            cert,
+            label: Some(label.into()),
+            key_handle: KeyHandle::Pkcs11Id(vec![1]),
+            always_authenticate: false,
+            chain: Vec::new(),
+        }
+    }
+
+    struct Fixed(Vec<StoreCertificate>);
+    impl SystemStore for Fixed {
+        fn certificates(&self) -> openfirma_core::Result<Vec<StoreCertificate>> {
+            Ok(self.0.clone())
+        }
+        fn sign_prehash(
+            &self,
+            _cert: &StoreCertificate,
+            _alg: openfirma_core::alg::DigestAlg,
+            _prehash: &[u8],
+        ) -> openfirma_core::Result<Vec<u8>> {
+            unreachable!("the filters never sign")
+        }
+    }
+
+    #[test]
+    fn the_dnie_authentication_certificate_is_hidden_and_the_signing_one_shown() {
+        // The pair from openfirma-core's shared fixture builder: AutoFirma's
+        // exact authentication rule (AC DNIE issuer, digitalSignature alone)
+        // beside its nonRepudiation twin.
+        let (auth_cert, sign_cert) = dnie_shaped_pair();
+        let auth = entry(auth_cert, "CertAutenticacion");
+        let sign = entry(sign_cert, "CertFirmaDigital");
+        let now = SystemTime::now();
+        assert!(hidden_by_default(&auth, now));
+        assert!(!hidden_by_default(&sign, now));
+
+        let store = FilteredStore::new(Arc::new(Fixed(vec![auth.clone(), sign.clone()])), now);
+        let labels: Vec<_> = store
+            .certificates()
+            .expect("listing")
+            .iter()
+            .map(|c| c.label.clone().unwrap_or_default())
+            .collect();
+        // With the auth certificate out of view, exactly one signer is left:
+        // `sign --store …` picks it with no --store-alias and no ambiguity —
+        // the behaviour AutoFirma's default shows.
+        assert_eq!(labels, ["CertFirmaDigital"]);
+    }
+
+    #[test]
+    fn an_expired_certificate_is_hidden() {
+        let dead = shape_cert(
+            "CN=Ana Test",
+            "CN=openfirma Test Intermediate CA,O=openfirma test",
+            Duration::ZERO,
+            Some((true, true)),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(hidden_by_default(
+            &entry(dead, "caducado"),
+            SystemTime::now()
+        ));
+    }
+
+    #[test]
+    fn ordinary_certificates_are_never_hidden() {
+        let alive = shape_cert(
+            "CN=Ana Test",
+            "CN=openfirma Test Intermediate CA,O=openfirma test",
+            Duration::from_secs(3600),
+            Some((true, false)),
+        );
+        let unflagged = shape_cert(
+            "CN=Ana Test",
+            "CN=openfirma Test Intermediate CA,O=openfirma test",
+            Duration::from_secs(3600),
+            None,
+        );
+        let now = SystemTime::now();
+        assert!(!hidden_by_default(&entry(alive, "ana"), now));
+        assert!(!hidden_by_default(&entry(unflagged, "sin keyUsage"), now));
+    }
+}

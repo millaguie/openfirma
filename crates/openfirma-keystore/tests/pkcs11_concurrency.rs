@@ -41,7 +41,7 @@ fn one_store_many_threads() {
             s.spawn(move || {
                 for _ in 0..5 {
                     let certs = store.certificates().expect("listing must succeed");
-                    assert_eq!(certs.len(), 3, "the fixture token holds three certs");
+                    assert_eq!(certs.len(), 5, "the fixture token holds five certificates");
                 }
             });
         }
@@ -65,7 +65,7 @@ fn concurrent_opens_and_listings() {
                     let store =
                         Pkcs11Store::open(&module, Some("openfirma test"), Some("12345678".into()))
                             .expect("reopening the shared library must succeed");
-                    assert_eq!(store.certificates().expect("listing").len(), 3);
+                    assert_eq!(store.certificates().expect("listing").len(), 5);
                 }
             });
         }

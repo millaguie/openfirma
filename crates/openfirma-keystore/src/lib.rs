@@ -23,4 +23,7 @@ pub mod macos;
 
 pub use pkcs11::Pkcs11Store;
 pub use pkcs12::Pkcs12;
-pub use store::{KeyHandle, StoreCertificate, StoreSigner, SystemStore, boxed_signer};
+pub use store::{
+    FilteredStore, KeyHandle, StoreCertificate, StoreSigner, SystemStore, boxed_signer,
+    hidden_by_default,
+};

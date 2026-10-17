@@ -6,6 +6,7 @@ pub mod alg;
 pub mod cert;
 pub mod dump;
 pub mod error;
+pub mod filter;
 pub mod oid;
 pub mod signer;
 pub mod tlv;

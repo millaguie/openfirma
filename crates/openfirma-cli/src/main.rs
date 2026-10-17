@@ -748,38 +748,93 @@ fn open_store(spec: &StoreSpec, pin: Option<Zeroizing<String>>) -> Result<DynSto
 /// when `--store-alias` gave one, otherwise requiring exactly one signer. An
 /// ambiguous pick is refused with the labels on offer — guessing which
 /// certificate signed a legal document is never acceptable.
-fn store_signer(store: &DynStore, alias: Option<&str>) -> Result<Box<dyn Signer + 'static>> {
-    let certs = store.certificates()?;
-    if certs.is_empty() {
+///
+/// Before choosing, AutoFirma's default filters run (finding A5): the DNIe's
+/// authentication certificate and expired certificates are hidden, so after
+/// filtering a signing card usually stands alone and needs no `--store-alias`
+/// at all. Naming a hidden entry with `--store-alias` still signs — the
+/// explicit request outranks the default view — but openfirma says out loud
+/// why that signature is not one a verifier will accept.
+fn store_signer(store: DynStore, alias: Option<&str>) -> Result<Box<dyn Signer + 'static>> {
+    let now = std::time::SystemTime::now();
+    let all = store.certificates()?;
+    if all.is_empty() {
         anyhow::bail!("this keystore holds no certificate with a signable private key");
     }
+    let pool: Vec<_> = all
+        .iter()
+        .filter(|c| !openfirma_keystore::hidden_by_default(c, now))
+        .cloned()
+        .collect();
+    if pool.is_empty() {
+        // The filter would empty the keystore. Say so rather than offer dead
+        // or login-only certificates as if they were ordinary signers.
+        anyhow::bail!(
+            "every certificate in this keystore is expired or filtered out (the \
+             DNIe's authentication certificate and expired certificates are never \
+             offered for signing); name one explicitly with --store-alias to sign \
+             with it despite that"
+        );
+    }
     let chosen = match alias {
-        Some(want) => certs
+        Some(want) => all
             .iter()
             .find(|c| c.label.as_deref() == Some(want))
             .with_context(|| {
                 let mut msg = format!("no keystore entry labeled '{want}'; entries present:");
-                for c in &certs {
+                for c in &pool {
                     let cn = c.cert.subject_cn().unwrap_or_else(|| "<no CN>".into());
                     msg.push_str(&format!("\n  {}", c.label.as_deref().unwrap_or(&cn)));
                 }
                 msg
             })?
             .clone(),
-        None if certs.len() == 1 => certs[0].clone(),
+        None if pool.len() == 1 => pool[0].clone(),
         None => {
             let mut msg = String::from(
                 "the keystore holds more than one signer; pick one with \
                               --store-alias:",
             );
-            for c in &certs {
+            for c in &pool {
                 let cn = c.cert.subject_cn().unwrap_or_else(|| "<no CN>".into());
                 msg.push_str(&format!("\n  {}", c.label.as_deref().unwrap_or(&cn)));
             }
             anyhow::bail!("{msg}")
         }
     };
-    Ok(boxed_signer(store.clone(), chosen))
+    warn_if_not_qualified(&chosen, now);
+    Ok(boxed_signer(store, chosen))
+}
+
+/// The one-line warning of finding A5: a certificate the default filters hide
+/// can still be signed with by name — but the user must hear why it is not a
+/// signing certificate before the document goes out, not learn it from a
+/// failed verification afterwards.
+fn warn_if_not_qualified(cert: &openfirma_keystore::StoreCertificate, now: std::time::SystemTime) {
+    let mut reasons = Vec::new();
+    if cert.cert.expired_at(now) {
+        reasons.push("it is expired".to_string());
+    }
+    if !cert.cert.can_sign() {
+        reasons.push("its keyUsage allows neither digitalSignature nor nonRepudiation".to_string());
+    }
+    if cert.cert.is_dnie_authentication_cert() {
+        reasons.push(
+            "it is the DNIe's authentication certificate, not its signing \
+             certificate (the signature would not be qualified)"
+                .to_string(),
+        );
+    }
+    if !reasons.is_empty() {
+        eprintln!(
+            "warning: signing with \"{}\": {}.",
+            cert.label
+                .as_deref()
+                .or(cert.cert.subject_cn().as_deref())
+                .unwrap_or("this certificate"),
+            reasons.join("; ")
+        );
+    }
 }
 
 /// Refuses `sign -i f -o f` unless `--force` says the overwrite is meant.
@@ -924,7 +979,7 @@ fn main() -> Result<()> {
                 }
                 let pin = store_pin(pin_env.as_ref())?;
                 let store = open_store(&parse_store_spec(spec)?, pin)?;
-                store_signer(&store, store_alias.as_deref())?
+                store_signer(store, store_alias.as_deref())?
             } else if let Some(container) = &p12 {
                 if pin_env.is_some() || store_alias.is_some() {
                     anyhow::bail!("--pin-env and --store-alias belong to --store");
@@ -1237,6 +1292,14 @@ fn main() -> Result<()> {
                     StoreSpec::Macos => "macos".into(),
                 };
                 match open_store(spec, pin.clone()).and_then(|store| {
+                    // AutoFirma's default view (finding A5): the DNIe's
+                    // authentication certificate and expired certificates
+                    // are not listed — `SkipAuthDNIeFilter` and
+                    // `showExpiredCerts = false` run before a listing.
+                    let store: DynStore = Arc::new(openfirma_keystore::FilteredStore::new(
+                        store,
+                        std::time::SystemTime::now(),
+                    ));
                     let certs = store.certificates()?;
                     Ok(certs)
                 }) {
@@ -2013,6 +2076,65 @@ fn fmt_system_time(t: std::time::SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store over a fixed list: the picker logic is about what it offers,
+    /// and these tests exercise that without a token.
+    struct FixedStore(Vec<openfirma_keystore::StoreCertificate>);
+    impl openfirma_keystore::SystemStore for FixedStore {
+        fn certificates(
+            &self,
+        ) -> openfirma_core::Result<Vec<openfirma_keystore::StoreCertificate>> {
+            Ok(self.0.clone())
+        }
+        fn sign_prehash(
+            &self,
+            _cert: &openfirma_keystore::StoreCertificate,
+            _alg: openfirma_core::alg::DigestAlg,
+            _prehash: &[u8],
+        ) -> openfirma_core::Result<Vec<u8>> {
+            unreachable!("the picker never signs")
+        }
+    }
+
+    fn dnie_pair() -> (
+        openfirma_core::CertificateHandle,
+        openfirma_core::CertificateHandle,
+    ) {
+        openfirma_core::filter::dnie_shaped_pair()
+    }
+
+    #[test]
+    fn the_picker_hides_the_dnie_auth_certificate_and_signs_with_the_twin() {
+        // The A5 picker rule end to end: a keystore holding auth+sign pair,
+        // no --store-alias anywhere in sight. Before the fix this refused with
+        // "more than one signer" or (worse) let an operator pick the auth
+        // certificate from an opaque list.
+        use openfirma_keystore::{KeyHandle, StoreCertificate};
+        let (auth_cert, sign_cert) = dnie_pair();
+        let entry = |cert: openfirma_core::CertificateHandle, label: &str| StoreCertificate {
+            cert,
+            label: Some(label.into()),
+            key_handle: KeyHandle::Pkcs11Id(vec![1]),
+            always_authenticate: false,
+            chain: Vec::new(),
+        };
+        let mk = || {
+            Arc::new(FixedStore(vec![
+                entry(auth_cert.clone(), "CertAutenticacion"),
+                entry(sign_cert.clone(), "CertFirmaDigital"),
+            ])) as DynStore
+        };
+        let signer = store_signer(mk(), None).expect("the signing twin must be chosen alone");
+        assert_eq!(
+            signer.certificate().subject_cn().as_deref(),
+            Some("Marta Viajera Garcia - test")
+        );
+        // And the hidden one is still reachable by explicit name.
+        let by_name = store_signer(mk(), Some("CertAutenticacion"))
+            .expect("an explicit alias reaches the hidden certificate");
+        assert!(by_name.certificate().is_dnie_authentication_cert());
+    }
+
     use std::time::SystemTime;
 
     /// Temp file named after the running test, because cargo runs the tests

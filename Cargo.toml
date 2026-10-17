@@ -24,7 +24,7 @@ description = "Pure Rust reimplementation of the Spanish government's AutoFirma 
 const-oid = { version = "0.10", features = ["db"] }
 der = { version = "0.8", features = ["derive", "oid", "alloc", "std"] }
 spki = { version = "0.8", features = ["alloc", "std"] }
-x509-cert = { version = "0.3", features = ["std", "pem"] }
+x509-cert = { version = "0.3", features = ["std", "pem", "builder"] }
 pkcs8 = { version = "0.11", features = ["std", "pem"] }
 
 # --- digests ---
