@@ -22,14 +22,16 @@
 //! - The headers themselves tell Windows consumers to wrap everything in
 //!   `#pragma pack(push, cryptoki, 1)` (the spec's Win32 recipe; SoftHSM2's
 //!   shipped header applies it for `_WIN32` unconditionally) while unix C uses
-//!   natural alignment. With the right per-platform ulong width above, the
-//!   only struct where both spellings still differ in *field* placement is
-//!   `CK_FUNCTION_LIST`: its two-byte `CK_VERSION` at offset 0 means packed
-//!   puts the first function pointer at byte 2 while natural alignment parks
-//!   it at 8 (slot 0's tail padding). Every other struct we read has ulongs
-//!   only where both rules agree, and is kept plain `#[repr(C)]`; structs
-//!   with a ulong *after* bytes (CK_SLOT_INFO, CK_TOKEN_INFO) would need the
-//!   cfg if they ever gained one — see `cryptoki_packed!` for the pattern.
+//!   natural alignment. With the right per-platform ulong width above, that
+//!   difference only *moves bytes* in `CK_FUNCTION_LIST`: its two-byte
+//!   `CK_VERSION` at offset 0 means packed puts the first function pointer at
+//!   byte 2 while natural alignment parks it at 8 (slot 0's tail padding).
+//!   The other structs we touch read identically under both spellings for
+//!   every width we target — the char arrays in CK_SLOT_INFO/CK_TOKEN_INFO
+//!   pin `flags` to the same byte either way, and pack(1) cannot slide a
+//!   pointer past an equal-width ulong — so they carry the cfg'd packed repr
+//!   as pure fidelity to the headers (`cryptoki_packed!`) while this file's
+//!   assertions pin every measured offset per target.
 //! - Slot arithmetic therefore has exactly two forms: windows and any
 //!   pointer-sized-ulong-but-packed table read spec function *k* at
 //!   `2 + k·sizeof(pointer)` (4 on i686, 8 on x64/arm64); LP64 unixes read it
@@ -477,16 +479,11 @@ cryptoki_packed! {
     /// at byte 2 — an unaligned address on x64 that a natural read would fault.
     #[derive(Clone, Copy)]
     pub struct CkFunctionList {
-    /// PKCS#11's CK_VERSION is exactly two bytes on every ABI. It must *stay*
-    /// a plain repr(C) pair even though the enclosing table is packed below:
-    /// unix C lays this field out as the natural pair-plus-six-padding (that
-    /// is why real LP64 modules start their pointers at byte 8), and packing
-    /// it would make rustc's offset_of! claim two bytes where SoftHSM stores
-    /// eight. The surrounding `repr(packed)` only removes padding *outside*
-    /// this field, so the first pointer still lands right after its declared
-    /// two bytes — exactly what the packed Win32 headers do (measured: clang
-    /// with MSVC's own ABI flags lays pack(1) CK_VERSION out at two bytes
-    /// with C_Initialize at byte 2 right behind it).
+    /// PKCS#11's CK_VERSION is exactly two bytes on every ABI (asserted at
+    /// the bottom of this file). Under Windows' packed headers the first
+    /// function pointer lands right after it at byte 2; on unix the natural
+    /// alignment of what follows pushes the pointers to byte 8, which is the
+    /// `_pad0` field below spelling out that padding.
     pub version: CkVersion,
     // PKCS#11's CK_VERSION declares only two bytes, but unix C aligns whatever
     // follows to its own width, and real modules store their function pointers
