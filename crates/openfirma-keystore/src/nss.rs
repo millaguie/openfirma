@@ -839,19 +839,29 @@ mod tests {
     #[test]
     fn firefox_parents_cover_snap_and_flatpak_roots() {
         // The list is built from HOME only on unix; point HOME at a tree
-        // laid out like a machine with both packaging formats.
+        // laid out like a machine with both packaging formats. CI anchors
+        // OPENFIRMA_FIREFOX_PARENTS to /nonexistent, and the override wins
+        // over the platform walk by design — so this test removes it for its
+        // locked window; that is precisely what it exists to pin down.
         let dir = tmp("parents");
         std::fs::create_dir_all(dir.join(".mozilla/firefox")).unwrap();
         std::fs::create_dir_all(dir.join("snap/firefox/4285/common/.mozilla/firefox")).unwrap();
         std::fs::create_dir_all(dir.join(".var/app/org.mozilla.firefox/.mozilla/firefox")).unwrap();
         let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        unsafe { std::env::set_var("HOME", &dir) };
+        let anchored = std::env::var_os("OPENFIRMA_FIREFOX_PARENTS");
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("OPENFIRMA_FIREFOX_PARENTS");
+        }
         let parents = firefox_parents();
         unsafe {
             match home {
                 Some(h) => std::env::set_var("HOME", h),
                 None => std::env::remove_var("HOME"),
+            }
+            if let Some(list) = anchored {
+                std::env::set_var("OPENFIRMA_FIREFOX_PARENTS", list);
             }
         }
         if cfg!(unix) && !cfg!(any(target_os = "macos", target_os = "ios")) {
