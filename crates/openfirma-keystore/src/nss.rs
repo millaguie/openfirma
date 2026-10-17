@@ -366,7 +366,18 @@ pub fn config_string(db: &str) -> Result<String> {
 /// can point at an exact libsoftokn3 without touching the search below.
 fn find_softokn() -> Result<PathBuf> {
     if let Ok(explicit) = std::env::var("OPENFIRMA_NSS_MODULE") {
+        // The same rule the descriptor parser enforces (finding M4): a bare
+        // name here would reach the loader's search — the current directory
+        // included, on Windows first of all — which is exactly what the
+        // absolute-path guarantee exists to close. An override that wants an
+        // exact library can spell it exactly.
         let path = PathBuf::from(explicit);
+        if !path.is_absolute() {
+            return Err(Error::Keystore(format!(
+                "OPENFIRMA_NSS_MODULE must name an absolute file, not {}",
+                path.display()
+            )));
+        }
         if path.is_file() {
             return Ok(path);
         }

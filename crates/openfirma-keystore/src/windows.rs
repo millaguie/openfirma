@@ -515,7 +515,13 @@ impl SystemStore for WindowsStore {
     }
 }
 
-#[link(name = "crypt32", kind = "raw-dylib")]
+// Undecorated too: these three live in their own block below the signing
+// code and were missed by the sweep above, which is exactly how a "fixed"
+// 32-bit build kept dying with STATUS_ENTRYPOINT_NOT_FOUND — the loader
+// reports the binary, never the missing import, so every crypt32/ncrypt/
+// advapi32 declaration has to carry the key, whichever block it sits in.
+#[cfg(target_arch = "x86")]
+#[link(name = "crypt32", kind = "raw-dylib", import_name_type = "undecorated")]
 unsafe extern "system" {
     fn CertCreateCertificateContext(
         dw_msg_encoding_type: u32,
@@ -528,6 +534,18 @@ unsafe extern "system" {
     /// import has existed in crypt32.dll since XP; `raw-dylib` resolves it at
     /// link time, which nothing here runs on a crypt32 lacking it would ever
     /// reach — the function has been in every supported Windows release.
+    fn CertDuplicateCertificateContext(p_cert_context: *const CertContext) -> *const CertContext;
+    fn CertFreeCertificateContext(p_cert_context: *const CertContext) -> i32;
+}
+
+#[cfg(not(target_arch = "x86"))]
+#[link(name = "crypt32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn CertCreateCertificateContext(
+        dw_msg_encoding_type: u32,
+        pb_cert_encoded: *const u8,
+        cb_cert_encoded: u32,
+    ) -> *const CertContext;
     fn CertDuplicateCertificateContext(p_cert_context: *const CertContext) -> *const CertContext;
     fn CertFreeCertificateContext(p_cert_context: *const CertContext) -> i32;
 }
