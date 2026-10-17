@@ -1916,6 +1916,9 @@ fn unregister_scheme() -> Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // The bail is the whole non-linux story; what follows it (`Ok(())`
+        // below) only exists for the linux branch's fallthrough.
+        #[allow(unreachable_code)]
         anyhow::bail!(
             "la desregistracion automatica existe en Linux (desktop entry + xdg-mime); en \
              Windows importa un .reg que tu importaste: borra HKEY_CURRENT_USER\\Software\\Classes\\\

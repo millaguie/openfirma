@@ -45,24 +45,22 @@ fn xmlsec_available() -> bool {
 }
 
 /// Whether this xmlsec1 knows `--add-id-attr` (it arrived in 1.3.0; Ubuntu's
-/// runner image ships 1.2.x). Probed by what the run PARSED, not by one
-/// version's refusal phrasing and not by one stream: the probe names a
-/// sentinel file, and only a tool that got past its option table says that
-/// name back (1.3 errors over the missing file; 1.2 answers the unknown flag
-/// with a usage banner — on stdout, where the first probe here did not look).
+/// runner image ships 1.2.x). Probed, never guessed from `--version`: an
+/// unknown flag makes 1.2.x print its usage banner to STDOUT plus "parameter
+/// "--add-id-attr" is not supported" to STDERR (measured against the real
+/// 1.2.39 apt ships), while 1.3 parses the flag and fails later over the
+/// file it was handed. So the refusal phrase on stderr means NO; anything
+/// else — including a usage banner without it — means the flag parsed.
 fn xmlsec_supports_id_attr() -> bool {
-    let sentinel = "xmlsec-idattr-probe-nonexistent.xml";
     Command::new("xmlsec1")
-        .args(["--verify", "--add-id-attr", "Id", sentinel])
+        .args([
+            "--verify",
+            "--add-id-attr",
+            "Id",
+            "/nonexistent-no-such-file.xml",
+        ])
         .output()
-        .is_ok_and(|o| {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            text.contains(sentinel) && !text.to_lowercase().contains("usage: xmlsec")
-        })
+        .is_ok_and(|o| !String::from_utf8_lossy(&o.stderr).contains("is not supported"))
 }
 
 fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> {
