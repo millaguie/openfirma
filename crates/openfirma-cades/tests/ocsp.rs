@@ -103,11 +103,12 @@ fn an_ocsp_response_is_only_trusted_when_its_signer_and_validity_check_out() {
     }
 
     // Una respuesta caducada no cubre una validación posterior a su inter-
-    // valo. El fixture del PKI de pruebas lleva nextUpdate 2029-01-18 (el
-    // UTCTime final de su SingleResponse); validar en 2030 debe devolverla
-    // fuera de intervalo aunque firma y autoridad sigan cuadraando. Bajo el
-    // viejo lector, que ignoraba el intervalo, una respuesta vieja pasaba
-    // por actual para siempre. El momento exacto se lee del fixture para no
+    // valo. El fixture del PKI de pruebas trae su propio nextUpdate (hoy una
+    // ventana larga, para que el test no caduque a la hora de generarlo);
+    // validar justo después de ese instante debe devolverla fuera de
+    // intervalo aunque firma y autoridad sigan cuadrando. Bajo el viejo
+    // lector, que ignoraba el intervalo, una respuesta vieja pasaba por
+    // actual para siempre. El momento exacto se lee del fixture para no
     // depender de cuando se genero.
     // El intervalo se comprueba ANTES de la autoridad del firmante (un firma
     // caducada no necesita probar quien hablo), asi que basta el momento ca-

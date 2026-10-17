@@ -298,11 +298,15 @@ ocsp_for() {
   openssl ocsp -reqout "$TMP/ocsp.req" -issuer intermediate.crt -cert "$cert" -no_nonce
   # -nmin: without it openssl answers with thisUpdate == nextUpdate, an inter-
   # val of zero seconds that every validator reads as already expired at the
-  # very second it was produced. An hour is plenty for the tests, which vali-
-  # date "now" and also after the window to prove expiry is enforced.
+  # very second it was produced. The window is deliberately long (3650 days,
+  # like the CRLs below and for the same reason): a real OCSP answer is short-
+  # lived, but this is a committed fixture validated against "now", and an
+  # hour-long window turned `cargo test` red an hour after `gen-testcert.sh`
+  # ran. The test reads the interval out of the fixture, so the expiry path
+  # it checks works whatever the window is.
   openssl ocsp -index "$TMP/ocsp-index.txt" -CA intermediate.crt \
     -rsigner "$signer" -rkey "$key" \
-    -reqin "$TMP/ocsp.req" -respout "$out" -nmin 60
+    -reqin "$TMP/ocsp.req" -respout "$out" -ndays 3650
 }
 
 ocsp_response() {

@@ -37,8 +37,8 @@ cargo build -q --bin openfirma
 normalize() {
   sed -E -e 's/(UTCTime|GeneralizedTime) .*/\1 <TIME>/' \
          -e 's/[0-9A-F]{48}\.\.\.\(([0-9]+) bytes\)/<hex \1 bytes>/' \
-         -e 's/^(OCTET STRING) <hex (7[0-2]) bytes>/\1 <ec signature>/' \
-         -e 's/^(OCTET STRING) [0-9A-F]{132,}/\1 <ec signature>/' |
+         -e 's/^([[:space:]]*OCTET STRING) <hex (7[0-2]) bytes>/\1 <ec signature>/' \
+         -e 's/^([[:space:]]*OCTET STRING) [0-9A-F]{132,}/\1 <ec signature>/' |
     # Second pass, and the reason it must be a second pass: an ECDSA blob is
     # 1-2 bytes longer (or shorter) depending on how the random s value falls,
     # so every container SEQUENCE/SET/[0] between it and the root carries a
