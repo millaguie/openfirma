@@ -188,6 +188,13 @@ run_xades_case() {
 
 run_xades_case simple "$INPUTS/simple.xml" signer-rsa
 
+# A root that declares namespaces is the shape FacturaE and almost every
+# administrative XML arrives in, and the shape review 03's C-1 broke: the
+# canonical SignedInfo/SignedProperties must carry the inherited context. The
+# golden normalizer recomputes every digest with lxml and has xmlsec1 verify
+# both sides, so a regression here cannot hide on one side of the diff.
+run_xades_case nsroot "$INPUTS/ns-root.xml" signer-rsa
+
 # A legal person is not a natural person with a different name: the subject
 # carries a CIF in serialNumber and an organizationIdentifier, and there is no
 # human in it at all. Both implementations must treat it as unremarkable.

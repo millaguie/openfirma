@@ -17,3 +17,10 @@
  indirect-annots.pdf  PDF cuyo /Annots de pagina es un objeto indirecto, la
                       forma que escribe iText. Comprueba que sigue siendo
                       indirecto despues de firmar.
+
+ ns-root.xml        XML cuyo elemento raiz declara espacios de nombres (la
+                    forma FacturaE) y un prefijo ds propio. Entra en el golden
+                    XAdES: la canonicalizacion de SignedInfo y
+                    SignedProperties debe llevar el contexto heredado de la
+                    raiz (revision 03, C-1). Sin declaraciones XML:* ni texto
+                    volatile: el diff sigue siendo estructural.

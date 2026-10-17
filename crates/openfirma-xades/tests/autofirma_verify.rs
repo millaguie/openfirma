@@ -168,6 +168,47 @@ fn autofirma_verifies_what_openfirma_signed() {
     std::fs::remove_file(&path).ok();
 }
 
+/// The same C-1 shapes through AutoFirma's own validator: it reads our file
+/// with Xerces and Santuario — the exact stack that computed KO NO_MATCH_DATA
+/// for every namespaced root before the fix. This is the verdict the brief
+/// asks to be independent of our reader.
+#[test]
+fn autofirma_verifies_signatures_over_documents_with_namespaced_roots() {
+    if !tool("java") || !tool("javac") {
+        eprintln!("skipped, no JDK on this machine");
+        return;
+    }
+    let Some(jar) = jar() else {
+        eprintln!("skipped, no autofirma.jar ($AUTOFIRMA_JAR or tools/fetch-autofirma.sh)");
+        return;
+    };
+    let Some(signer) = load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let driver = driver_dir(&jar);
+    let cases: &[(&str, &[u8])] = &[
+        ("autofirma-verify-ns-root.xml", br#"<fe:Facturae xmlns:fe="http://www.facturae.es/FacturaE/2011/namespaces/facturae" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><Header>x</Header></fe:Facturae>"#),
+        ("autofirma-verify-defns.xml", br#"<doc xmlns="urn:x"><a>x</a></doc>"#),
+        ("autofirma-verify-xmllang.xml", br#"<doc xml:lang="es"><a>x</a></doc>"#),
+    ];
+    for (name, input) in cases {
+        let signed = xades_sign(input, &signer, &XadesOptions::default())
+            .unwrap_or_else(|e| panic!("signing {name}: {e}"));
+        let path = write_tmp(name, &signed);
+        let (ok, text) = autofirma_verify(&jar, &driver, &path);
+        assert!(
+            ok && text.contains("OK"),
+            "AutoFirma's own validator rejected our signature over {name}:\n{text}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}
+
 /// The ECDSA path has no AutoFirma golden (AutoFirma cannot sign it, see
 /// docs/xades.md), but its validator can still read ours: JSR-105
 /// verification of ecdsa-sha256 works even where their signing provider

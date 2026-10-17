@@ -264,7 +264,17 @@ def recompute_reference(ref, ltree, lroot):
         found = lroot.xpath('//*[@Id="%s"]' % uri[1:])
         if not found:
             return uri, False, "no element carries Id=%s" % uri[1:]
-        state = copy.deepcopy(found[0])
+        # Canonicalize the node IN ITS TREE (remove every other Signature
+        # from a copy of the whole document and take the same node there):
+        # C14N 1.0 makes a subtree root re-emit the bindings inherited from
+        # its ancestors (§2.3), and a detached lxml copy has no ancestors to
+        # inherit them from, so deep-copying the target alone digests a
+        # different form than any validator does. The removed-signature
+        # cleanup for enveloped/XPath transforms runs on this same attached
+        # copy below (strip_signatures walks it with .//).
+        whole = copy.deepcopy(ltree)
+        targets = whole.xpath('//*[@Id="%s"]' % uri[1:])
+        state = targets[0] if targets else copy.deepcopy(found[0])
 
     with_comments = False
     exclusive = False

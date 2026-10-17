@@ -200,7 +200,9 @@ pub struct Options {
 
 /// Canonicalizes a whole document: prolog PIs and comments, the root, the
 /// epilog, no declaration, no DTD, nothing outside the root that is
-/// whitespace.
+/// whitespace. Comments follow `opts.with_comments`, like every other node:
+/// the enveloped-signature transform of Base64 and every validator works on
+/// the comment-excluding form, and the same option decides the prolog.
 pub fn document(doc: &Document, opts: &Options) -> Vec<u8> {
     let mut out = Vec::new();
     for node in &doc.prolog {
@@ -343,7 +345,10 @@ fn subtree_with_inherited(
     out
 }
 
-fn extend_xml_attrs(parent: &[xml::Attribute], el: &Element) -> Vec<xml::Attribute> {
+/// The nearest-in-scope value of each `xml:` attribute along the path, after
+/// element `el`: what a canonicalized subtree below `el` must propagate per
+/// §2.4 (a subtree root re-prints its own plus these, unless it overrides).
+pub fn extend_xml_attrs(parent: &[xml::Attribute], el: &Element) -> Vec<xml::Attribute> {
     let mut out: Vec<xml::Attribute> = parent
         .iter()
         .filter(|a| {
@@ -528,7 +533,7 @@ fn element_with_context(
         .map(|(ns, local)| (ns.as_str(), local.as_str()));
     for child in &el.children {
         match child {
-            Child::Text(t) => escape_text(t, out),
+            Child::Text(t) => escape_text_into(t, out),
             Child::Comment(c) => {
                 if opts.with_comments {
                     out.extend_from_slice(b"<!--");
@@ -593,7 +598,25 @@ fn write_qname(name: &xml::QName, out: &mut Vec<u8>) {
     out.extend_from_slice(name.local.as_bytes());
 }
 
-fn escape_text(text: &str, out: &mut Vec<u8>) {
+/// Escapes text for character data: `>` as well as `&` and `<`, because text
+/// is not attribute values. The signing code builds its template by hand, and
+/// one escaper in the crate beats two that could drift apart (finding B-4).
+pub fn escape_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Byte-level escaping for character data — `>` as well as the two others,
+/// plus the CR reference — writing straight into the canonical output buffer.
+fn escape_text_into(text: &str, out: &mut Vec<u8>) {
     for c in text.chars() {
         match c {
             '&' => out.extend_from_slice(b"&amp;"),

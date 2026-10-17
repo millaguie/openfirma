@@ -39,8 +39,15 @@ element**. Serialization of the output, measured:
 - the declaration is normalized to exactly `<?xml version="1.0" encoding="UTF-8"?>`:
   `standalone` is dropped, a missing declaration is added, no newline follows it,
 - nothing follows the root end tag: a trailing newline in the input is dropped,
-- document-level PIs and comments (outside the root) are dropped, including a
-  locally-unresolvable `xml-stylesheet` PI.
+- document-level **comments** (outside the root) are dropped, including a
+  locally-unresolvable `xml-stylesheet`'s neighbouring comment; document-level
+  **processing instructions are kept**, right after the declaration and before
+  the root element. Measured against AutoFirma's own output: its serializer is
+  a DOM `Document` node saved whole (declaration first, every PI child of the
+  Document written in order, the comments it never inserts simply absent), and
+  xmlsec1 verifies over them. A prolog PI that had been dropped used to make
+  the whole-document reference digest diverge: the data transform canonicalizes
+  the document *including its prolog PIs* (docs review 03, follow-up of C-1).
 
 ## SignedInfo
 
@@ -135,6 +142,21 @@ the SignedProperties element including its inherited namespace declarations**,
 so the canonical form begins
 `<xades:SignedProperties xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:xades="http://uri.etsi.org/01903/v1.3.2#" Id="...">`.
 Verified by recomputation against AutoFirma's output.
+
+**Inherited means inherited from the whole document, not from the template.**
+Review 03 found (C-1) that canonicalizing SignedProperties — and SignedInfo —
+over a detached fragment missed what the signed document's own root puts in
+scope: with `xmlns="urn:x"` or `xml:lang` on the root, a validator re-emits it
+on both elements (§2.3 re-emits every binding in scope at a subtree root;
+§2.4 propagates the ancestors' `xml:` attributes), so the fragment's digest
+matched nothing and every FacturaE-shaped file was invalid. AutoFirma cannot
+produce that bug — Santuario canonicalizes the live DOM after `appendChild` —
+and its own output proves the rule: recomputing our old fragment digests fails
+against `ns-root.af.xml`, while the in-place form passes. openfirma now signs
+the same way it gets read: the final bytes are spliced, reparsed, and both
+elements are canonicalized at the position they occupy in that tree (see
+`sign.rs`, "the template fragments"). The golden corpus carries `ns-root.xml`
+for exactly this.
 
 ## Ids and what is volatile
 

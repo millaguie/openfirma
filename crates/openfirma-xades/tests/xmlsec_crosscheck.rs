@@ -117,6 +117,53 @@ fn xmlsec_verifies_the_rsa_signature() {
     std::fs::remove_file(&path).ok();
 }
 
+/// Review 03, C-1: SignedInfo and SignedProperties used to be canonicalized
+/// as detached fragments, so every namespace the DOCUMENT root declares (and
+/// its xml:* attributes) was missing from what we digested, while validators
+/// compute them over the elements hanging off that root. The signature was
+/// then invalid for any document whose root carries an xmlns or an xml:lang —
+/// FacturaE and nearly all administrative XML. These are the reviewer's own
+/// three shapes; each must have BOTH references verified by xmlsec1's own
+/// parser, canonicalizer and digest machinery.
+#[test]
+fn xmlsec_verifies_signatures_over_documents_with_namespaced_roots() {
+    if !xmlsec_available() {
+        eprintln!("skipped, xmlsec1 not found");
+        return;
+    }
+    let Some(signer) = load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let cases: &[(&str, &[u8])] = &[
+        // a prefixed root declaring its own ds prefix, the FacturaE shape
+        ("ns-root.xml", br#"<fe:Facturae xmlns:fe="http://www.facturae.es/FacturaE/2011/namespaces/facturae" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><Header>x</Header></fe:Facturae>"#),
+        // a default namespace on the root: the canonical SignedProperties
+        // must carry xmlns="urn:x", which only inherited-context
+        // canonicalization prints
+        ("defns.xml", br#"<doc xmlns="urn:x"><a>x</a></doc>"#),
+        // an xml:lang on the root propagates into both canonical subtrees
+        // per C14N 1.0 §2.4
+        ("xmllang.xml", br#"<doc xml:lang="es"><a>x</a></doc>"#),
+    ];
+    for (name, input) in cases {
+        let signed = xades_sign(input, &signer, &XadesOptions::default())
+            .unwrap_or_else(|e| panic!("signing {name}: {e}"));
+        let path = write_tmp(name, &signed);
+        let (ok, text) = xmlsec_verify(&path);
+        assert!(ok, "xmlsec1 rejected the signature over {name}:\n{text}");
+        assert!(
+            text.contains("SignedInfo References (ok/all): 2/2"),
+            "not both references verified for {name}:\n{text}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}
+
 #[test]
 fn xmlsec_verifies_the_ecdsa_signature() {
     if !xmlsec_available() {

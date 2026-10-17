@@ -133,9 +133,11 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
     // The root carries the Id we just validated, so URI="#id" resolves to it
     // — and nothing else in the document may carry it (the duplicate check
     // above guarantees that). Without an Id the reference is URI="", which is
-    // the whole document too. Either way the target is the root.
-    let target = &doc.root;
-    let data_c14n = c14n::subtree(target, &c14n::Axis::new(), &[], &data_opts);
+    // the whole document too. Either way the target is the root, and the
+    // canonical form of a root element is identical whether taken as a
+    // subtree of its own declarations or as the whole document: nothing is
+    // in scope above the root (review 03, C-1).
+    let data_c14n = c14n::document(&doc, &data_opts);
     let data_digest = opts.reference_digest.digest(&data_c14n);
 
     let cert = signer.certificate();
@@ -151,7 +153,23 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
         None => oid_for_mime(&mime_type).map(str::to_string),
     };
 
-    // ---- the ds:Object content: QualifyingProperties/SignedProperties ----
+    // ---- the template fragments, built once ----
+    //
+    // Review 03, C-1: the SignedProperties and SignedInfo digests are NOT
+    // taken over these strings canonicalized on their own. A validator reads
+    // them hanging off the signed document's root (inside ds:Signature /
+    // ds:Object) and canonicalizes with inclusive C14N 1.0, which re-emits
+    // every namespace in scope — including what the document's own root
+    // declares — and propagates the ancestors' xml:* attributes (§2.3/§2.4).
+    // Canonicalizing a detached fragment misses exactly that context, so both
+    // digests went wrong as soon as the root carried an xmlns or an xml:lang,
+    // which is FacturaE and nearly all administrative XML. Instead: parse the
+    // final file itself — the input's root with this ds:Signature spliced in,
+    // exactly the bytes we ship — and canonicalize SignedProperties and
+    // SignedInfo at the position each one occupies there. AutoFirma signs
+    // exactly this way (Santuario on the DOM after appendChild), and its own
+    // measured output proves it: recomputing ns-root.af.xml's digests in
+    // place gets xmlns:fe onto both elements (docs/xades.md).
 
     let mut qp = String::new();
     qp.push_str(&format!(
@@ -159,16 +177,16 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
          Id=\"{sig_id}-QualifyingProperties\" Target=\"#{sig_id}-Signature\" \
          xmlns:ds=\"{DS_NS}\">"
     ));
+    let time_text = format_signing_time(signing_time)?;
     qp.push_str(&format!(
         "<xades:SignedProperties Id=\"{sig_id}-SignedProperties\">\
          <xades:SignedSignatureProperties>\
-         <xades:SigningTime>{}</xades:SigningTime>\
+         <xades:SigningTime>{time_text}</xades:SigningTime>\
          <xades:SigningCertificateV2><xades:Cert><xades:CertDigest>\
          <ds:DigestMethod Algorithm=\"{digest_uri}\"/>\
          <ds:DigestValue>{}</ds:DigestValue>\
          </xades:CertDigest><xades:IssuerSerialV2/></xades:Cert></xades:SigningCertificateV2>\
          </xades:SignedSignatureProperties>",
-        format_signing_time(signing_time)?,
         b64(&cert_digest),
     ));
     qp.push_str("<xades:SignedDataObjectProperties>");
@@ -184,93 +202,43 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
              <xades:Identifier Qualifier=\"OIDAsURN\">urn:oid:{}</xades:Identifier>\
              <xades:Description/>\
              </xades:ObjectIdentifier>",
-            escape_text(oid)
+            c14n::escape_text(oid)
         ));
     }
     qp.push_str(&format!(
         "<xades:MimeType>{}</xades:MimeType><xades:Encoding/>\
          </xades:DataObjectFormat>",
-        escape_text(&mime_type)
+        c14n::escape_text(&mime_type)
     ));
     qp.push_str("</xades:SignedDataObjectProperties></xades:SignedProperties>");
     qp.push_str("</xades:QualifyingProperties>");
 
-    // The SignedProperties digest is taken over the canonical form of the
-    // SignedProperties element *including the namespaces it inherits from
-    // QualifyingProperties*. Parsing the fragment and canonicalizing through
-    // the same code a verifier uses is how the inherited xmlns:ds and
-    // xmlns:xades end up in the digest (docs/xades.md).
-    let qp_doc = xml::parse(qp.as_bytes()).map_err(|e| {
-        Error::other(format!(
-            "internal error: the QualifyingProperties template does not parse: {e}"
-        ))
-    })?;
-    let sp_opts = c14n::Options::default();
-    let sp_c14n = c14n::subtree_from(
-        &qp_doc.root,
-        |el| el.namespace.as_deref() == Some(XADES_NS) && el.name.local == "SignedProperties",
-        &sp_opts,
-    )
-    .ok_or_else(|| Error::other("internal error: no SignedProperties in the template"))?;
-    let sp_digest = opts.reference_digest.digest(&sp_c14n);
+    // ---- SignedInfo, as a closure of its two digest values ----
 
-    // ---- SignedInfo ----
-
-    let signed_info = format!(
-        "<ds:SignedInfo>\
-         <ds:CanonicalizationMethod Algorithm=\"{C14N_URI}\"/>\
-         <ds:SignatureMethod Algorithm=\"{sig_method_uri}\"/>\
-         <ds:Reference Id=\"{ref_id}\" URI=\"{}\">\
-         <ds:Transforms>\
-         <ds:Transform Algorithm=\"{ENVELOPED_URI}\"/>\
-         <ds:Transform Algorithm=\"{C14N_URI}\"/>\
-         <ds:Transform Algorithm=\"{XPATH_URI}\">\
-         <ds:XPath xmlns:ds=\"{DS_NS}\">{XPATH_FILTER}</ds:XPath>\
-         </ds:Transform>\
-         </ds:Transforms>\
-         <ds:DigestMethod Algorithm=\"{digest_uri}\"/>\
-         <ds:DigestValue>{}</ds:DigestValue>\
-         </ds:Reference>\
-         <ds:Reference Type=\"{SIGNED_PROPERTIES_TYPE}\" URI=\"#{sig_id}-SignedProperties\">\
-         <ds:DigestMethod Algorithm=\"{digest_uri}\"/>\
-         <ds:DigestValue>{}</ds:DigestValue>\
-         </ds:Reference>\
-         </ds:SignedInfo>",
-        escape_attr(&data_uri),
-        b64(&data_digest),
-        b64(&sp_digest),
-    );
-
-    // The signature is over the canonical form of SignedInfo with the
-    // xmlns:ds it inherits from ds:Signature. The ds:XPath element carries
-    // its own redundant xmlns:ds in the file, and C14N 1.0 suppresses it in
-    // the canonical form; parsing the wrapper and canonicalizing through the
-    // same rules reproduces exactly what Apache Santuario signed (the
-    // "Gotcha" of docs/xades.md).
-    let wrapper = format!("<ds:Signature xmlns:ds=\"{DS_NS}\">{signed_info}</ds:Signature>");
-    let wrapper_doc = xml::parse(wrapper.as_bytes()).map_err(|e| {
-        Error::other(format!(
-            "internal error: the SignedInfo wrapper does not parse: {e}"
-        ))
-    })?;
-    let si_c14n = c14n::subtree_from(
-        &wrapper_doc.root,
-        |el| el.namespace.as_deref() == Some(DS_NS) && el.name.local == "SignedInfo",
-        &sp_opts,
-    )
-    .ok_or_else(|| Error::other("internal error: no SignedInfo in the wrapper"))?;
-
-    let prehash = opts.digest.digest(&si_c14n);
-    let raw_sig = signer.sign_prehash(opts.digest, &prehash)?;
-    // AutoFirma checks the PKCS#1 it just produced against the certificate
-    // public key (ETSI TS 119 102-1); so do we, before any conversion
-    openfirma_core::signer::verify_prehash(cert, opts.digest, &prehash, &raw_sig)?;
-    let sig_value = match key_alg {
-        KeyAlgorithm::Rsa => raw_sig,
-        KeyAlgorithm::EcPrimeField(curve) => ecdsa_der_to_p1363(&raw_sig, coord_len(curve))?,
+    let signed_info = |data_digest: &str, sp_digest: &str| {
+        format!(
+            "<ds:SignedInfo>\
+             <ds:CanonicalizationMethod Algorithm=\"{C14N_URI}\"/>\
+             <ds:SignatureMethod Algorithm=\"{sig_method_uri}\"/>\
+             <ds:Reference Id=\"{ref_id}\" URI=\"{}\">\
+             <ds:Transforms>\
+             <ds:Transform Algorithm=\"{ENVELOPED_URI}\"/>\
+             <ds:Transform Algorithm=\"{C14N_URI}\"/>\
+             <ds:Transform Algorithm=\"{XPATH_URI}\">\
+             <ds:XPath xmlns:ds=\"{DS_NS}\">{XPATH_FILTER}</ds:XPath>\
+             </ds:Transform>\
+             </ds:Transforms>\
+             <ds:DigestMethod Algorithm=\"{digest_uri}\"/>\
+             <ds:DigestValue>{data_digest}</ds:DigestValue>\
+             </ds:Reference>\
+             <ds:Reference Type=\"{SIGNED_PROPERTIES_TYPE}\" URI=\"#{sig_id}-SignedProperties\">\
+             <ds:DigestMethod Algorithm=\"{digest_uri}\"/>\
+             <ds:DigestValue>{sp_digest}</ds:DigestValue>\
+             </ds:Reference>\
+             </ds:SignedInfo>",
+            escape_attr(&data_uri),
+        )
     };
-
-    // ---- KeyInfo ----
 
     let mut certs_b64 = String::new();
     certs_b64.push_str(&format!(
@@ -309,17 +277,130 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
     // In baseline the KeyInfo exists but is not referenced from SignedInfo,
     // measured; the signature covers the data and the SignedProperties only.
 
-    let signature = format!(
-        "<ds:Signature xmlns:ds=\"{DS_NS}\" Id=\"{sig_id}-Signature\">\
-         {signed_info}\
-         <ds:SignatureValue Id=\"{sig_id}-SignatureValue\">{}</ds:SignatureValue>\
-         {key_info}\
-         <ds:Object>{qp}</ds:Object>\
-         </ds:Signature>",
-        b64(&sig_value),
-    );
+    // The SignatureValue text runs through both digest computations as this
+    // comment: it keeps the file well formed while nothing depends on it —
+    // the SignedInfo canonicalization ends before ds:SignatureValue, the
+    // SignedProperties subtree does not contain it, and the data reference
+    // omits every ds:Signature subtree. The final bytes swap it for the real
+    // value with no digest to recompute.
+    let placeholder = "<!--signature-value-->";
+    let pass = |signed_info: &str| {
+        format!(
+            "<ds:Signature xmlns:ds=\"{DS_NS}\" Id=\"{sig_id}-Signature\">\
+             {signed_info}\
+             <ds:SignatureValue Id=\"{sig_id}-SignatureValue\">{placeholder}</ds:SignatureValue>\
+             {key_info}\
+             <ds:Object>{qp}</ds:Object>\
+             </ds:Signature>"
+        )
+    };
 
-    splice_into_document(input, &doc, signature.as_bytes())
+    // Pass one: SignedProperties canonicalized inside the final document,
+    // with everything its ancestors put in scope — the document root's own
+    // declarations first. A validator reparses our shipped bytes and reads
+    // exactly this tree, so this is the form its digest will match.
+    let sp_opts = c14n::Options::default();
+    let pass1_bytes = splice_into_document(input, &doc, pass(&signed_info("", "")).as_bytes())?;
+    let pass1_doc = xml::parse(&pass1_bytes).map_err(internal)?;
+    let root_xml_attrs = c14n::extend_xml_attrs(&[], &pass1_doc.root);
+    let (sp, sp_context) = subtree_in_context(
+        &pass1_doc.root,
+        XADES_NS,
+        "SignedProperties",
+        "internal error: no SignedProperties in the signed document",
+    )?;
+    let sp_c14n = c14n::subtree(sp, &sp_context, &root_xml_attrs, &sp_opts);
+    let sp_digest = b64(&opts.reference_digest.digest(&sp_c14n));
+
+    // Pass two: SignedInfo now carries its final digest values; canonicalize
+    // it where it stands and sign that. The ds:XPath element keeps its
+    // redundant xmlns:ds in the file, and C14N 1.0 suppresses it in the
+    // canonical form (docs/xades.md, "Gotcha"); walking the real tree makes
+    // both happen by themselves, exactly like Santuario on the final DOM.
+    let pass2_bytes = splice_into_document(
+        input,
+        &doc,
+        pass(&signed_info(&b64(&data_digest), &sp_digest)).as_bytes(),
+    )?;
+    let pass2_doc = xml::parse(&pass2_bytes).map_err(internal)?;
+    let (si, si_context) = subtree_in_context(
+        &pass2_doc.root,
+        DS_NS,
+        "SignedInfo",
+        "internal error: no SignedInfo in the signed document",
+    )?;
+    let root_xml_attrs = c14n::extend_xml_attrs(&[], &pass2_doc.root);
+    let si_c14n = c14n::subtree(si, &si_context, &root_xml_attrs, &sp_opts);
+
+    let prehash = opts.digest.digest(&si_c14n);
+    let raw_sig = signer.sign_prehash(opts.digest, &prehash)?;
+    // AutoFirma checks the PKCS#1 it just produced against the certificate
+    // public key (ETSI TS 119 102-1); so do we, before any conversion
+    openfirma_core::signer::verify_prehash(cert, opts.digest, &prehash, &raw_sig)?;
+    let sig_value = match key_alg {
+        KeyAlgorithm::Rsa => raw_sig,
+        KeyAlgorithm::EcPrimeField(curve) => ecdsa_der_to_p1363(&raw_sig, coord_len(curve))?,
+    };
+
+    // The bytes we ship: pass two with the placeholder comment replaced by
+    // the signature value. No digest depends on it (see `placeholder`), so
+    // the tree this string came from and the file a validator reads agree.
+    let mut final_signature = pass(&signed_info(&b64(&data_digest), &sp_digest));
+    let at = final_signature
+        .find(placeholder)
+        .expect("the template always carries the placeholder");
+    final_signature.replace_range(at..at + placeholder.len(), &b64(&sig_value));
+
+    splice_into_document(input, &doc, final_signature.as_bytes())
+}
+
+/// Our own output failing to parse is a bug, not user input; say so in the
+/// same voice as the other internal errors of this module.
+fn internal(e: openfirma_core::Error) -> openfirma_core::Error {
+    Error::other(format!(
+        "internal error: our own signed document does not parse: {e}"
+    ))
+}
+
+/// Finds `ns:local` in a parsed tree and returns it with the namespace axis
+/// of its ANCESTORS only — every declaration written on every element above
+/// it, outermost first, inner bindings last. The target's own declarations
+/// are not part of it: `c14n::subtree` merges them against this context,
+/// exactly like a validator's inclusive C14N re-emits what the subtree root
+/// inherits and prints its own over it.
+fn subtree_in_context<'e>(
+    root: &'e xml::Element,
+    ns: &str,
+    local: &str,
+    what: &str,
+) -> Result<(&'e xml::Element, c14n::Axis)> {
+    fn walk<'e>(
+        el: &'e xml::Element,
+        ns: &str,
+        local: &str,
+        axis: &mut c14n::Axis,
+    ) -> Option<&'e xml::Element> {
+        if el.namespace.as_deref() == Some(ns) && el.name.local == local {
+            return Some(el);
+        }
+        let base = axis.len();
+        // this element is an ancestor of anything below it: its declarations
+        // join the context for the descent, and come back out when the
+        // descent returns empty-handed
+        axis.extend(el.ns_decls.iter().cloned());
+        for child in &el.children {
+            if let xml::Child::Element(inner) = child {
+                if let Some(found) = walk(inner, ns, local, axis) {
+                    return Some(found);
+                }
+            }
+        }
+        axis.truncate(base);
+        None
+    }
+    let mut axis = c14n::Axis::new();
+    let el = walk(root, ns, local, &mut axis).ok_or_else(|| Error::other(what.to_string()))?;
+    Ok((el, axis))
 }
 
 /// The output file: the normalized declaration, then the input bytes of the
@@ -328,6 +409,24 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
 fn splice_into_document(input: &[u8], doc: &xml::Document, signature: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() + signature.len() + 64);
     out.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    // Prolog and epilog nodes the measured AutoFirma serialization keeps:
+    // processing instructions, in source order (its DOM serializer writes
+    // every child of the Document node except the document element, and its
+    // parser has consumed the declaration). Comments are what it drops —
+    // including the prolog and epilog ones, as measured byte for byte — and
+    // whitespace between them is not significant. DTDs cannot be here: the
+    // reader refuses them.
+    for node in doc.prolog.iter().chain(doc.epilog.iter()) {
+        if let xml::DocLevelNode::Pi { target, data } = node {
+            out.extend_from_slice(b"<?");
+            out.extend_from_slice(target.as_bytes());
+            if !data.is_empty() {
+                out.push(b' ');
+                out.extend_from_slice(data.as_bytes());
+            }
+            out.extend_from_slice(b"?>");
+        }
+    }
 
     let root = &doc.root;
     if root.self_closing {
@@ -552,21 +651,6 @@ fn escape_attr(value: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Escapes a string for XML character data: `>` as well as the two others,
-/// because text is not attribute values.
-fn escape_text(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
             _ => out.push(c),
         }
     }

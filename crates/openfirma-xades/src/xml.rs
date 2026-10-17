@@ -155,7 +155,10 @@ pub fn parse(input: &[u8]) -> Result<Document> {
         ))
     })?;
     let mut p = Parser {
-        src: input,
+        // not `input`: `text.as_bytes()` is byte-identical to it (from_utf8
+        // succeeded), and tying the two together means every position in src
+        // is also a character boundary of text, which all its slicing needs
+        src: text.as_bytes(),
         text,
         pos: 0,
     };
