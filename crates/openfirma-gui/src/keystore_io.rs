@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use openfirma_core::workflow::StoreSpec;
 use openfirma_core::{CertificateHandle, Error, Result};
-use openfirma_keystore::{Pkcs12, StoreCertificate, SystemStore};
+use openfirma_keystore::{StoreCertificate, SystemStore};
 use zeroize::Zeroizing;
 
 /// Open a store descriptor behind one `Arc<dyn SystemStore>`. The work lives
@@ -48,7 +48,7 @@ pub fn load_p12(
 ) -> Result<openfirma_core::SoftwareSigner> {
     let bytes = std::fs::read(path)
         .map_err(|e| Error::Keystore(format!("cannot read {}: {e}", path.display())))?;
-    let container = Pkcs12::load(&bytes, password)
+    let container = openfirma_keystore::Pkcs12::load(&bytes, password)
         .map_err(|e| Error::Keystore(format!("{}: {e}", path.display())))?;
     let entry = container.entry(alias)?;
     let leaf = parse_certificate(&entry.chain[0])
@@ -119,4 +119,138 @@ pub fn containing_dir(path: &Path) -> PathBuf {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), |p| p.to_path_buf())
+}
+
+/// The PKCS#11 modules a smart-card reader on this machine almost certainly
+/// has installed, probed by file existence only (never opened, never
+/// PIN-touched — the CLI's `keystores list` rule that a token is only ever
+/// named, not guessed at). Review 06 A-6's first half: AutoFirma finds the
+/// DNIe without the citizen learning what a `.so` is; the names shown here
+/// are what makes that true in openfirma. The order is by how much each one
+/// is what the user meant (a smart card IS the DNIe on every Spanish desktop
+/// that has one).
+pub fn detected_card_modules() -> Vec<(&'static str, PathBuf)> {
+    let mut found: Vec<(&'static str, PathBuf)> = Vec::new();
+    // Every path below is where a vendor's own package installs its module
+    // on a Debian/Ubuntu/Fedora desktop (AutoFirma's three Linux targets) —
+    // the probe reads file existence only. A family name matches a *file*,
+    // never a guess about what a card contains; OpenSC comes first because
+    // the government's own DNIe install script configures it, and one row
+    // per family is one door for the user either way.
+    #[cfg(target_os = "linux")]
+    {
+        push_existing(&mut found, "opensc", "/usr/lib/opensc-pkcs11.so");
+        push_existing(
+            &mut found,
+            "opensc",
+            "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so",
+        );
+        push_existing(
+            &mut found,
+            "opensc",
+            "/usr/lib/x86_64-linux-gnu/pkcs11/opensc-pkcs11.so",
+        );
+        push_existing(&mut found, "opensc", "/usr/lib64/pkcs11/opensc-pkcs11.so");
+        // The DNIe's own vendor module (dnie-action package), tried after
+        // OpenSC because OpenSC is what the government's own install script
+        // configures.
+        push_existing(&mut found, "dniaction", "/usr/lib/dnie/libdnie-sof.so");
+        push_existing(
+            &mut found,
+            "fnmt-ceres",
+            "/usr/lib/libpkcs11nShield2015FNMT.so",
+        );
+        push_existing(
+            &mut found,
+            "fnmt-ceres",
+            "/usr/local/lib/libpkcs11nShield2015FNMT.so",
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        push_existing(&mut found, "opensc", "/usr/local/lib/opensc-pkcs11.so");
+        push_existing(&mut found, "opensc", "/opt/homebrew/lib/opensc-pkcs11.so");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // AutoFirma's Windows default is the CAPI store (open_store's
+        // `windows` spec), which discoverable_stores already offers; these
+        // are third-party middleware installs, named not guessed.
+        for dir in [
+            std::env::var_os("ProgramFiles"),
+            std::env::var_os("ProgramFiles(x86)"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let root = PathBuf::from(dir);
+            push_existing(
+                &mut found,
+                "opensc",
+                root.join("OpenSC Project\\OpenSC\\pkcs11\\opensc-pkcs11.dll"),
+            );
+            push_existing(
+                &mut found,
+                "fnmt-ceres",
+                root.join("FNMT-RCM\\libpkcs11nShield2015FNMT.dll"),
+            );
+        }
+    }
+    // One entry per family: the first path wins; two OpenSC installs are one
+    // door, and listing both only teaches the user to distrust pickers.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|(family, _)| seen.insert(*family));
+    found
+}
+
+fn push_existing(
+    found: &mut Vec<(&'static str, PathBuf)>,
+    family: &'static str,
+    path: impl AsRef<Path>,
+) {
+    let path = path.as_ref().to_path_buf();
+    if path.is_file() {
+        found.push((family, path));
+    }
+}
+
+/// The descriptors the picker offers with one click: the cards this machine
+/// has middleware for (A-6), the NSS databases discovery can name (the CLI's
+/// own `nss::discover` — Firefox profiles included; finding A7 called its
+/// absence in the window a defect, and it is the same list `keystores list`
+/// prints), and the platform store on Windows/macOS. PKCS#11 modules are
+/// never *guessed* at (same rule as `keystores list` without arguments): a
+/// detected middleware file is named by path exactly like the CLI names it,
+/// so window and terminal accept the same descriptors.
+pub fn suggested_stores() -> Vec<(String, String)> {
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for (family, module) in detected_card_modules() {
+        let descriptor = format!("pkcs11:{}", module.display());
+        let name = match family {
+            "dniaction" => "dnie",
+            "opensc" => "opensc",
+            "fnmt-ceres" => "fnmt",
+            _ => continue,
+        };
+        lines.push((name.to_string(), descriptor));
+    }
+    // The NSS side: discovery never opens anything (the keystore crate's own
+    // promise), so this costs nothing when no browser exists. `nss::discover`
+    // already dedupes and returns ready-to-parse specs.
+    for spec in openfirma_keystore::nss::discover() {
+        let name = match &spec {
+            StoreSpec::NssFirefox { .. } => "firefox",
+            _ => "nssdb",
+        };
+        lines.push((name.to_string(), spec.descriptor()));
+    }
+    for spec in openfirma_core::workflow::discoverable_stores() {
+        let name = match &spec {
+            StoreSpec::Windows => "windows",
+            StoreSpec::Macos => "macos",
+            _ => continue,
+        };
+        lines.push((name.to_string(), spec.descriptor()));
+    }
+    lines
 }

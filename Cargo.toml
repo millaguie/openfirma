@@ -88,11 +88,19 @@ rfd = "0.16"
 
 # --- GUI, feature-gated behind `gui` and never a CLI dependency: see ADR-0006 ---
 # eframe 0.37 is the current release; it is egui's own windowing framework.
+# `accesskit`: the platform accessibility tree (a screen reader must be able
+# to read this window — finding A-2). It was a production gap before: only
+# the dev-dependency egui_kittest pulled it in, so tests exercised an a11y
+# layer the shipped binary never built. The `clipboard` feature is NOT turned
+# on deliberately: its Linux half needs `smithay-clipboard`, which is not in
+# the vendored offline registry (it would break `cargo --offline` and CI),
+# while this app copies through rfd/std::process instead (see app.rs).
 eframe = { version = "0.37", default-features = false, features = [
     "glow",
     "x11",
     "wayland",
     "default_fonts",
+    "accesskit",
 ] }
 egui = "0.37"
 # The windowless UI test harness of egui (ADR-0006): it drives the widget tree

@@ -1,18 +1,16 @@
 //! The strings of openfirma's window, in one place (brief rule: every
-//! user-visible string lives here).
+//! user-visible string lives here — a literal inside a widget is the drift
+//! review 06, M-6 measured).
 //!
-//! Spanish is the interface language on purpose: this tool signs documents
-//! for citizens dealing with a Spanish-government ecosystem, and AutoFirma —
-//! what it replaces — ships only in Spanish. English identifiers, comments
-//! and docs stay everywhere else.
-//!
-//! How this would be translated (this module is the whole translation
-//! surface): every user-visible text is an entry of [`Tr`], and a second
-//! `impl Tr` block would return the same keys with different values — one
-//! struct, two constructors (`Tr::es()`, `Tr::en()`), selected at startup
-//! from the locale; the widgets already take `&Tr` and never literal text.
-//! When a real second language is ever needed, replace this with a tiny
-//! generated lookup (a `tr(key)` over const maps) — no widget changes.
+//! Spanish is the default interface language on purpose: this tool signs
+//! documents for citizens dealing with a Spanish-government ecosystem. The
+//! review's point stands though — AutoFirma ships six locales (es, ca, gl,
+//! eu, va, en), so the seam here is real and not aspirational: every text is
+//! an entry of [`Tr`], [`Tr::for_locale`] picks one from `$LANG`, and a new
+//! language is one more `impl` block returning the same keys — no widget
+//! changes. English ships today (the second locale AutoFirma's installs fall
+//! back to); Catalan, Galician, Basque and Valencian are the same one-block
+//! step whenever someone competent in them contributes the wording.
 
 /// Every user-visible string of the window.
 #[derive(Clone, Debug)]
@@ -30,6 +28,10 @@ pub struct Tr {
     pub detected_xml: String,
     pub detected_data: String,
     pub formats_for: String,
+    /// The name of the "already signed?" refusal when a signature file is
+    /// dropped where a document was expected (B-3): its own screen sentence.
+    pub drop_is_signature_title: String,
+    pub drop_is_signature_body: String,
     // --- certificate picker -------------------------------------------
     pub choose_certificate: String,
     pub no_certificates: String,
@@ -37,6 +39,16 @@ pub struct Tr {
     pub password_label: String,
     pub open_keystore: String,
     pub keystore_pin: String,
+    /// The friendly card names the picker offers with one click (A-6): a
+    /// DNIe is not a module path.
+    pub store_dnie: String,
+    pub store_opensc: String,
+    pub store_fnmt: String,
+    /// Per-row badges under the certificate name (A-7).
+    pub cert_issuer_line: String,
+    pub cert_valid_until_line: String,
+    pub cert_expired: String,
+    pub cert_auth_only: String,
     // --- signing -------------------------------------------------------
     pub sign_button: String,
     pub advanced_show: String,
@@ -44,26 +56,62 @@ pub struct Tr {
     pub adv_tsa: String,
     pub adv_digest: String,
     pub adv_reason: String,
+    pub back_button: String,
+    /// The reason the sign button is grey (M-4): under the field, not lost.
+    pub password_wrong: String,
+    pub password_missing: String,
     // --- result ---------------------------------------------------------
     pub signed_ok: String,
     pub open_folder: String,
     pub save_as: String,
+    /// Copy the written file's path to the system clipboard (A-2).
+    pub copy_path: String,
     pub sign_another: String,
+    /// Shown while the background thread signs (A-1): what it is waiting for.
+    pub signing_in_progress: String,
     // --- verify -----------------------------------------------------------
     pub verdict_valid: String,
     pub verdict_invalid: String,
+    pub verdict_unknown: String,
     pub verdict_unsigned: String,
+    /// A drop refused while a finished signature still stands unacknowledged
+    /// on the Done screen (M-8's never-lose rule in its drop form).
+    pub drop_while_done: String,
     pub signer_line: String,
     pub signed_at_line: String,
+    /// The honest qualifier of a signingTime nobody confirmed with a TSA
+    /// stamp (B-4).
+    pub declared_time_note: String,
     pub chain_line: String,
     pub no_trust_anchors: String,
+    /// Ask-the-anchor wording done right (review 06 B-2): what to do when the
+    /// user does not know — get the issuer's certificate from its own site.
+    pub anchor_hint: String,
     pub verify_another: String,
+    // --- plain-language verification reasons (A-5) --------------------------
+    /// The document was modified after signing.
+    pub reason_digest: String,
+    /// The certificate chain does not reach any anchor the user supplied.
+    pub reason_chain: String,
+    /// The certificate's validity window had passed at validation time.
+    pub reason_expired: String,
+    /// Not a signature file at all / unreadable structure.
+    pub reason_not_signature: String,
+    /// A detached signature whose original document was not found.
+    pub reason_detached_content: String,
+    /// The certificate revoked or otherwise refused by name (prefix + cause).
+    pub reason_generic_prefix: String,
     // --- errors --------------------------------------------------------------
     pub error_title: String,
-    pub details_toggle: String,
+    /// Per-line details control when the technical block is closed (M-3):
+    /// open and closed need different words on the button so its label says
+    /// which way the click goes.
+    pub details_show: String,
+    pub details_hide: String,
     pub try_again: String,
     // --- closing guard -------------------------------------------------------
     pub close_unsaved: String,
+    pub close_signing: String,
     pub keep_working: String,
     pub discard_result: String,
     // --- window titles / dialogs -------------------------------------------
@@ -73,10 +121,43 @@ pub struct Tr {
     /// certification authority to trust, not the user's own certificate.
     pub dialog_open_anchor: String,
     pub dialog_save_sig: String,
+    pub dialog_content_for_detached: String,
+    /// The overwrite question (A-3) before any bytes are written.
+    pub ask_overwrite_body: String,
+    pub ask_overwrite_yes: String,
+    pub ask_overwrite_no: String,
+    // --- failures the library writes in English but the window must show
+    //     in this language (B-2's jargon ban): each is a wrapper prefix that
+    //     errors.rs weaves over the technical cause.
+    pub fail_wrong_password: String,
+    pub fail_anchor_read: String,
+    pub fail_no_anchors_internal: String,
+    pub fail_tsa_unverified: String,
 }
 
 impl Tr {
-    /// The Spanish interface — the one this tool ships with (see above).
+    /// The locale `$LANG` asks for, Spanish for anything unknown (AutoFirma's
+    /// own fallback is its base bundle).
+    pub fn for_locale() -> Self {
+        Self::from_locale(&std::env::var("LANG").unwrap_or_default())
+    }
+
+    /// The pure half of [`Tr::for_locale`]: the `$LANG` text in, one `Tr` out.
+    /// A test can hold no environment race this way.
+    pub fn from_locale(lang: &str) -> Self {
+        let code = lang
+            .split(['.', '@'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if code.starts_with("en") {
+            Tr::en()
+        } else {
+            Tr::es()
+        }
+    }
+
+    /// The Spanish interface — the one this tool ships by default.
     pub fn es() -> Self {
         Tr {
             app_title: "openfirma".into(),
@@ -89,51 +170,234 @@ impl Tr {
             detected_pdf: "Es un PDF. Se firmará como PAdES (firma dentro del propio PDF).".into(),
             detected_xml: "Es un XML. Se firmará como XAdES (firma dentro del propio XML).".into(),
             detected_data:
-                "Es un documento de texto o datos. Se firmará como CAdES (firma aparte, `.csig`)."
+                "Es un documento de texto o datos. Se firmará como CAdES (firma aparte, archivo \
+                 «.csig» junto al original)."
+                    .into(),
+            drop_is_signature_title: "Este archivo ya es una firma".into(),
+            drop_is_signature_body:
+                "El archivo que has abierto lleva una firma dentro; no se firma una firma. Para \
+                 ver si esa firma es válida pulsa «Verificar una firma» y elige este mismo \
+                 archivo."
                     .into(),
             formats_for: "Formato".into(),
             choose_certificate: "Elige el certificado con el que firmar".into(),
             no_certificates: "No se ha encontrado ningún certificado con el que firmar.".into(),
             p12_button: "Abrir un archivo de certificado (.p12)…".into(),
             password_label: "Contraseña del certificado".into(),
-            open_keystore: "Abrir un repositorio del sistema…".into(),
-            keystore_pin: "PIN (se usa solo para abrir el repositorio)".into(),
+            open_keystore: "Otro almacén (escribe su ruta o nombre)…".into(),
+            keystore_pin: "PIN (se recuerda durante esta sesión)".into(),
+            store_dnie: "DNI electrónico".into(),
+            store_opensc: "Tarjeta criptográfica (OpenSC)".into(),
+            store_fnmt: "Certificado de la FNMT (AC CFv3)".into(),
+            cert_issuer_line: "Emitido por".into(),
+            cert_valid_until_line: "Válido hasta".into(),
+            cert_expired: "caducado".into(),
+            cert_auth_only: "solo sirve para identificarse, no para firmar".into(),
             sign_button: "Firmar".into(),
             advanced_show: "Opciones avanzadas".into(),
             advanced_hide: "Ocultar opciones avanzadas".into(),
-            adv_tsa: "Sellar el tiempo con un servidor de sellado (para que la firma siga siendo \
-                      válido dentro de años; necesita la URL del servidor)"
+            adv_tsa: "Añadir sello de tiempo: demuestra a qué hora existía la firma (necesita la \
+                      URL del servidor de sellado)"
                 .into(),
             adv_digest: "Algoritmo de resumen".into(),
             adv_reason: "Motivo de la firma (opcional, queda dentro del PDF)".into(),
+            back_button: "Elegir otro documento".into(),
+            password_wrong: "Contraseña incorrecta. Vuelve a escribirla.".into(),
+            password_missing: "Falta la contraseña del certificado.".into(),
             signed_ok: "Firma guardada".into(),
             open_folder: "Abrir carpeta".into(),
             save_as: "Guardar en otra parte…".into(),
+            copy_path: "Copiar ruta".into(),
             sign_another: "Firmar otro documento".into(),
+            signing_in_progress: "Firmando. Si usas una tarjeta, tenla a mano…".into(),
             verdict_valid: "Firma válida".into(),
             verdict_invalid: "La firma NO es válida".into(),
+            verdict_unknown: "No se puede confirmar la validez de esta firma".into(),
             verdict_unsigned: "Este archivo no tiene ninguna firma".into(),
+            drop_while_done: "Termina primero con la firma que tienes en pantalla: guarda o \
+                              descarta su resultado antes de abrir otro archivo."
+                .into(),
             signer_line: "Quién firmó".into(),
             signed_at_line: "Cuándo".into(),
-            chain_line: "Cadena de confianza hasta".into(),
+            declared_time_note: "hora indicada por el firmante, sin sello de tiempo que la \
+                                 confirme"
+                .into(),
+            chain_line: "Confía en la autoridad".into(),
             no_trust_anchors:
-                "No sabes en quién confiar todavía: openfirma no verifica contra raíz alguna \
-                 por defecto. Elige el certificado de la entidad en la que confías."
+                "openfirma solo da el visto bueno a una firma cuando llega hasta una autoridad \
+                 en la que tú confías. Elige ahora el certificado de esa autoridad."
+                    .into(),
+            anchor_hint:
+                "¿No sabes cuál es? Suele ser el «certificado de raíz» o «cadena» en la web del \
+                 emisor de tu certificado (la FNMT, tu empresa, tu administración)."
                     .into(),
             verify_another: "Verificar otro archivo".into(),
+            reason_digest:
+                "El documento cambió después de firmarse: lo que se firmó no es lo que hay ahora."
+                    .into(),
+            reason_chain:
+                "No se llega a ninguna autoridad en la que confíes: falta el certificado de la \
+                 autoridad que emitió la del firmante."
+                    .into(),
+            reason_expired:
+                "El certificado del firmante había caducado en el momento de comprobarla.".into(),
+            reason_not_signature: "Este archivo no tiene una firma que openfirma pueda leer."
+                .into(),
+            reason_detached_content:
+                "Esta es una firma separada del documento (un «.csig»): hay que abrir también el \
+                 documento que firmó."
+                    .into(),
+            reason_generic_prefix: "Motivo".into(),
             error_title: "No se ha podido continuar".into(),
-            details_toggle: "Ver detalles técnicos".into(),
+            details_show: "Ver detalles técnicos".into(),
+            details_hide: "Ocultar detalles técnicos".into(),
             try_again: "Intentar de nuevo".into(),
-            close_unsaved: "La firma que acabas de hacer aún no está guardada. ¿Quieres cerrarla \
-                            sin guardarla?"
+            close_unsaved: "Hay una firma cuyo resultado no has visto todavía. ¿Quieres cerrarla \
+                            sin más?"
+                .into(),
+            close_signing: "La firma se está haciendo todavía. ¿Quieres cancelarla y cerrar?"
                 .into(),
             keep_working: "Seguir trabajando".into(),
-            discard_result: "Cerrar sin guardar".into(),
+            discard_result: "Cerrar sin esperar".into(),
             dialog_open_file: "Elige el documento".into(),
             dialog_open_cert: "Elige tu certificado".into(),
-            dialog_open_anchor: "Elige la autoridad en la que confías (ancla de verificación)"
-                .into(),
+            dialog_open_anchor: "Elige el certificado de la autoridad en la que confías".into(),
             dialog_save_sig: "Guardar la firma".into(),
+            dialog_content_for_detached: "Elige el documento que se firmó".into(),
+            ask_overwrite_body: "Ese archivo ya existe. ¿Seguro que quieres sustituirlo?".into(),
+            ask_overwrite_yes: "Sustituir".into(),
+            ask_overwrite_no: "Elegir otro nombre".into(),
+            fail_wrong_password:
+                "La contraseña del certificado no es correcta o el archivo está dañado.".into(),
+            fail_anchor_read: "No se ha podido usar el archivo elegido como autoridad:".into(),
+            fail_no_anchors_internal:
+                "No se ha indicado ninguna autoridad en la que confiar (variable \
+                 OPENFIRMA_TRUST). Elige el certificado de la autoridad para comprobar esta \
+                 firma."
+                    .into(),
+            fail_tsa_unverified:
+                "El sello de tiempo no se ha podido comprobar: demuestra la hora solo si \
+                 confías en quien lo emitió."
+                    .into(),
+        }
+    }
+
+    /// English — AutoFirma's `en_US` counterpart, and the fallback locale of
+    /// its installs (second one here for the same reason).
+    pub fn en() -> Self {
+        Tr {
+            app_title: "openfirma".into(),
+            drop_here: "Drop the document you want to sign here".into(),
+            drop_hint: "or type its path and press Enter".into(),
+            paste_path: "Document path…".into(),
+            browse: "Browse…".into(),
+            verify_verb: "Verify a signature".into(),
+            sign_verb: "Sign a document".into(),
+            detected_pdf: "It is a PDF. It will be signed as PAdES (inside the PDF itself).".into(),
+            detected_xml: "It is an XML. It will be signed as XAdES (inside the XML itself)."
+                .into(),
+            detected_data: "It is a text or data document. It will be signed as CAdES (a separate \
+                 \".csig\" file beside it)."
+                .into(),
+            drop_is_signature_title: "This file already is a signature".into(),
+            drop_is_signature_body:
+                "The file you opened carries a signature inside; a signature is not signed \
+                 again. To check whether that signature holds, press \"Verify a signature\" \
+                 and pick this same file."
+                    .into(),
+            formats_for: "Format".into(),
+            choose_certificate: "Choose the certificate to sign with".into(),
+            no_certificates: "No certificate to sign with was found.".into(),
+            p12_button: "Open a certificate file (.p12)…".into(),
+            password_label: "Certificate password".into(),
+            open_keystore: "Another keystore (type its path or name)…".into(),
+            keystore_pin: "PIN (remembered for this session)".into(),
+            store_dnie: "Electronic ID card (DNIe)".into(),
+            store_opensc: "Smart card (OpenSC)".into(),
+            store_fnmt: "FNMT certificate (AC CFv3)".into(),
+            cert_issuer_line: "Issued by".into(),
+            cert_valid_until_line: "Valid until".into(),
+            cert_expired: "expired".into(),
+            cert_auth_only: "identification only, cannot sign".into(),
+            sign_button: "Sign".into(),
+            advanced_show: "Advanced options".into(),
+            advanced_hide: "Hide advanced options".into(),
+            adv_tsa:
+                "Add a time-stamp: proves when the signature existed (needs the TSA server URL)"
+                    .into(),
+            adv_digest: "Digest algorithm".into(),
+            adv_reason: "Reason for signing (optional, stays inside the PDF)".into(),
+            back_button: "Choose another document".into(),
+            password_wrong: "Wrong password. Type it again.".into(),
+            password_missing: "The certificate's password is missing.".into(),
+            signed_ok: "Signature saved".into(),
+            open_folder: "Open folder".into(),
+            save_as: "Save as…".into(),
+            copy_path: "Copy path".into(),
+            sign_another: "Sign another document".into(),
+            signing_in_progress: "Signing. If you use a card, have it ready…".into(),
+            verdict_valid: "Signature is valid".into(),
+            verdict_invalid: "The signature is NOT valid".into(),
+            verdict_unknown: "The signature's validity cannot be confirmed".into(),
+            verdict_unsigned: "This file carries no signature".into(),
+            drop_while_done: "Finish with the signature on screen first: save or discard its \
+                              result before opening another file."
+                .into(),
+            signer_line: "Who signed".into(),
+            signed_at_line: "When".into(),
+            declared_time_note: "time declared by the signer, no stamp confirms it".into(),
+            chain_line: "Trusts the authority".into(),
+            no_trust_anchors:
+                "openfirma only approves a signature that chains up to an authority you trust. \
+                 Choose that authority's certificate now."
+                    .into(),
+            anchor_hint:
+                "Don't know which one? It is usually the \"root\" or \"chain\" certificate on \
+                 the website of your certificate's issuer (FNMT, your company, your agency)."
+                    .into(),
+            verify_another: "Verify another file".into(),
+            reason_digest:
+                "The document changed after signing: what was signed is not what is there now."
+                    .into(),
+            reason_chain:
+                "It does not reach any authority you trust: the certificate of the authority \
+                 that issued the signer's is missing."
+                    .into(),
+            reason_expired: "The signer's certificate had expired at validation time.".into(),
+            reason_not_signature: "This file holds no signature openfirma can read.".into(),
+            reason_detached_content:
+                "This is a signature kept apart from its document (a \".csig\"): the document \
+                 it signed must be opened too."
+                    .into(),
+            reason_generic_prefix: "Reason".into(),
+            error_title: "Could not continue".into(),
+            details_show: "Show technical details".into(),
+            details_hide: "Hide technical details".into(),
+            try_again: "Try again".into(),
+            close_unsaved:
+                "A signature's result has not been seen yet. Close and discard it anyway?".into(),
+            close_signing: "The signature is still being made. Cancel it and close?".into(),
+            keep_working: "Keep working".into(),
+            discard_result: "Close without waiting".into(),
+            dialog_open_file: "Choose the document".into(),
+            dialog_open_cert: "Choose your certificate".into(),
+            dialog_open_anchor: "Choose the authority certificate you trust".into(),
+            dialog_save_sig: "Save the signature".into(),
+            dialog_content_for_detached: "Choose the document that was signed".into(),
+            ask_overwrite_body: "That file already exists. Replace it?".into(),
+            ask_overwrite_yes: "Replace".into(),
+            ask_overwrite_no: "Choose another name".into(),
+            fail_wrong_password: "The certificate's password is wrong, or the file is damaged."
+                .into(),
+            fail_anchor_read: "The chosen authority file could not be used:".into(),
+            fail_no_anchors_internal:
+                "No trust anchor was supplied (OPENFIRMA_TRUST). Choose the authority's \
+                 certificate to check this signature."
+                    .into(),
+            fail_tsa_unverified:
+                "The time-stamp could not be checked: it proves the time only if you trust \
+                 who issued it."
+                    .into(),
         }
     }
 }
@@ -141,5 +405,145 @@ impl Tr {
 impl Default for Tr {
     fn default() -> Self {
         Tr::es()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A-3/M-6: every key ships in every language — an entry missing from one
+    /// `impl` is a compile error, but the values must also all be non-empty,
+    /// which a field added to the struct and filled for es only would not be.
+    #[test]
+    fn every_string_ships_in_every_language() {
+        let check = |tr: &Tr, lang: &str| {
+            let fields: &[&String] = &[
+                &tr.app_title,
+                &tr.drop_here,
+                &tr.drop_hint,
+                &tr.paste_path,
+                &tr.browse,
+                &tr.verify_verb,
+                &tr.sign_verb,
+                &tr.detected_pdf,
+                &tr.detected_xml,
+                &tr.detected_data,
+                &tr.drop_is_signature_title,
+                &tr.drop_is_signature_body,
+                &tr.formats_for,
+                &tr.choose_certificate,
+                &tr.no_certificates,
+                &tr.p12_button,
+                &tr.password_label,
+                &tr.open_keystore,
+                &tr.keystore_pin,
+                &tr.store_dnie,
+                &tr.store_opensc,
+                &tr.store_fnmt,
+                &tr.cert_issuer_line,
+                &tr.cert_valid_until_line,
+                &tr.cert_expired,
+                &tr.cert_auth_only,
+                &tr.sign_button,
+                &tr.advanced_show,
+                &tr.advanced_hide,
+                &tr.adv_tsa,
+                &tr.adv_digest,
+                &tr.adv_reason,
+                &tr.back_button,
+                &tr.password_wrong,
+                &tr.password_missing,
+                &tr.signed_ok,
+                &tr.open_folder,
+                &tr.save_as,
+                &tr.sign_another,
+                &tr.signing_in_progress,
+                &tr.verdict_valid,
+                &tr.verdict_invalid,
+                &tr.verdict_unknown,
+                &tr.verdict_unsigned,
+                &tr.signer_line,
+                &tr.signed_at_line,
+                &tr.declared_time_note,
+                &tr.chain_line,
+                &tr.no_trust_anchors,
+                &tr.anchor_hint,
+                &tr.verify_another,
+                &tr.reason_digest,
+                &tr.reason_chain,
+                &tr.reason_expired,
+                &tr.reason_not_signature,
+                &tr.reason_detached_content,
+                &tr.reason_generic_prefix,
+                &tr.error_title,
+                &tr.details_show,
+                &tr.try_again,
+                &tr.close_unsaved,
+                &tr.close_signing,
+                &tr.keep_working,
+                &tr.discard_result,
+                &tr.dialog_open_file,
+                &tr.dialog_open_cert,
+                &tr.dialog_open_anchor,
+                &tr.dialog_save_sig,
+                &tr.dialog_content_for_detached,
+                &tr.ask_overwrite_body,
+                &tr.ask_overwrite_yes,
+                &tr.ask_overwrite_no,
+                &tr.fail_wrong_password,
+                &tr.fail_anchor_read,
+                &tr.fail_no_anchors_internal,
+                &tr.fail_tsa_unverified,
+            ];
+            for f in fields {
+                assert!(!f.trim().is_empty(), "{lang} has an empty string");
+            }
+        };
+        let es = Tr::es();
+        let en = Tr::en();
+        check(&es, "es");
+        check(&en, "en");
+        // The two languages are not the same text by copy-paste accident.
+        assert_ne!(es.verdict_valid, en.verdict_valid);
+    }
+
+    #[test]
+    fn locale_selection_falls_back_to_spanish() {
+        // Unknown and empty locales are Spanish (AutoFirma's own base bundle).
+        for probe in ["", "es_ES.UTF-8", "ca_ES@valencia", "en_US.UTF-8"] {
+            let picked = Tr::from_locale(probe);
+            assert_eq!(
+                picked.verdict_valid,
+                if probe.starts_with("en") {
+                    Tr::en().verdict_valid
+                } else {
+                    Tr::es().verdict_valid
+                },
+                "{probe}"
+            );
+        }
+    }
+
+    /// M-2: the review's concrete privacy failure — the DN dump that leaked a
+    /// DNI number on the verdict screen — is a pure function now, and pinned.
+    #[test]
+    fn the_signer_line_never_carries_the_dn() {
+        assert_eq!(
+            crate::verdicts::signer_display("CN=\"PEREZ GARCIA, ANA\",SERIALNUMBER=IDCES-12345678Z,OU=AC openfirma Usuarios,O=openfirma test,C=ES").as_deref(),
+            Some("PEREZ GARCIA, ANA"),
+        );
+        // No CN at all: the organisation signs for itself (sello de entidad).
+        assert_eq!(
+            crate::verdicts::signer_display("SERIALNUMBER=IDCES-12345678Z,O=openfirma test,C=ES")
+                .as_deref(),
+            Some("openfirma test"),
+        );
+        // Nothing recognisable: no name at all — never a DN, which is what
+        // printed the DNI number.
+        assert_eq!(
+            crate::verdicts::signer_display("OU=cosas,C=ES").as_deref(),
+            None,
+        );
     }
 }

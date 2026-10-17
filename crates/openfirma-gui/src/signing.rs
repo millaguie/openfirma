@@ -1,13 +1,13 @@
-//! El despachador de formatos de la ventana: una sola lista, una sola cadena
-//! de acceso al token, tanto para el terminal como para esta GUI.
+//! The window's format dispatcher: one list, one token access path, shared by
+//! the terminal and this GUI.
 //!
-//! La lógica vive en `openfirma_browser::signing` — el único crate que depende
-//! de los tres de formato sin arrastrar nada gráfico — y este módulo la llama
-//! marcando la petición como venida de la ventana (`from_window`), para que un
-//! nivel largo-term incompleto reciba la frase honesta que señala al terminal
-//! en lugar de banderas que esta ventana nunca enseñó (hallazgo M-4: con tres
-//! `match`es separados, un formato renombrado firmaba en un sitio y era
-//! desconocido en otro sin que ningún test lo notase).
+//! The logic lives in `openfirma_browser::signing` — the only crate that
+//! depends on the three format crates without dragging in anything graphic —
+//! and this module calls it marking the request as coming from the window
+//! (`from_window`), so an incomplete long-term level receives the honest
+//! sentence that points at the terminal instead of flags this window never
+//! showed (finding M-4: with three separate `match`es, a renamed format signed
+//! in one place and was unknown in the other without any test noticing).
 
 use openfirma_cades::TimestampFn;
 use openfirma_core::alg::DigestAlg;
@@ -16,8 +16,8 @@ use openfirma_pades::Appearance;
 
 pub use openfirma_browser::signing::{all_formats, format_label};
 
-/// Lo que la ventana pide firmar: el formato (la misma ortografía que el
-/// `--format` del terminal), el digest y lo poco que la ventana recoge.
+/// What the window asks to sign: the format (the same spelling as the
+/// terminal's `--format`), the digest and the few things the window collects.
 pub struct WinRequest<'a> {
     pub format: &'a str,
     pub digest: DigestAlg,
@@ -26,9 +26,9 @@ pub struct WinRequest<'a> {
     pub reason: Option<String>,
 }
 
-/// Produce la firma de una petición de la ventana. `input` es el documento
-/// completo (lo que `openfirma sign -i` leería). Equivale exacta a lo que el
-/// terminal hace con los mismos argumentos; la diferencia es solo `from_window`.
+/// Produces the signature for a window request. `input` is the whole document
+/// (what `openfirma sign -i` would read). Exactly what the terminal does with
+/// the same arguments; the only difference is `from_window`.
 pub fn execute(
     format: &str,
     content: &[u8],
@@ -47,7 +47,7 @@ pub fn execute(
     openfirma_browser::signing::execute_with_detection(&mut req, content, signer)
 }
 
-/// La forma completa, con la perilla extra de la GUI (un rectángulo visible).
+/// The full form, with the GUI's extra knob (a visible rectangle).
 pub fn execute_request(
     req: WinRequest<'_>,
     detected: openfirma_core::workflow::Format,
@@ -58,8 +58,8 @@ pub fn execute_request(
     openfirma_browser::signing::execute_request(&mut shared, detected, content, signer)
 }
 
-/// Traducción petición-ventana → petición-compartida; ningún otro camino debe
-/// existir: una knob nueva que la ventana llegue a controlar se añade aquí.
+/// Window-request → shared-request translation; no other path may exist: a
+/// new knob the window comes to control is added here.
 fn shared_request(req: WinRequest<'_>) -> openfirma_browser::signing::SignRequest<'_> {
     let mut out =
         openfirma_browser::signing::SignRequest::new(req.format, req.digest).from_window();
@@ -73,9 +73,9 @@ fn shared_request(req: WinRequest<'_>) -> openfirma_browser::signing::SignReques
 mod tests {
     use super::*;
 
-    /// La delegación debe negarse a un formato incompatible antes de tocar el
-    /// firmante: la misma guard corre aquí que en el despachador compartido.
-    /// `Mock` representa cualquier signer — nunca se llama cuando se niega.
+    /// The delegation must refuse an incompatible format before touching the
+    /// signer: the same guard runs here as in the shared dispatcher. `Mock`
+    /// stands for any signer — it is never called when the request is refused.
     #[test]
     fn a_format_that_cannot_hold_the_file_is_refused() {
         let signer: &dyn Signer = &Mock;
@@ -97,7 +97,8 @@ mod tests {
 
     #[test]
     fn half_a_long_term_level_is_refused() {
-        // Sin TSA, B-LT no puede sellar nada y lo primero que oye es la url…
+        // Without a TSA, B-LT cannot seal anything and the first thing heard
+        // is the url…
         let err = execute(
             "pades-b-lt",
             b"%PDF-1.4\n",
@@ -108,9 +109,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("TSA url"), "{err}");
-        // …y con ella sigue la negación honesta que esta ventana recoge: la
-        // frase de delegación es compartida y apunta al terminal (la GUI no
-        // recoge nada). La marca from_window hace la frase específica.
+        // …and with one comes the honest refusal this window collects: the
+        // delegation sentence is shared and points at the terminal (the GUI
+        // collects nothing). The from_window marker makes the sentence specific.
         let tsa: TimestampFn = std::sync::Arc::new(|_, _| Ok(vec![vec![0u8; 2]]));
         let err = execute(
             "pades-b-lt",
@@ -134,7 +135,7 @@ mod tests {
     struct Mock;
     impl Signer for Mock {
         fn certificate(&self) -> &CertificateHandle {
-            unreachable!("una negativa nunca pregunta quién firma")
+            unreachable!("a refusal never asks who signs")
         }
         fn chain(&self) -> &[CertificateHandle] {
             &[]
@@ -143,7 +144,7 @@ mod tests {
             Ok(openfirma_core::KeyAlgorithm::Rsa)
         }
         fn sign_prehash(&self, _: DigestAlg, _: &[u8]) -> openfirma_core::Result<Vec<u8>> {
-            unreachable!("una negativa nunca firma")
+            unreachable!("a refusal never signs")
         }
     }
 }

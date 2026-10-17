@@ -132,8 +132,16 @@ impl CertificateHandle {
 
     /// `true` when the certificate's validity window ended before `now`.
     pub fn expired_at(&self, now: std::time::SystemTime) -> bool {
+        self.not_after() < now
+    }
+
+    /// The instant the validity window ends (RFC 5280 `notAfter`), as a plain
+    /// `SystemTime` so frontends never need the ASN.1 type by name — the GUI's
+    /// picker prints "válido hasta" from exactly this value and cannot drift
+    /// from what `expired_at` decided (finding A-7).
+    pub fn not_after(&self) -> std::time::SystemTime {
         let not_after = self.parsed().tbs_certificate().validity().not_after;
-        std::time::SystemTime::from(not_after) < now
+        std::time::SystemTime::from(not_after)
     }
 
     /// The DNIe's authentication certificate, by the rule AutoFirma applies

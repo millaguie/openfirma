@@ -28,7 +28,15 @@ use openfirma_core::signer::Signer;
 
 /// A keystore the operating system or a token owns, and whose keys cannot be
 /// read out of it.
-pub trait SystemStore {
+///
+/// `Send + Sync` is part of the boundary (review 06, A-1): the GUI's signing
+/// worker holds its store behind an `Arc` while it runs off the UI thread, so
+/// "which keystore am I looking at" must stay answerable from another thread.
+/// Every backend already satisfies it — PKCS#11 calls are serialised by the
+/// module's own `call_lock`, and the platform stores wrap plain handles (the
+/// same ones that crossed threads in `boxed_signer` before). NSS keeps its
+/// database pointer in a process-wide registry rather than in the store.
+pub trait SystemStore: Send + Sync {
     /// Every certificate in the store that has a private key the store can
     /// sign with, leaf first. Objects without a matching private key are not
     /// returned: they cannot sign, and listing them would let `--store` pick

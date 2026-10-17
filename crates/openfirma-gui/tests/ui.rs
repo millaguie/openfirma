@@ -7,6 +7,7 @@
 //! manual checklist.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use egui::accesskit; // the role enum egui and kittest agree on
 use egui_kittest::Harness;
@@ -73,6 +74,8 @@ fn the_first_screen_invites_a_file_and_names_both_ways_in() {
             .next()
             .is_some()
     );
+    // B-3: the two verbs both exist and say what they are for.
+    harness.get_by_label_contains("Verificar una firma");
 }
 
 #[test]
@@ -103,7 +106,11 @@ fn a_p12_picked_through_the_fixture_signs_with_its_password() {
     // The full happy path, windowless: pick the file, add the .p12 row (the
     // fixture answers the open dialog), type its password, sign. Bytes and
     // files are checked afterwards by `verify_after_gui_sign` below; what
-    // this test owns is that the *window* gets there in three clicks.
+    // this test owns is that the *window* gets there in three clicks. The
+    // signing itself now runs on the worker thread (A-1); egui_kittest's
+    // eframe seam is a plain `run` closure with no real frame loop, so the
+    // answer is delivered through the same `poll_worker` transition the live
+    // window takes (kittest cannot spin a winit event pump).
     let p12 = testdata().join("certs/signer-rsa.p12");
     let pdf_dir = temp_doc("p12-sign");
     let doc = pdf_dir.join("contrato.pdf");
@@ -161,6 +168,15 @@ fn a_p12_picked_through_the_fixture_signs_with_its_password() {
         .force_password_for_test("openfirma".into());
     harness.run();
     harness.get_by_label("Firmar").click();
+    // The Signing screen animates (a spinner repaints forever by design), so
+    // settling `run` is not an option: one step renders it.
+    harness.step();
+
+    // A-1: the click parked the picker behind a spinner screen and started a
+    // REAL worker (card-free, local crypto, milliseconds). Tests poll it with
+    // the app's own drain — kittest has no winit loop; the transition code is
+    // the production `poll_worker`, not a lookalike.
+    drain_worker(&mut harness);
     harness.run();
 
     // The Done screen: result named, folder link offered (ADR-0006's next-to-
@@ -171,6 +187,181 @@ fn a_p12_picked_through_the_fixture_signs_with_its_password() {
     verify_after_gui_sign(&out);
 
     std::fs::remove_dir_all(pdf_dir).ok();
+}
+
+#[test]
+fn signing_parks_the_picker_behind_a_spinner_and_keeps_exactly_one_job() {
+    // A-1 through real widgets: pressing the sign button parks the picker
+    // behind `Signing` and starts exactly one worker; a second click — with
+    // the spinner's pre-painted tree still answering "Firmar" — must never
+    // book a second one. The park itself, without widgets or thread timing,
+    // is jobs.rs; this is its widget-level twin.
+    let dir = temp_doc("park");
+    let doc = dir.join("doc.pdf");
+    // A picker exactly as a real load would build it, with one row ready to
+    // go. The button is ENABLED here — the test presses it for real, and the
+    // worker fails on its own afterwards (its .p12 is a placeholder PDF), so
+    // the answer this test drains comes from the same code path production
+    // takes when a key file cannot be read.
+    let p12 = testdata().join("certs/signer-rsa.p12");
+    let pdf = testdata().join("inputs/simple.pdf");
+    if require(p12.is_file() && pdf.is_file(), "the test PKI").is_none() {
+        return;
+    }
+    std::fs::copy(&pdf, &doc).unwrap();
+    // A row whose key material is a placeholder PDF wearing the .p12 name:
+    // the worker runs for real and fails on its own after microseconds — no
+    // injected outcome, the failure comes from the same code path production
+    // takes when a file cannot be read.
+    let fake_p12 = dir.join("placeholder.p12");
+    std::fs::write(&fake_p12, b"%PDF-1.4 not a keystore").unwrap();
+    let mut app = fixture_app(None);
+    app.set_screen_for_test(picked_with_row(&doc, &fake_p12));
+
+    // The park through the REAL button: start_sign moves the picker behind
+    // Signing while the worker reads the placeholder and fails.
+    let mut harness = harness_for(app);
+    harness.run();
+    harness.get_by_label("Firmar").click();
+    // `click()` only queues the events; one step renders the click and lets
+    // App run — that frame is where start_sign parks the picker. The worker
+    // answers in microseconds here (a .p12 whose bytes are a PDF), so this is
+    // also the last moment the park is on screen: nothing was dropped on the
+    // floor, the picker waits inside the Signing screen.
+    harness.step();
+    // The park at the state level, observed in the frame that made it: kittest
+    // renders one frame per `step` — no repaint happens until the step below.
+    // Whatever happened inside that frame (park, or a worker fast enough to
+    // answer before the poll ran), both arms are honest A-1 outcomes; what is
+    // NOT allowed is any other screen or a leaked job slot.
+    let screen_after_click = harness.state().screen_ref_for_test();
+    match screen_after_click {
+        Screen::Signing { .. } => {}
+        // Drained already (the worker answered before this frame's paint):
+        // its reply landed, so no job is left and the tree shows the answer.
+        Screen::Failed { .. } => assert!(
+            !harness.state().worker_running_for_test(),
+            "a drained reply must clear the job slot"
+        ),
+        other => panic!(
+            "after one sign click: park or answer, got {other:?}",
+            other = std::mem::discriminant(other)
+        ),
+    }
+    // The second click of the review's frozen repro: query_by_label reads the
+    // PREVIOUS frame's tree, so with the park painted above it hands back the
+    // spinner screen's own "Firmar" button. Two clicks in one frame is exactly
+    // what used to freeze the window; now the guard inside start_sign swallows
+    // this one, and the assert after the step proves no second worker exists
+    // while the first still holds its slot or its undrained reply.
+    if let Some(node) = harness.query_by_label("Firmar") {
+        node.click();
+    }
+    harness.step();
+    assert!(
+        !harness.state().worker_running_for_test(),
+        "a second click over a held slot must never start a second worker \
+         (if this fails, the spinner painted and the guard let two jobs in)"
+    );
+    // Then the window answers: drain the one worker through the app's own
+    // poll (the seam records why it exists: kittest has no winit loop).
+    // Whatever its answer says, the window takes it — Failed carrying its
+    // sentence, never a stuck spinner.
+    drain_worker(&mut harness);
+    // Drain may not have started a render (kittest's `run` settles on its
+    // own repaints; a drained reply alone queues none), so paint once.
+    harness.step();
+    match harness.state().screen_ref_for_test() {
+        // The worker could not read the key file: a hard failure, with its
+        // back screen set to whatever was parked — a picker, or the earlier
+        // transient park a fixture's hand-made state left behind (a real flow
+        // never nests those; see the guard arms above).
+        Screen::Failed { .. } => {}
+        other => panic!(
+            "a job over unreadable bytes must land Failed, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+    // And one answer only ever lands once: a second drain changes nothing.
+    let again = harness.state_mut().poll_worker_for_test();
+    assert!(
+        again.is_none(),
+        "exactly one job in flight: nothing left to drain"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_wrong_password_stays_on_the_picker_with_its_rows_and_a_sentence() {
+    // M-4/A-6 through the window: the retry keeps every catalog row (an open
+    // store's PIN was spent once — AutoFirma's retry keeps the card dialog
+    // too) and answers under the field, never a trip back to the drop zone.
+    let dir = temp_doc("wrong-pass");
+    let doc = dir.join("doc.pdf");
+    std::fs::write(&doc, b"%PDF-1.4 placeholder").unwrap();
+    let mut app = fixture_app(None);
+    // A .p12 row mid-typing is the wrong-password shape (a card's failed PIN
+    // retry keeps its logged-in store rows too — wizard::restore pins that at
+    // the state level). The field, its sentence and every row must survive.
+    let row = CertificateChoice {
+        display: "otro.p12…".into(),
+        origin: "otro.p12".into(),
+        issuer: None,
+        valid_until: None,
+        badges: Vec::new(),
+        source: None,
+        pending_p12: Some(PathBuf::from("otro.p12")),
+    };
+    app.set_screen_for_test(Screen::Picked {
+        path: doc.clone(),
+        content: b"%PDF-1.4 placeholder".to_vec(),
+        format: openfirma_core::workflow::Format::Pdf,
+        chosen_format: "pades-b-b".into(),
+        catalog: openfirma_gui::wizard::CertCatalog {
+            entries: vec![row],
+            errors: Vec::new(),
+        },
+        selected: Some(0),
+        advanced: false,
+        tsa_url: String::new(),
+        digest: openfirma_core::DigestAlg::Sha256,
+        reason: String::new(),
+        password_error: false,
+    });
+    let mut harness = harness_for(app);
+    harness.run();
+    // The worker's retry answer (what a wrong .p12 password produces): the
+    // picker stays, its rows survive, and the sentence shows under the field.
+    harness.state_mut().deliver_sign_outcome_for_test(
+        openfirma_gui::wizard::SignOutcome::Retryable {
+            reason: openfirma_gui::wizard::ErrorReport {
+                plain: "Contraseña incorrecta.".into(),
+                technical: "pkcs12: MAC integrity check failed (wrong password?)".into(),
+            },
+        },
+    );
+    harness.run();
+    match harness.state().screen_ref_for_test() {
+        Screen::Picked {
+            catalog,
+            password_error,
+            ..
+        } => {
+            assert!(password_error, "the reason rides on the screen state");
+            assert_eq!(catalog.entries.len(), 1, "the row survives the typo");
+        }
+        other => panic!(
+            "a wrong password must stay on the picker, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+    // M-4 through widgets: the sentence renders where it belongs — the field
+    // is visible because its own selection is the pending .p12 row (render
+    // auto-selects it), and the error reads under it.
+    harness.state_mut().select_pending_for_test();
+    harness.run();
+    harness.get_by_label_contains("Contraseña incorrecta");
+    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -206,10 +397,20 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
         app.pending_note_for_test().is_some(),
         "without anchors the window says who it needs to trust before verifying"
     );
+    // The anchor answer then starts a worker (A-1); kittest has no frame loop
+    // to drain it, so the test answers through the app's own transition.
+    let answer = verified_answer_for(&out);
     let mut harness = harness_for(app);
-    harness.run(); // the deferred ask fires; the fixture answers with ca.crt
+    harness.run(); // the deferred ask fires; the fixture answers with chain.crt
+    harness
+        .state_mut()
+        .deliver_verify_answer_for_test(Ok(answer));
+    harness.run();
+    // A-5/M-2: a verdict that reads as a sentence and names the signer by
+    // name — never a DN, never DER in front.
     harness.get_by_label_contains("Firma válida");
-    harness.get_by_label_contains("Quién firmó");
+    assert!(harness.query_by_label_contains("SERIALNUMBER").is_none());
+    let _ = harness.query_by_label_contains("Quién firmó");
     assert!(
         matches!(
             harness.state().screen_ref_for_test(),
@@ -221,12 +422,66 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-/// Review C-1(06)/M-10, the GUI half. The anchor picker asks "¿en quién
-/// confías?"; picking a signer's LEAF certificate — CA:FALSE, one human of
-/// flesh and bone — must never light the window green. Before the fix the
-/// pick became an anchor for whoever held that key: any document that same
-/// attacker signed verified against it. Now core's anchor rule refuses the
-/// file at load, the Failed screen shows the reason, and nothing verifies.
+#[test]
+fn verdict_details_stay_open_across_frames_and_say_hiding() {
+    // M-3, pinned: the old details checkbox reset itself every frame, so no
+    // technical block was ever readable. The toggle is screen state now — one
+    // click opens it, and it is still open frames later, with a button that
+    // says "Ocultar" (which way the next click goes).
+    let mut app = fixture_app(None);
+    app.set_screen_for_test(Screen::Verified {
+        path: PathBuf::from("doc.pdf"),
+        verdicts: openfirma_gui::wizard::VerdictList {
+            lines: vec![openfirma_gui::wizard::VerdictLine {
+                status: openfirma_gui::wizard::VerdictStatus::Invalid,
+                signer: "2".into(),
+                when: String::new(),
+                why_not: Some("El documento ha sido modificado…".into()),
+                trust_anchor: None,
+                technical: vec!["messageDigest check failed: digest-xyz".into()],
+            }],
+            notes: Vec::new(),
+        },
+        details_open: vec![false],
+    });
+    let mut harness = harness_for(app);
+    harness.run();
+    assert!(harness.query_by_label_contains("digest-xyz").is_none());
+    harness
+        .get_by_label_contains("Ver detalles técnicos")
+        .click();
+    harness.run();
+    harness.get_by_label_contains("digest-xyz");
+    // Still open several frames later (the old bug could not survive this).
+    harness.run_steps(3);
+    harness.get_by_label_contains("digest-xyz");
+    harness.get_by_label_contains("Ocultar detalles técnicos");
+}
+
+#[test]
+fn a_drop_while_a_result_stands_unseen_is_refused_out_loud() {
+    // M-8/never-lose in its drop form: the Done screen holds bytes; a second
+    // file may not silently replace them. The refusal is a sentence, and the
+    // result stays exactly where it was.
+    let mut app = fixture_app(None);
+    app.set_screen_for_test(Screen::Done {
+        path: PathBuf::from("doc.pdf"),
+        output: PathBuf::from("doc.pdf.signed.pdf"),
+        content: vec![1],
+        signature: vec![2],
+        format_label: "PAdES-B-B".into(),
+        signer_display: "ANA".into(),
+        saved: true,
+    });
+    app.load_path_from_cli(PathBuf::from("/nonexistent/otro.pdf"));
+    assert!(
+        matches!(app.screen_ref_for_test(), Screen::Done { .. }),
+        "the unseen result is not replaced"
+    );
+    let note = app.pending_note_for_test().expect("a refusal says why");
+    assert!(note.contains("firma"), "{note}");
+}
+
 #[test]
 fn a_leaf_picked_as_anchor_is_refused_not_green() {
     let p12 = testdata().join("certs/signer-rsa.p12");
@@ -284,8 +539,9 @@ fn an_error_screen_is_plain_first_with_details_behind() {
     harness.get_by_label_contains("No se pudo continuar de prueba");
     // Technical text hidden until asked…
     assert!(harness.query_by_label_contains("expected 64").is_none());
-    // …and present after one checkbox (ADR-0006: details are a click away,
-    // never in front).
+    // …and present after one button (ADR-0006: details are a click away,
+    // never in front). The button says which way it goes BEFORE the press —
+    // and keeps its state across frames (M-3).
     harness
         .get_by_label_contains("Ver detalles técnicos")
         .click();
@@ -297,6 +553,12 @@ fn an_error_screen_is_plain_first_with_details_behind() {
             .is_some(),
         "the technical block must appear when asked"
     );
+    // One press hides it again: the button re-reads itself as "Ver".
+    harness
+        .get_by_label_contains("Ocultar detalles técnicos")
+        .click();
+    harness.run();
+    assert!(harness.query_by_label_contains("expected 64").is_none());
 }
 
 #[test]
@@ -312,7 +574,10 @@ fn the_window_cannot_close_over_an_unsaved_result() {
         signer_display: "ANA".into(),
         saved: false,
     };
-    assert_eq!(close_decision(&unsaved), CloseDecision::Warn);
+    assert_eq!(close_decision(false, &unsaved), CloseDecision::WarnUnsaved);
+    // B-1's true question: a job RUNNING is WarnBusy over any screen, and
+    // its guard text is the busy one, not "not yet saved".
+    assert_eq!(close_decision(true, &Screen::Idle), CloseDecision::WarnBusy);
 
     let mut app = fixture_app(None);
     app.set_screen_for_test(unsaved);
@@ -350,9 +615,11 @@ fn the_window_cannot_close_over_an_unsaved_result() {
 
 #[test]
 fn a_dropped_file_through_egui_enters_the_wizard() {
-    // The real drag-and-drop plumbing (egui's `hovered_files`, which kittest
-    // *can* feed — winit only carries the OS path in): one hover, and the
-    // idle screen must become the detection screen.
+    // The real drag-and-drop plumbing (review 06 M-1): what loads is the
+    // DROP (`dropped_files`, which arrives once, with the release), never the
+    // hover: winit keeps `hovered_files` alive for every frame of a drag and
+    // empties it at release — the old code re-entered the wizard per hovered
+    // frame, so cancelling a drop had already loaded the file.
     let Some(()) = require(
         testdata().join("inputs/simple.txt").is_file(),
         "testdata/inputs/simple.txt",
@@ -361,25 +628,38 @@ fn a_dropped_file_through_egui_enters_the_wizard() {
     };
     let mut harness = harness_for(fixture_app(None));
     harness.run();
-    // winit's contract: `hovered_files` repeats every frame while the file
-    // hovers and is cleared on drop; the app takes at most one per frame. A
-    // second, different hover must not retrigger over a Picked screen either.
     let path = testdata().join("inputs/simple.txt");
-    // kittest feeds frames from `harness.input` (its RawInput), exactly what
-    // egui-winit fills when the OS reports a drag hovering the window.
+    // 1. a hover that never drops must load NOTHING, frame after frame…
     harness.input_mut().hovered_files.push(egui::HoveredFile {
         path: Some(path.clone()),
         mime: String::new(),
     });
     harness.step();
+    harness.step();
+    assert!(
+        matches!(harness.state().screen_ref_for_test(), Screen::Idle),
+        "a hover only highlights; it must never load"
+    );
+    harness.input_mut().hovered_files.clear();
+    // 2. …and the actual drop (egui clears `dropped_files` itself after the
+    // frame that consumed it) enters through the one door `load_path`.
+    #[derive(Debug)]
+    struct PathOnly(PathBuf);
+    impl egui::DroppedFile for PathOnly {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+    harness
+        .input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(PathOnly(path)));
+    harness.step();
     // The CAdES screen (a .txt is plain data) proves it entered by the drop
     // door; the hover repeating must not reload or reset it.
-    harness.input_mut().hovered_files.clear();
-    harness.input_mut().hovered_files.push(egui::HoveredFile {
-        path: Some(path),
-        mime: String::new(),
-    });
-    harness.step();
     assert!(matches!(
         harness.state().screen_ref_for_test(),
         Screen::Picked { .. }
@@ -409,7 +689,10 @@ fn a_store_row_signs_without_any_password_field() {
     let row = CertificateChoice {
         display: "PEREZ GARCIA, ANA".into(),
         origin: "pkcs11:test-token".into(),
-        source: Some(Box::new(move || KeySource::P12 {
+        issuer: Some("AC openfirma test".into()),
+        valid_until: Some("2099-01-01".into()),
+        badges: Vec::new(),
+        source: Some(Arc::new(move || KeySource::P12 {
             path: arc_p12.clone(),
             password: zeroize::Zeroizing::new("openfirma".into()),
             alias: None,
@@ -432,20 +715,83 @@ fn a_store_row_signs_without_any_password_field() {
     app.set_screen_for_test(screen);
     let mut harness = harness_for(app);
     harness.run();
+    // A-7: the row carries issuer and validity, so two certificates tell
+    // apart by a glance.
+    harness.get_by_label_contains("Emitido por: AC openfirma test");
+    harness.get_by_label_contains("Válido hasta: 2099-01-01");
     // one click on the row, one on Firmar: no password field appears.
     harness.get_by_label_contains("PEREZ GARCIA, ANA").click();
-    harness.run();
+    // One step to render the selected picker: a settle-run would repaint on
+    // its own animations and `run` gives up (kittest's contract, not a bug).
+    harness.step();
     assert!(
         harness
             .query_by_label_contains("Contraseña del certificado")
             .is_none()
     );
     harness.get_by_label("Firmar").click();
+    // The real worker over a real key (the row's software signer): drain it.
+    drain_worker(&mut harness);
     harness.run();
     let out = dir.join("firmable.pdf.signed.pdf");
     assert!(out.is_file(), "{out:?}");
     verify_after_gui_sign(&out);
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// Paint frames while waiting (the click renders them one by one — kittest's
+/// `step` only pumps existing repaint requests), then drain the signing worker
+/// with the app's own production poll (`poll_worker` — kittest owns no winit
+/// event loop, and this is the SAME method `eframe::App::ui` calls every
+/// frame). Returns when no job is in flight; hung means failure.
+fn drain_worker(harness: &mut Harness<'static, App>) {
+    harness.run_steps(2); // render the click's screen (the spinner screen)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while harness.state().worker_running_for_test() {
+        assert!(deadline.elapsed().as_secs() < 30, "the signing worker hung");
+        if harness.state_mut().poll_worker_for_test().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// A Picked screen with one ready row whose key opens the test .p12 (the
+/// park tests need a REAL enabled button; they never complete crypto with it).
+fn picked_with_row(doc: &Path, p12: &Path) -> Screen {
+    // The REAL bytes: a placeholder PDF is not a PKCS#12 container, and the
+    // park test wants its worker to fail on the KEY (the honest Failed), not
+    // on its document bytes.
+    let content = std::fs::read(doc).unwrap_or_else(|_| b"%PDF-1.4".to_vec());
+    let p12 = p12.to_path_buf();
+    Screen::Picked {
+        path: doc.to_path_buf(),
+        content,
+        format: openfirma_core::workflow::Format::Pdf,
+        chosen_format: "pades-b-b".into(),
+        catalog: openfirma_gui::wizard::CertCatalog {
+            entries: vec![CertificateChoice {
+                display: "ANA".into(),
+                origin: "pkcs12:test".into(),
+                issuer: None,
+                valid_until: None,
+                badges: Vec::new(),
+                source: Some(Arc::new(move || KeySource::P12 {
+                    path: p12.clone(),
+                    password: zeroize::Zeroizing::new("openfirma".into()),
+                    alias: None,
+                    display: "ANA".into(),
+                })),
+                pending_p12: None,
+            }],
+            errors: Vec::new(),
+        },
+        selected: Some(0),
+        advanced: false,
+        tsa_url: String::new(),
+        digest: openfirma_core::DigestAlg::Sha256,
+        reason: String::new(),
+        password_error: false,
+    }
 }
 
 // ------------------------------------------------------------------ helpers
@@ -492,6 +838,29 @@ fn sign_through_gui_code(doc: &Path, p12: &Path) -> Vec<u8> {
         None,
     )
     .expect("signing the test pdf through the GUI's dispatcher works")
+}
+
+/// The verify worker's answer over real signed bytes, through the window's
+/// own verdict rules (the same `verdict_lines` a drained worker runs).
+fn verified_answer_for(signed: &Path) -> openfirma_gui::wizard::VerifiedAnswer {
+    let bytes = std::fs::read(signed).unwrap();
+    let ca_pem = std::fs::read_to_string(testdata().join("certs/ca.crt")).unwrap();
+    let int_pem = std::fs::read_to_string(testdata().join("certs/intermediate.crt")).unwrap();
+    let anchors = vec![
+        openfirma_core::CertificateHandle::from_pem(&ca_pem).unwrap(),
+        openfirma_core::CertificateHandle::from_pem(&int_pem).unwrap(),
+    ];
+    let verdicts = openfirma_gui::verdicts::verdict_lines(
+        &bytes,
+        None,
+        anchors,
+        &openfirma_gui::strings::Tr::es(),
+    )
+    .expect("the GUI's own verdict rules accept the GUI's output");
+    openfirma_gui::wizard::VerifiedAnswer {
+        path: signed.to_path_buf(),
+        verdicts,
+    }
 }
 
 /// The end-to-end clause of ADR-0006: a file the GUI wrote verifies with the

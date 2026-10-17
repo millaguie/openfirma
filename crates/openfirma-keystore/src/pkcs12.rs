@@ -186,7 +186,12 @@ impl Pkcs12 {
         }
     }
 
-    fn aliases(&self) -> Vec<String> {
+    /// The entry names of this container, in file order: each entry's
+    /// friendlyName, or a positional `<entry n>` when it carries none. Public
+    /// because `autofirma listaliases` (review 06, A-8) answers exactly that
+    /// question for a PKCS#12 and must read it through this crate's own rule,
+    /// never a re-parse that could drift from what `entry()` actually picks.
+    pub fn aliases(&self) -> Vec<String> {
         self.entries
             .iter()
             .enumerate()

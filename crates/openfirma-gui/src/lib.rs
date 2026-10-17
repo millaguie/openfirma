@@ -9,3 +9,7 @@ pub mod strings;
 pub mod tsa;
 pub mod verdicts;
 pub mod wizard;
+
+/// The window's type under the name `main.rs` (and downstream tests) use:
+/// one obvious entry point, re-exported from the module that owns it.
+pub use app::App as OpenfirmaApp;
