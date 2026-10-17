@@ -143,16 +143,6 @@ pub fn expand_home(path: &str) -> String {
     path.to_string()
 }
 
-/// The default trust anchors of the GUI's verify path, in this order:
-///
-/// 1. `$OPENFIRMA_TRUST`, a `:`-separated list of PEM/DER files (the knob
-///    tests and power users use, mirroring how other tools take an explicit
-///    CAfile),
-/// 2. the system trust store where one can be read without a dependency that
-///    breaks the pure-Rust rule — which today means nothing portable in-tree,
-///    so with no variable set there are no anchors and the caller must show
-///    its "what certificate do you trust?" affordance instead of pretending.
-///
 /// The default trust anchors of both frontends' verify path: today exactly
 /// one source, `$OPENFIRMA_TRUST`, a search-path list of PEM/DER files (the
 /// platform separator — `:` on unix, `;` on Windows, so paths carrying a

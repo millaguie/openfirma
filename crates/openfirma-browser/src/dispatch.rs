@@ -274,9 +274,11 @@ fn sign_from_uri(
     op: Operation,
 ) -> Result<BrowserResult, BrowserError> {
     // cosign and countersign both need an already-signed document to work on;
-    // openfirma can produce a CAdES co-signature the way `sign` does (a second
-    // SignerInfo), but there is no golden proof for what a sede's page expects
-    // back from them, so they are named and refused rather than guessed at.
+    // openfirma has no co-signature or counter-signature function yet (a plain
+    // `sign` call produces a single SignerInfo over the content, which is not
+    // the same operation), and there is no golden proof for what a sede's page
+    // expects back from either, so they are named and refused rather than
+    // guessed at.
     if op != Operation::Sign {
         return Err(BrowserError::new(
             "unsupported-operation",

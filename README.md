@@ -17,10 +17,15 @@ are reached through Rust binding crates, see `docs/platforms.md`.
 
 Very early, phase 1. What works today:
 
-- **CAdES-B-B** signing, RSA and ECDSA P-256, SHA-1/224/256/384/512,
-  encapsulated and detached, with `signingCertificateV2`, `signingTime` and the
-  ESS `contentHint` attribute. Verified by OpenSSL in CI, and structurally
-  identical to the official AutoFirma 1.9 output, see `tools/golden-diff.sh`.
+- **CAdES-B-B** signing, RSA and ECDSA P-256/P-384/P-521,
+  SHA-1/224/256/384/512 (SHA-1 only with `--allow-weak-algorithms`: the
+  ETSI TS 119 312 conservative policy refuses it by default), encapsulated
+  and detached, with `signingCertificateV2` (v1 for SHA-1, AutoFirma's rule),
+  `signingTime`, the ESS `contentHint` attribute, the certificatePolicies copy
+  into ESSCertIDv2, and the optional `signaturePolicyIdentifier`,
+  `commitmentTypeIndication` and `mime-type` attributes. Verified by OpenSSL in
+  CI, and structurally identical to the official AutoFirma 1.9 output, see
+  `tools/golden-diff.sh` and the measured case table in `docs/validation.md`.
 - **PAdES-B-B** signing: a detached CAdES in `/Contents`, added as an
   incremental update that leaves the original document bytes untouched, with
   the AcroForm field, `/ByteRange`, and an invisible or a visible appearance.
@@ -55,8 +60,12 @@ Very early, phase 1. What works today:
   attributes re-tagged as `SET OF`, the `signingCertificateV2` reference, and
   the certificate chain from the signer up to the trust anchors you supply,
   each link's signature and every validity date checked at a validation time
-  of your choice. RSA and ECDSA P-256. It is the in-repo verifier, not a
-  substitute for VALIDe or the ETSI validators, see `docs/validation.md`.
+  of your choice. RSA and ECDSA P-256/P-384/P-521, and SKI-based signer
+  identifiers (SignerInfo version 3). The default `AlgorithmPolicy` is the
+  ETSI TS 119 312 conservative one: SHA-1 signature digests and RSA keys
+  below 2048 bits are refused unless the caller opts out explicitly. It is
+  the in-repo verifier, not a substitute for VALIDe or the ETSI validators,
+  see `docs/validation.md`.
 - CLI: `openfirma sign`, `openfirma verify`, `openfirma inspect` (dumping any
   DER signature as a normalized tree for diffing), and `openfirma keystores
   list`, which lists what a PKCS#11 token or NSS database holds.
@@ -71,7 +80,7 @@ docs/adr/0005-browser-protocol.md and the table row below.
 
 | Component | Status |
 |---|---|
-| CAdES-B-B (RFC 5652 CMS + ETSI EN 319 122-1) | works, crosschecked with OpenSSL |
+| CAdES-B-B (RFC 5652 CMS + ETSI EN 319 122-1) | works, crosschecked with OpenSSL; measured golden cases and the not-implemented list (co-signature, counter-signature, ESS V3, EPES) in docs/cades.md |
 | PAdES-B-B (PDF, ISO 32000 + ETSI EN 319 142-1) | works, crosschecked with OpenSSL and qpdf |
 | Verification of CAdES and PAdES (crypto, chain, trust anchors) | works, crosschecked with OpenSSL |
 | CAdES/PAdES B-T (RFC 3161 time-stamp) | works, crosschecked with openssl ts |

@@ -70,6 +70,28 @@ in the CAdES encoder that OpenSSL tolerated: a missing `SigningCertificateV2`
 wrapper level, an unsorted `certificates` set, `sha256WithRSAEncryption` where
 RFC 3370 requires `rsaEncryption`, and encapsulating content by default.
 
+The CAdES cases the driver runs today, each one measuring a specific shape
+against the jar rather than arguing about it:
+
+| case | what it pins | finding |
+|---|---|---|
+| `simple` | advanced-profile defaults: detached, signingTime, V2 with issuerAndSerialNumber, contentHint "binary" | — |
+| `sha1` | v1 `signingCertificate` for SHA-1 (the dump drives every mirrored knob), and the openfirma refusal unless `--allow-weak-algorithms` | M1, M5 |
+| `ecdsa` | `SEQUENCE { OID ecdsa-withSHA256, NULL }` — BouncyCastle's parameters shape | B1 |
+| `policies` | the certificate's certificatePolicies copied into ESSCertIDv2, flattened exactly as BouncyCastle encodes them (no wrapper tag) | M2 |
+| `policy_commit` | signaturePolicyIdentifier with the sede's published sigPolicyHash (`AQI=` travels to both sides) and commitmentTypeIndication | M9 |
+| `mime` | mime-type as UTF8String under 0.4.0.1733.2.1 | M3 |
+
+The hint description in every case is read back from AutoFirma's own dump
+rather than guessed, because its Spanish per-type descriptions come from a
+jmimemagic database openfirma does not ship by design; the jar writes "binary"
+on this driver's classpath and openfirma mirrors exactly that. The `mime`
+case therefore also documents what is *not* diffed: AutoFirma's jmimemagic
+probe attribute when MIME detection is on and no type was pinned. Every case
+skips cleanly when the certificate it needs (`signer-policy`, `signer-ec`) is
+not generated, and the whole set prints MATCH on a machine with the jar, the
+test PKI and cargo built.
+
 ## 2. Independent verifiers in cargo test
 
 Five independent implementations are wired into `cargo test`, each checking a

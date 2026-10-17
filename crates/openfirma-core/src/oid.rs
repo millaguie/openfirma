@@ -21,7 +21,9 @@ pub const ID_SIGNING_TIME: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.
 pub const ID_COUNTER_SIGNATURE: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.6");
 
-// RFC 3370 / ESS, used by AutoFirma's advanced profile by default
+// ESS attributes (RFC 2634, OID arc assigned through the S/MIME certificate
+// attributes of RFC 5755's lineage; RFC 3370 only lists them in its CMS
+// appendix). The advanced profile signs with contentHint by default.
 pub const ID_CONTENT_HINT: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.4");
 
