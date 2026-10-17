@@ -74,6 +74,29 @@ enum Command {
         #[arg(long)]
         register: bool,
 
+        /// With --register only: confirm that openfirma takes the `afirma://`
+        /// scheme from any AutoFirma installed on this machine (a scheme has
+        /// exactly one default handler; finding A-2). Without it, a detected
+        /// AutoFirma makes --register refuse. Also accepts --unregister to
+        /// undo what --register wrote — nothing else's registration is touched.
+        #[arg(long, requires = "register")]
+        acknowledge_autofirma: bool,
+
+        /// Undo the scheme registration (--desktop/--registry file and the
+        /// default-handler association) that openfirma wrote; never a key or
+        /// a browser's own settings. Takes no URI and signs nothing.
+        #[arg(long, conflicts_with = "register")]
+        unregister: bool,
+
+        /// Allow THIS invocation's key to sign browser calls without asking
+        /// anybody (finding A-3). The AutoFirma-equivalent of skipping its
+        /// certificate dialog and PIN prompt: only an owner who means it
+        /// passes this; with a --config key, `allow_unattended = true` in the
+        /// config file is the standing form of the same opt-in. Without any
+        /// opt-in, a browser call refuses instead of signing quietly.
+        #[arg(long)]
+        allow_unattended: bool,
+
         /// Password of the --p12 container. INSECURE like `sign`'s own flag
         /// (argv is visible in ps), but every command that opens a PKCS#12 —
         /// `sign`, `afirma-uri`, `afirma-serve` — answers the same three
@@ -116,6 +139,16 @@ enum Command {
         /// A named --p12 always wins over what the config says.
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// A-3: run the endpoint over a key nobody is asked about. The opt-in
+        /// itself still needs `allow_unattended = true` IN THE BROWSER CONFIG
+        /// when the key comes from it (a standing service outlives whoever
+        /// typed a flag), so this flag is what lets an argv --p12 be the
+        /// opted-in one. Every request holding a valid token then signs with
+        /// no human in the loop; AutoFirma answers that flow with its dialog
+        /// and openfirma's headless endpoint has none.
+        #[arg(long)]
+        allow_unattended: bool,
 
         /// Address to bind. Only loopback addresses are accepted, and
         /// 127.0.0.1:0 (the default) is the documented form: the port that
@@ -1379,7 +1412,19 @@ fn main() -> Result<()> {
             password_file,
             config,
             register,
+            acknowledge_autofirma,
+            unregister,
+            allow_unattended,
         } => {
+            if unregister {
+                if uri.is_some() || output.is_some() {
+                    anyhow::bail!(
+                        "--unregister removes openfirma's registration and signs nothing; a \
+                         URI or --output with it would be ambiguous about this invocation"
+                    );
+                }
+                return unregister_scheme();
+            }
             if register {
                 if uri.is_some() || output.is_some() {
                     anyhow::bail!(
@@ -1387,18 +1432,50 @@ fn main() -> Result<()> {
                          with it would be ambiguous about which one this invocation is"
                     );
                 }
-                return register_scheme(p12, password_file, config.as_deref());
+                return register_scheme(
+                    p12,
+                    password_file,
+                    config.as_deref(),
+                    acknowledge_autofirma,
+                    allow_unattended,
+                );
             }
             let uri = uri.context(
                 "afirma-uri needs the afirma://… URI the browser handed over (or --register \
                  to install the scheme instead of answering a call)",
             )?;
+            // The version the error wire must speak is in the URI itself
+            // (finding M-2), so parse before deciding anything else about it.
+            let parsed = openfirma_browser::uri::parse(&uri).map_err(|e| {
+                anyhow::anyhow!(
+                    "{}",
+                    match openfirma_browser::dispatch::wire_target(None) {
+                        openfirma_browser::dispatch::WireTarget::Protocol41Plus => {
+                            e.wire_error().wire_new()
+                        }
+                        openfirma_browser::dispatch::WireTarget::Legacy =>
+                            e.wire_error().wire_old(),
+                    }
+                )
+            })?;
             // M-3b: the URI channel's key has two homes. argv (--p12 plus its
             // password inputs) wins whenever it names one — that is what an
             // explicit invocation asked for. Otherwise the browser config
             // resolves it (the file `--register` writes), because the OS hands
             // the handler only the URI and nothing else. Both missing is still
             // the named refusal, now with the fix the user can actually apply.
+            // A-3 splits the two homes' consent story: a key that arrives on
+            // argv came from a human typing a command (explicit), a config key
+            // signs quietly only under its file's allow_unattended (or this
+            // flag), and neither ever asks silently on behalf of a page.
+            let config = match &p12 {
+                Some(_) => None,
+                None => browser_key_config(config.as_deref())?,
+            };
+            let mut allow = allow_unattended;
+            // Which home answered decides whose consent this call already has:
+            // argv means the human typing it owns both sides of the key.
+            let used_argv = p12.is_some();
             let (container, password) = match p12 {
                 Some(container) => (
                     container,
@@ -1408,9 +1485,12 @@ fn main() -> Result<()> {
                     )?,
                 ),
                 None => {
-                    let config = browser_key_config(config.as_deref())?;
-                    match config.and_then(|c| c.p12.zip(c.password_file)) {
+                    match config
+                        .as_ref()
+                        .and_then(|c| c.p12.clone().zip(c.password_file.clone()))
+                    {
                         Some((container, password_file)) => {
+                            allow |= config.as_ref().is_some_and(|c| c.allow_unattended);
                             eprintln!(
                                 "signing with the browser config's key: {}",
                                 container.display()
@@ -1438,12 +1518,47 @@ fn main() -> Result<()> {
                     }
                 }
             };
-            let key = openfirma_browser::dispatch::KeySource::P12 {
-                path: &container,
-                password: &password,
+            let key = if allow || used_argv {
+                // Two doors into "the human asked for THIS sign": the explicit
+                // --allow-unattended opt-in, and a key handed over argv by the
+                // very person typing the command (whose consent IS the
+                // invocation — dispatch's Unattended door grants that case with
+                // Consent::Granted, while an un-opted CONFIG key stays refused
+                // until its file says allow_unattended = true). A tty still
+                // prompts on top either way.
+                openfirma_browser::dispatch::KeySource::P12 {
+                    path: &container,
+                    password: &password,
+                }
+            } else {
+                // A config-file key without `allow_unattended = true` in it
+                // (or a half-openable container): no standing authority to sign
+                // quietly; the consent callback below decides.
+                openfirma_browser::dispatch::KeySource::Unattended(
+                    openfirma_browser::dispatch::UnattendedKey {
+                        path: &container,
+                        password: Some(password.as_str()),
+                        allow_unattended: false,
+                        label: "browser config key",
+                    },
+                )
             };
-            let result = openfirma_browser::dispatch::handle_uri_text(&uri, &key)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let consent = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                terminal_consent()
+            } else {
+                // No prompter: `Granted` without an opt-in is exactly the case
+                // dispatch refuses by name ("consent-required").
+                openfirma_browser::dispatch::Consent::Granted
+            };
+            let result = openfirma_browser::dispatch::execute_with_consent(&parsed, &key, consent)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}",
+                        e.wire(openfirma_browser::dispatch::wire_target(
+                            parsed.protocol_version.as_deref()
+                        ))
+                    )
+                })?;
             match output {
                 Some(path) => std::fs::write(&path, &result.payload)
                     .with_context(|| format!("writing {}", path.display()))?,
@@ -1470,6 +1585,7 @@ fn main() -> Result<()> {
             password,
             password_file,
             config,
+            allow_unattended,
             bind,
             issue_token,
             token_only,
@@ -1478,6 +1594,10 @@ fn main() -> Result<()> {
                 .parse()
                 .with_context(|| format!("--bind {bind:?} is not an address like 127.0.0.1:0"))?;
             // Same two homes as `afirma-uri`: argv first, then the config file.
+            // A-3: which home decided also decides whether quiet signing is
+            // allowed — argv keys need this invocation's --allow-unattended,
+            // config keys carry their standing opt-in in the file itself.
+            let allow = allow_unattended;
             let (container, password) = match p12 {
                 Some(container) => (
                     container,
@@ -1487,11 +1607,23 @@ fn main() -> Result<()> {
                 ),
                 None => {
                     let config = browser_key_config(config.as_deref())?;
+                    // A-3: the endpoint is a headless signer by construction —
+                    // it answers every token-bearing request, and AutoFirma's
+                    // equivalent flow always has its dialog + PIN in between.
+                    // So the endpoint accepts only keys whose owner opted them
+                    // in IN THE CONFIG FILE; --allow-unattended cannot stand in
+                    // for a missing file-level opt-in here (a standing service
+                    // outlives whoever typed the flag).
                     match config.and_then(|c| c.p12.zip(c.password_file)) {
-                        Some((container, password_file)) => (
+                        Some((container, password_file)) if allow => (
                             container,
                             p12_password(None, Some(password_file))?
                                 .context("the browser config names a p12 but no password_file")?,
+                        ),
+                        Some(_) => anyhow::bail!(
+                            "the browser config's key has no allow_unattended = true, and \
+                             an endpoint signs every token-bearing request without asking: \
+                             add the opt-in to the config file if its owner means it"
                         ),
                         None => anyhow::bail!(
                             "--p12 names the key the endpoint signs with, or write the \
@@ -1501,6 +1633,21 @@ fn main() -> Result<()> {
                     }
                 }
             };
+            if !allow {
+                // A-3: an endpoint answers whatever loopback request holds a
+                // token; AutoFirma puts a dialog in front of every one of them.
+                // Without the owner's opt-in there is no dialog here, so there
+                // is no endpoint either — refusing now beats signing quietly
+                // later. The config path keeps working when it carries its
+                // own decision; `allow` already folded that in.
+                anyhow::bail!(
+                    "an endpoint over {} would sign browser calls without asking anybody: \
+                     pass --allow-unattended, or let the key come from a browser config \
+                     with allow_unattended = true — only if that is what the key's owner \
+                     decided; see docs/adr/0005-browser-protocol.md",
+                    container.display()
+                );
+            }
             let server = openfirma_browser::serve::LoopbackServer::start(
                 addr,
                 openfirma_browser::serve::OwnedKeySource::P12 {
@@ -1580,6 +1727,8 @@ fn register_scheme(
     p12: Option<PathBuf>,
     password_file: Option<PathBuf>,
     config_path: Option<&Path>,
+    acknowledges_autofirma: bool,
+    allow_unattended: bool,
 ) -> Result<()> {
     // M-3b: the Exec the installer writes carries no key flags (the desktop
     // hands the handler argv's URI and nothing else), so a registration is
@@ -1614,30 +1763,54 @@ fn register_scheme(
             ),
         }
     }
-    let exe = std::env::current_exe().context(
+    let _exe = std::env::current_exe().context(
         "the registration must name openfirma's own absolute path (the OS starts this \
          process from a path already, so this failure means the OS lied about argv0)",
     )?;
+    // A-2: a scheme has exactly ONE default handler. Detect what stands in
+    // the way BEFORE writing anything and require the acknowledgement — the
+    // same decision AutoFirma's configurator dialog makes visible.
+    let detected = openfirma_browser::scheme::detect_autofirma_install();
+    if !detected.is_empty() && !acknowledges_autofirma {
+        anyhow::bail!(
+            "hay un AutoFirma instalado ({}): el esquema afirma:// solo admite un handler \
+             por defecto, y registrar openfirma le sustituye (sus archivos siguen en disco \
+             pero dejen de recibir las llamadas). Repite con --acknowledge-autofirma para \
+             asumirlo, o desinstala primero AutoFirma.",
+            detected
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !detected.is_empty() {
+        println!(
+            "AVISO: se sustituye la registracion de AutoFirma ({}) para afirma://; \
+             se puede revertir con `openfirma afirma-uri --unregister` y volviendo a \
+             ejecutar el configurador de AutoFirma",
+            detected
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     #[cfg(target_os = "linux")]
     {
-        let (path, reindex) = openfirma_browser::scheme::linux_install_paths();
-        // M-3: what cannot be a desktop entry value is refused here, before a
-        // file exists — an entry the desktop environment cannot parse looks
-        // installed and never fires, which no one ever notices.
-        let contents = openfirma_browser::scheme::linux_desktop_entry(&exe).map_err(|e| {
-            anyhow::anyhow!(
-                "el ejecutable no se puede registrar: {e} ({})",
-                exe.display()
-            )
-        })?;
-        std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
-        println!("wrote {}", path.display());
-        println!("then run:  {reindex}");
-        println!(
-            "and make sure the Exec path exists for the desktop environment: \
-             currently it is {}",
-            exe.display()
-        );
+        // A-1/B-1: writing the file is not registration. linux_install_and_register
+        // creates $XDG_DATA_HOME/applications when missing, writes the entry with
+        // AutoFirma's exact Exec quoting, and records it as the default handler
+        // with xdg-mime — the step whose absence left Firefox launching nothing.
+        openfirma_browser::scheme::linux_install_and_register()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (path, _) = openfirma_browser::scheme::linux_install_paths();
+        println!("wrote and registered {}", path.display());
+        if !openfirma_browser::scheme::is_xdg_mime_available() {
+            // Unreachable on this branch (the installer refuses without it),
+            // but the printed advice below is what a user greps for.
+            println!("xdg-mime no esta disponible: instala xdg-utils para completar el registro");
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -1701,21 +1874,71 @@ fn register_scheme(
                 pw_file.display()
             );
         }
+        // B-2: the config names (and the password file IS) signing-key
+        // material — same private-mode rule on both, before anything reads
+        // them.
+        openfirma_browser::scheme::check_private(&pw_file).map_err(anyhow::Error::msg)?;
         let contents = openfirma_browser::scheme::BrowserConfig {
             p12: Some(container.clone()),
             password_file: Some(pw_file.clone()),
+            allow_unattended,
         }
         .to_toml();
         if let Some(dir) = config.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        std::fs::write(&config, contents)
+        std::fs::write(&config, contents.clone())
             .with_context(|| format!("writing {}", config.display()))?;
+        // The file names where the signing key lives: private from its first
+        // write (B-2 — an earlier revision wrote it with the process umask,
+        // and a shared home read 0644).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("protecting {}", config.display()))?;
+        }
         println!("wrote {}", config.display());
         println!(
             "the handler signs with {} (password: first line of {})",
             container.display(),
             pw_file.display()
+        );
+        if allow_unattended {
+            eprintln!(
+                "AVISO A-3: allow_unattended = true firmado en el config; cada llamada del \
+                 navegador firmara CON ESTA CLAVE SIN PREGUNTAR A NADIE"
+            );
+        } else {
+            println!(
+                "sin allow_unattended, cada llamada del navegador debe confirmarse o \
+                 rechazarse (A-3); para firmar sin prompt escribe allow_unattended = true \
+                 en {}",
+                config.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `afirma-uri --unregister`: remove only what openfirma wrote (its desktop
+/// entry / its .reg advice and the default-handler association while it still
+/// points at us). Another product's registration — a reinstalled AutoFirma —
+/// survives untouched. Finding A-2: reversible by construction.
+fn unregister_scheme() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        openfirma_browser::scheme::linux_unregister().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (path, _) = openfirma_browser::scheme::linux_install_paths();
+        println!("retirado el registro de openfirma: {}", path.display());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::bail!(
+            "la desregistracion automatica existe en Linux (desktop entry + xdg-mime); en \
+             Windows importa un .reg que tu importaste: borra HKEY_CURRENT_USER\\Software\\Classes\\\
+             afirma o HKEY_CLASSES_ROOT\\afirma segun como se instalara, y en macOS dale a \
+             lsregister al bundle que registro el esquema"
         );
     }
     Ok(())
@@ -1782,6 +2005,65 @@ fn p12_password(
     // password may come from; this wrapper only adapts the error type.
     openfirma_core::workflow::p12_password(flag.as_deref(), file.as_deref())
         .map_err(anyhow::Error::msg)
+}
+
+/// The consent prompter for a terminal session (finding A-3): shows exactly
+/// what is about to be signed — operation, asking app, SHA-256 of the payload
+/// and its size, in AutoFirma's dialog's information set — and reads y/N. A
+/// "no" answers dispatch's cancellation (`err-11:=AF500001` / `CANCEL`), like
+/// closing AutoFirma's dialog. It cannot collect a container PIN: the
+/// password's two real homes (a file, OPENFIRMA_PASSWORD) already decided
+/// before this prompt was possible, and argv never is one.
+fn terminal_consent() -> openfirma_browser::dispatch::Consent<'static> {
+    openfirma_browser::dispatch::Consent::Prompt(&TerminalConsent)
+}
+
+struct TerminalConsent;
+
+impl openfirma_browser::dispatch::ConsentFn for TerminalConsent {
+    fn approve(
+        &self,
+        summary: &openfirma_browser::dispatch::OperationSummary,
+        needs_password: bool,
+    ) -> Result<openfirma_browser::dispatch::ConsentAnswer, openfirma_browser::dispatch::BrowserError>
+    {
+        use std::io::Write;
+        let app = if summary.app_name.is_empty() {
+            "una aplicacion sin nombre".to_string()
+        } else {
+            summary.app_name.clone()
+        };
+        eprintln!("openfirma pide confirmar una operacion del navegador:");
+        eprintln!("  operacion : {}", summary.operation);
+        eprintln!("  solicitud : {app}");
+        eprintln!(
+            "  documento : {} bytes, SHA-256 {}",
+            summary.document_len, summary.document_digest
+        );
+        if needs_password {
+            // dispatch only asks this prompt for a secret when the key has
+            // none stored (Unattended with password: None), which the CLI
+            // never constructs; saying so beats pretending we can read one
+            // here. The wire error names the same reason.
+            eprintln!("  (la clave necesita un PIN que este prompt no puede recoger)");
+        }
+        eprint!("? Firmar [s/N] ");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).unwrap_or(0) == 0 {
+            // EOF on a closed stdin is not a yes.
+            return Ok(openfirma_browser::dispatch::ConsentAnswer::No);
+        }
+        let yes = matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "s" | "si" | "sí" | "y" | "yes"
+        );
+        Ok(if yes {
+            openfirma_browser::dispatch::ConsentAnswer::Yes { password: None }
+        } else {
+            openfirma_browser::dispatch::ConsentAnswer::No
+        })
+    }
 }
 
 /// Reads a certificate and a PKCS#8 key, accepting PEM or DER for both.
@@ -2283,7 +2565,7 @@ mod tests {
         let cfg = dir.join("browser.toml");
         let _ = std::fs::remove_file(&cfg);
         let err = with_home(&dir, || {
-            register_scheme(None, None, Some(&cfg))
+            register_scheme(None, None, Some(&cfg), false, false)
                 .unwrap_err()
                 .to_string()
         });
@@ -2303,7 +2585,7 @@ mod tests {
         // refusal: it would write half a key into the file. Same HOME scope.
         let pw = write_tmp("halfpair.pw", b"secreto\n");
         let err = with_home(&dir, || {
-            register_scheme(None, Some(pw.clone()), Some(&cfg))
+            register_scheme(None, Some(pw.clone()), Some(&cfg), false, false)
                 .unwrap_err()
                 .to_string()
         });
@@ -2333,11 +2615,20 @@ mod tests {
         let p12 = dir.join("Ana María/clave #7.p12");
         std::fs::create_dir_all(p12.parent().unwrap()).unwrap();
         std::fs::write(&p12, b"not really a p12 but a file").unwrap();
+        // 0600 like any password file the installer itself writes: B-2's
+        // private-mode rule refuses world-readable key material by design, so
+        // a test that hands the installer a 0644 password is testing the wrong
+        // precondition — this fixture must arrive as a real one would.
         let pw = dir.join("pw.txt");
         std::fs::write(&pw, b"secreto\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         let wrote = with_home(&dir, || {
-            register_scheme(Some(p12.clone()), Some(pw.clone()), Some(&cfg))
+            register_scheme(Some(p12.clone()), Some(pw.clone()), Some(&cfg), false, true)
         });
         wrote.expect("a --register with a real key must write its config");
 

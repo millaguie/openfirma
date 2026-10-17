@@ -132,6 +132,11 @@ fn openfirma_password_reaches_the_browser_subcommands_too() {
             "afirma-serve",
             "--p12",
             p12.to_str().unwrap(),
+            // A-3: an endpoint signs without ever seeing a human, so it needs
+            // the owner's explicit opt-in; this test pins the PASSWORD plumbing
+            // (fail-fast opening the container), not the consent rule — which
+            // has its own tests below.
+            "--allow-unattended",
             "--token-only",
         ])
         .env("OPENFIRMA_PASSWORD", "openfirma")
