@@ -742,7 +742,7 @@ impl<'m> Session<'m> {
             (self.module.f().get_attribute_value)(self.handle, object, tmpl.as_mut_ptr(), 1),
             "C_GetAttributeValue",
         )?;
-        buf.truncate(tmpl[0].ul_value_len.min(len));
+        buf.truncate(tmpl[0].ul_value_len.min(len) as usize);
         Ok(Some(buf))
     }
 
@@ -753,7 +753,7 @@ impl<'m> Session<'m> {
         let mut tmpl = [CkAttribute {
             type_: attr,
             p_value: std::ptr::from_mut(&mut value).cast(),
-            ul_value_len: std::mem::size_of::<CkUlong>(),
+            ul_value_len: ul(std::mem::size_of::<CkUlong>()),
         }];
         let rv = (self.module.f().get_attribute_value)(self.handle, object, tmpl.as_mut_ptr(), 1);
         if rv == CKR_ATTRIBUTE_SENSITIVE || rv == CKR_ATTRIBUTE_TYPE_INVALID {
@@ -763,7 +763,7 @@ impl<'m> Session<'m> {
         // C writes back the attribute's size (or UNAVAILABLE) through the
         // length slot; anything other than a full ulong means this object does
         // not carry the attribute.
-        if tmpl[0].ul_value_len != std::mem::size_of::<CkUlong>() {
+        if tmpl[0].ul_value_len != ul(std::mem::size_of::<CkUlong>()) {
             return Ok(None);
         }
         Ok(Some(value))
@@ -809,7 +809,7 @@ impl From<&FindTemplate> for CkAttribute {
             FindTemplate::Class(v) => CkAttribute {
                 type_: CKA_CLASS,
                 p_value: std::ptr::from_ref(v.as_ref()).cast_mut().cast(),
-                ul_value_len: std::mem::size_of::<CkUlong>(),
+                ul_value_len: ul(std::mem::size_of::<CkUlong>()),
             },
             FindTemplate::Id(b) => CkAttribute {
                 type_: CKA_ID,
