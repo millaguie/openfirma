@@ -21,11 +21,124 @@ use openfirma_core::{Error, Result, oid, tlv};
 /// `id-ct-TSTInfo`, the content type a time-stamp token carries.
 pub const OID_TST_INFO: &str = "1.2.840.113549.1.9.16.1.4";
 
+/// A fresh nonce for a time-stamp query, RFC 3161 2.4.1: a randomly generated
+/// integer the TSA echoes back so the answer is bound to this exact request.
+/// Random, not a clock reading: two signings in the same nanosecond, or an
+/// attacker who can guess the "random" value, defeat a timestamp made of time
+/// (finding M7). The value stays below 2^63 so its DER INTEGER is always
+/// positive with a leading zero byte at most.
+pub fn random_nonce() -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| Error::Other(format!("the operating system refused random bytes: {e}")))?;
+    Ok(u64::from_be_bytes(bytes) >> 1)
+}
+
+/// The `nonce` of a `TimeStampReq`, when it carries one (RFC 3161 makes it
+/// OPTIONAL). Used to check a token against the query that asked for it.
+pub fn request_nonce(query: &[u8]) -> Result<Option<u64>> {
+    let mut req = cur(query).sequence("the TimeStampReq")?;
+    let _version = req.number("the INTEGER of the time-stamp")?;
+    let _imprint = req.value()?;
+    Ok(match req.peek_tag() {
+        Some(tlv::TAG_INTEGER) => Some(req.u64("the TimeStampReq.nonce")?),
+        _ => None,
+    })
+}
+
+/// The `nonce` of a token's `TSTInfo`, when the TSA echoed one back. All the
+/// structural checks that matter (that this is a SignedData whose eContent is
+/// a primitive OCTET STRING holding a TSTInfo) are made here on the way; the
+/// full parse with signature verification lives in
+/// [`verify_token_signature`].
+pub fn token_nonce(token: &[u8]) -> Result<Option<u64>> {
+    let mut ci = cur(token).sequence("the ContentInfo")?;
+    let content_type = ci.oid("the ContentInfo.contentType")?.to_string();
+    if content_type != oid::ID_SIGNED_DATA.to_string() {
+        return Err(Error::Other(format!(
+            "a time-stamp token must be a SignedData, this ContentInfo is {content_type}"
+        )));
+    }
+    let mut sd = cur(ci.explicit(0, "ContentInfo.content")?).sequence("the SignedData")?;
+    let _version = sd.number("the INTEGER of the time-stamp")?;
+    let _digest_algs = sd.value()?;
+    let mut eci = sd.sequence("the encapContentInfo")?;
+    let _ct = eci.oid("the encapContentInfo.contentType")?;
+    if eci.peek_tag() != Some(0xA0) {
+        return Err(Error::Other(
+            "the token's encapContentInfo carries no eContent".into(),
+        ));
+    }
+    // eContent is `[0] EXPLICIT OCTET STRING`: step into [0], read the OCTET
+    // STRING, and its content is the TSTInfo itself. (An earlier draft here
+    // took the OCTET STRING's content as a TLV to parse once more, which made
+    // every genuine token answer "no nonce".)
+    let mut field = cur(eci.explicit(0, "eContent")?);
+    let v = field.value()?;
+    // A constructed OCTET STRING is possible in the wild; this nonce helper
+    // only reads the definite primitive form, and its callers treat `None` as
+    // "nothing to compare", which verify_token_signature covers properly.
+    if v.tag != tlv::TAG_OCTET_STRING || v.tag & 0x20 != 0 {
+        return Ok(None);
+    }
+    let mut tst = cur(v.content).sequence("the TSTInfo")?;
+    let _version = tst.number("the INTEGER of the time-stamp")?;
+    // TSTInfo fields in order: policy is any OBJECT IDENTIFIER — a TSA names
+    // its own, openssl's default config 1.2.3.4.1 and even encodes it in the
+    // BER long form (0x81 ...), so this must accept every readable OID, not
+    // only some prefix. parse_tst_info is permissive for exactly this reason;
+    // a field that is not an OID means the policy was omitted and the next
+    // field, messageImprint, begins.
+    if tst.peek_tag() == Some(tlv::TAG_OID) {
+        let _policy = tst.value()?;
+    }
+    let _imprint = tst.value()?;
+    let _serial = tst.value()?;
+    // GeneralizedTime or UTCTime, whatever tag: this helper only walks past
+    // it. Reading it with a strict date reader here mispositioned the cursor
+    // and every genuine token answered "no nonce".
+    let _gen_time = tst.value()?;
+    // ordering BOOLEAN and accuracy SEQUENCE sit between genTime and nonce,
+    // both OPTIONAL; the field order in parse_tst_info is the reference. Step
+    // over them by tag (a nonce is an INTEGER where ordering is a BOOLEAN and
+    // accuracy a SEQUENCE), and read the nonce when one follows.
+    loop {
+        match tst.peek_tag() {
+            Some(0x01) | Some(0x30) => {
+                let _skipped = tst.value()?;
+            }
+            Some(tlv::TAG_INTEGER) => return Ok(Some(tst.u64("the TSTInfo.nonce")?)),
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// The nonce binding of RFC 3161 2.4.2: when the request carried a nonce, the
+/// token MUST carry the same one. `None` on either side means "not sent", and
+/// a token that answers a nonce-bearing query without echoing it back gets
+/// refused here too (AutoFirma does exactly this in its TSTValidator).
+pub fn check_nonce(request: Option<u64>, token: Option<u64>) -> Result<()> {
+    match (request, token) {
+        (Some(want), Some(got)) if want == got => Ok(()),
+        (Some(want), Some(got)) => Err(Error::Other(format!(
+            "the time-stamp token answers nonce {got}, this query asked for {want}: the \
+             token does not belong to this request"
+        ))),
+        (Some(_want), None) => Err(Error::Other(
+            "the time-stamp query carried a nonce and the TSA's token carries none, so the \
+             token cannot be tied to this request (RFC 3161 2.4.2)"
+                .into(),
+        )),
+        (None, _) => Ok(()),
+    }
+}
+
 /// A `TimeStampReq`, RFC 3161 2.4.1.
 ///
 /// `certReq` is true so the TSA includes its certificate chain in the token,
 /// which is what lets a validator check the token years later without having
-/// to find the TSA certificate some other way.
+/// to find the TSA certificate some other way. Pass [`random_nonce`] as
+/// `nonce`: a clock reading is guessable and defeats the binding (M7).
 pub fn request(digest: DigestAlg, message: &[u8], nonce: u64) -> Result<Vec<u8>> {
     let imprint = tlv::sequence(&[
         tlv::algorithm_identifier(&digest.algorithm_identifier()?)?,
@@ -34,8 +147,9 @@ pub fn request(digest: DigestAlg, message: &[u8], nonce: u64) -> Result<Vec<u8>>
     Ok(tlv::sequence(&[
         tlv::integer_small(1),
         imprint,
-        // a nonce binds the answer to this query, so a replayed token from
-        // another signing run cannot be substituted
+        // a nonce binds the answer to this query — checked on the way back by
+        // token_from_response — so a replayed token from another signing run
+        // cannot be substituted
         tlv::tlv(tlv::TAG_INTEGER, &minimal_integer(nonce)),
         tlv::tlv(0x01, &[0xff]), // certReq TRUE
     ]))
@@ -44,11 +158,17 @@ pub fn request(digest: DigestAlg, message: &[u8], nonce: u64) -> Result<Vec<u8>>
 /// Reads a `TimeStampResp`, checks it answers the question we asked, and
 /// returns the token as a `ContentInfo`, ready to be embedded.
 ///
-/// Two checks, both of which matter: the status must be granted, and the
-/// token's `messageImprint` must be the digest of `message`. Embedding a token
-/// that imprints something else would produce a signature whose timestamp
-/// proves nothing about it.
-pub fn token_from_response(response: &[u8], digest: DigestAlg, message: &[u8]) -> Result<Vec<u8>> {
+/// Three checks, all of which matter: the status must be granted, the token's
+/// `messageImprint` must be the digest of `message`, and — when the query that
+/// produced this response carried a nonce (`request_nonce`) — the token must
+/// echo it back (finding M7: without this the nonce was sent but never
+/// compared, so the comment claiming it prevented substitution was a lie).
+pub fn token_from_response(
+    response: &[u8],
+    digest: DigestAlg,
+    message: &[u8],
+    request: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let mut outer = cur(response).sequence("a TimeStampResp")?;
     let mut status = outer.sequence("the PKIStatusInfo")?;
     let code = status.small_uint("the PKIStatus")?;
@@ -67,6 +187,9 @@ pub fn token_from_response(response: &[u8], digest: DigestAlg, message: &[u8]) -
     // the token is a ContentInfo; keep its whole DER, that is what gets embedded
     let token = outer.value()?.whole;
     check_token(token, digest, message)?;
+    if let Some(query) = request {
+        check_nonce(request_nonce(query)?, token_nonce(token)?)?;
+    }
     Ok(token.to_vec())
 }
 
@@ -286,6 +409,7 @@ pub fn verify_token_signature(
             trust_anchors: anchors.to_vec(),
             validation_time: at,
             ts_mode: true,
+            ..crate::verify::VerifyOptions::tst(anchors.to_vec(), at)
         },
     )
     .map_err(|e| Error::Other(format!("the time-stamp token does not verify: {e}")))?;
@@ -596,6 +720,36 @@ mod tests {
         let mut imprint = outer.sequence("the request").unwrap();
         let _alg = imprint.sequence("the request").unwrap();
         imprint.octets("the hashedMessage").unwrap().to_vec()
+    }
+
+    /// Finding M7, part one: a nonce is generated from the operating system's
+    /// random source, not off the clock, and it stays a positive INTEGER.
+    #[test]
+    fn a_generated_nonce_is_random_and_positive() {
+        let a = random_nonce().unwrap();
+        let b = random_nonce().unwrap();
+        assert_ne!(a, b, "two draws must not agree");
+        // the DER of every generated nonce is a positive minimal INTEGER:
+        // the sign bit never set means at most a 9-byte encoding starting 00
+        let req = request(DigestAlg::Sha256, b"x", a).unwrap();
+        assert_eq!(request_nonce(&req).unwrap(), Some(a));
+    }
+
+    /// Finding M7, part two: RFC 3161 2.4.2 — when the query asked for a
+    /// nonce, the token must answer it. Substituting a token from another
+    /// request is exactly what this refuses.
+    #[test]
+    fn the_nonce_of_the_answer_is_checked_against_the_question() {
+        assert!(check_nonce(Some(7), Some(7)).is_ok());
+        assert!(check_nonce(None, None).is_ok());
+        assert!(
+            check_nonce(None, Some(7)).is_ok(),
+            "no question, no promise"
+        );
+        let wrong = check_nonce(Some(7), Some(8)).unwrap_err();
+        assert!(wrong.to_string().contains("nonce"), "{wrong}");
+        let missing = check_nonce(Some(7), None).unwrap_err();
+        assert!(missing.to_string().contains("nonce"), "{missing}");
     }
 
     #[test]

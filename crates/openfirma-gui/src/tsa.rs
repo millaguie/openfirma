@@ -43,13 +43,10 @@ pub fn provider(url: &str) -> Result<openfirma_cades::TimestampFn, String> {
     }
     let url = url.to_string();
     Ok(Arc::new(move |sig: &[u8], digest| {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let nonce = tsp::random_nonce()?;
         let query = tsp::request(digest, sig, nonce)?;
         let response = http_post(&url, &query).map_err(|e| Error::Other(e.to_string()))?;
-        let token = tsp::token_from_response(&response, digest, sig)?;
+        let token = tsp::token_from_response(&response, digest, sig, Some(&query))?;
         warn_if_token_unverified(&format!("the TSA at {url}"), &token);
         Ok(vec![tsp::unsigned_attribute(&token)?])
     }))
