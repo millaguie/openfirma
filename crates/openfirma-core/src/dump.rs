@@ -173,6 +173,14 @@ fn string_kind(tag: u8) -> &'static str {
         0x0C => "UTF8String",
         0x13 => "PrintableString",
         0x16 => "IA5String",
+        // X.690 table: tag 0x1E is BMPString (UTF-16BE), not T61String, which
+        // is 0x14. This dumper is the CAdES golden normalizer, so labelling a
+        // BMPString as something else would move real differences across the
+        // diff line instead of showing them. Lossy UTF-8 rendering stays: the
+        // bytes are shown through `from_utf8_lossy` above, which for UTF-16BE
+        // reads as mostly escapes — legible enough to see it is not a
+        // UTF8String, and that is what the label has to make unmistakable.
+        0x1E => "BMPString",
         _ => "T61String",
     }
 }
@@ -302,6 +310,19 @@ mod tests {
         der.extend_from_slice(&body);
         let dump = der_dump(&der).unwrap();
         assert!(dump.contains("1.2.840.113549.1.7.2"), "{dump}");
+    }
+
+    #[test]
+    fn bmp_string_is_labelled_bmp_string() {
+        // X.690 puts BMPString at 0x1E; the dumper used to print every other
+        // string tag as T61String (which is really 0x14), so a name encoded
+        // as BMPString looked like something it never was — and this dumper
+        // is the CAdES golden normalizer, where such a lie would hide or fake
+        // a real difference.
+        let der = [0x1E, 0x04, 0x00, b'A', 0x00, b'B'];
+        let dump = der_dump(&der).unwrap();
+        assert!(dump.contains("BMPString"), "{dump}");
+        assert!(!dump.contains("T61String"), "{dump}");
     }
 
     #[test]
