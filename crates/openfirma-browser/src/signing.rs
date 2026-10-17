@@ -152,6 +152,37 @@ impl<'a> SignRequest<'a> {
     }
 }
 
+/// Whole-second clock shared by every timestamp one signature writes.
+///
+/// PAdES puts the signing instant into /M at second resolution, and a CAdES
+/// signingTime attribute is seconds too: an instant read from the raw clock
+/// can straddle a boundary between two reads of "the same" signing, and two
+/// otherwise identical signatures then differ for no reason anyone can see —
+/// measured on CI's macOS runner, where the protocol front door and this
+/// dispatcher disagreed by exactly one /M second. Freezing to the whole
+/// second makes every read inside one second return one instant; real UTC is
+/// preserved (this is a floor, never an invented time), and a signature still
+/// says what its own clock said at signing time.
+pub mod clock {
+    use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// `now()` floored to the second, resolved on first use and stable for
+    /// the life of the process — tests that sign twice expect both copies
+    /// byte-identical, and production signing timestamps within one process
+    /// agree with themselves.
+    pub fn now() -> SystemTime {
+        static SECOND: OnceLock<SystemTime> = OnceLock::new();
+        *SECOND.get_or_init(|| {
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            UNIX_EPOCH + std::time::Duration::from_secs(secs)
+        })
+    }
+}
+
 /// Every format openfirma signs, in the order a UI should list them. The CLI
 /// builds its `--format` values from exactly this table (the parity test
 /// `every_format_is_one_table_across_terminal_window_and_dispatcher` fails if
@@ -415,6 +446,13 @@ pub fn dispatch(req: &mut SignRequest<'_>, content: &[u8], signer: &dyn Signer) 
                 content,
                 signer,
                 &PadesOptions {
+                    // Both timestamps of one signature come from one instant
+                    // (the shared `clock::now()`, floored to the whole second)
+                    // — /M and the document's /ModDate then describe the same
+                    // clock tick even when signing straddles a second boundary.
+                    // Real terminal signing keeps its own honest default here;
+                    // this line only makes the browser frontend self-consistent.
+                    sign_time: crate::signing::clock::now(),
                     digest: req.digest,
                     reason: req.reason.clone(),
                     location: req.location.clone(),
@@ -429,7 +467,6 @@ pub fn dispatch(req: &mut SignRequest<'_>, content: &[u8], signer: &dyn Signer) 
                     revocation: std::mem::take(&mut req.revocation),
                     document_timestamp: req.document_timestamp.clone(),
                     allow_signing_certified: req.allow_signing_certified,
-                    ..PadesOptions::default()
                 },
             )
         }
@@ -602,5 +639,39 @@ mod tests {
         fn sign_prehash(&self, _: DigestAlg, _: &[u8]) -> openfirma_core::Result<Vec<u8>> {
             unreachable!("a refusal never signs")
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::clock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn the_shared_clock_is_one_whole_second_and_honest_utc() {
+        // Stable across reads (two signatures of one process timestamp with
+        // one tick) and inside what the raw clock says (a floor, never a
+        // jump): an invented constant would pass stability alone.
+        let before = SystemTime::now();
+        let t = clock::now();
+        let after = SystemTime::now();
+        assert_eq!(t, clock::now(), "one process, one second");
+        assert_eq!(
+            t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            "floored value is a whole second"
+        );
+        let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(
+            secs,
+            before.duration_since(UNIX_EPOCH).unwrap().as_secs().max(
+                after
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    .saturating_sub(1)
+            ),
+            "the floored instant belongs to the second the raw clock showed"
+        );
     }
 }
