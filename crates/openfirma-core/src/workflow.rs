@@ -74,15 +74,31 @@ impl Format {
     /// and the GUI writes next to the original without asking (the deliberate
     /// deviation from AutoFirma's save-dialog-every-time is docs/adr/0006-gui-toolkit.md).
     pub fn default_output(self, input: &Path) -> PathBuf {
-        let base = input.with_extension("");
-        let ext = match self {
+        // The suffix beside the original's stem (review 06, A-3). Plain
+        // `with_extension` is collision-prone in the two ways the review
+        // measured: it DROPS the last extension, so `informe.v1.pdf` and
+        // `informe.v2.pdf` both became `informe.signed.pdf`, and `foto.jpg`
+        // and `foto.png` both became `foto.csig` — signing the second input
+        // deleted the first one's signature. So: a name that still carries a
+        // dot after its last separator keeps EVERY extension it has
+        // (`informe.v1.signed.pdf`, `foto.jpg.csig`); a bare or hidden name
+        // takes the suffix as its only extension, AutoFirma's classic shape
+        // (`SIN_EXT.csig`). The scheme's own output never grows again: an
+        // openfirma file is its own replaceable slot, so signing it twice
+        // yields one file, not a `.signed.signed` runaway.
+        let suffix = match self {
             Format::Pdf => "signed.pdf",
             Format::Xml => "signed.xml",
             Format::Data => "csig",
         };
-        base.with_extension(ext)
+        if is_signed_output(input) {
+            return input.to_path_buf();
+        }
+        match input.file_name().map(|n| n.to_string_lossy().into_owned()) {
+            Some(name) if name.contains('.') => input.with_file_name(format!("{name}.{suffix}")),
+            _ => input.with_extension(suffix),
+        }
     }
-
     /// Detects the format of `bytes`: `%PDF-` at byte 0 wins, then a leading
     /// XML declaration or root element after optional BOM and whitespace, and
     /// everything else is data. A PDF that has been encrypted (the bytes are
@@ -591,6 +607,34 @@ fn non_utf8_secret_error() -> String {
         .to_string()
 }
 
+/// Whether a path is named like one of openfirma's own default outputs (see
+/// [`Format::default_output`]). The GUI routes such an input to verify rather
+/// than sign — its name promises the signature is already inside it — and
+/// `default_output` refuses to grow the name a second time.
+pub fn is_signed_output(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| {
+        let n = n.to_string_lossy();
+        n.ends_with(".signed.pdf") || n.ends_with(".signed.xml") || n.ends_with(".csig")
+    })
+}
+
+/// Refuses writing an output that already exists, unless forced (review 06,
+/// A-3). An existing file is somebody's data: AutoFirma routes every save
+/// through its OS save dialog, which asks before replacing; a CLI or a window
+/// that truncates in silence is strictly worse than the tool it replaces.
+/// The GUI answers this refusal with its save dialog (the user picks another
+/// name or confirms by overwriting there); the CLI refuses until `--force`.
+pub fn check_not_overwrite(output: &Path, force: bool) -> Result<(), String> {
+    if force || !output.exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} already exists: signing would replace it without a second look. \
+         Choose a different output, or pass --force to overwrite it anyway",
+        output.display()
+    ))
+}
+
 /// Refuses `sign -i f -o f` unless `--force` says the overwrite is meant.
 ///
 /// Both paths are compared before any reading happens, and twice: the plain
@@ -887,27 +931,58 @@ mod tests {
         assert_eq!(Format::Pdf.default_signature_format(), "pades-b-b");
         assert_eq!(Format::Xml.default_signature_format(), "xades-b-b");
         assert_eq!(Format::Data.default_signature_format(), "cades-b-b");
-        let p = std::path::Path::new("/docs/contrato.pdf");
+        // Review 06, A-3: the name keeps EVERY extension a dotted file has,
+        // because dropping the last one made `informe.v1.pdf` and
+        // `informe.v2.pdf` collide on `informe.signed.pdf` (and foto.jpg /
+        // foto.png on foto.csig): signing the second input deleted the first
+        // signature. A bare name takes the suffix as its only extension —
+        // AutoFirma's classic shape.
         assert_eq!(
-            Format::Pdf.default_output(p).file_name().unwrap(),
-            "contrato.signed.pdf"
+            Format::Pdf
+                .default_output(std::path::Path::new("/docs/contrato.pdf"))
+                .file_name()
+                .unwrap(),
+            "contrato.pdf.signed.pdf"
         );
-        let x = std::path::Path::new("a/facturae.xml");
         assert_eq!(
-            Format::Xml.default_output(x).file_name().unwrap(),
-            "facturae.signed.xml"
+            Format::Xml
+                .default_output(std::path::Path::new("a/facturae.xml"))
+                .file_name()
+                .unwrap(),
+            "facturae.xml.signed.xml"
         );
         let d = std::path::Path::new("a/nota.txt");
         assert_eq!(
             Format::Data.default_output(d).file_name().unwrap(),
-            "nota.csig"
+            "nota.txt.csig"
         );
-        // a file with no extension still gets a clean sibling name
+        // a bare or hidden name still gets a clean sibling name
         let n = std::path::Path::new("a/SIN_EXT");
         assert_eq!(
             Format::Data.default_output(n).file_name().unwrap(),
             "SIN_EXT.csig"
         );
+        let h = std::path::Path::new("a/.linorc");
+        assert_eq!(
+            Format::Data.default_output(h).file_name().unwrap(),
+            ".linorc.csig"
+        );
+        // the collisions the review measured are gone by construction
+        for (a, b) in [
+            ("/docs/informe.v1.pdf", "/docs/informe.v2.pdf"),
+            ("foto.jpg", "foto.png"),
+        ] {
+            let pa = std::path::Path::new(a);
+            let pb = std::path::Path::new(b);
+            assert_ne!(
+                Format::Pdf.default_output(pa),
+                Format::Pdf.default_output(pb),
+                "{a} and {b} must not share one output name"
+            );
+        }
+        // and the scheme's own output is its own replaceable slot: no chain
+        let once = Format::Data.default_output(std::path::Path::new("a/nota.txt"));
+        assert_eq!(Format::Data.default_output(&once), once);
     }
 
     #[test]

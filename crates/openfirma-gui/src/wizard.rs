@@ -418,8 +418,10 @@ mod tests {
 
     #[test]
     fn the_output_path_is_the_libraries_rule() {
+        // One naming scheme for both frontends, including its collision-free
+        // shape (review 06, A-3): a dotted name keeps every extension.
         let p = output_path(Format::Pdf, Path::new("/a/contrato.pdf"));
-        assert_eq!(p.file_name().unwrap(), "contrato.signed.pdf");
+        assert_eq!(p.file_name().unwrap(), "contrato.pdf.signed.pdf");
     }
 
     #[test]

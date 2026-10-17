@@ -972,6 +972,13 @@ fn main() -> Result<()> {
                 allow_weak_algorithms: _,
             } = *args;
             check_not_in_place(&input, &output, force)?;
+            // Review 06, A-3 (CLI half): an existing output is somebody else's
+            // file and `File::create`/`fs::write` truncates it in silence.
+            // AutoFirma asks through its save dialog; the terminal has no
+            // dialog, so the refusal is the answer and --force is the explicit
+            // yes — the same shape as the input==output guard above.
+            openfirma_core::workflow::check_not_overwrite(&output, force)
+                .map_err(anyhow::Error::msg)?;
             let ltv = matches!(format, Format::PadesLt | Format::PadesLta);
             if !ltv && (!validation_cert.is_empty() || !crl.is_empty() || !ocsp.is_empty()) {
                 anyhow::bail!(

@@ -166,7 +166,7 @@ fn a_p12_picked_through_the_fixture_signs_with_its_password() {
     // The Done screen: result named, folder link offered (ADR-0006's next-to-
     // original rule), and no second save dialog on the way.
     harness.get_by_label_contains("Firma guardada");
-    let out = pdf_dir.join("contrato.signed.pdf");
+    let out = pdf_dir.join("contrato.pdf.signed.pdf");
     assert!(out.is_file(), "the signature must sit next to the original");
     verify_after_gui_sign(&out);
 
@@ -191,7 +191,7 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     }
     std::fs::copy(testdata().join("inputs/simple.pdf"), &doc).unwrap();
     let signed = sign_through_gui_code(&doc, &p12);
-    let out = dir.join("doc.signed.pdf");
+    let out = dir.join("doc.pdf.signed.pdf");
     std::fs::write(&out, &signed).unwrap();
 
     // No anchors configured (the clean-machine case): the window must ask
@@ -243,7 +243,7 @@ fn a_leaf_picked_as_anchor_is_refused_not_green() {
     }
     std::fs::copy(testdata().join("inputs/simple.pdf"), &doc).unwrap();
     let signed = sign_through_gui_code(&doc, &p12);
-    let out = dir.join("doc.signed.pdf");
+    let out = dir.join("doc.pdf.signed.pdf");
     std::fs::write(&out, &signed).unwrap();
 
     // same drop as the verify test above, but the fixture answers the anchor
@@ -305,7 +305,7 @@ fn the_window_cannot_close_over_an_unsaved_result() {
     // window's behavior of cancelling the close while it holds a result.
     let unsaved = Screen::Done {
         path: PathBuf::from("doc.pdf"),
-        output: PathBuf::from("doc.signed.pdf"),
+        output: PathBuf::from("doc.pdf.signed.pdf"),
         content: vec![1],
         signature: vec![2],
         format_label: "PAdES-B-B".into(),
@@ -442,7 +442,7 @@ fn a_store_row_signs_without_any_password_field() {
     );
     harness.get_by_label("Firmar").click();
     harness.run();
-    let out = dir.join("firmable.signed.pdf");
+    let out = dir.join("firmable.pdf.signed.pdf");
     assert!(out.is_file(), "{out:?}");
     verify_after_gui_sign(&out);
     std::fs::remove_dir_all(dir).ok();

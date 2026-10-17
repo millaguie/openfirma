@@ -111,7 +111,10 @@ run_case() {
     || of+=(--no-issuer-serial)
   [ -n "$hint" ] && of+=(--content-hint "$hint")
 
-  ./target/debug/openfirma sign -i "$input" -o "$ours" \
+  # --force: this script owns $ours (the corpus is regenerated per run, see
+  # docs/validation.md), and the CLI refuses to replace an existing output of
+  # another run without being told the overwrite is meant (review 06, A-3).
+  ./target/debug/openfirma sign -i "$input" -o "$ours" --force \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
     "${of[@]}" >/dev/null
@@ -192,7 +195,10 @@ run_alg_case() {
   # openfirma-side flags beyond the dump-derived ones, set by the caller
   of+=("${of_extra[@]+"${of_extra[@]}"}")
 
-  ./target/debug/openfirma sign -i "$input" -o "$ours" \
+  # --force: this script owns $ours (the corpus is regenerated per run, see
+  # docs/validation.md), and the CLI refuses to replace an existing output of
+  # another run without being told the overwrite is meant (review 06, A-3).
+  ./target/debug/openfirma sign -i "$input" -o "$ours" --force \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
     "${of[@]}" >/dev/null; echo "ALG-CASE $name flags: ${of[*]}" >&2
@@ -237,7 +243,7 @@ if [ -f "$CERTS/signer-ec.p12" ]; then
     found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
     found && /OID /        { exit }
   ' "$OUT/$name.autofirma.dump")"
-  ./target/debug/openfirma sign -i "$INPUTS/simple.txt" -o "$ours" \
+  ./target/debug/openfirma sign --force -i "$INPUTS/simple.txt" -o "$ours" \
     --cert "$CERTS/signer-ec.crt" --key "$CERTS/signer-ec.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
     --digest sha256 ${hint:+--content-hint "$hint"} >/dev/null
@@ -288,7 +294,7 @@ if [ -f "$CERTS/signer-policy.p12" ]; then
     found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
     found && /OID /        { exit }
   ' "$OUT/$name.autofirma.dump")"
-  ./target/debug/openfirma sign -i "$INPUTS/simple.txt" -o "$ours" \
+  ./target/debug/openfirma sign --force -i "$INPUTS/simple.txt" -o "$ours" \
     --cert "$CERTS/signer-policy.crt" --key "$CERTS/signer-policy.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
     ${hint:+--content-hint "$hint"} \
@@ -325,7 +331,7 @@ hint="$(awk '
   found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
   found && /OID /        { exit }
 ' "$OUT/$name.autofirma.dump")"
-./target/debug/openfirma sign -i "$INPUTS/simple.txt" -o "$ours" \
+./target/debug/openfirma sign --force -i "$INPUTS/simple.txt" -o "$ours" \
   --cert "$CERTS/signer-rsa.crt" --key "$CERTS/signer-rsa.key" \
   --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
   ${hint:+--content-hint "$hint"} \
@@ -366,7 +372,7 @@ run_pades_case() {
     "$CERTS/$base.p12" "$PASS" "$input" "$af" SHA256withRSA >/dev/null 2>&1 \
     || { echo "SKIP   $name (AutoFirma refused to sign it)"; return 0; }
 
-  ./target/debug/openfirma sign -i "$input" -o "$ours" --format pades-b-b \
+  ./target/debug/openfirma sign --force -i "$input" -o "$ours" --format pades-b-b \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" >/dev/null
 
@@ -416,7 +422,7 @@ run_xades_case() {
     format=XAdES\ Enveloped profile=baseline >/dev/null 2>&1 \
     || { echo "SKIP   $name (AutoFirma refused to sign it)"; return 0; }
 
-  ./target/debug/openfirma sign -i "$input" -o "$ours" --format xades-b-b \
+  ./target/debug/openfirma sign --force -i "$input" -o "$ours" --format xades-b-b \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" >/dev/null
 

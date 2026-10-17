@@ -272,6 +272,10 @@ fn every_cades_flag_reaches_the_signature_the_binary_writes() {
         return;
     };
     let out = write_tmp("flags.csig", b"");
+    // The refuse-overwrite guard of review 06 (A-3) treats an existing output
+    // as somebody's data, so the fixture starts from nothing: what remains is
+    // exactly the second run's refusal, pinned by its own assertion below.
+    std::fs::remove_file(&out).ok();
     let input = write_tmp("flagged.dat", b"bytes that carry every flag\n");
     let status = Command::new(env!("CARGO_BIN_EXE_openfirma"))
         .args(["sign", "-i"])
@@ -299,6 +303,29 @@ fn every_cades_flag_reaches_the_signature_the_binary_writes() {
         status.status.success(),
         "{}",
         String::from_utf8_lossy(&status.stderr)
+    );
+    // Review 06, A-3 (CLI half): the same command again onto a now-existing
+    // output must refuse without --force — AutoFirma's save dialog asks; a
+    // terminal's answer is this refusal.
+    let again = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args(["sign", "-i"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&out)
+        .args(["--cert"])
+        .arg(pki.join("signer-rsa.crt"))
+        .arg("--key")
+        .arg(pki.join("signer-rsa.key"))
+        .output()
+        .expect("the binary must run");
+    assert!(
+        !again.status.success(),
+        "signing over an existing output without --force must be refused"
+    );
+    let text = String::from_utf8_lossy(&again.stderr).to_string();
+    assert!(
+        text.contains("already exists") && text.contains("--force"),
+        "the refusal must name the existing file and the flag that overrides: {text}"
     );
     let report = Command::new(env!("CARGO_BIN_EXE_openfirma"))
         .args(["inspect", "-i"])
@@ -389,6 +416,9 @@ fn trust_accepts_a_pem_bundle_of_several_certificates() {
         return;
     }
     let signed = write_tmp("bundle-signed.pdf", b"");
+    // start clean: the refuse-overwrite guard (review 06, A-3) would otherwise
+    // answer the leftover zero-byte fixture instead of signing.
+    std::fs::remove_file(&signed).ok();
     let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
         .args(["sign", "-i"])
         .arg(&in_doc)
@@ -492,6 +522,9 @@ fn openfirma_trust_answers_for_verify_without_the_flag() {
         return;
     }
     let signed = write_tmp("env-verify.pdf", b"");
+    // start clean: the refuse-overwrite guard (review 06, A-3) would otherwise
+    // answer the leftover zero-byte fixture instead of signing.
+    std::fs::remove_file(&signed).ok();
     let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
         .args(["sign", "-i"])
         .arg(&in_doc)
