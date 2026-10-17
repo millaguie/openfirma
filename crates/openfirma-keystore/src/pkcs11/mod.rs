@@ -779,7 +779,14 @@ impl<'m> Session<'m> {
                 (self.module.f().find_objects_final)(self.handle);
                 return Err(session_error("C_FindObjects", rv));
             }
-            objects.extend_from_slice(&batch[..count as usize]);
+            // A conforming module never returns more than it was asked for,
+            // but `count` is its word: clamp before slicing so a buggy or
+            // hostile PKCS#11 library truncates its answer instead of
+            // panicking this process (`&batch[..count]` would index out of
+            // bounds on count > 32). At the batch cap, an over-answer also
+            // means "keep looping", which is what not breaking does.
+            let taken = (count as usize).min(batch.len());
+            objects.extend_from_slice(&batch[..taken]);
             // count is the module's answer (CkUlong); compare at its width.
             if (count as usize) < batch.len() {
                 break;
