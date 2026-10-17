@@ -35,8 +35,7 @@ pub const MIME_TYPE: &str = "x-scheme-handler/afirma";
 
 /// Desktop entry file name — unchanged from before A-1 so an upgraded
 /// openfirma replaces its own old entry instead of adding a second handler.
-#[cfg(target_os = "linux")]
-const DESKTOP_FILE: &str = "openfirma-afirma.desktop";
+pub const DESKTOP_FILE: &str = "openfirma-afirma.desktop";
 
 fn browser_error(message: impl Into<String>) -> crate::dispatch::BrowserError {
     crate::dispatch::BrowserError::new("scheme-registration", message)
@@ -144,7 +143,9 @@ pub fn macos_plist_fragment() -> &'static str {
 /// new file by itself). Finding B-1: `$XDG_DATA_HOME` overrides the
 /// `~/.local/share` default per the freedesktop spec, and an earlier revision
 /// wrote `~/.local/share` even when the variable said otherwise — registering
-/// into a directory no desktop environment reads.
+/// into a directory no desktop environment reads. Callable on every platform
+/// (it is only path arithmetic; the CLI prints it as advice where it cannot
+/// register), so nothing here is cfg'd.
 pub fn linux_install_paths() -> (PathBuf, &'static str) {
     let dir = applications_dir();
     let hint = "xdg-mime default openfirma-afirma.desktop x-scheme-handler/afirma";
@@ -154,7 +155,6 @@ pub fn linux_install_paths() -> (PathBuf, &'static str) {
 /// `$XDG_DATA_HOME/applications`, with the specification's fallback — the
 /// exact resolution XDG tells desktop environments to read ([finding B-1]).
 /// A non-absolute `XDG_DATA_HOME` is ignored, like every other XDG variable.
-#[cfg(target_os = "linux")]
 fn applications_dir() -> PathBuf {
     applications_dir_in(
         std::env::var_os("XDG_DATA_HOME").as_deref(),
@@ -164,7 +164,6 @@ fn applications_dir() -> PathBuf {
 
 /// The same rule on given inputs, so it is testable without racing sibling
 /// tests over the process environment (see browser_config_path_in).
-#[cfg(target_os = "linux")]
 fn applications_dir_in(xdg: Option<&std::ffi::OsStr>, home: Option<&Path>) -> PathBuf {
     let mut dir = match xdg {
         Some(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
