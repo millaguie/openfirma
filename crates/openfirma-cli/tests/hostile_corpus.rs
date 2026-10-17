@@ -98,8 +98,8 @@ fn xml_corpus_never_panics_and_names_the_truncation() {
 fn pkcs12_corpus_refuses_with_an_error() {
     for name in ["p12-garbage-head.p12", "p12-truncated-header.p12"] {
         let bytes = read(name);
-        let err = Pkcs12::load(&bytes, "anything")
-            .expect_err("a truncated or junked PFX must not load");
+        let err =
+            Pkcs12::load(&bytes, "anything").expect_err("a truncated or junked PFX must not load");
         assert!(!err.to_string().is_empty(), "{name}: empty error text");
     }
 }
@@ -179,7 +179,7 @@ fn mutation_sweep_of_shipped_specimens_never_panics() {
         assert!(!spec.is_empty(), "a shipped specimen is empty");
         // byte flips: 40% of the file's length, capped so big golden PDFs do
         // not dominate CI time — depth matters more than sheer count.
-        let flips = (spec.len() / 5).min(2_000).max(64);
+        let flips = (spec.len() / 5).clamp(64, 2_000);
         for _ in 0..flips {
             let i = rng.below(spec.len());
             let mut mutated = spec.clone();

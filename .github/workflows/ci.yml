@@ -160,6 +160,28 @@ jobs:
           SOFTHSM2_CONF: /tmp/opencode/keystores/softhsm/softhsm2.conf
         run: cargo test --target ${{ matrix.target }}
 
+  # i686-pc-windows-msvc is where the PKCS#11 ABI cfgs differ most (packed
+  # cryptoki headers, 4-byte pointers) and where a natural-alignment or
+  # usize-equals-unsigned-long assumption breaks first. It ships in the
+  # release matrix, so its *tests* must run here: on a windows runner the
+  # target is native, cargo test executes the i686 binaries for real, and
+  # every compile-time layout assert in openfirma-keystore/src/pkcs11/types.rs
+  # plus the runtime checks of tests/pkcs11_abi.rs evaluate on the 32-bit ABI.
+  # The GUI stays excluded: no 32-bit windowing stack is provisioned (the
+  # release job builds it CLI-only too).
+  test-i686-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: build every member without the GUI (no 32-bit windowing stack here)
+        run: cargo build --workspace --exclude openfirma-gui --target i686-pc-windows-msvc
+      - name: keystore tests on the 32-bit ABI (ABI asserts execute natively)
+        run: cargo test -p openfirma-keystore -p openfirma-core --target i686-pc-windows-msvc
+
   no-real-certs:
     runs-on: ubuntu-latest
     steps:
