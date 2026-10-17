@@ -1913,20 +1913,21 @@ fn unregister_scheme() -> Result<()> {
         openfirma_browser::scheme::linux_unregister().map_err(|e| anyhow::anyhow!("{e}"))?;
         let (path, _) = openfirma_browser::scheme::linux_install_paths();
         println!("retirado el registro de openfirma: {}", path.display());
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // The bail is the whole non-linux story; what follows it (`Ok(())`
-        // below) only exists for the linux branch's fallthrough.
-        #[allow(unreachable_code)]
+        // Every branch answers by itself: the bail IS the whole non-linux
+        // story (H-9's per-platform clippy called a fall-through `Ok(())`
+        // after it unreachable, and it was right — there is no code that
+        // should follow).
         anyhow::bail!(
             "la desregistracion automatica existe en Linux (desktop entry + xdg-mime); en \
              Windows importa un .reg que tu importaste: borra HKEY_CURRENT_USER\\Software\\Classes\\\
              afirma o HKEY_CLASSES_ROOT\\afirma segun como se instalara, y en macOS dale a \
              lsregister al bundle que registro el esquema"
-        );
+        )
     }
-    Ok(())
 }
 
 /// One `POST /echo` with the headers the endpoint demands, and the body it

@@ -389,16 +389,17 @@ def integrity(path, trusted):
         lines.append("FAIL xmlsec1 is not installed, the SignatureValue cannot "
                      "be verified independently")
         return lines
-    cmd = [xmlsec, "--verify", "--verbose", "--enabled-key-data", "x509"]
-    # --add-id-attr only exists from xmlsec1 1.3 on (Ubuntu ships 1.2.x).
-    # An unknown flag makes 1.2.x say "parameter ... is not supported" on
-    # stderr (measured against the real apt package); anything else means it
-    # parsed. The usage banner lands on stdout there, so keying off it alone
-    # reads the wrong way round — the Rust twin of this probe says why.
+    cmd = [xmlsec, "--verify", "--enabled-key-data", "x509"]
+    # --add-id-attr only exists from xmlsec1 1.3 on (Ubuntu ships 1.2.x). An
+    # unknown flag makes 1.2.x say "parameter ... is not supported" on stderr
+    # (measured against the real apt package: it ALSO dumps its usage banner
+    # on stdout, so keying off one stream reads that backwards); and 1.2.39
+    # knows no --verbose either, while the counters only print verbosely —
+    # which is why the "ok" line tolerates refs (?,?) on the older shape.
     probe = subprocess.run([xmlsec, "--verify", "--add-id-attr", "Id", "/nonexistent.xml"],
                            capture_output=True, text=True)
     if "is not supported" not in (probe.stderr or ""):
-        cmd += ["--add-id-attr", "Id"]
+        cmd += ["--add-id-attr", "Id", "--verbose"]
     for t in trusted:
         cmd += ["--trusted-pem", str(t)]
     cmd.append(str(path))

@@ -44,14 +44,13 @@ fn xmlsec_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Whether this xmlsec1 knows `--add-id-attr` (it arrived in 1.3.0; Ubuntu's
-/// runner image ships 1.2.x). Probed, never guessed from `--version`: an
-/// unknown flag makes 1.2.x print its usage banner to STDOUT plus "parameter
-/// "--add-id-attr" is not supported" to STDERR (measured against the real
-/// 1.2.39 apt ships), while 1.3 parses the flag and fails later over the
-/// file it was handed. So the refusal phrase on stderr means NO; anything
-/// else — including a usage banner without it — means the flag parsed.
-fn xmlsec_supports_id_attr() -> bool {
+/// Whether this xmlsec1 accepts `--add-id-attr` (1.3+). Unknown flags answer
+/// "parameter "--add-id-attr" is not supported" on stderr AND dump their
+/// usage banner on stdout — measured against the real 1.2.39, where an
+/// earlier version of this probe read only one stream and got it backwards
+/// (H-1's lesson, third time). The refusal phrase is the NO; anything else
+/// parsed.
+fn xmlsec_accepts_add_id_attr() -> bool {
     Command::new("xmlsec1")
         .args([
             "--verify",
@@ -61,6 +60,36 @@ fn xmlsec_supports_id_attr() -> bool {
         ])
         .output()
         .is_ok_and(|o| !String::from_utf8_lossy(&o.stderr).contains("is not supported"))
+}
+
+/// xmlsec1 needs the trust anchor for the chain, and on 1.3+ an explicit
+/// statement that `Id` is an XML ID (`--add-id-attr Id`; measured against
+/// both 1.3.12 and the very 1.2.39 Ubuntu's runners install: without the
+/// flag a 1.2.x verifies the fixture by its built-in Id knowledge, while a
+/// 1.3 fails the XPointer id() lookup — and prints 0/0 references). The
+/// counter is only printed in verbose mode, and 1.2.39 has no `--verbose`
+/// (another measured difference), so 2/2 is asserted only when the tool
+/// actually reports counters; on its own, "Verification status: OK" says
+/// both references verified — which tampering demonstrably breaks, because
+/// xmlsec resolves `URI="#id"` by id() once the Id is typed (proven by
+/// `xmlsec_notices_a_tampered_document`).
+fn xmlsec_verify(file: &Path) -> (bool, String) {
+    let mut cmd = Command::new("xmlsec1");
+    cmd.args(["--verify", "--enabled-key-data", "x509"]);
+    if xmlsec_accepts_add_id_attr() {
+        cmd.args(["--add-id-attr", "Id", "--verbose"]);
+    }
+    let out = cmd
+        .args([
+            "--trusted-pem",
+            certs_dir().join("ca.crt").to_str().unwrap(),
+        ])
+        .arg(file)
+        .output()
+        .expect("xmlsec1 disappeared mid test");
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    (text.contains("Verification status: OK"), text)
 }
 
 fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> {
@@ -83,30 +112,6 @@ fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> 
         })
         .collect();
     Some(signer.with_chain(handles))
-}
-
-/// xmlsec1 needs the trust anchor for the chain and, on 1.3+, the Id hack:
-/// the fixture declares no DTD that would type `Id` as an XML ID, and only
-/// `--add-id-attr` tells xmlsec so (1.2.x treats `Id` as a known ID name by
-/// default — probing which shape this binary speaks is what
-/// `xmlsec_supports_id_attr` exists for).
-fn xmlsec_verify(file: &Path) -> (bool, String) {
-    let mut cmd = Command::new("xmlsec1");
-    cmd.args(["--verify", "--verbose", "--enabled-key-data", "x509"]);
-    if xmlsec_supports_id_attr() {
-        cmd.args(["--add-id-attr", "Id"]);
-    }
-    let out = cmd
-        .args([
-            "--trusted-pem",
-            certs_dir().join("ca.crt").to_str().unwrap(),
-        ])
-        .arg(file)
-        .output()
-        .expect("xmlsec1 disappeared mid test");
-    let text =
-        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    (text.contains("Verification status: OK"), text)
 }
 
 fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
@@ -136,10 +141,13 @@ fn xmlsec_verifies_the_rsa_signature() {
 
     let (ok, text) = xmlsec_verify(&path);
     assert!(ok, "xmlsec1 rejected our XAdES-B-B signature:\n{text}");
-    assert!(
-        text.contains("SignedInfo References (ok/all): 2/2"),
-        "not both references verified:\n{text}"
-    );
+    if xmlsec_accepts_add_id_attr() {
+        // the verbose mode this flag enables also prints the counters
+        assert!(
+            text.contains("SignedInfo References (ok/all): 2/2"),
+            "not both references verified:\n{text}"
+        );
+    }
     std::fs::remove_file(&path).ok();
 }
 
@@ -182,10 +190,12 @@ fn xmlsec_verifies_signatures_over_documents_with_namespaced_roots() {
         let path = write_tmp(name, &signed);
         let (ok, text) = xmlsec_verify(&path);
         assert!(ok, "xmlsec1 rejected the signature over {name}:\n{text}");
-        assert!(
-            text.contains("SignedInfo References (ok/all): 2/2"),
-            "not both references verified for {name}:\n{text}"
-        );
+        if xmlsec_accepts_add_id_attr() {
+            assert!(
+                text.contains("SignedInfo References (ok/all): 2/2"),
+                "not both references verified for {name}:\n{text}"
+            );
+        }
         std::fs::remove_file(&path).ok();
     }
 }
