@@ -70,6 +70,15 @@ in the CAdES encoder that OpenSSL tolerated: a missing `SigningCertificateV2`
 wrapper level, an unsorted `certificates` set, `sha256WithRSAEncryption` where
 RFC 3370 requires `rsaEncryption`, and encapsulating content by default.
 
+Two diff classes are known volatile and the normalizer is allowed to keep them
+apart rather than hide them: ECDSA signature values differ per run (a 70-vs-71
+byte OCTET STRING — the encoding of `s` under P-256 is length-variable, which
+is why the ecdsa case can print DIFF while its structure matches line for
+line), and every second-resolution timestamp. Both are pinned where they must
+be: timestamps by the shared whole-second clock (`clock::now`) and by tests
+that sign across a real second boundary; EC lengths by inspecting the value's
+DER shape instead of its byte length.
+
 The CAdES cases the driver runs today, each one measuring a specific shape
 against the jar rather than arguing about it:
 
