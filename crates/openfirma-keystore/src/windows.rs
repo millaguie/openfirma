@@ -50,22 +50,53 @@ struct CertContext {
 //
 // Because rustc writes *that* name verbatim, the declaration is on the hook
 // for what each DLL actually exports — and the loader checks it at process
-// start, before a single test runs. That is exactly how the i686 job died:
-// with STATUS_ENTRYPOINT_NOT_FOUND, naming nothing. Which spelling is right
-// is per-DLL measured fact, not taste: crypt32 genuinely decorates its 32-bit
-// exports (both CRYPT32.dll and every consumer of them — msvcrt-era link
-// tables — read `CertOpenStore@20`), while advapi32.dll and ncrypt.dll export
-// plain names on every architecture, so their blocks must say so with
-// `import_name_type = "undecorated"` (windows-targets' raw-dylib macro passes
-// exactly that for its x86 tables). Nothing about the ABI changes: these are
-// all stdcall on x86 — the decoration was never wrong for *calling*, only as
-// an import name. The two blocks below carry that key; crypt32 above does
-// not, and that difference is load-or-die on i686.
-//
-// The loader's STATUS_ENTRYPOINT_NOT_FOUND named nothing (PE load failures
-// never do), so the diagnosis came from reading the binary: a hand PE import
-// dump of the test executable cross-checked against the DLLs' export strings,
-// run in CI — five advapi32 names MISSING there, crypt32's table complete.
+// start, before a single test runs. That is exactly how the i686 job died for
+// five slices: STATUS_ENTRYPOINT_NOT_FOUND, which names nothing (PE load
+// failures never do), so CI dumped the test binary's PE import directory by
+// hand and cross-checked every name against System32's export strings. The
+// measurement was a surprise: advapi32.dll exports its functions *plain*
+// (`CryptSignHashW`, no underscore, no @24) on 32-bit just as on 64, while an
+// undeclared `extern "system"` name on x86 resolves to the stdcall form —
+// every one of this crate's five advapi32 imports came back MISSING. crypt32
+// turned out to be exported plain too; the earlier fix that added decoration
+// for it was cargo-culted from a wrong reading of a toolchain dump and only
+// survived because it happened to match what rustc already wrote by default.
+// The whole table now declares `import_name_type = "undecorated"` on x86 —
+// exactly what windows-targets' raw-dylib macro passes for that arch — and
+// plain declarations elsewhere, which is where the undecorated names are the
+// only names (the key itself is rejected off x86). Nothing about the ABI
+// changed: these really are stdcall on x86; the decoration was never wrong
+// for calling, only ever as an import name.
+// The import-name key is x86-only rustc syntax, hence the cfg split: System32
+// crypt32.dll exports plain names at every architecture (dumped from the
+// runner's own DLL), so 32-bit must be told to stop stdcall-decorating them;
+// 64-bit never decorates and takes the key-free declaration as before.
+#[cfg(target_arch = "x86")]
+#[link(name = "crypt32", kind = "raw-dylib", import_name_type = "undecorated")]
+unsafe extern "system" {
+    fn CertOpenStore(
+        lpsz_store_provider: *const u16,
+        dw_msg_encoding_type: u32,
+        h_crypto_provider: usize,
+        dw_flags: u32,
+        pv_para: *const u16,
+    ) -> usize;
+    fn CertCloseStore(h_cert_store: usize, dw_flags: u32) -> i32;
+    fn CertEnumCertificatesInStore(
+        h_cert_store: usize,
+        p_prev_context: *const CertContext,
+    ) -> *const CertContext;
+    fn CryptAcquireCertificatePrivateKey(
+        p_cert: *const CertContext,
+        dw_flags: u32,
+        pv_reserve: *const c_void,
+        ph_prov_or_key: *mut usize,
+        pdw_key_spec: *mut u32,
+        pf_caller_must_free: *mut i32,
+    ) -> i32;
+}
+
+#[cfg(not(target_arch = "x86"))]
 #[link(name = "crypt32", kind = "raw-dylib")]
 unsafe extern "system" {
     fn CertOpenStore(
@@ -99,6 +130,13 @@ unsafe extern "system" {
 // block above needs no key because that DLL really does export decorated
 // names on 32-bit; the difference between the two blocks is measured fact,
 // not taste — see the comment over there.
+#[cfg(not(target_arch = "x86"))]
+#[link(name = "ncrypt", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn NCryptFreeObject(h_object: usize) -> u32;
+}
+
+#[cfg(target_arch = "x86")]
 #[link(name = "ncrypt", kind = "raw-dylib", import_name_type = "undecorated")]
 unsafe extern "system" {
     /// CNG signs (and stores its keys) through `NCrypt*` handles. A key that
@@ -117,6 +155,37 @@ unsafe extern "system" {
 // Undecorated like ncrypt: advapi32's exports are plain names on every
 // architecture, and a decorated import is what made the 32-bit keystore test
 // binary refuse to load at all (see the two comments above).
+#[cfg(not(target_arch = "x86"))]
+#[link(name = "advapi32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn CryptGetHashParam(
+        h_hash: usize,
+        dw_param: u32,
+        pb_data: *mut u8,
+        pdw_data_len: *mut u32,
+        dw_flags: u32,
+    ) -> i32;
+    fn CryptCreateHash(
+        h_prov: usize,
+        alg_id: u32,
+        h_key: usize,
+        dw_flags: u32,
+        ph_hash: *mut usize,
+    ) -> i32;
+    fn CryptSetHashParam(h_hash: usize, dw_param: u32, pb_data: *const u8, dw_flags: u32) -> i32;
+    fn CryptSignHashW(
+        h_hash: usize,
+        key_spec: u32,
+        description: *const u16,
+        flags: u32,
+        pb_signature: *mut u8,
+        pcb_signature: *mut u32,
+    ) -> i32;
+    fn CryptDestroyHash(h_hash: usize) -> i32;
+    fn CryptReleaseContext(h_prov: usize, dw_flags: u32) -> i32;
+}
+
+#[cfg(target_arch = "x86")]
 #[link(
     name = "advapi32",
     kind = "raw-dylib",
