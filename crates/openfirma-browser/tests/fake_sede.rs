@@ -63,11 +63,23 @@ fn request(
     // is saturated and Windows discards answers most. Tests whose flow must
     // survive a discarded real answer call `ask`, which mints fresh per try.
     let may_reask = !path.starts_with("/sign/") || sign_path_may_reask(path);
-    // Three retries, not five: this sleep-retry loop replaces the old
-    // non-blocking storm that starved the endpoint's backlog under CPU load
-    // (that storm is what these helpers used to crash), so a bounded number
-    // of patient attempts suffices.
-    let tries = if may_reask { 3 } else { 1 };
+    // Three retries normally, six from inside the 503 flood probe: that test
+    // holds every handler slot busy with stalled connections and probes while
+    // saturated — exactly when the endpoint answers fastest (the refusal is a
+    // write-and-close) and Windows' accept queue drops the answer most. The
+    // CI witness (run 39019344987, aarch64-pc-windows-msvc, twice) shows the
+    // refused answer dying unread three times running while the endpoint kept
+    // working for everything else, so patience — not a logic change — is what
+    // this race needs. This sleep-retry loop replaces the old non-blocking
+    // storm that starved the endpoint's backlog under CPU load (that storm is
+    // what these helpers used to crash).
+    let tries = if !may_reask {
+        1
+    } else if path == "/echo" {
+        6
+    } else {
+        3
+    };
     for attempt in 0..tries {
         let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
         let answer = request_on(stream, addr, method, path, host, origin, body);
