@@ -42,8 +42,33 @@ pub struct SignRequest<'a> {
     /// content info and XAdES `DataObjectFormat` (the terminal's
     /// `--mime-type`).
     pub cades_mime_type: Option<String>,
-    /// CAdES `contentHint`: the terminal's advanced flag.
+    /// CAdES `contentHint`: the terminal's advanced flag. The CAdES default is
+    /// AutoFirma's generic `"binary"`; `Some(String::new())` means that same
+    /// default, and only the CLI's `--no-content-hint` sets it to `None`.
     pub cades_content_hint: Option<String>,
+    /// Whether the contentHint attribute is included at all — AutoFirma drops
+    /// it on `includeContentHintAttribute=false`, the terminal on
+    /// `--no-content-hint` (finding B2: not sending it by default was the diff).
+    pub cades_include_content_hint: bool,
+    /// Opt out of the conservative algorithm policy on the signing side —
+    /// the terminal's `--allow-weak-algorithms`. Default false: SHA-1 digests
+    /// and RSA keys below 2048 bits are refused before any crypto (finding
+    /// M5); whoever sets this owns what validators make of the result.
+    pub cades_allow_weak_algorithms: bool,
+    /// ETSI `signaturePolicyIdentifier` as an OID string — the terminal's
+    /// `--signature-policy`, AutoFirma's `policyIdentifier` extraParam. A bad
+    /// OID is refused at dispatch, not silently dropped.
+    pub cades_signature_policy: Option<String>,
+    /// The `sigPolicyHash` bytes for [`Self::cades_signature_policy`] — the
+    /// digest of the policy assertion text, AutoFirma's
+    /// `policyIdentifierHash`. Empty keeps the placeholder byte.
+    pub cades_signature_policy_hash: Vec<u8>,
+    /// ETSI `commitmentTypeIndication` as an OID string — the terminal's
+    /// `--commitment-type`, AutoFirma's `commitmentTypeIndication0Identifier`.
+    pub cades_commitment_type: Option<String>,
+    /// Copy the certificate's certificatePolicies into the signer-certificate
+    /// attribute (AutoFirma's default; `--no-certificate-policies` off).
+    pub cades_include_certificate_policies: bool,
     /// Whether the SignerInfo names the issuer and serial (`--no-issuer-serial`
     /// turns it off).
     pub cades_include_issuer_serial: bool,
@@ -96,6 +121,12 @@ impl<'a> SignRequest<'a> {
             cades_encapsulate_content: false,
             cades_mime_type: None,
             cades_content_hint: None,
+            cades_include_content_hint: true,
+            cades_allow_weak_algorithms: false,
+            cades_signature_policy: None,
+            cades_signature_policy_hash: Vec::new(),
+            cades_commitment_type: None,
+            cades_include_certificate_policies: true,
             // The CAdES default both frontends sign with unless told otherwise.
             cades_include_issuer_serial: true,
             cades_signing_time: Some(std::time::SystemTime::now()),
@@ -194,6 +225,22 @@ pub fn execute_with_detection(
     execute_request(req, Format::detect(content), content, signer)
 }
 
+/// Parses the optional OID strings of the two policy knobs. An empty string
+/// means "not set"; anything that is not a dotted OID is an error naming the
+/// value, because silently dropping it would sign without the attribute the
+/// caller asked for.
+fn parse_policy_oid(value: Option<&str>) -> Result<Option<const_oid::ObjectIdentifier>> {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) => {
+            use std::str::FromStr;
+            const_oid::ObjectIdentifier::from_str(s)
+                .map(Some)
+                .map_err(|_| Error::Other(format!("{s} is not an OID in dotted form")))
+        }
+    }
+}
+
 /// The dispatcher itself: format string in, signature bytes out. Callers gate
 /// on the file shape first (`execute_request`/`execute_with_detection`).
 fn dispatch(req: &mut SignRequest<'_>, content: &[u8], signer: &dyn Signer) -> Result<Vec<u8>> {
@@ -202,12 +249,31 @@ fn dispatch(req: &mut SignRequest<'_>, content: &[u8], signer: &dyn Signer) -> R
         // pins its own shape): encapsulation is the caller's choice and the
         // GUI keeps AutoFirma's default off — detached is the citizen answer.
         "cades-b-b" => {
+            // OID-string knobs are parsed here so both frontends refuse a bad
+            // one identically.
+            let signature_policy = parse_policy_oid(req.cades_signature_policy.as_deref())?;
+            let commitment_type = parse_policy_oid(req.cades_commitment_type.as_deref())?;
             let mut opts = CadesOptions {
                 digest: req.digest,
                 encapsulate_content: req.cades_encapsulate_content,
                 mime_type: req.cades_mime_type.clone(),
-                content_hint: req.cades_content_hint.clone(),
+                content_hint: if req.cades_include_content_hint {
+                    Some(req.cades_content_hint.clone().unwrap_or_else(|| {
+                        openfirma_cades::AUTOFIRMA_DEFAULT_CONTENT_DESCRIPTION.to_string()
+                    }))
+                } else {
+                    None
+                },
                 include_issuer_serial: req.cades_include_issuer_serial,
+                include_certificate_policies: req.cades_include_certificate_policies,
+                signature_policy,
+                signature_policy_hash: req.cades_signature_policy_hash.clone(),
+                commitment_type,
+                algorithms: if req.cades_allow_weak_algorithms {
+                    openfirma_cades::verify::AlgorithmPolicy::All
+                } else {
+                    openfirma_cades::verify::AlgorithmPolicy::Conservative
+                },
                 ..CadesOptions::default()
             };
             opts.timestamp = req.timestamp.clone();

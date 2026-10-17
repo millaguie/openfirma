@@ -511,6 +511,7 @@ fn verify_after_gui_sign(signed: &Path) {
         trust_anchors: anchors,
         validation_time: std::time::SystemTime::now(),
         ts_mode: false,
+        ..openfirma_cades::VerifyOptions::default()
     };
     let document = openfirma_pades::pades_verify(&bytes, &opts).expect("the GUI's output verifies");
     assert_eq!(document.signatures.len(), 1);

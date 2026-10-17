@@ -42,6 +42,7 @@ pub fn verdicts_for(
         trust_anchors: anchors,
         validation_time: now(),
         ts_mode: false,
+        ..VerifyOptions::default()
     };
     match openfirma_core::workflow::Format::detect(bytes) {
         openfirma_core::workflow::Format::Pdf => Ok(verdicts_from_pdf(

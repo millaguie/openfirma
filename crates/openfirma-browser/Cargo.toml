@@ -10,6 +10,7 @@ description = "The browser protocol of openfirma: the afirma:// URI scheme and t
 [dependencies]
 openfirma-core.workspace = true
 openfirma-cades.workspace = true
+const-oid.workspace = true
 openfirma-pades.workspace = true
 openfirma-xades.workspace = true
 openfirma-keystore.workspace = true
