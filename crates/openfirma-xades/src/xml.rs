@@ -175,9 +175,121 @@ struct Parser<'a> {
 /// namespace is the entry with prefix None.
 type Scope = Vec<(Option<String>, String)>;
 
+/// The encoding name a declaration declares ("" when it declares none). XML
+/// names encodings case-insensitively and the ASCII case folds are all inside
+/// ASCII, so a byte-level fold is exact here.
+fn encoding_is(declared: &str, wanted: &[u8]) -> bool {
+    declared.len() == wanted.len()
+        && declared
+            .bytes()
+            .zip(wanted)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// The value of the `name=` pseudo-attribute of the XML declaration (trimmed,
+/// single quotes accepted), or None when absent. Production [24] of the spec
+/// is strict — Name Eq OptSp AttValue — and every real declaration begins
+/// with version, so only the spelling anchored at the start of the content
+/// (or right after the leading whitespace) is recognized: a `version=` that
+/// appears anywhere else inside the declaration is not this attribute.
+fn declared_pseudo_attribute<'a>(content: &'a str, name: &str) -> Option<&'a str> {
+    let rest = content.trim_start_matches([' ', '\t', '\r', '\n']);
+    if !rest.starts_with(name) {
+        return None;
+    }
+    // the character right after the name may only be whitespace or '='
+    let after_name = &rest[name.len()..];
+    let next = *after_name.as_bytes().first()?;
+    if !(next.is_ascii_whitespace() || next == b'=') {
+        return None;
+    }
+    declared_attvalue(after_name)
+}
+
+/// The `Eq OptSp AttValue` part of a pseudo-attribute: given the text that
+/// begins right after its name, return the quoted value or None. Shared by
+/// the two callers so the grammar lives in one place.
+fn declared_attvalue(rest: &str) -> Option<&str> {
+    let rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+    let rest = rest.strip_prefix('=')?;
+    let rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+    let quote = *rest.as_bytes().first()?;
+    if quote != b'"' && quote != b'\'' {
+        // version=1.0 without quotes is not an AttValue (production [24]), so
+        // it is not this pseudo-attribute at all
+        return None;
+    }
+    let end = rest[1..].find(quote as char)?;
+    Some(rest[1..end + 1].trim())
+}
+
+/// The declaration's attributes are checked in order, so `encoding` has to be
+/// found wherever it sits: scan the content for a whitespace-delimited
+/// `name=` occurrence.
+fn declared_attribute_anywhere<'a>(content: &'a str, name: &str) -> Option<&'a str> {
+    // the declaration's names are case-insensitive tokens (production [24]
+    // and namespaces in general): compare a lowercased copy at ASCII byte
+    // boundaries so the returned slice keeps the exact spelling to echo back
+    let haystack = content.to_ascii_lowercase();
+    let bytes = haystack.as_bytes();
+    let name = &name.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(name) {
+        let at = from + offset;
+        let before_ok = at == 0 || matches!(bytes[at - 1], b' ' | b'\t' | b'\r' | b'\n');
+        let after = at + name.len();
+        let next = bytes.get(after).copied();
+        if before_ok && next.is_none_or(|b| b == b'=') {
+            // an AttValue is quoted, and the value ends at its OWN closing
+            // quote: searching from the opening one matched the hyphen inside
+            // UTF-8 as a delimiter and handed back "UTF-" (the byte/char mix
+            // this replaced was the real story; the shape is production [24])
+            // the scan found `name=` (lowercased) at byte `at`; the VALUE is
+            // not lowercased data, so re-reading it from the real content at
+            // the same offset is what echoes back the document's spelling.
+            // ASCII-only tokens make both slices start at a char boundary;
+            // the defensive get avoids any panic if that ever changes.
+            let value = content.get(at..).and_then(|rest| {
+                let rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+                // `rest` begins with the lowercased name at exactly `name.len()`
+                // ASCII bytes; everything after is Eq OptSp AttValue
+                let rest = rest.get(name.len()..)?;
+                declared_attvalue(rest)
+            })?;
+            return Some(value);
+        }
+        from = after;
+    }
+    None
+}
+
 impl<'a> Parser<'a> {
     fn parse_document(&mut self) -> Result<Document> {
         self.skip_bom();
+        // XML 1.0 (Well-Formedness Constraint XMLDeclSpec) puts the declaration
+        // at byte zero, after an optional BOM that `skip_bom` has just consumed:
+        // `  <?xml ...?><doc/>` is not well formed and libxml2 refuses it
+        // (reviewer finding M-3 — we used to sign it). Checked against the raw
+        // bytes here, before the element loop's skip_space swallows the
+        // whitespace and hides the shape from every later check.
+        let mut cursor = self.pos;
+        while matches!(self.src.get(cursor), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            cursor += 1;
+        }
+        // <?xmlname is the target <?xml plus a name character, not a declaration.
+        let after_target = cursor + 5;
+        let is_decl = match self.src.get(after_target) {
+            None => true,
+            Some(&c) => matches!(c, b' ' | b'\t' | b'\r' | b'\n') || c == b'?',
+        };
+        if is_decl && cursor > self.pos && self.src[cursor..].starts_with(b"<?xml") {
+            let line = self.src[..cursor].iter().filter(|b| **b == b'\n').count() + 1;
+            return Err(Error::Xml(format!(
+                "whitespace before the XML declaration makes the document not \
+                 well formed: XML puts the declaration at byte zero, after an \
+                 optional BOM (line {line})"
+            )));
+        }
         let decl = self.parse_declaration()?;
 
         let mut root: Option<Element> = None;
@@ -251,9 +363,9 @@ impl<'a> Parser<'a> {
 
     /// The `<?xml ... ?>` declaration. Its raw bytes are recorded but the
     /// output always carries the normalized declaration AutoFirma writes, so
-    /// nothing here is validated beyond "it parses".
+    /// nothing here is validated beyond well-formedness and what its version
+    /// and encoding pseudo-attributes claim (see `check_declaration`).
     fn parse_declaration(&mut self) -> Result<Option<(usize, usize)>> {
-        self.skip_space();
         if !self.starts_with(b"<?xml") {
             return Ok(None);
         }
@@ -264,8 +376,76 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         self.expect(b"<?xml")?;
+        let content_start = self.pos;
         self.skip_until_pi_end()?;
+        // `<? ... ?>` closing the declaration is well-formedness, checked here
+        // because production [23] demands the question marks even when the
+        // attributes are refused for other reasons
+        if !self.src[content_start..self.pos].starts_with(b" ") {
+            return Err(self.err(
+                "the XML declaration must be followed by whitespace or '?>', and its \
+                 attributes separated from the target",
+            ));
+        }
+        // `version` and `encoding` are the two pseudo-attributes that decide
+        // how the bytes below mean something, so they are checked here (the
+        // rest of the declaration is data no consumer of ours reads). The
+        // whitespace check above makes content_start..pos start at the first
+        // character after the `<?xml` target itself; trimming it lands on the
+        // first pseudo-attribute.
+        let content = self.text[content_start..self.pos - 2].trim();
+        self.check_declaration(content)?;
         Ok(Some((start, self.pos)))
+    }
+
+    /// version="1.0" and a declared encoding we can honour. XML 1.1 changes
+    /// the line-end repertoire (U+0085 becomes a line end), which would
+    /// change the content between what we sign and what a 1.1 parser
+    /// reads, and no administrative XML in the field declares it: refused.
+    /// The encoding rule is reviewer finding A-3: declaring ISO-8859-1 over
+    /// bytes that happen to also be valid UTF-8 used to sign *different text*
+    /// than what every other parser reads from the same file, and write a
+    /// UTF-8 declaration over it. We never re-interpret the bytes behind the
+    /// declaration's back: either the name is one of the two we can read with
+    /// certainty (UTF-8 itself, or US-ASCII, whose bytes are all single-char
+    /// in both readings) or the document is refused with the name it declares.
+    fn check_declaration(&self, content: &str) -> Result<()> {
+        // production [24] puts version first; real-world producers always do.
+        let version = declared_pseudo_attribute(content, "version").ok_or_else(|| {
+            self.err(
+                "the XML declaration carries no version, or spells it without the \
+                 quoted value the specification requires",
+            )
+        })?;
+        if !encoding_is(version, b"1.0") {
+            return Err(self.err(&format!(
+                "the XML declaration declares version=\"{version}\"; openfirma signs \
+                 version 1.0 documents (and 1.1 would redefine the line ends inside \
+                 your content)"
+            )));
+        }
+        if let Some(encoding) = declared_attribute_anywhere(content, "encoding") {
+            // A declared UTF-8 encoding over bytes that are not valid UTF-8
+            // is refused by the whole-file UTF-8 check in `parse` before this
+            // method ever runs, so it cannot reach here.
+            // utf8 is the IANA registered alias of UTF-8 and a shape real
+            // producers write; it names exactly the bytes this reader has
+            // already validated, so it is honored like the hyphenated spelling.
+            if !encoding_is(encoding, b"UTF-8")
+                && !encoding_is(encoding, b"utf8")
+                && !encoding_is(encoding, b"US-ASCII")
+            {
+                return Err(Error::Xml(format!(
+                    "the document declares encoding=\"{encoding}\" while its bytes are \
+                     being read as UTF-8. Signing it as-is could sign different text \
+                     than what a parser that obeys the declaration reads, so openfirma \
+                     refuses it. Convert the document first: iconv -f {encoding} -t \
+                     UTF-8 in.xml > out.xml (and update its encoding=\"{encoding}\" \
+                     declaration)"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn parse_element(&mut self, scope: &mut Scope, depth: usize) -> Result<Element> {
@@ -285,9 +465,12 @@ impl<'a> Parser<'a> {
         let mut attributes = Vec::new();
         // a set, not a scanned Vec: checking "attribute seen before" by
         // linear search made one element with thousands of attributes cost
-        // the square of their count (99 KB of attributes took 0.65 s debug,
-        // and c14n then quadratic on top)
+        // the square of their count (review 03, M-2)
         let mut seen_names: HashSet<(Option<String>, String)> = HashSet::new();
+        // namespace declarations are attributes too, and checked for repeats
+        // in tag order like everything else below; kept apart because their
+        // value decides scope before the other attributes are resolved
+        let mut seen_decls: HashSet<Option<String>> = HashSet::new();
 
         // the declarations of this element apply to its own name, so they are
         // collected first and pushed onto the scope before anything is checked
@@ -306,21 +489,58 @@ impl<'a> Parser<'a> {
             self.expect(b"=")?;
             self.skip_space();
             let value = self.parse_attr_value()?;
-
             // attribute value normalization first, entity expansion second:
             // a literal tab or newline becomes a space, but &#x9; stays a
-            // tab, which canonicalization then prints as a reference again
-            let expanded = self.expand_entities(&collapse_space(&value))?;
-            if attr_name.prefix.is_none() && attr_name.local == "xmlns" {
-                ns_decls.push((None, expanded));
+            // tab, which canonicalization then prints as a reference again.
+            // Line ends are normalized before collapsing (§2.11 runs before
+            // §3.3.3), so a CRLF in the source is one line end and therefore
+            // exactly one space, not two (reviewer finding A-1: libxml2 reads
+            // "x\r\ny" as "x y").
+            let collapsed = collapse_space(&normalize_line_ends(&value));
+            let expanded = self.expand_entities(&collapsed)?;
+            let value = validate_chars(&expanded, "an attribute value")?;
+            let decl_prefix = if attr_name.prefix.is_none() && attr_name.local == "xmlns" {
+                None
             } else if attr_name.prefix.as_deref() == Some("xmlns") {
-                ns_decls.push((Some(attr_name.local.clone()), expanded));
+                // xmlns: with an empty local name is a namespace declaration
+                // attribute only in this exact spelling; anything weirder was
+                // already refused by parse_qname
+                Some(attr_name.local.clone())
             } else {
-                pending_attrs.push((attr_name, expanded));
+                // duplicate attributes are an error even before namespace
+                // resolution decides their identity (libxml2 refuses them in
+                // the tag itself). All non-xmlns attributes of one element
+                // carry distinct (prefix, local) names or libxml2 stops here.
+                if !seen_names.insert((attr_name.prefix.clone(), attr_name.local.clone())) {
+                    return Err(self.err(&format!(
+                        "the attribute {} appears twice on <{}>",
+                        attr_name.to_string_with_prefix(),
+                        name.to_string_with_prefix()
+                    )));
+                }
+                pending_attrs.push((attr_name, value));
+                continue;
+            };
+            // the same prefix declared twice on one element is an error even
+            // with the identical URI (libxml2: Attribute xmlns:a redefined —
+            // reviewer finding M-3, we used to sign such documents and the
+            // output could not even be parsed back)
+            if !seen_decls.insert(decl_prefix.clone()) {
+                return Err(self.err(&format!(
+                    "the namespace declaration {} appears twice on the same element",
+                    match &decl_prefix {
+                        Some(p) => format!("xmlns:{p}"),
+                        None => "xmlns".to_string(),
+                    }
+                )));
             }
+            ns_decls.push((decl_prefix, value));
         }
 
-        let pushed = scope.len();
+        // namespace declaration well-formedness (reviewer finding M-3): a
+        // document that violates one of these rules parses nowhere else, and
+        // signing it would produce a file no validator can even read. The
+        // duplicate check already ran with the attributes, in tag order.
         for (prefix, uri) in &ns_decls {
             if prefix.as_deref() == Some("xml") && uri != "http://www.w3.org/XML/1998/namespace" {
                 return Err(self.err("the xml prefix cannot be rebound"));
@@ -332,7 +552,18 @@ impl<'a> Parser<'a> {
                 if !is_ncname(p) {
                     return Err(self.err(&format!("xmlns:{p} is not a valid prefix")));
                 }
+                // an empty URI cancels the default namespace, which only plain
+                // `xmlns` may do: xmlns:p="" reserves a prefix to nothing
+                // (Namespaces in XML §6.2; libxml2: Empty XML namespace is not
+                // allowed for a prefix)
+                if uri.is_empty() {
+                    return Err(self.err(&format!("xmlns:{p} cannot name an empty namespace")));
+                }
             }
+        }
+
+        let pushed = scope.len();
+        for (prefix, uri) in &ns_decls {
             // no shadow removal here: resolve_ns scans back to front, so the
             // last declaration of a prefix wins, and the truncate at the end
             // of the element restores the outer scope exactly
@@ -368,14 +599,6 @@ impl<'a> Parser<'a> {
                     Some(ns)
                 }
             };
-            let key = (attr_ns.clone(), attr_name.local.clone());
-            if !seen_names.insert(key) {
-                return Err(self.err(&format!(
-                    "the attribute {} appears twice on <{}>",
-                    attr_name.to_string_with_prefix(),
-                    name.to_string_with_prefix()
-                )));
-            }
             attributes.push(Attribute {
                 name: attr_name,
                 namespace: attr_ns,
@@ -521,7 +744,17 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         let raw = &self.text[start..self.pos];
-        self.expand_entities(&normalize_line_ends(raw))
+        // §2.5 forbids the literal sequence ']]>' in content text (reviewer
+        // finding M-3): a document carrying it parses nowhere else, and both
+        // ends normalizing it away is precisely the divergence a signature
+        // must not paper over
+        if raw.contains("]]>") {
+            return Err(
+                self.err("']]' is not allowed in text content unless followed by '>' outside here")
+            );
+        }
+        let expanded = self.expand_entities(&normalize_line_ends(raw))?;
+        validate_chars(&expanded, "text content")
     }
 
     fn parse_cdata(&mut self) -> Result<String> {
@@ -532,7 +765,8 @@ impl<'a> Parser<'a> {
             .ok_or_else(|| self.err("a CDATA section is never closed"))?;
         let raw = &self.text[start..end];
         self.pos = end + 3;
-        Ok(normalize_line_ends(raw))
+        let normalized = normalize_line_ends(raw);
+        validate_chars(&normalized, "a CDATA section")
     }
 
     fn parse_comment(&mut self) -> Result<String> {
@@ -546,7 +780,11 @@ impl<'a> Parser<'a> {
         if raw.contains("--") || raw.ends_with('-') {
             return Err(Error::Xml("'--' is not allowed inside a comment".into()));
         }
-        Ok(raw.to_string())
+        // §2.11 runs before anything looks at the node, so a comment keeps no
+        // CR; the comment mode of canonicalization would otherwise print a
+        // raw CRLF where libxml2 prints an LF
+        let normalized = normalize_line_ends(raw);
+        validate_chars(&normalized, "a comment")
     }
 
     fn parse_pi(&mut self) -> Result<(String, String)> {
@@ -560,10 +798,14 @@ impl<'a> Parser<'a> {
         self.skip_until_pi_end()?;
         // the whitespace between the target and the data is not part of the
         // data: canonicalization prints one space, and every implementation
-        // measured (libxml2, Apache Santuario) agrees with the spec example
-        let data = self.text[start..self.pos - 2]
-            .trim_start_matches([' ', '\t', '\r', '\n'])
-            .to_string();
+        // measured (libxml2, Apache Santuario) agrees with the spec example.
+        // §2.11 normalization applies to PI data too (reviewer finding A-2):
+        // libxml2 canonically prints `<?pi a\r\nb?>` as `<?pi a\nb?>`, and a
+        // CR reaching write_pi verbatim breaks the digest
+        let data = normalize_line_ends(
+            self.text[start..self.pos - 2].trim_start_matches([' ', '\t', '\r', '\n']),
+        );
+        let data = validate_chars(&data, "a processing instruction")?;
         Ok((target, data))
     }
 
@@ -636,8 +878,14 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// The four characters XML 1.0 calls whitespace (§2.3). `u8::is_ascii_-
+    /// whitespace` also counts form feed and vertical tab, which libxml2
+    /// rejects between attributes (reviewer finding M-3), so it is exactly the
+    /// wrong predicate here.
     fn skip_space(&mut self) {
-        while self.pos < self.src.len() && self.src[self.pos].is_ascii_whitespace() {
+        while self.pos < self.src.len()
+            && matches!(self.src[self.pos], b' ' | b'\t' | b'\r' | b'\n')
+        {
             self.pos += 1;
         }
     }
@@ -685,6 +933,29 @@ fn parse_char_ref(numeric: &str) -> Option<char> {
         return None;
     }
     char::from_u32(code)
+}
+
+/// The `Char` production of XML 1.0 (§2.2), applied to expanded content: text,
+/// attribute values, CDATA, comments and PI data all forbid the C0 controls
+/// (only tab, LF and CR were ever legal there) and surrogates. Reviewer
+/// finding M-3: a document carrying them is not XML, libxml2 refuses to parse
+/// it, and signing one produced a file no validator could even read. `&#0;`
+/// and friends reach here as expanded characters, which is where they are
+/// caught.
+fn validate_chars(text: &str, where_: &str) -> Result<String> {
+    if let Some(c) = text
+        .chars()
+        .find(|c| matches!(c, '\0' | '\x01'..='\x08' | '\x0b' | '\x0c' | '\x0e'..='\x1f'))
+    {
+        return Err(Error::Xml(format!(
+            "invalid XML character U+{:04X} in {where_}: the parser of every other \
+             implementation (libxml2, Xerces) refuses to read this document, so it \
+             would carry a signature nobody can verify; remove or encode the control \
+             characters first",
+            c as u32
+        )));
+    }
+    Ok(text.to_string())
 }
 
 /// The XML line end rule, applied before anything else reads the text: CRLF
@@ -822,6 +1093,48 @@ mod tests {
         assert_eq!(doc.root.attributes[0].value, "one two three");
     }
 
+    /// Reviewer finding A-1: §2.11 normalizes line ends before the attribute
+    /// value normalization of §3.3.3, so a CRLF in the source is one line end
+    /// and becomes exactly one space. The reader used to replace CR and LF
+    /// separately and produced two spaces, which made xmlsec1 report
+    /// `Reference 0/1` on any document whose attribute carried a Windows line
+    /// ending.
+    #[test]
+    fn crlf_in_an_attribute_value_becomes_one_space() {
+        let doc = parse(b"<doc a=\"x\r\ny\"><b>t</b></doc>").unwrap();
+        assert_eq!(doc.root.attributes[0].value, "x y");
+        // a lone CR is one line end too (the reader already got this right)
+        let doc = parse(b"<doc a=\"1\r2\"/>").unwrap();
+        assert_eq!(doc.root.attributes[0].value, "1 2");
+        // and the reference form survives untouched, per §3.3.3
+        let doc = parse(b"<doc a=\"x&#xD;y\"/>").unwrap();
+        assert_eq!(doc.root.attributes[0].value, "x\u{d}y");
+    }
+
+    /// Reviewer finding A-2: the line end rule of §2.11 applies to processing
+    /// instruction data (and comment text) as well; libxml2 canonically prints
+    /// `<?pi a\r\nb?>` with an LF, and a raw CR reaching the canonicalizer
+    /// broke every digest over the document.
+    #[test]
+    fn line_ends_are_normalized_in_pis_and_comments() {
+        let doc = parse(b"<doc><?pi a\r\nb?><b>t</b></doc>").unwrap();
+        match &doc.root.children[0] {
+            Child::Pi { data, .. } => assert_eq!(data, "a\nb"),
+            other => panic!("expected a PI, got {other:?}"),
+        }
+        let doc = parse(b"<doc><!--c1\r\nc2--><b/></doc>").unwrap();
+        match &doc.root.children[0] {
+            Child::Comment(c) => assert_eq!(c, "c1\nc2"),
+            other => panic!("expected a comment, got {other:?}"),
+        }
+        // document level PIs too
+        let doc = parse(b"<?t x\r\ny?><doc/>").unwrap();
+        match &doc.prolog[0] {
+            DocLevelNode::Pi { data, .. } => assert_eq!(data, "x\ny"),
+            other => panic!("expected a PI, got {other:?}"),
+        }
+    }
+
     #[test]
     fn namespaces_resolve_and_prefixes_must_be_declared() {
         let doc = parse(
@@ -847,6 +1160,58 @@ mod tests {
         assert_eq!(doc.root.namespace.as_deref(), Some("urn:d"));
     }
 
+    /// Reviewer finding A-3: a declaration that says something other than
+    /// UTF-8 about bytes the whole pipeline reads as UTF-8 means two readers
+    /// see different text, and the signature would sit over one of them. The
+    /// reader refuses instead of guessing — naming what was declared and how
+    /// to fix it (review 03 asked for exactly this refusal path).
+    #[test]
+    fn a_declaration_that_lies_about_the_bytes_is_refused() {
+        // valid UTF-8 AND meaningful Latin-1 text: the divergent case where
+        // obeying the declaration and ignoring it produce different strings.
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"iso-8859-1\"?><doc>caf\xc3\xa9</doc>";
+        let e = parse(latin1.as_slice()).unwrap_err().to_string();
+        // the message names the encoding exactly as the document spelled it
+        assert!(e.contains("iso-8859-1"), "{e}");
+        assert!(e.contains("iconv"), "{e}");
+        // a declaration that puts anything before version is outside
+        // production [24] and refused, whatever it declares there; the check
+        // that matters (case-insensitive names) runs on the position-anchored
+        // spelling too
+        assert!(parse(b"<?xml standalone=\"no\"?>").is_err());
+        assert!(parse(b"<?xml version=\"1.0\" ENCODING=\"ISO-8859-1\"?><doc/>").is_err());
+        assert!(parse(b"<?xml version=\"1.0\" encoding=\"utf8\"?><doc/>").is_ok());
+        // what we do read with certainty stays legal: UTF-8 itself and the
+        // ASCII subset, spelled any way that names them
+        assert!(parse(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><doc>caf\xc3\xa9</doc>").is_ok());
+        assert!(parse(b"<?xml version='1.0' encoding='us-ascii'?><doc/>").is_ok());
+        // and no declaration at all: nothing is declared, the bytes are UTF-8
+        assert!(parse(b"<doc>x</doc>").is_ok());
+    }
+
+    /// Reviewer finding M-3: a version other than 1.0, whitespace in front of
+    /// the declaration, or a version outside production [24] — documents
+    /// libxml2 refuses to read, so signing them would produce a file no
+    /// verifier can open (review 03).
+    #[test]
+    fn an_invalid_or_misplaced_declaration_is_refused() {
+        let bad: &[&[u8]] = &[
+            br#"<?xml version="1.1"?><doc/>"#,
+            br#"  <?xml version="1.0"?><doc/>"#,
+            b"\n<?xml version=\"1.0\"?><doc/>",
+            br#"<?xml?><doc/>"#,                  // no version at all
+            br#"<?xml version=1.0?><doc/>"#,      // production [24] requires a quoted value
+            br#"<?xml encoding="UTF-8"?><doc/>"#, // and version comes first
+        ];
+        for input in bad {
+            assert!(parse(input).is_err(), "{:?} was accepted", input);
+        }
+        // a comment or PI before the root with no declaration is a legal
+        // prolog: it is only the declaration that may not move
+        assert!(parse(b"<!--c--><doc/>").is_ok());
+        assert!(parse(b"<?pi d?><doc/>").is_ok());
+    }
+
     #[test]
     fn refuses_what_it_cannot_understand() {
         let bad: &[&[u8]] = &[
@@ -859,10 +1224,62 @@ mod tests {
             b"",                     // nothing
             b"<a b=c/>",             // unquoted value
             b"\xff\xfe<a/>",         // not UTF-8
+            b"<a b=",                // attribute value cut off at EOF (M-1)
+            b"<a b= ",               // ... with a trailing space
+            b"<doc>&#0;x</doc>",     // character reference to a non xmlChar
+            b"<doc>\x01x</doc>",     // control character in text
+            b"<doc>a]]>b</doc>",     // ']]>' in content text (M-3)
+            b"<a v=\"x\x01y\"/>",    // control character in an attribute value
         ];
         for input in bad {
             assert!(parse(input).is_err(), "{:?} was accepted", input);
         }
+    }
+
+    /// Reviewer finding M-1: `<a b=` indexed one past the end of the source
+    /// and panicked; a truncated document must fail like every other cut.
+    #[test]
+    fn truncated_input_fails_with_an_error_never_a_panic() {
+        let cases: &[&[u8]] = &[
+            b"<a b=",
+            b"<a b= ",
+            b"<a b=\"",
+            b"<a/",
+            b"<a></a",
+            b"<a x=\"1\"",
+            b"<a>&",
+        ];
+        for input in cases {
+            assert!(parse(input).is_err(), "{:?} was accepted", input);
+        }
+        // and the systematic form: cut a valid document at every byte, none
+        // may panic
+        let full =
+            br#"<?xml version="1.0"?><r xmlns:x="urn:x" Id="i"><x:c a="1">t</x:c><!--k--></r>"#;
+        for cut in 0..full.len() {
+            let _ = parse(&full[..cut]);
+        }
+    }
+
+    /// Reviewer finding M-2: attribute duplicate detection and namespace
+    /// resolution scanned linear structures per attribute, which cost the
+    /// square of their count. One element with 10 000 attributes must parse
+    /// in well under a second, debug build included.
+    #[test]
+    fn many_attributes_do_not_cost_quadratic_time() {
+        let mut s = String::from("<doc");
+        for i in 0..10_000 {
+            s.push_str(&format!(" x{i}=\"urn:a\" a{i}=\"{i}\""));
+        }
+        s.push_str("/>");
+        let start = std::time::Instant::now();
+        let doc = parse(s.as_bytes()).expect("10 000 attributes must parse");
+        assert_eq!(doc.root.attributes.len(), 20_000);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "parsing 10 000 attributes took {elapsed:?}"
+        );
     }
 
     #[test]

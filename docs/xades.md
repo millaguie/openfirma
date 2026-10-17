@@ -215,7 +215,15 @@ set by `docs/pades.md` and `docs/adr/0003`.
    normalized declaration rather than the input's.
 3. **Input encoding.** UTF-8 only. Input that does not decode as UTF-8 is
    refused with an error naming the cause; AutoFirma would transcode through
-   its serializer.
+   its serializer. A declaration whose `encoding` names anything other than
+   UTF-8 (or its registered alias `utf8`, or US-ASCII) is refused too, naming
+   what it declared and the `iconv` to run: signing bytes while a validator
+   re-reads them through the declared encoding signs different text than what
+   gets verified. Same for a version other than 1.0, whitespace in front of
+   the declaration, and namespace declarations that XML itself forbids
+   (duplicate prefixes on one element, `xmlns:p=""`): every validator's parser
+   (libxml2) refuses those documents, so signing them would ship bytes nobody
+   can even re-open.
 4. **DTD and entities.** Refused: a DOCTYPE is rejected before parsing (XXE
    safety, and no golden input has one) and any entity reference beyond the
    five predefined ones is an error. The error says to sign the expanded
