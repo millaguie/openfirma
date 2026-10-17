@@ -23,5 +23,5 @@ pub mod tsp;
 pub mod verify;
 
 pub use revocation::read_ocsp_response;
-pub use signed_data::{CadesOptions, TimestampFn, sign};
-pub use verify::{Attributes, VerifyOptions, VerifyReport, verify};
+pub use signed_data::{AUTOFIRMA_DEFAULT_CONTENT_DESCRIPTION, CadesOptions, TimestampFn, sign};
+pub use verify::{Attributes, VerifyOptions, VerifyReport, signer_certificates, verify};
