@@ -340,6 +340,56 @@ wording, a real certificate that never enters the repository.
 - [ ] CLI parity spot-check: every action above reproduces with the
       equivalent `openfirma sign/verify` line from the README.
 
+## 6. Keystore interoperability manual checklist (wave 4a)
+
+Everything here compiles on CI but cannot run here: this development box has
+no Windows, no macOS keychain contents it may touch, and no DNIe card. Each
+item is what a person with that hardware runs once; findings go to
+`docs/validation-log.md`.
+
+- [ ] Windows, own login: `openfirma keystores list --store windows` shows the
+      store's signing certificates with their key specs (the enumeration asks
+      CNG then legacy CAPI per certificate, and refuses to call a
+      non-exportable key signable when neither provider can be opened for it).
+- [ ] Windows, sign: `openfirma sign -i doc.txt -o doc.csig --store windows`
+      with a cert whose key is non-exportable (its "Microsoft Enhanced
+      Cryptographic Provider v1.0" style CSP or a CNG key marked
+      non-exportable). This exercises signing through the store's own
+      certificate context: AutoFirma's Java path needs it too — a context
+      rebuilt from DER has no `CERT_KEY_PROV_INFO` and `CryptAcquireCertificatePrivateKey`
+      fails on it (its javap evidence is in this repo's ADR-0004 discussion).
+      If the store crypto ever produced "No CAPI provider for this
+      certificate's private key" for a cert that AutoFirma signs fine, that is
+      exactly this bug.
+- [ ] Windows, DNIe: same through the card's CSP; with a PIN, expect the card
+      dialog or the prompt to be suppressible by `SILENT` only when a PIN was
+      already supplied — check the interactive and the pre-authenticated case.
+- [ ] macOS keychain (14+, 26): `--store macos-keychain:` listing; until it is
+      tested the code refuses rather than guessing, so this box checks that the
+      refusal wording is actionable, nothing else.
+- [ ] DNIe card, PIN twice: a token whose keys carry
+      `CKA_ALWAYS_AUTHENTICATE` (a real DNIe does; SoftHSM can simulate it by
+      PKCS#11 tooling) must authenticate once for listing and again per
+      signature (`C_Login(CKU_CONTEXT_SPECIFIC)`), and a card that resets its
+      operation between calls gets its retry — the sequence is exactly what
+      AutoFirma's `Pkcs11Mixin` does. A wrong PIN here must say so without
+      burning retries beyond one.
+- [ ] NSS via Firefox: with Firefox installed (deb, snap or flatpak), run
+      `openfirma keystores list` with no `--store`: it should offer exactly the
+      profiles Firefox itself would open — `profiles.ini` decides, including
+      an install whose default differs from the global one — and every listing
+      must work through libnss3 loaded read-only (no cert9.db changes: compare
+      its checksum before and after).
+- [ ] NSS with spaces: move a profile database to a path containing spaces and
+      list it by descriptor (`nss:<path>`); quoting is unit-tested against real
+      libsoftokn3 on Linux, this box confirms the vendor's own error wording.
+- [ ] PKCS#12 out of Java: take one `.p12` each from a RealVNC export, a
+      Google-wide-character-set keystore, and any 40-bit RC2 legacy keystore;
+      `openfirma keystores list --p12 <f>` must open all three where the old
+      DER walker refused. These are the exact shapes AutoFirma's Sun provider
+      reads (its ASN1Parser integer/length limits were measured by javap, see
+      ADR-0003); the synthetic versions of them are in CI (`pkcs12_interop`).
+
 ## Test certificate material
 
 `testdata/certs/` is gitignored except for its README. Generated on demand by

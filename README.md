@@ -78,8 +78,8 @@ docs/adr/0005-browser-protocol.md and the table row below.
 | PAdES B-LT (`/DSS` validation data, CRL and OCSP) | works, crosschecked with openssl crl and the DSS-shape checks in verify |
 | PAdES B-LTA (document time-stamp over the archive) | works, crosschecked with openssl ts, qpdf and pdfsig |
 | CAdES ES-LT / ES-LTA (validation data inside the CMS) | out of scope: the long-term path is PAdES B-LT/B-LTA, see docs/pades.md |
-| Keystores: PKCS#12 | works, pure Rust, MAC checked before decrypting |
-| Keystores: PKCS#11 tokens (OpenSC/DNIe shape), NSS shared DB | works, FFI into the vendor module at runtime, tested against SoftHSM and libsoftokn3 with signatures double-verified by openfirma and openssl |
+| Keystores: PKCS#12 | works, pure Rust: BER parser (RealVNC/Google-style indefinite-length files open), keyLength 128-bit keys and legacy RC2-40 certificates decrypt via PBES1, absent-password spellings match Java KeyStore, see docs/adr/0003-pkcs12-container.md |
+| Keystores: PKCS#11 tokens (OpenSC/DNIe shape), NSS shared DB | works, FFI into the vendor module at runtime, tested against SoftHSM and libsoftokn3 with signatures double-verified by openfirma and openssl; keys whose token advertises CKA_ALWAYS_AUTHENTICATE get their per-signature context login; `keystores list` with no --store discovers Firefox/Thunderbird profile databases through profiles.ini (snap and flatpak included) |
 | Keystores: Windows cert store, macOS keychain | Windows compiles on CI and is untested at runtime; macOS refuses both listing and signing until it can be tested, see docs/adr/0004-system-keystores.md |
 | XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
 | XAdES B-T and above, FacturaE, enveloping/detached shapes | not started |
@@ -143,7 +143,13 @@ export DRIE_PIN=...        # never on the command line
 cargo run -- sign -i doc.txt -o doc.csig \
     --store pkcs11:/usr/lib/opensc-pkcs11.so:"3CM-ES..." --pin-env DRIE_PIN
 cargo run -- sign -i doc.txt -o doc.csig --store nss      # $HOME/.pki/nssdb
+cargo run -- keystores list                              # also discovers Firefox/Thunderbird profiles
 ```
+
+The module path of a `pkcs11:` descriptor must be absolute: NSS itself looks
+a bare name up in the system library paths, and accepting one would sign with
+some other library than the one named. `nss:<path>` passes the path to NSS
+quoted when it contains spaces, read-only.
 
 A sede's browser call answers through the same signing code. The scheme and
 the loopback endpoint's rules are docs/adr/0005-browser-protocol.md; at install

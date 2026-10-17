@@ -432,6 +432,10 @@ unsafe extern "system" {
         pb_cert_encoded: *const u8,
         cb_cert_encoded: u32,
     ) -> *const CertContext;
+    /// Adds a reference to a certificate context and returns it. The store
+    /// variants of the crypto provider functions need a context that belongs
+    /// to a store, so signing takes its own reference on the listed one.
+    fn CertDuplicateCertificateContext(p_cert_context: *const CertContext) -> *const CertContext;
     fn CertFreeCertificateContext(p_cert_context: *const CertContext) -> i32;
 }
 
