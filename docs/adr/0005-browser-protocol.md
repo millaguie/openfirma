@@ -1,210 +1,210 @@
-# ADR-0005: the browser protocol speaks AutoFirma's wire, over plain HTTP on loopback — TLS stays out until a pure-Rust stack can carry it honestly
+# ADR-0005 — The browser protocol (afirma://) and its loopback endpoint
 
-Date: 2026-10-16
-Status: accepted
+**Status:** accepted, amended 2026-10-17 by wave 4d's review findings (C-1, A-1..A-5, M-1..M-9, B-1..B-6 from `/tmp/review/05-browser.md`); every rule below is recorded line-by-line against the AutoFirma 1.9.1 sources (`tools/fetch-autofirma.sh`, corpus location in `docs/validation.md`).
 
 ## Context
 
-A sede electrónica signs documents in the browser by talking to a program on
-the user's machine. AutoFirma 1.9 is that program, and its protocol was read
-off the shipped sources (`/tmp/opencode/autofirma-src`, AF 1.7.0+ sources that
-match the 1.9 wire behaviour) rather than guessed:
-
-1. **Scheme hand-off.** The page navigates to `afirma://<operation>?…`
-   (`ProtocolInvocationUriParser.parserUri`). The *host* part of the URI is the
-   operation — `sign`, `cosign`, `countersign`, `selectcert`, `save`,
-   `signandsave`, `batch`, `websocket`, `service`. Parameters ride in the
-   query: `dat`, `format`, `algorithm`, `idsession`, `gzip`, `rtservlet`,
-   `stservlet`, `key`, `cipher`, `fileid`, `properties`, `mcv`. The scheme
-   itself has no reply channel; results leave through another mechanism.
-2. **The websocket mechanism.** `afirma://websocket?ports=…&v=4&jvc=…&idsession=…`
-   (`ProtocolInvocationLauncherWebSocketV4`) makes AutoFirma start a **wss**
-   server on 127.0.0.1 at page-chosen ports in 49152–65535 (up to three,
-   tried in random order). The TLS material is a self-signed PKCS#12 generated
-   on the fly (`SecureSocketUtils.java:22-24`: hardcoded password `654321`),
-   which the page's websocket client accepts by pinning — no CA, no hostname,
-   nothing verifiable. Authentication of each message is: peer IP equals
-   127.0.0.1 and a session id (`idsession`) previously announced. The probe
-   contract is `echo=` → `OK`; a sign answer is
-   `base64(cert)|base64(signature)` (`NativeSignDataProcessor.postProcess`);
-   `selectcert` answers plain base64 of the leaf DER
-   (`ProtocolInvocationLauncherSelectCert.java:234`); errors ride a healthy
-   socket as `err-00:=AF<code> - <desc>` and cancellations as `err-11:=`.
-
-Real sedes' autoscript.js opens `wss://127.0.0.1:<port>`, so the TLS leg is
-not decoration for them — but what it protects is only wire confidentiality
-on the loopback interface, because everything that authenticates a message is
-the IP check and the session id on top of it. A browser page can make the
-user's machine connect to any port; any local process can connect to any
-loopback port. The attack model for *our* endpoint must assume both.
-
-The project rule (README, ADR-0001) is pure Rust: no C crypto, and by the
-same reading no vendored TLS stack pretending to be one. rustls depends on
-`ring` or `aws-lc-rs`, both native; adding it would break that rule silently.
+A sede electrónica's page cannot talk to a local process through a socket of
+its own making: browsers only hand an `afirma://…` URI to a registered OS
+handler, and AutoFirma answers the page from there through a loopback endpoint
+it listens on. openfirma replaces that client, so it has to be byte-compatible
+with what millions of sedes' pages (`autoscript.js`) already send, with the
+wire forms those pages parse, and with the security properties AutoFirma's
+users actually get — nothing may be silently weaker than the original even
+where the original is only convention.
 
 ## Decision
 
-1. openfirma implements the **URI parsing and dispatch** of the scheme
-   exactly (crate `openfirma-browser`, `uri.rs`/`dispatch.rs`) with the three
-   measured response shapes above, and refuses at parse time what it cannot
-   prove (`cosign`/`countersign` — no golden evidence of the wire a page
-   expects; `rtservlet`/`stservlet` callbacks — openfirma does not post
-   results to remote servers; URL-valued or `file:`-valued `dat`).
-2. The **loopback endpoint** (`serve.rs`) is plain HTTP on 127.0.0.1, not wss:
-   `POST /sign/<token>` (body = one afirma:// URI, the message form AutoFirma's
-   socket accepts; a JSON object with that URI under `"message"` is also read),
-   `POST /echo` → `OK`, ephemeral port learned out of
-   band, plus the mitigations below. A real sede pointing its autoscript at it
-   will fail the TLS handshake — this endpoint is for openfirma's own pages,
-   tests, and integrations that opt in explicitly; §Reasons states exactly
-   what a real sede still needs.
-3. Scheme registration ships as **generated fragments plus instructions**
-   (`scheme.rs`: a `.desktop` file + `xdg-mime` command on Linux, a `.reg`
-   file on Windows, a `.plist` fragment + `swiftdefault`/manual import on
-   macOS); openfirma never edits a system registration by itself. Because the
-   installed Exec carries no flags but the URI (`… afirma-uri "%u"`), the key
-   it signs with needs a home outside argv: `--register` also writes a
-   per-user browser config — `$XDG_CONFIG_HOME/openfirma/browser.toml`, two
-   keys only (`p12`, `password_file`: paths, never a password) — and both
-   browser commands resolve it when `--p12` was not given (an explicit
-   `--p12` always wins). *(Recorded 2026-10-16, finding M-3b: the first
-   revision of this decision shipped a registered handler that could never
-   sign; the config file is what closes that half.)*
-4. TLS is revisited **when** either (a) a pure-Rust TLS stack without native
-   crypto lands (e.g. rustls on a pure-Rust feature, or `fussel`-class
-   stacks mature enough to trust), or (b) the deployment requires answering a
-   real sede's `wss://` client — in which case the cert must still be
-   generated per session, but the pinning model of AutoFirma is what has to
-   be reproduced, not improved on. Until then this ADR records the gap
-   instead of papering over it.
+### The URI parser mirrors `ProtocolInvocationUriParser` / `UrlParameters*`
 
-## Mitigations implemented (serve.rs)
+Operation from the host part; parameters per AutoFirma's own tables (`id`/
+`idsession`, `v`/`ver`/`mcv`, `dat`, `gzip`, `format`, `algorithm`, `appname`,
+`properties`, `rtservlet`/`stservlet`). Percent-decoding once, like Java's
+URLDecoder. The bounds that exist (URI bytes, decoded document, session-id
+length 20 after lower-casing) are AutoFirma's own.
 
-The threat: any local process, and any page the browser visits, can reach a
-loopback port. What stops an uninvited caller here:
+**A-5.** `checkIdSession` tests `id.toLowerCase().matches("([a-z0-9])+")`:
+the *test* is case-folded, the *value* keeps its case (`setSessionId(sessionId)`
+takes the original). Mixed-case ids parse and stay verbatim — a follow-up
+matching against them is byte-exact. Refusals carry AutoFirma's own pair for
+a bad session: AF620010 / SAF_46 (`INVALID_SESSION_ID`).
 
-- **One-time token in the path.** Each launch mints a 128-bit token
-  (`token.rs`, getrandom); it is consumed by its first request (`take`). A
-  page that guesses the port still has to guess the token, and cannot replay
-  it into a second operation.
-- **Strict Host and Origin.** `Host` must be exactly `127.0.0.1:<port>` or
-  `localhost:<port>` (defeats DNS rebinding: a rebound domain names itself in
-  Host). Any `Origin` header must equal the endpoint's own origin; its absence
-  is tolerated only because curl and tests send none — browsers always send
-  it, so every cross-site fetch is refused by name (`bad-origin`, 403).
-- **POST-only.** GET/HEAD/OPTIONS answer 405 with no `Access-Control-Allow-*`
-  anywhere (`post-only`); a form navigation or `<img>` from another site
-  cannot even reach the operation path, and the CORS preflight is refused.
-- **Body shape enforced.** `Transfer-Encoding` is refused outright
-  (chunked bodies have no cap before arriving); `Content-Length` is required,
-  finite, exact; declared bodies over 8 MiB are refused before being read
-  (413 from the header alone); more bytes than declared is a refusal
-  (`content-length-mismatch`) so request smuggling cannot ride a connection.
-- **Caps in three levels**: socket body 8 MiB, hand-off URI channel 2 MiB,
-  decoded document 16 MiB (checked on base64 *character counts* before
-  decoding, and again bounded during gzip expansion so a bomb is refused at
-  limit+1 rather than inflated).
-- **Operation failures are not transport failures.** A valid request whose
-  operation fails answers 200 with AutoFirma's `err-00:=…` wire text and an
-  `X-Openfirma-Reason` header — the same split a healthy AutoFirma socket
-  makes, so no page can be tricked into reading a refusal as a signing error
-  of *its* document.
-- Process limits: ≤16 concurrent connections (refused with 503 past that, and
-  refused *while* at capacity — the endpoint never shuts itself down because a
-  crowd was knocking), an absolute request budget of 30 s per connection plus
-  a 5 s silence window per read — bytes received renew the silence window, so
-  the defence never cuts a caller whose bytes keep arriving on a loaded
-  machine *inside* the budget; and the 30 s budget itself is evaluated on
-  every read's success path, not only where a read would block, so a peer
-  that keeps dribbling without ever falling silent dies at accept + 30 s
-  whatever its rhythm (no slowloris-by-idleness: Linux reports a socket read
-  timeout as `WouldBlock`, so the limit cannot be delegated to the platform's
-  error kind; and no slowloris-by-trickle: budget checks reachable only from
-  an expired — blocking — read are unreachable to a peer whose bytes always
-  arrive in time), bind refuses any non-loopback address. The token is
-  consumed only when a complete request has arrived, so a client that dies
-  mid-request costs the session a refusal, not its only signing opportunity.
-  *(Amended 2026-10-16 after the adversarial review, finding M-2: the previous
-  text's "30 s per connection" and an implied request-count shutdown were not
-  what the code did — the timeout never fired on Linux and the accept loop
-  died at 17 bare connections. The ADR always stated the intended promise;
-  the code now enforces it, and the shutdown-by-request-count is replaced by
-  the concurrency refusal because killing a launch's endpoint from unauthenticated
-  empty connects served no threat model this ADR has. Second amendment, same
-  day (round-3 re-check of M-2): "the code now enforces it" was ahead of the
-  code again — the budget was consulted only when a read would block, so an
-  ever-talking dribbler never met it and lived indefinitely; both read loops
-  now compare against the fixed budget after every successful read. On
-  capacity: what frees a slot is a handler dying, so the two ceilings above
-  are also what bounds a 503 window — silent peers for ≤5 s per wave,
-  ever-talking dribblers for ≤30 s plus one trickle interval per connection;
-  an attacker who reconnects to keep all 16 slots busy pays one dead
-  connection per reconnect in refused work (measured: a tokened caller is
-  served within the budget plus scheduling slack of the first dribble wave
-  dying, bounded at 60 s by `dribbling_peers_never_starve_a_tokened_caller`).
-  The residual nuance, stated precisely: while all slots are honestly held by
-  peers still inside their budgets, a new caller *is* refused — survivable
-  and bounded, not a dead port; there is no slot class reserved for tokened
-  callers.)*
-- Two recorded deviations from AutoFirma's URI handling, both in `uri.rs`'s
-  `dat` decoding, both toward refusing rather than signing the wrong bytes:
-  (1) there is **no literal-text fallback** — where AutoFirma signs a
-  non-decoding payload verbatim (`DataDownloader.java:127-137`), openfirma
-  refuses and names the parameter, because a valid-looking signature over
-  bytes nobody sent is worse than a failed call; (2) the whitespace stripped
-  before base64 decoding is **slightly wider than AutoFirma's alphabet**: its
-  iharder decoder skips `\t \n \r` (and space and `\f`, which it only reaches
-  through `trim()`, never inside the stream), while openfirma also drops a
-  space or form feed found *inside* the payload. The direction of that
-  difference is the safe one — where AutoFirma would hand a malformed payload
-  to its literal fallback and sign text, openfirma decodes what reads as
-  base64 and signs the document — but it is a divergence all the same: for a
-  `dat` with interior spaces openfirma signs the decoded bytes where AutoFirma
-  would sign the literal text. Recorded here rather than only in a code
-  comment (round-2 finding A-2's residual); a future parity claim must cite
-  this section, not the other way round.
+**Percent escapes.** A `%` escape at the very end of a value (a padded base64
+ending `%3D%3D`, exactly what `encodeURIComponent` produces) is legal; an
+early off-by-one in the truncation test refused precisely those URIs. Pinned
+by `uri_parse`'s recorded-shape tests and by A-4's full round trip below.
 
-## Reasons
+### The wire forms of answers — findings M-1, M-2, M-3
 
-- **Plain HTTP instead of wss, and why it is not weaker than AutoFirma's
-  TLS on this threat model.** The loopback interface is not a network an
-  off-machine attacker can sniff; what attacks exist here are *other code on
-  the machine* — a page's script or a local process — and neither is stopped
-  by TLS: AutoFirma accepts its own self-signed cert from any connecting peer
-  whose IP is 127.0.0.1, so a malicious local process gets the same channel
-  TLS "protects". Our token + Host/Origin + POST-only rules are strictly
-  stronger authentication of *who may ask*, which is what actually matters;
-  confidentiality on loopback buys little against the only reachable enemies.
-- **No fake TLS.** Wrapping plain HTTP in a self-signed rustls-with-native-crypto
-  handshake would copy AutoFirma's theatre while breaking the project's pure
-  Rust rule, so it is the worst of both options and explicitly rejected.
-- **HTTP/1.x subset by hand, not a crate.** axum/hyper are pure Rust and
-  allowed, but an HTTP server that must refuse malformed requests *by named
-  reason* is where their abstractions hide the refusals; ~400 lines of
-  read-parse-refuse with tests naming each attack beat that. (Revisit if an
-  HTTP/1.1 keep-alive or pipelining requirement ever appears — there is none:
-  one request per connection, no keep-alive.)
-- **cosign/countersign refused despite parsing them.** AutoFirma implements
-  them through UI dialogs whose result wire we could read but never see a
-  sede consume; inventing a response shape would make openfirma *look*
-  compatible while being wrong in production. A refusal that names itself is
-  honest; a guessed payload is worse than no implementation (ADR-0001's rule).
-- **rtservlet/stservlet refused when the operation needs them.** Fetching or
-  posting to government intermediate servers would make openfirma a client of
-  infrastructure whose contract we have not measured, and gives a page's URI
-  a server-side request forgery lever through our process. The recorded URIs
-  that carry `stservlet` alongside `dat` still parse (the parameter is simply
-  unused) because real sedes send both.
+* **M-1 (sign/selectcert payload).** `Base64.encode(x, true)` in the shipped
+  jar is URL-safe alphabet, `=` padding, a single line (measured: 200 bytes →
+  268 chars). The payload is `base64url(cert)|base64url(signature)` and every
+  page-side consumer folds `-`/`_` back (`processSignResponse`, recorded at
+  autoscript.js's own lines); `dispatch::base64_url` is the single door, and
+  both fake_sede and sede_crosscheck pin the fold round trip with recorded
+  literals.
+
+* **M-2 (error wire).** One door in serve.rs (`write_error_wire`) answers every
+  refusal: protocol ≥ 4.1 → `err-00:=AF<code> - <descripción>` (cancellations
+  `err-11:=`), below it or on a broken version → the legacy `SAF_xx: <mensaje>`
+  table (`CANCEL` alone for cancellations). The description strings are AutoFirma's
+  own Spanish catalogue texts (`getErrorMessage` quotes `getDescription()`);
+  the legacy form quotes the ERRORS-table message, not the catalogue. Every
+  AF↔SAF pairing is line-recorded from `ProtocolInvocationLauncherErrorManager`
+  (`OLD_ERRORS_ASSOCIATION`, lines ~40–290): CANCELLED 500001/CANCEL, URI_NOT_FOUND
+  620012/SAF_01, UNSUPPORTED_SCHEME 620009/SAF_02, UNSUPPORTED_OPERATION
+  600002/SAF_04, INVALID_SESSION_ID 620010/SAF_46, MALFORMED_SOCKET_PARAMS
+  620016/SAF_03, DATA_NOT_FOUND 600100/SAF_03, UNSUPPORTED_FORMAT 600105/SAF_06,
+  UNSUPPORTED_ALGORITHM 600107/SAF_03, INVALID_SIGNING_KEY 200110/SAF_51,
+  SIGNING_FAILED 200115/**SAF_03** (the unlisted-codes group — an earlier draft
+  said SAF_09, the recorded table does not), SELECT_CERT_FAILED 200201/SAF_03,
+  KEYSTORE_ERROR 201101/SAF_08, DATA_LOAD_FAILED **200600**/SAF_00,
+  UNSUPPORTED_HASH_ALGORITHM 200118/SAF_53 (the fallback group),
+  UNSUPPORTED_PROTOCOL_VERSION 620011/SAF_21.
+
+  The page reads these bodies through a recorded predicate (autoscript.js
+  2642-2659): after `:=` the body must carry `" - "` at index **8** and start
+  with `AF` + six digits. `tests/autoscript_wire.rs` re-implements that
+  predicate verbatim and runs every catalogue entry through it — no test here
+  agrees with itself about what an error looks like, it agrees with the page.
+
+* **Deliberate deviation — a URI without any `ver`/`v`.** AutoFirma's launcher
+  treats a missing version as VERSION_0 (the legacy wire). openfirma answers
+  such a call on the MODERN form: no recorded sede omits the parameter (every
+  recorded invocation carries one), and answering an unknown caller with the
+  oldest form would hide exactly the catalogue page-side consumers already
+  parse. Pinned by `wire_target` tests; a deliberate, visible choice, not an
+  oversight.
+
+* **B-6.** The endpoint's reason header carries AutoFirma's catalogue number
+  for the refusal (`dispatch::error_reason_header` → `e.wire.af_code`), so a
+  log line, a curl run and the wire text a page parses quote one and the same
+  number.
+
+* **M-3 (formats).** The dispatcher accepts AutoFirma's format-name table and
+  refuses by name everything it cannot produce identically (trifásica names,
+  ASiC-S, CMS/PKCS#7, FacturaE, ODF/OOXML/SOAP, XAdES Detached/Enveloping).
+  `auto` resolves on the bytes like AutoFirma's AUTO. The browser protocol runs
+  through the SAME shared dispatcher as the CLI (M-4): one door for every
+  frontend, no second signing policy living in serve.rs.
+
+### `properties` is applied or refused by name — finding A-4
+
+`AOUtil.base642Properties` + a Java-faithful `Properties.load`. The gate
+(`execute_gate`) runs **before anything touches the keystore**: cosign/
+countersign and the storage-servlet route refuse, then every `properties` key
+is consulted against one closed table.
+
+* `precalculatedHashAlgorithm` — implemented for CAdES: AutoFirma's
+  `CAdESParameters.load` (lines 119–155) sets `dataDigest = data; contentData
+  = null` and lets the property OVERRIDE the URI's digest algorithm. openfirma
+  signs the payload verbatim as the CMS message imprint via
+  `openfirma_cades::sign_with_digest` (whose length check locks the imprint to
+  the named algorithm — a SHA-256-size hash can never ride a SHA-1 identifier),
+  detached only (`contentData = null`; an imprint encapsulating bytes it did
+  not compute is refused). `tests/prehash_golden.rs` proves both directions:
+  openssl accepts the signature over the sede's hash bytes while the signed
+  messageDigest equals the payload verbatim and NOT a re-hash of it (a raw DER
+  walk, independent of openfirma's verifier); the no-property twin signs
+  exactly one sha256 over the document; naming SHA-1 hits the workspace-wide
+  conservative signing policy — proof the algorithm half was APPLIED at
+  dispatch, which is precisely what a client ignoring the property cannot
+  produce.
+
+* `mode=explicit` passes (the protocol default already IS detached/explicit);
+  every other value refuses. Unknown or unimplemented members (visiblePdfSignature
+  and the PdfExtraParams geometry, signatureVersion, onlyRealSigners, policy*/
+  filter*, serverUrl/presign/postsign) refuse by name with their key in the
+  message — never a silent drop, because "could not load" must mean "nothing
+  was asked", never "something was quietly ignored". An unreadable hash-algorithm
+  name refuses too (AutoFirma's own getDigestAlgorithmName throws).
+
+### Consent over the user's key — finding A-3
+
+Nobody ever proves to a signing client that the human in front of the screen
+asked for this signature; AutoFirma's answer is its certificate dialog + PIN at
+exactly the moment of signing. openfirma keeps that invariant headlessly:
+
+* `dispatch::execute_with_consent` is the door. A key arrives either as an
+  explicit `P12` (somebody standing here said sign) or as an `UnattendedKey`.
+  An unattended key signs only with its owner's per-key `allow_unattended`
+  opt-in plus a stored password, or through a consent callback that answered
+  yes; otherwise refusal, never silence (`consent-required`, AF600002/SAF_04).
+* The CLI scheme path (`afirma-uri`) prompts on a terminal (operation, app
+  name, digest and size of the exact bytes) — AutoFirma's dialog, in text.
+  A key handed over **argv** carries its own consent: the human typing the
+  command owns both the key and the secret they supplied; that case signs
+  through the same Unattended machinery with `Consent::Granted` (and still
+  prompts when a tty exists). A **config-file** key without `allow_unattended
+  = true` IN THE FILE never signs quietly — the file's own declaration is the
+  only standing authority; a CLI flag alone cannot launder a config key.
+* The endpoint (`afirma-serve`) refuses to start over an argv key without
+  `--allow-unattended`, and over a config key whose file lacks
+  `allow_unattended = true` (the flag alone is not enough — deliberate, the
+  opt-in must belong to the key's owner, not to whoever restarted the server).
+
+### Scheme registration — findings A-1, A-2, B-2
+
+* The XDG desktop entry mirrors AutoFirma's registered shape:
+  `Exec="<absolute path>" afirma-uri %u` — the PATH quoted (G_TOKEN_STRING
+  escaping), `%u` OUTSIDE quotes (a quoting bug here was C-1's sibling: paths
+  with spaces or hashes broke hand-off). No `\s`, no `Categories=Signature`.
+* `--register` IS the registration (desktop file + `update-desktop-database`
+  + `xdg-mime default openfirma-afirma.desktop x-scheme-handler/afirma`); it
+  refuses when AutoFirma is installed unless `--acknowledge-autofirma` says
+  the human knows ("no se instalan dos clientes a la vez" — two handlers fight
+  for the scheme). It writes the browser config at 0600, and BOTH the config
+  and the password file must be private (`check_private` refuses mode&0o077 ≠
+  0) — B-2: key material is never world-readable. `--unregister` removes only
+  what openfirma itself wrote. XDG_DATA_HOME is honored end to end.
+
+### The loopback endpoint stays localhost-only and never posts
+
+serve.rs binds 127.0.0.1 (refuses non-loopback before binding), validates Host
+and Origin against rebinding, one-shot tokens from a CSPRNG, HTTP/1.1 keep-alive
+with absolute deadlines (stalled/dribbling/flooded peers age out with 408/503 —
+never a dead endpoint). **openfirma never POSTs to any server**: `stservlet`/
+`rtservlet` URIs that need the intermediate-server route are refused by name
+(M-5: signing without delivering is worse than not signing), and the answer
+travels only over the connection the page itself opened.
+
+**The honest gap (why wss is NOT here).** Current sedes speak to AutoFirma's
+HTTPS/WebSocket endpoint (`AfirmaWebSocketServerV4Sup`, `wss://localhost:port/
+servicios`). autoscript.js selects it when the page finds the secure endpoint;
+it also keeps the plain-socket path in its compatibility branches, and that is
+the path openfirma answers today. Making wss work requires (a) serving TLS with
+the CA AutoFirma's configurator generates — `CN=Autofirma ROOT`, plus a
+`127.0.0.1` leaf (see M-7 below: NOT "silent self-signed acceptance", Firefox
+gets the cert imported by the configurator), and (b) shipping that CA into each
+browser's trust store, which is exactly the installer behavior this project has
+not yet reviewed for its own security properties. ADR-0005 therefore keeps the
+endpoint on plain TCP + one-shot token, refuses nothing the plain channel can
+honestly answer, and names the wss gap openly: a real sede that demands wss
+gets no answer from openfirma until an ADR amends this section with a reviewed
+TLS design. This is a recorded limitation, not an accident.
+
+### M-7 — what AutoFirma actually does about TLS (correcting the old premise)
+
+The previous revision of this ADR described AutoFirma as "silently accepting
+its own self-signed certificate". The sources say otherwise: the configurator
+generates a CA (`CN=Autofirma ROOT`) and a `127.0.0.1` leaf signed by it
+(CertUtil / ConfiguratorFirefoxLinux), and IMPORTS the CA into the browser's
+trust store, so the page's wss connection verifies normally. openfirma neither
+does that today (gap above) nor trusts such certificates on verification paths:
+its CMS verifier is unchanged. Correcting the premise changes no code; it
+matters because a future TLS ADR must decide about exactly this installer step.
 
 ## Consequences
 
-- openfirma answers its own pages and test sedes end-to-end today, with
-  refusals that name themselves; the recorded-autofirma golden suite stays
-  green because both sides run through one parser (ADR-0001 method).
-- A production deployment against a *real* sede still needs the TLS leg per
-  §Decision 4 — until then, `docs/validation.md` labels browser integration
-  as protocol-complete but transport-partial, and README says so.
-- The hardcoded port range (49152–65535), ephemeral bind and one-time token
-  mean an sede that *caches* an openfirma endpoint across launches will get
-  `bad-token` — by design; each launch is a new session, exactly as AutoFirma
-  treats each `afirma://websocket` invocation.
+* `cargo test --workspace` pins all of the above: 16 lib tests, autoscript_wire
+  (7, recorded page predicates), fake_sede end-to-end (11, URL-safe shapes and
+  wire texts included), prehash_golden (4, A-4 both directions + gate ordering),
+  uri_parse (13, recorded URIs byte-exact), sede_crosscheck (openssl at the
+  end of a full flow). The golden suite stays 12/12 MATCH against AutoFirma's
+  jar output.
+* Any error path added later must go through `write_error_wire` with a table
+  entry; autoscript_wire's predicate test fails if someone writes an error form
+  the page cannot parse, so drifting is loud, not silent.
+* cosign/countersign, the storage servlet, PAdES/XAdES pre-hash, visible PDF
+  signatures and the trifásica flow remain refused-by-name with their wave in
+  `DEFERRED.md` — each refusal names itself and this file.

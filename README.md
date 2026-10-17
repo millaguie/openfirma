@@ -92,7 +92,7 @@ docs/adr/0005-browser-protocol.md and the table row below.
 | Keystores: Windows cert store, macOS keychain | Windows compiles on CI and is untested at runtime; macOS refuses both listing and signing until it can be tested, see docs/adr/0004-system-keystores.md |
 | XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
 | XAdES B-T and above, FacturaE, enveloping/detached shapes | not started |
-| Browser integration (`afirma://` parsing, dispatch, loopback endpoint) | works end to end against a fake sede (openssl crosschecks the signature it produces); plain HTTP transport: real sedes need wss, refused rather than faked, see docs/adr/0005-browser-protocol.md |
+| Browser integration (`afirma://` parsing, dispatch, loopback endpoint) | works end to end against a fake sede (openssl crosschecks the signature it produces); wire forms — the URL-safe base64 payload, the `:=` error envelope with AutoFirma's Spanish catalogue and SAF pairings — pinned against recorded autoscript.js predicates (tests/autoscript_wire.rs); precalculatedHashAlgorithm signs the sede's imprint verbatim, proven against openssl (tests/prehash_golden.rs); plain HTTP transport: real sedes need wss, refused rather than faked, see docs/adr/0005-browser-protocol.md |
 | GUI (`openfirma-gui`, egui/eframe): sign, verify, keystores, .p12 | works: the same library calls as the CLI (docs/adr/0006-gui-toolkit.md); windowless kittest tests drive the real App, including an end-to-end sign-then-verify; real-display checks live in docs/validation.md's manual checklist |
 
 ## Quick start

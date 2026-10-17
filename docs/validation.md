@@ -412,6 +412,18 @@ item is what a person with that hardware runs once; findings go to
       reads (its ASN1Parser integer/length limits were measured by javap, see
       ADR-0003); the synthetic versions of them are in CI (`pkcs12_interop`).
 
+## Reference corpus
+
+Byte-level evidence for the protocol-layer tests (the recorded autoscript.js
+literals and `javap -c` forms that `tests/autoscript_wire.rs`,
+`tests/prehash_golden.rs` and the comments in `uri.rs` / `dispatch.rs` quote)
+comes from the official AutoFirma 1.9 package: `tools/fetch-autofirma.sh`
+downloads and extracts it, which yields the jar (`.../usr/lib/Autofirma/
+autofirma.jar`, record class bodies with `javap -c`) and the webapp resources
+(`autoscript.js`). The recorded shapes that matter are pinned by tests over
+the wire forms themselves — if a future AutoFirma changes one, the golden diff
+and these tests go red together. Nothing from the extraction is committed.
+
 ## Test certificate material
 
 `testdata/certs/` is gitignored except for its README. Generated on demand by
