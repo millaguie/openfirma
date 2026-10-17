@@ -108,7 +108,9 @@ mod tests {
             token: None,
             wants_no_pin: false,
         };
-        let err = open_store(&spec, None).err().expect("a missing module cannot open");
+        let err = open_store(&spec, None)
+            .err()
+            .expect("a missing module cannot open");
         assert!(err.to_string().contains("/nonexistent/mod.so"), "{err}");
     }
 }

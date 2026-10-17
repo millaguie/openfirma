@@ -75,6 +75,13 @@ jobs:
       # accepted by an independent implementation, so openssl has to be on
       # PATH and the test PKI has to exist before cargo test runs.
       #
+      # gen-p12-fixtures.sh rides along: the wave-4a keystore interop tests
+      # read the same PKI (its cert/key) to synthesize their PKCS#12 fixtures,
+      # and OPENFIRMA_REQUIRE_TESTS makes a missing fixture a failure — so on
+      # any runner that has an openssl, the fixtures must be generated here.
+      # Where there is no openssl at all, the allow-skip env set below covers
+      # them too.
+      #
       # On Windows this step runs in Git Bash, which can see the openssl that
       # Git for Windows bundles, but the test step runs in pwsh and cannot. So
       # the directory always goes to GITHUB_PATH, converted with cygpath,
@@ -99,6 +106,7 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
           openssl version
           ./tools/gen-testcert.sh
+          ./tools/gen-p12-fixtures.sh
 
       # Where no keystore can be built (see the two linux-only steps above),
       # the keystore tests must skip instead of panicking under
@@ -208,6 +216,25 @@ jobs:
         shell: bash
       - name: build every member without the GUI (no 32-bit windowing stack here)
         run: cargo build --workspace --exclude openfirma-gui --target i686-pc-windows-msvc
+      # The PKI this step's Git Bash can generate is cheap and lets the pure
+      # parsing tests (PKCS#12 fixtures, CMS crosschecks that don't shell out)
+      # run for real on the 32-bit ABI instead of skipping.
+      - name: generate test PKI
+        shell: bash
+        run: |
+          openssl_bin="$(command -v openssl || true)"
+          if [ -z "$openssl_bin" ]; then
+            for candidate in "$(dirname "$(command -v git)")/../usr/bin" "/c/Program Files/Git/usr/bin"; do
+              if [ -x "$candidate/openssl.exe" ]; then openssl_bin="$candidate/openssl.exe"; break; fi
+            done
+          fi
+          if [ -n "$openssl_bin" ]; then
+            export PATH="$(dirname "$openssl_bin"):$PATH"
+            ./tools/gen-testcert.sh
+            ./tools/gen-p12-fixtures.sh
+          else
+            echo "no openssl on this runner; fixture tests will skip"
+          fi
       - name: keystore tests on the 32-bit ABI (ABI asserts execute natively)
         run: cargo test -p openfirma-keystore -p openfirma-core --target i686-pc-windows-msvc
 
