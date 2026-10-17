@@ -22,16 +22,11 @@ pub struct Tr {
     pub paste_path: String,
     pub browse: String,
     pub verify_verb: String,
-    pub sign_verb: String,
     // --- detection ----------------------------------------------------
     pub detected_pdf: String,
     pub detected_xml: String,
     pub detected_data: String,
     pub formats_for: String,
-    /// The name of the "already signed?" refusal when a signature file is
-    /// dropped where a document was expected (B-3): its own screen sentence.
-    pub drop_is_signature_title: String,
-    pub drop_is_signature_body: String,
     // --- certificate picker -------------------------------------------
     pub choose_certificate: String,
     pub no_certificates: String,
@@ -122,10 +117,6 @@ pub struct Tr {
     pub dialog_open_anchor: String,
     pub dialog_save_sig: String,
     pub dialog_content_for_detached: String,
-    /// The overwrite question (A-3) before any bytes are written.
-    pub ask_overwrite_body: String,
-    pub ask_overwrite_yes: String,
-    pub ask_overwrite_no: String,
     // --- failures the library writes in English but the window must show
     //     in this language (B-2's jargon ban): each is a wrapper prefix that
     //     errors.rs weaves over the technical cause.
@@ -133,6 +124,28 @@ pub struct Tr {
     pub fail_anchor_read: String,
     pub fail_no_anchors_internal: String,
     pub fail_tsa_unverified: String,
+    // --- strings review 06's second pass found outside the table (A-7's
+    //     "every string through one Tr table" completed) ---------------------
+    /// Drop refused while a job runs (the one-slot rule speaks out loud).
+    pub drop_while_working: String,
+    /// The close guard's words while a VERIFY job holds the slot (B-1: exact
+    /// words for the state; "la firma se está haciendo" is a sign job's).
+    pub close_verifying: String,
+    /// The dead-worker answer (a job whose thread died without an answer).
+    pub fail_worker_died: String,
+    /// Buttons of the add-keystore form.
+    pub add_store_open: String,
+    pub add_store_cancel: String,
+    /// Instructions of the add-keystore form.
+    pub add_store_help: String,
+    /// Folder-reveal failed (its own sentence; the OS error rides behind it).
+    pub fail_open_folder: String,
+    /// Copying the path to the clipboard failed (no clipboard tool answered).
+    pub fail_copy_path: String,
+    /// Saving to a chosen name failed (its own sentence).
+    pub fail_save_as: String,
+    /// A keystore with no signable certificate (catalog error line tail).
+    pub store_no_private_key: String,
 }
 
 impl Tr {
@@ -166,18 +179,11 @@ impl Tr {
             paste_path: "Ruta del documento…".into(),
             browse: "Examinar…".into(),
             verify_verb: "Verificar una firma".into(),
-            sign_verb: "Firmar un documento".into(),
             detected_pdf: "Es un PDF. Se firmará como PAdES (firma dentro del propio PDF).".into(),
             detected_xml: "Es un XML. Se firmará como XAdES (firma dentro del propio XML).".into(),
             detected_data:
                 "Es un documento de texto o datos. Se firmará como CAdES (firma aparte, archivo \
                  «.csig» junto al original)."
-                    .into(),
-            drop_is_signature_title: "Este archivo ya es una firma".into(),
-            drop_is_signature_body:
-                "El archivo que has abierto lleva una firma dentro; no se firma una firma. Para \
-                 ver si esa firma es válida pulsa «Verificar una firma» y elige este mismo \
-                 archivo."
                     .into(),
             formats_for: "Formato".into(),
             choose_certificate: "Elige el certificado con el que firmar".into(),
@@ -264,9 +270,6 @@ impl Tr {
             dialog_open_anchor: "Elige el certificado de la autoridad en la que confías".into(),
             dialog_save_sig: "Guardar la firma".into(),
             dialog_content_for_detached: "Elige el documento que se firmó".into(),
-            ask_overwrite_body: "Ese archivo ya existe. ¿Seguro que quieres sustituirlo?".into(),
-            ask_overwrite_yes: "Sustituir".into(),
-            ask_overwrite_no: "Elegir otro nombre".into(),
             fail_wrong_password:
                 "La contraseña del certificado no es correcta o el archivo está dañado.".into(),
             fail_anchor_read: "No se ha podido usar el archivo elegido como autoridad:".into(),
@@ -279,6 +282,27 @@ impl Tr {
                 "El sello de tiempo no se ha podido comprobar: demuestra la hora solo si \
                  confías en quien lo emitió."
                     .into(),
+            close_verifying: "La comprobación de firmas sigue en marcha. ¿Quieres cancelarla \
+                 y cerrar?"
+                .into(),
+            drop_while_working:
+                "Termina primero la operación que está en marcha: esta ventana hace una sola \
+                 cosa cada vez para no perder ningún resultado."
+                    .into(),
+            fail_worker_died:
+                "La operación se ha interrumpido porque el proceso que la hacía ha dejado de \
+                 responder. No se ha guardado nada; vuelve a intentarlo."
+                    .into(),
+            add_store_open: "Abrir".into(),
+            add_store_cancel: "Cancelar".into(),
+            add_store_help:
+                "Escribe el descriptor del almacén: pkcs11:/ruta/modulo.so[:token], nss (la \
+                 base de Firefox/Chromium), o los almacenes del sistema."
+                    .into(),
+            fail_open_folder: "No se pudo abrir la carpeta:".into(),
+            fail_copy_path: "No se pudo copiar la ruta al portapapeles:".into(),
+            fail_save_as: "No se pudo guardar:".into(),
+            store_no_private_key: "no contiene ningún certificado con clave privada".into(),
         }
     }
 
@@ -292,19 +316,12 @@ impl Tr {
             paste_path: "Document path…".into(),
             browse: "Browse…".into(),
             verify_verb: "Verify a signature".into(),
-            sign_verb: "Sign a document".into(),
             detected_pdf: "It is a PDF. It will be signed as PAdES (inside the PDF itself).".into(),
             detected_xml: "It is an XML. It will be signed as XAdES (inside the XML itself)."
                 .into(),
             detected_data: "It is a text or data document. It will be signed as CAdES (a separate \
                  \".csig\" file beside it)."
                 .into(),
-            drop_is_signature_title: "This file already is a signature".into(),
-            drop_is_signature_body:
-                "The file you opened carries a signature inside; a signature is not signed \
-                 again. To check whether that signature holds, press \"Verify a signature\" \
-                 and pick this same file."
-                    .into(),
             formats_for: "Format".into(),
             choose_certificate: "Choose the certificate to sign with".into(),
             no_certificates: "No certificate to sign with was found.".into(),
@@ -384,9 +401,6 @@ impl Tr {
             dialog_open_anchor: "Choose the authority certificate you trust".into(),
             dialog_save_sig: "Save the signature".into(),
             dialog_content_for_detached: "Choose the document that was signed".into(),
-            ask_overwrite_body: "That file already exists. Replace it?".into(),
-            ask_overwrite_yes: "Replace".into(),
-            ask_overwrite_no: "Choose another name".into(),
             fail_wrong_password: "The certificate's password is wrong, or the file is damaged."
                 .into(),
             fail_anchor_read: "The chosen authority file could not be used:".into(),
@@ -398,6 +412,24 @@ impl Tr {
                 "The time-stamp could not be checked: it proves the time only if you trust \
                  who issued it."
                     .into(),
+            close_verifying: "The signature check is still running. Cancel it and close?".into(),
+            drop_while_working:
+                "Finish the operation already running first: this window does one thing at a \
+                 time so that no result gets lost."
+                    .into(),
+            fail_worker_died: "The operation was interrupted because the process doing it stopped \
+                 answering. Nothing was saved; please try again."
+                .into(),
+            add_store_open: "Open".into(),
+            add_store_cancel: "Cancel".into(),
+            add_store_help:
+                "Type the keystore descriptor: pkcs11:/path/module.so[:token], nss (the \
+                 Firefox/Chromium database), or the system keystores."
+                    .into(),
+            fail_open_folder: "The folder could not be opened:".into(),
+            fail_copy_path: "The path could not be copied to the clipboard:".into(),
+            fail_save_as: "Could not save:".into(),
+            store_no_private_key: "contains no certificate with a private key".into(),
         }
     }
 }
@@ -425,12 +457,9 @@ mod tests {
                 &tr.paste_path,
                 &tr.browse,
                 &tr.verify_verb,
-                &tr.sign_verb,
                 &tr.detected_pdf,
                 &tr.detected_xml,
                 &tr.detected_data,
-                &tr.drop_is_signature_title,
-                &tr.drop_is_signature_body,
                 &tr.formats_for,
                 &tr.choose_certificate,
                 &tr.no_certificates,
@@ -488,13 +517,23 @@ mod tests {
                 &tr.dialog_open_anchor,
                 &tr.dialog_save_sig,
                 &tr.dialog_content_for_detached,
-                &tr.ask_overwrite_body,
-                &tr.ask_overwrite_yes,
-                &tr.ask_overwrite_no,
                 &tr.fail_wrong_password,
                 &tr.fail_anchor_read,
                 &tr.fail_no_anchors_internal,
                 &tr.fail_tsa_unverified,
+                &tr.copy_path,
+                &tr.drop_while_done,
+                &tr.details_hide,
+                &tr.close_verifying,
+                &tr.drop_while_working,
+                &tr.fail_worker_died,
+                &tr.add_store_open,
+                &tr.add_store_cancel,
+                &tr.add_store_help,
+                &tr.fail_open_folder,
+                &tr.fail_copy_path,
+                &tr.fail_save_as,
+                &tr.store_no_private_key,
             ];
             for f in fields {
                 assert!(!f.trim().is_empty(), "{lang} has an empty string");

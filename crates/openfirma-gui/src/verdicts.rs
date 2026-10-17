@@ -109,33 +109,81 @@ fn cms_verdicts(
     }
 }
 
-/// How many SignerInfos a CMS holds (cheap DER walk of the SET); it decides
-/// whether `verify`'s failure text carries "signer N:" labels at all.
+/// How many SignerInfos a CMS holds; it decides whether `verify`'s failure
+/// text carries "signer N:" labels at all. The count comes from the library's
+/// own structure check (openfirma-cades' parse — the same one `verify`
+/// iterates), never from byte windows: every RSA CMS matches OID-byte probes
+/// twice before a single signer exists, and a wrong count silently collapses
+/// per-signer verdicts into one "?" line. An unparseable CMS counts zero, and
+/// the caller's cross-check keeps any split collapsed to one honest line.
 fn signer_count(bytes: &[u8]) -> usize {
-    // The same answer verify() reached before failing, without reparsing the
-    // crypto: count SEQUENCEs inside the signerInfos SET. Rather than a
-    // second DER parser (a drift risk this project bans), ask the library:
-    // an OPTIONS-free parse is exactly what failed, so approximate from the
-    // labels the failure itself carries.
-    1 + bytes
-        .windows(4)
-        .filter(|w| *w == b"\x06\x09\x2a\x86")
-        .count()
-        .saturating_sub(1)
-        .min(1) // conservative: only a labelled failure can split (see split_per_signer)
+    openfirma_cades::signer_count(bytes).unwrap_or(0)
 }
 
 /// Split `verify`'s joined failure into one message per signer. The library
 /// joins with "; " and labels each part "signer N: " when there is more than
-/// one signer, so the labels are the authoritative boundary — an unlabelled
-/// message answers exactly one line (`expected == 1`). Guessing at any other
-/// split would invent verdicts, so anything unexpected collapses to a single
-/// unknown line instead (the caller checks `parts.len() != count`).
+/// one signer (openfirma-cades verify.rs), so the count decides the shape:
+/// `expected == 1` — no labels exist, the whole message names this one
+/// signer; `expected > 1` — the parts are exactly the labelled ones. A
+/// message whose labels disagree with the count (a future join format, a
+/// hand-built CMS) would invent verdicts, so it collapses to nothing and the
+/// caller renders one honest file-level line instead (it checks
+/// `parts.len() != expected`).
 fn split_per_signer(msg: &str, expected: usize) -> Vec<String> {
-    if expected != 1 {
-        return Vec::new();
+    if expected == 1 {
+        return vec![msg.to_string()];
     }
-    vec![msg.to_string()]
+    let mut parts = Vec::new();
+    for (n, chunk) in split_cms_failures(msg).into_iter().enumerate() {
+        // Every part carries its label ("signer N: ", numbered from 1, in
+        // order) iff there is more than one signer; anything else means the
+        // join did not say who it belongs to, which is a shape this code
+        // must not guess at.
+        let want = format!("signer {}: ", n + 1);
+        if !chunk.starts_with(&want) {
+            return Vec::new();
+        }
+        parts.push(chunk);
+    }
+    parts
+}
+
+/// Join-splitter for `openfirma_cades::verify`'s failures: cut at "; " that
+/// opens a new part ("signer N: "), keeping quoted detail intact — the same
+/// care `split_failures` gives pades' labels.
+fn split_cms_failures(msg: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = msg;
+    loop {
+        match next_join(rest, "signer ") {
+            Some((head, tail)) => {
+                parts.push(head.to_string());
+                rest = tail;
+            }
+            None => {
+                parts.push(rest.to_string());
+                return parts;
+            }
+        }
+    }
+}
+
+/// The head of `rest` up to the next "; " that opens with `opener`, and the
+/// remainder starting at that opener. A "; " inside quoted detail (the
+/// libraries quote technical text) is not a boundary.
+fn next_join<'a>(rest: &'a str, opener: &str) -> Option<(&'a str, &'a str)> {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        if bytes[i] == b';' && bytes[i + 1] == b' ' {
+            let after = &rest[i + 2..];
+            if after.starts_with(opener) {
+                return Some((&rest[..i], after));
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The PDF verdicts (review 06, A-5): `pades_verify` all-or-nothings the
@@ -214,9 +262,11 @@ fn pdf_verdicts(
 /// green line: `pades_verify` only answers Ok when EVERYTHING passed, so the
 /// parts that passed carry no report unless they are asked for themselves.
 /// The inspector hands over this dictionary's own CMS (the /Contents bytes,
-/// zero padding removed) and its /ByteRange; the covered bytes are exactly
-/// `[0,B) + [A+B,C)` of the document — which is what `verify` digested before
-/// ever naming a failure elsewhere. The CMS verifier runs with the very same
+/// zero padding removed) and its /ByteRange `[A, B, C, D]`: the covered bytes
+/// are `[A, A+B) + [C, C+D)` — the two ranges around the /Contents placeholder
+/// — which is what `verify` digested before ever naming a failure elsewhere
+/// (the same reading `openfirma_pades::verify`'s own covered-bytes uses).
+/// The CMS verifier runs with the very same
 /// options and anchors, so this line says what it means: THIS signature was
 /// checked on its own bytes and holds.
 fn verify_one_pdf_signature(
@@ -231,15 +281,18 @@ fn verify_one_pdf_signature(
     if !sig.problems.is_empty() {
         return Err(Error::Verification(sig.problems.join("; ")));
     }
-    let [a, b, c, _d] = sig.byte_range;
-    if c > bytes.len() || a + b > c {
+    let [a, b, c, d] = sig.byte_range;
+    // Every bound measured against the file: a malformed /ByteRange says so
+    // as this line's error instead of panicking in release arithmetic.
+    if a > bytes.len() || b > bytes.len() - a || c > bytes.len() || d > bytes.len() - c || a + b > c
+    {
         return Err(Error::Other(
             "the /ByteRange does not describe this document".into(),
         ));
     }
-    let covered: Vec<u8> = bytes[..b]
+    let covered: Vec<u8> = bytes[a..a + b]
         .iter()
-        .chain(bytes[a + b..c].iter())
+        .chain(bytes[c..c + d].iter())
         .copied()
         .collect();
     let mut reports = openfirma_cades::verify(&sig.cms, Some(&covered), opts)?;
@@ -768,6 +821,16 @@ mod tests {
             split_per_signer("messageDigest check failed: x", 1).len(),
             1
         );
+        // A multi-signer CMS whose failure carries "signer N: " labels splits
+        // into that many parts — and the count comes from the DER, not from
+        // byte windows (an RSA CMS matches OID-byte probes repeatedly with a
+        // single signer, which is how the old heuristic answered 2 for every
+        // RSA signature and collapsed the split forever).
+        let joined = "signer 1: digest mismatch; signer 2: chain stops at CN=AC";
+        assert_eq!(split_per_signer(joined, 2).len(), 2);
+        // A count that disagrees with the message's shape stays unsplit (the
+        // caller renders one honest file-level line then).
+        assert_eq!(split_per_signer("a; b", 3), Vec::<String>::new());
         // pades_verify's label split survives a quoted "; " inside detail.
         let joined = "signature 1 (object 5 0): messageDigest check failed: \"a; b\" differs; \
                       signature 2 (object 9 0): validityDates check failed: expired";
@@ -881,9 +944,53 @@ mod tests {
         assert_eq!(anchors.len(), 2);
         let tr = Tr::es();
         let without = verdict_lines(&sig, None, anchors.clone(), &tr).unwrap();
-        assert!(!without.lines.iter().any(|l| l.valid()));
+        // The red status itself (A-5), not merely "not green": an
+        // unsigned-content .csig fails its messageDigest, and that is a NOT
+        // VALID line, never the "?" of an unsplit file-level guess. (The old
+        // assertion only checked `!valid()`, which Unknown also passed — it
+        // hid a broken signer count that made Invalid unreachable for every
+        // RSA CMS.)
+        assert_eq!(without.lines.len(), 1);
+        use crate::wizard::VerdictStatus;
+        assert_eq!(without.lines[0].status, VerdictStatus::Invalid);
         let with = verdict_lines(&sig, Some(doc), anchors, &tr).unwrap();
         assert_eq!(with.lines.len(), 1);
         assert!(with.lines[0].valid());
+    }
+
+    #[test]
+    fn the_signer_count_is_the_librarys_own_parse() {
+        // The count that decides whether failures split per signer comes
+        // from openfirma-cades' structure check, so a signature's real
+        // shape — not an OID byte-window — answers it (an RSA CMS matches
+        // those probes twice before one signer exists).
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+        let Ok(container) = std::fs::read(dir.join("certs/signer-rsa.p12")) else {
+            eprintln!("SKIP: the test PKI is absent, run tools/gen-testcert.sh");
+            if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+                panic!("OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing");
+            }
+            return;
+        };
+        let key = crate::wizard::KeySource::P12 {
+            path: dir.join("certs/signer-rsa.p12"),
+            password: zeroize::Zeroizing::new("openfirma".into()),
+            alias: None,
+            display: "test".into(),
+        };
+        let _ = container;
+        let signer = key.signer().unwrap();
+        let sig = crate::signing::execute(
+            "cades-b-b",
+            b"contar firmantes",
+            signer.as_ref(),
+            openfirma_core::DigestAlg::Sha256,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(signer_count(&sig), 1);
+        // Garbage is not a CMS: zero, i.e. "do not split".
+        assert_eq!(signer_count(b"nada"), 0);
     }
 }

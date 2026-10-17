@@ -1379,6 +1379,17 @@ pub fn signer_certificates(der: &[u8]) -> Result<Vec<CertificateHandle>> {
         .collect()
 }
 
+/// How many `SignerInfo`s a CMS holds — the library's own structure check
+/// (the same parse [`verify`] iterates), not a byte heuristic. A front-end
+/// rendering one line per signer needs exactly this number to know whether
+/// `verify`'s joined failure carries "signer N: " labels at all; guessing it
+/// from byte windows counts the OIDs every CMS carries and gets it wrong on
+/// the first RSA signature. An unparseable CMS has no count, which callers
+/// read as "do not split".
+pub fn signer_count(der: &[u8]) -> Result<usize> {
+    Ok(parse_signed_data(der)?.signer_infos.len())
+}
+
 fn check_validity(cert: &CertificateHandle, at: SystemTime) -> Result<()> {
     let validity = cert.parsed().tbs_certificate().validity();
     let not_before = SystemTime::from(validity.not_before);

@@ -17,8 +17,18 @@ use std::path::PathBuf;
 
 use openfirma_gui::{app, strings};
 
+/// The document named on the command line: argv[0] is the program, so the
+/// FIRST user argument is `nth(1)` (finding B-7 — the double-click and the
+/// `Exec=%f` line pass exactly one). A flag, or nothing at all, is no file.
+/// Its own function because it parses argv text, not paths: a test can call
+/// it without spawning a window (the review's `nth(2)` bug stayed invisible
+/// precisely because nothing but a real argv ever reached this line).
+fn startup_file_from(mut args: impl Iterator<Item = String>) -> Option<String> {
+    args.nth(1).filter(|a| !a.starts_with('-'))
+}
+
 fn main() -> eframe::Result<()> {
-    let file = std::env::args().nth(2).filter(|a| !a.starts_with('-'));
+    let file = startup_file_from(std::env::args());
     // A double-clicked or `Exec=`-passed name is a request to open, not a
     // promise it can: checking readability here says "this file" in its own
     // words instead of surfacing later as a generic load error.
@@ -60,4 +70,27 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(a))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_file_from;
+
+    #[test]
+    fn the_document_is_the_first_argument_not_the_second() {
+        // B-7 through argv itself: `openfirma-gui contrato.pdf` must load
+        // `contrato.pdf`. (The original bug read `nth(2)` — the SECOND user
+        // argument — so every double-click landed on the welcome screen.)
+        let args = ["openfirma-gui", "contrato.pdf"]
+            .map(String::from)
+            .into_iter();
+        assert_eq!(startup_file_from(args).as_deref(), Some("contrato.pdf"));
+        // Flags never name the document.
+        let args = ["openfirma-gui", "--title", "x"]
+            .map(String::from)
+            .into_iter();
+        assert_eq!(startup_file_from(args), None);
+        // Nothing named: plain welcome screen.
+        assert_eq!(startup_file_from(std::iter::empty()), None);
+    }
 }
