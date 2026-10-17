@@ -321,6 +321,13 @@ impl StoreSpec {
     /// module parses back, so the GUI's list and the CLI's `--store` are one
     /// language.
     pub fn descriptor(&self) -> String {
+        self.descriptor_at(std::env::var_os("HOME").as_deref())
+    }
+
+    /// Same text with `$HOME` resolved against something other than the
+    /// process environment — for tests that hold HOME under a lock and do
+    /// not want a sibling thread's value leaking into the answer.
+    pub fn descriptor_at(&self, home: Option<&std::ffi::OsStr>) -> String {
         match self {
             StoreSpec::Pkcs11 {
                 module,
@@ -342,7 +349,19 @@ impl StoreSpec {
                 Some(token) => format!("pkcs11:{module}:{token}::", module = module.display()),
                 None => format!("pkcs11:{}::", module.display()),
             },
-            StoreSpec::Nss { db } => format!("nss:{db}"),
+            StoreSpec::Nss { db } => match home {
+                Some(h) if db.starts_with("$HOME") => {
+                    format!(
+                        "nss:sql:{}{}",
+                        PathBuf::from(h).display(),
+                        &db["$HOME".len()..]
+                    )
+                }
+                // No HOME to resolve the sentinel with: printing it verbatim
+                // is honest, and opening such a spec fails at open time with
+                // the way-out message in nss::config_string.
+                _ => format!("nss:{db}"),
+            },
             StoreSpec::NssFirefox {
                 profile: Some(name),
             } => format!("nss:firefox:{name}"),
@@ -425,12 +444,15 @@ impl StoreSpec {
                     });
                 }
                 let db = if rest.is_empty() {
-                    let home = std::env::var("HOME").map_err(|_| {
-                        "the default NSS database is $HOME/.pki/nssdb and HOME is not set: \
-                         name the database with --store nss:sql:/path/to/db"
-                            .to_string()
-                    })?;
-                    format!("sql:{home}/.pki/nssdb")
+                    // The sentinel is resolved at open time (nss::open →
+                    // expand_home), not here: `StoreSpec::parse` runs inside
+                    // library code and test threads, and reading `$HOME` at
+                    // parse time turned every sibling that relocates HOME
+                    // into a race. `descriptor()` prints the sentinel back,
+                    // which is also the honest spelling — the file the store
+                    // will open may not exist yet, and no path was chosen
+                    // until someone opens it.
+                    "$HOME/.pki/nssdb".to_string()
                 } else {
                     rest.to_string()
                 };

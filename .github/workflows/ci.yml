@@ -10,6 +10,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # NSS discovery (finding A7) reads the browser profile roots of $HOME and
+  # friends. GitHub runners come with service accounts whose trees contain
+  # real Firefox profiles, which would make every discovery assertion about
+  # the runner's desktop instead of the fixture. Point the list at something
+  # that cannot exist: tests lay their own trees under a fixture HOME inside
+  # one locked window and override this variable for its duration.
+  OPENFIRMA_FIREFOX_PARENTS: /nonexistent
   # The crosscheck tests skip themselves when the test PKI is missing. In CI
   # the material is generated on purpose, so a skip there means the generation
   # step silently broke and the suite would go green without verifying

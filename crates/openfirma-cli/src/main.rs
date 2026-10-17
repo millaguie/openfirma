@@ -2347,23 +2347,22 @@ mod tests {
     }
 
     #[test]
-    fn bare_nss_store_names_home_shared_database() {
-        // Mutating HOME is unsafe in Rust 2024 precisely because sibling test
-        // threads see it: the value is one no machine uses, and it goes back
-        // to what it was before this test returns.
-        let home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", "/home/openfirma-spec-test") };
-        let got = match parse_store_spec("nss").unwrap() {
-            StoreSpec::Nss { db } => db,
+    fn bare_nss_store_carries_the_home_sentinel_without_reading_the_environment() {
+        // The race this design kills: parse used to read $HOME, so any
+        // sibling test that relocated HOME saw the wrong default database —
+        // and macOS runners start test processes with no HOME at all, which
+        // made the bare form a coin flip. Parsing now stores `$HOME/.pki/…`
+        // literally; nss::config_string expands it at open time, and
+        // descriptor() resolves it without the environment when given a home.
+        let spec = parse_store_spec("nss").unwrap();
+        match &spec {
+            StoreSpec::Nss { db } => assert_eq!(db, "$HOME/.pki/nssdb"),
             other => panic!("expected an nss spec, got {other:?}"),
-        };
-        unsafe {
-            match home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
         }
-        assert_eq!(got, "sql:/home/openfirma-spec-test/.pki/nssdb");
+        // Round trip is literal when HOME cannot answer, and resolved when it
+        // can — the same text `--store nss` opens with.
+        let rendered = spec.descriptor_at(Some(std::ffi::OsStr::new("/home/openfirma-spec-test")));
+        assert_eq!(rendered, "nss:sql:/home/openfirma-spec-test/.pki/nssdb");
     }
 
     #[test]

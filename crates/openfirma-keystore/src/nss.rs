@@ -279,8 +279,15 @@ fn profiles_ini(ini: &Path, wanted: Option<&str>) -> Result<Option<PathBuf>> {
     }
     // No Default=1 anywhere: Firefox's own second rule is the [Install…]
     // section's Default= (profiles.ini written by Firefox 67+ keeps it there
-    // even when no profile carries the flag). The file order is the answer.
-    if wanted.is_none() {
+    // even when no profile carries the flag). The two rules are strictly
+    // ordered — nsToolkitProfileService::GetSelectedProfile consults the
+    // Default=1 profiles first and only calls GetInstallDefaultsProfile when
+    // none answered — so a bare `Default=` inside an [Install…] section may
+    // never override a profile that carries its own Default=1, however late
+    // in the file it appears. Gating on fallback.is_none() is exactly that
+    // precedence; reading both keys without the gate let an Install line beat
+    // a trailing Default=1 (review finding #3).
+    if wanted.is_none() && fallback.is_none() {
         for line in text.lines() {
             let line = line.trim();
             let Some((key, value)) = line.split_once('=') else {
@@ -301,7 +308,21 @@ fn profiles_ini(ini: &Path, wanted: Option<&str>) -> Result<Option<PathBuf>> {
 /// platform plus snap and flatpak roots (finding A7 — AutoFirma's helper
 /// reads the same list, `MozillaKeyStoreUtilities.java`). Both Firefox and
 /// Thunderbird hold NSS databases of this exact shape.
+///
+/// `OPENFIRMA_FIREFOX_PARENTS` (path-separator-joined) replaces the list
+/// wholesale when set. It exists for two reasons: packaging that keeps a
+/// profile tree outside the platform standard (rare), and tests — discovery
+/// otherwise reads `$HOME`, which any sibling test that relocates `HOME` in
+/// its own thread turns into a race, and CI runners are full of services
+/// with real Firefox profiles. The CI lanes anchor it to `/nonexistent` so
+/// every determinism claim below is about this crate, not the runner's
+/// desktop.
 fn firefox_parents() -> Vec<PathBuf> {
+    if let Some(list) = std::env::var_os("OPENFIRMA_FIREFOX_PARENTS") {
+        return std::env::split_paths(&list)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+    }
     let mut dirs = Vec::new();
     if cfg!(target_os = "windows") {
         for var in ["APPDATA", "LOCALAPPDATA"] {
@@ -534,6 +555,13 @@ fn expand_db_location(db: &str) -> String {
         return openfirma_core::workflow::expand_home(trimmed);
     }
     let location = openfirma_core::workflow::expand_home(trimmed);
+    // The bare `nss` descriptor carries the unexpanded `$HOME/.pki/nssdb`
+    // sentinel (parse must not read HOME — see workflow.rs), so this is where
+    // a missing HOME becomes an error, at open time when somebody actually
+    // means to use that database.
+    if location.starts_with("$HOME") {
+        return String::new();
+    }
     // Quote-safe: a path containing a single quote cannot be represented in
     // softokn3's parameter syntax, and passing it through mangled would make
     // the module fail with an opaque parse error. Refuse with our own message
@@ -646,6 +674,28 @@ mod tests {
             .unwrap()
             .expect("the install default");
         assert_eq!(got, dir.join("zzz.default-release"));
+    }
+
+    #[test]
+    fn a_profile_default_beats_the_install_default_whatever_the_order() {
+        // Review finding #3, against Firefox's own nsToolkitProfileService:
+        // GetSelectedProfile tries Default=1 profiles first and only asks the
+        // [Install…] section when none answered. Here the Install line names
+        // a different profile than the trailing Default=1 — file order would
+        // answer zzz, the real precedence answers yyy.
+        let dir = tmp("precedence");
+        std::fs::write(
+            dir.join("profiles.ini"),
+            "[InstallABC]\nDefault=zzz.other\n\n\
+             [Profile0]\nName=real\nIsRelative=1\nPath=yyy.default\nDefault=1\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("yyy.default")).unwrap();
+        std::fs::create_dir_all(dir.join("zzz.other")).unwrap();
+        let got = profiles_ini(&dir.join("profiles.ini"), None)
+            .unwrap()
+            .expect("the Default=1 profile");
+        assert_eq!(got, dir.join("yyy.default"));
     }
 
     #[test]
@@ -881,17 +931,34 @@ mod tests {
         if cfg!(windows) {
             vars.push("USERPROFILE");
         }
+        // The swapped set includes OPENFIRMA_FIREFOX_PARENTS: CI anchors it
+        // to /nonexistent so the runner's service-account Firefox profiles
+        // are invisible, and this fixture replaces that anchor with its own
+        // trees for the duration of the call.
+        vars.push("OPENFIRMA_FIREFOX_PARENTS");
         let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            vars.into_iter().map(|v| (v, std::env::var_os(v))).collect();
+            vars.iter().map(|v| (*v, std::env::var_os(v))).collect();
         unsafe {
             for v in saved.iter().map(|(v, _)| *v) {
                 std::env::set_var(v, &dir);
             }
+            // Point the parent list at the platform's fixture tree only —
+            // the other two spellings are the Windows and macOS trees, so
+            // listing all three here would count one profile three times on
+            // any single OS. The invariant this test guards (a fixture-decided
+            // count, deduped) is about the lookup variables, and CI's anchor
+            // makes it hold with exactly one tree everywhere.
+            std::env::set_var("OPENFIRMA_FIREFOX_PARENTS", &firefox_trees[0]);
         }
         let specs: Vec<_> = discover()
             .into_iter()
-            .filter(|s| {
-                matches!(s, openfirma_core::workflow::StoreSpec::Nss { db } if db.contains(name))
+            .filter(|s| match s {
+                // descriptor_at keeps the shared DB's text independent of
+                // whatever HOME the filter runs under; the fixture spells it.
+                openfirma_core::workflow::StoreSpec::Nss { db } => {
+                    s.descriptor_at(Some(dir.as_os_str())).contains(name) || db.contains(name)
+                }
+                _ => false,
             })
             .collect();
         // A spec that appears twice is a bug in its own right (two parents
