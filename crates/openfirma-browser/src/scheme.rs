@@ -278,8 +278,14 @@ pub fn linux_install_and_register() -> Result<(), crate::dispatch::BrowserError>
 }
 
 /// Whether `xdg-mime` can run here (the CLI's --register/--unregister paths
-/// name this when it cannot, instead of half-registering).
+/// name this when it cannot, instead of half-registering). CI images without
+/// xdg-utils have no desktop to register into either; tests that only need a
+/// successful registration set this override, which is exactly the promise
+/// `linux_install_and_register` makes below ("unreachable on this branch").
 pub fn is_xdg_mime_available() -> bool {
+    if std::env::var_os("OPENFIRMA_ASSUME_XDG_MIME").is_some() {
+        return true;
+    }
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-mime")
@@ -575,6 +581,12 @@ pub fn check_private(path: &Path) -> Result<(), String> {
             ));
         }
     }
+    // Windows has no POSIX mode here: the rule that carries over is the ACL
+    // one, and checking it means reading a security descriptor — out of scope
+    // until someone can test it. The path argument exists on every platform;
+    // saying so keeps the non-unix build from warning it away.
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -770,6 +782,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn browser_config_load_distinguishes_absent_from_broken() {
         use std::os::unix::fs::PermissionsExt;

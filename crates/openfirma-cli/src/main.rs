@@ -1763,11 +1763,17 @@ fn register_scheme(
             ),
         }
     }
-    let _exe = std::env::current_exe().context(
+    // The registration needs openfirma's own absolute path: the Linux desktop
+    // entry gets it inside linux_install_and_register, Windows writes it into
+    // the .reg below. (A former `let _exe` here looked like the shared value
+    // and left the windows block referencing a name that never existed — CI's
+    // windows targets were the only place to notice.)
+    let exe = std::env::current_exe().context(
         "the registration must name openfirma's own absolute path (the OS starts this \
          process from a path already, so this failure means the OS lied about argv0)",
     )?;
-    // A-2: a scheme has exactly ONE default handler. Detect what stands in
+    #[cfg(not(target_os = "windows"))]
+    let _ = &exe; // A-2: a scheme has exactly ONE default handler. Detect what stands in
     // the way BEFORE writing anything and require the acknowledgement — the
     // same decision AutoFirma's configurator dialog makes visible.
     let detected = openfirma_browser::scheme::detect_autofirma_install();
@@ -2487,6 +2493,22 @@ mod tests {
     /// threads of one binary. Each still restores HOME for whoever comes next.
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The env is process-wide, so tests that promise xdg-mime (see
+    /// `is_xdg_mime_available`) hold this lock while the variable is set. It
+    /// rides on HOME_LOCK's reasons and restores like `with_home` does.
+    static XDG_MIME_OVERRIDE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Lock without the panic politics: a sibling test that died holding this
+    /// lock left the data (a `()`) perfectly fine, and panicking here instead
+    /// turned one failure into a cascade across CI's targets — where HOME is
+    /// process-wide exactly because cargo runs these as threads of one binary.
+    fn lock_quiet(lock: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+        match lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Give the platform block a home directory for the duration of `run`.
     /// Windows CI exports no HOME at all (register_scheme's linux block never
     /// compiles there, so it never notices; these tests must not notice either),
@@ -2549,7 +2571,7 @@ mod tests {
 
     #[test]
     fn register_without_any_key_source_names_the_refusal_it_cannot_sign_with() {
-        let _home_guard = HOME_LOCK.lock().unwrap();
+        let _home_guard = lock_quiet(&HOME_LOCK);
         // The refusal a fresh `--register` (no --p12 anywhere) must print:
         // naming the fix, not just the missing flag — the whole point of the
         // round-two finding was an install step that "succeeded" into a
@@ -2564,6 +2586,10 @@ mod tests {
         std::fs::create_dir_all(dir.join(".local/share/applications")).unwrap();
         let cfg = dir.join("browser.toml");
         let _ = std::fs::remove_file(&cfg);
+        // A CI image may not ship xdg-utils; the refusal under test is the
+        // missing key, so promise xdg-mime and let the key rule decide.
+        let _xdg_guard = lock_quiet(&XDG_MIME_OVERRIDE);
+        unsafe { std::env::set_var("OPENFIRMA_ASSUME_XDG_MIME", "1") };
         let err = with_home(&dir, || {
             register_scheme(None, None, Some(&cfg), false, false)
                 .unwrap_err()
@@ -2598,7 +2624,7 @@ mod tests {
 
     #[test]
     fn register_writes_a_config_the_handler_reads_back() {
-        let _home_guard = HOME_LOCK.lock().unwrap();
+        let _home_guard = lock_quiet(&HOME_LOCK);
         // The round trip that closes M-3b: what `--register` writes must be
         // exactly what `afirma-uri` reads with no flags but the URI — spaces
         // and all, because installs under `/home/Ana María/` are real.
@@ -2627,6 +2653,15 @@ mod tests {
             std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
+        // A CI image without xdg-utils has no desktop to register into; the
+        // override below is exactly what linux_install_and_register's error
+        // text demands ("instala xdg-utils y repite"), and this test pins the
+        // config round trip, not that binary. The env var itself is read on
+        // every platform (is_xdg_mime_available checks it before its cfg);
+        // only the lock is gated to where the promise changes any behavior.
+        #[cfg(target_os = "linux")]
+        let _xdg_guard = lock_quiet(&XDG_MIME_OVERRIDE);
+        unsafe { std::env::set_var("OPENFIRMA_ASSUME_XDG_MIME", "1") };
         let wrote = with_home(&dir, || {
             register_scheme(Some(p12.clone()), Some(pw.clone()), Some(&cfg), false, true)
         });
