@@ -99,6 +99,12 @@ pub fn discover() -> Vec<openfirma_core::workflow::StoreSpec> {
             }
         }
     }
+    // Two environment variables can name one directory — %APPDATA% and
+    // %LOCALAPPDATA%\Mozilla\Firefox versus a profiles.ini that keeps profiles
+    // directly under the parent, or both spellings Windows browsers use — and
+    // a picker must show every database once.
+    specs.sort_by_key(|s| s.descriptor());
+    specs.dedup_by(|a, b| a.descriptor() == b.descriptor());
     specs
 }
 
@@ -543,15 +549,35 @@ mod tests {
     use crate::store::SystemStore;
 
     fn tmp(name: &str) -> PathBuf {
+        // Fresh per *process and thread*: a CI matrix can leave an old
+        // runner's or another binary's fixture of the same name in the shared
+        // temp directory, and discovery would count its contents as part of
+        // this test's answer. A random suffix makes that impossible.
         let dir = std::env::temp_dir().join(format!(
             "openfirma-nss-test-{}-{}-{name}",
             std::process::id(),
             std::thread::current()
                 .name()
                 .unwrap_or("t")
-                .replace("::", "_")
+                .replace("::", "_"),
         ));
         let _ = std::fs::remove_dir_all(&dir);
+        if dir.try_exists().unwrap_or(true) {
+            // Even a failed removal must not leave a foreign fixture behind:
+            // retire to a name nothing else can have created.
+            let salted = format!(
+                "{}-{}",
+                dir.display(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0)
+            );
+            let dir = PathBuf::from(salted);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("test temp dir");
+            return dir;
+        }
         std::fs::create_dir_all(&dir).expect("test temp dir");
         dir
     }
@@ -787,79 +813,69 @@ mod tests {
     fn discovery_finds_profile_databases_and_names_them() {
         let name = "discover";
         let dir = tmp(name);
-        let profile = dir.join(".mozilla/firefox/abcd.default-release");
-        std::fs::create_dir_all(&profile).unwrap();
-        std::fs::write(profile.join("cert9.db"), b"synthetic").unwrap();
+        // The strictest shape the listing honours — an ini that names one
+        // profile and nothing else — under every parent discovery consults on
+        // this platform. Crash Reports below is a directory a real browser's
+        // own bookkeeping keeps beside profiles and that must stay invisible.
+        // Which directories those parents are belongs to firefox_parents, not
+        // here: every variable it reads moves into this fixture further down,
+        // so the fixture lays its tree wherever discovery actually looks. The
+        // runner may hold real Firefox profiles in those variables (one x64
+        // run counted a third spec because Windows runners ship
+        // %LOCALAPPDATA%\Mozilla\Firefox\Profiles with a profile in it), which
+        // is why the swap has to cover them all and this file lays profiles
+        // under both spellings discovery could resolve them to.
+        let firefox_trees = [
+            dir.join(".mozilla").join("firefox"),
+            dir.join("Mozilla").join("Firefox"),
+            dir.join("Library")
+                .join("Application Support")
+                .join("Firefox"),
+        ];
+        for tree in &firefox_trees {
+            std::fs::create_dir_all(tree).unwrap();
+            let profile = tree.join("abcd.default-release");
+            std::fs::create_dir_all(&profile).unwrap();
+            std::fs::write(profile.join("cert9.db"), b"synthetic").unwrap();
+            std::fs::write(
+                tree.join("profiles.ini"),
+                "[Profile0]\nName=release\nIsRelative=1\nPath=abcd.default-release\nDefault=1\n\n\
+                 [General]\nStartWithLastProfile=1\nVersion=2\n",
+            )
+            .unwrap();
+        }
+        // A non-profile directory inside the first tree must stay invisible.
+        std::fs::create_dir_all(firefox_trees[0].join("Crash Reports")).unwrap();
         std::fs::write(
-            dir.join(".mozilla/firefox/profiles.ini"),
-            // The strictest shape the listing honours: an ini that names a
-            // profile — and names nothing else. Crash Reports below is thus a
-            // directory a real browser's own bookkeeping excludes.
-            "[Profile0]\nName=release\nIsRelative=1\nPath=abcd.default-release\nDefault=1\n\n\
-             [General]\nStartWithLastProfile=1\nVersion=2\n",
-        )
-        .unwrap();
-        // A non-profile directory inside the same parent must stay invisible.
-        std::fs::create_dir_all(dir.join(".mozilla/firefox/Crash Reports")).unwrap();
-        std::fs::write(
-            dir.join(".mozilla/firefox/Crash Reports/cert9.db"),
+            firefox_trees[0].join("Crash Reports/cert9.db"),
             b"synthetic",
         )
         .unwrap();
-        // The shared DB too — but asserted through a HOME of its own, not
+        // The shared DB too — asserted through a HOME of the test's own, not
         // through whatever the machine happens to have: `shared_db_exists` is
         // a $HOME thing (`$HOME/.pki/nssdb`, the Chromium location) on every
-        // platform, so the candidate exists exactly as long as we say HOME
-        // exists. Swapping it into the fixture inside this test's own locked
-        // window makes the fixture, not the runner, decide the count — which
-        // is precisely what GitHub's macOS runners broke before, when they
-        // start test processes with no HOME at all and an unconditional
-        // expectation became a guess.
+        // platform. macOS runners start test processes with no HOME at all;
+        // moving one into the fixture makes it count here and nowhere else.
         std::fs::create_dir_all(dir.join(".pki/nssdb")).unwrap();
         std::fs::write(dir.join(".pki/nssdb/cert9.db"), b"synthetic").unwrap();
         let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Every variable discovery consults moves into this fixture for the
         // duration of the call, so the fixture — not the runner's environment
-        // — decides what gets found: $HOME carries the unix trees and the
-        // shared DB on every platform, and Windows browsers keep profiles
-        // under %APPDATA%/%LOCALAPPDATA% (firefox_parents reads both). A
-        // sibling test swapping them concurrently would make discovery look at
-        // the wrong tree, so the whole swap lives inside one locked window;
-        // every candidate path contains this test's own directory name, so a
-        // leaked window elsewhere could not add to this count either.
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> = if cfg!(windows) {
-            ["HOME", "APPDATA", "LOCALAPPDATA"]
-                .into_iter()
-                .map(|v| (v, std::env::var_os(v)))
-                .collect()
-        } else {
-            vec![("HOME", std::env::var_os("HOME"))]
-        };
+        // — decides what gets found. A sibling test swapping them concurrently
+        // would make discovery look at the wrong tree, so the whole swap lives
+        // inside one locked window; every candidate path contains this test's
+        // own directory name, so a leaked window elsewhere could not add to
+        // this count either.
+        let mut vars: Vec<&str> = vec!["HOME", "APPDATA", "LOCALAPPDATA"];
+        if cfg!(windows) {
+            vars.push("USERPROFILE");
+        }
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            vars.into_iter().map(|v| (v, std::env::var_os(v))).collect();
         unsafe {
             for v in saved.iter().map(|(v, _)| *v) {
                 std::env::set_var(v, &dir);
             }
-        }
-        // On Windows the profile parent is %APPDATA%\Mozilla\Firefox; lay the
-        // fixture's firefox tree where that platform looks for it too.
-        let parents: Vec<std::path::PathBuf> = if cfg!(windows) {
-            vec![
-                dir.join("Mozilla").join("Firefox"),
-                dir.join(".mozilla").join("firefox"),
-            ]
-        } else {
-            vec![dir.join(".mozilla").join("firefox")]
-        };
-        for parent in parents {
-            let profile = parent.join("abcd.default-release");
-            if std::fs::create_dir_all(&profile).is_err() {
-                continue;
-            }
-            let _ = std::fs::write(profile.join("cert9.db"), b"synthetic");
-            let _ = std::fs::write(
-                parent.join("profiles.ini"),
-                "[Profile0]\nName=release\nIsRelative=1\nPath=abcd.default-release\nDefault=1\n",
-            );
         }
         let specs: Vec<_> = discover()
             .into_iter()
@@ -867,6 +883,14 @@ mod tests {
                 matches!(s, openfirma_core::workflow::StoreSpec::Nss { db } if db.contains(name))
             })
             .collect();
+        // A spec that appears twice is a bug in its own right (two parents
+        // offering one database), and comparing sets rather than lengths keeps
+        // Windows — where APPDATA and LOCALAPPDATA are the same directory, so
+        // one fixture legitimately answers through both spellings — assertable
+        // against unix's two distinct paths.
+        let mut unique = specs.clone();
+        unique.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        unique.dedup_by(|a, b| format!("{a:?}") == format!("{b:?}"));
         unsafe {
             for (v, value) in saved {
                 match value {
@@ -875,12 +899,19 @@ mod tests {
                 }
             }
         }
-        // One profile plus the shared DB. With every lookup variable pointed
-        // into this fixture, nothing else can answer on any platform — which
-        // is exactly what failed before: the runner's own %APPDATA% had a real
-        // Firefox profile (Windows found that parent first), and macOS runners
-        // start test processes with no HOME at all. Both counted through the
-        // `name` filter, so only a fixture-decided count is stable.
-        assert_eq!(specs.len(), 2, "{specs:?}");
+        // One profile plus the shared DB, after dedup. With every lookup
+        // variable pointed into this fixture, nothing else can answer on any
+        // platform — which is exactly what failed before: the runner's own
+        // %APPDATA% had a real Firefox profile (Windows found that parent
+        // first), and macOS runners start test processes with no HOME at all.
+        // Both counted through the `name` filter, so only a fixture-decided
+        // count is stable. A duplicate before dedup means discovery listed one
+        // database twice, so that is checked too.
+        assert_eq!(unique.len(), 2, "{specs:?}");
+        assert_eq!(
+            specs.len(),
+            unique.len(),
+            "discovery listed the same database twice: {specs:?}"
+        );
     }
 }
