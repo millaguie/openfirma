@@ -434,7 +434,10 @@ unsafe extern "system" {
     ) -> *const CertContext;
     /// Adds a reference to a certificate context and returns it. The store
     /// variants of the crypto provider functions need a context that belongs
-    /// to a store, so signing takes its own reference on the listed one.
+    /// to a store, so signing takes its own reference on the listed one. Its
+    /// import has existed in crypt32.dll since XP; `raw-dylib` resolves it at
+    /// link time, which nothing here runs on a crypt32 lacking it would ever
+    /// reach — the function has been in every supported Windows release.
     fn CertDuplicateCertificateContext(p_cert_context: *const CertContext) -> *const CertContext;
     fn CertFreeCertificateContext(p_cert_context: *const CertContext) -> i32;
 }
