@@ -84,6 +84,21 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+#[link(name = "ncrypt", kind = "raw-dylib")]
+unsafe extern "system" {
+    /// CNG signs (and stores its keys) through `NCrypt*` handles. A key that
+    /// `CryptAcquireCertificatePrivateKey` returns with
+    /// `CERT_NCRYPT_KEY_SPEC` is one of these — **not** an `HCRYPTPROV` — and
+    /// must be freed through this family only. Mixing the handle families
+    /// (feeding a CNG handle to `CryptCreateHash`, or releasing it with
+    /// `CryptReleaseContext`) is undefined behavior, which is H-10; the
+    /// branch in [`WindowsStore::sign_prehash`] is what refuses it until an
+    /// `NCryptSignHash` signer exists. The declarations mirror the SDK
+    /// headers: ncrypt.dll exports these as undecorated C names on every
+    /// architecture, so raw-dylib resolves them like the crypt32 table.
+    fn NCryptFreeObject(h_object: usize) -> u32;
+}
+
 #[link(name = "advapi32", kind = "raw-dylib")]
 unsafe extern "system" {
     fn CryptGetHashParam(
@@ -127,8 +142,22 @@ const CERT_STORE_READONLY_FLAG: u32 = 0x0000_8000;
 /// `PKCS_7_ASN_ENCODING | X509_ASN_ENCODING` — the encodings a MY store uses.
 const ENCODINGS: u32 = 0x0001_0001;
 /// Ask CAPI for whichever provider backs the key, legacy CSP or smart card.
-const CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG: u32 = 0x0000_0100;
-const CRYPT_ACQUIRE_PREFER_NCRYPT_KEY_FLAG: u32 = 0x0000_0200;
+const CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG: u32 = 0x0001_0000;
+/// Prefer the CNG handle when a key exists in both stores. Kept deliberately
+/// *off* on signing (see [`sign_prehash`]): openfirma's signer speaks PKCS#1
+/// v1.5 through CAPI, and a CNG handle must go through `NCryptSignHash`, to
+/// which we have no call path — passing it onward would hand an `NCRYPT
+/// KEY_HANDLE` to functions expecting an `HCRYPTPROV`. Listing still passes
+/// ALLOW so CNG-only keys (every EC key on a modern machine) are *seen*; the
+/// handle is dropped immediately and signing refuses them by name.
+const CRYPT_ACQUIRE_PREFER_NCRYPT_KEY_FLAG: u32 = 0x0002_0000;
+/// Never prompt the user, even for a smart card without a cached PIN. Listing
+/// certificates must not ask anyone to unlock anything; without this flag a
+/// PIN dialog can pop up per certificate while merely enumerating MY.
+const CRYPT_ACQUIRE_SILENT_FLAG: u32 = 0x0000_0040;
+/// `CERT_NCRYPT_KEY_SPEC`: what `pdwKeySpec` reports when the acquired handle
+/// is a CNG key. The value must be checked before any CAPI call on the handle.
+const CERT_NCRYPT_KEY_SPEC: u32 = 0xFFFF_FFFF;
 /// `HP_HASHVAL`: read the hash value back out of a hash object.
 const HP_HASHVAL: u32 = 0x0002;
 /// The CNG algorithm ids for the plain-SHA hash objects that carry a caller-
@@ -204,13 +233,20 @@ impl SystemStore for WindowsStore {
             };
             // A certificate only belongs in the list when CAPI can find a
             // private key for it — the same rule as PKCS#11 pairing by CKA_ID.
-            let (mut prov, mut spec, mut must_free) = (0usize, 0u32, 0i32);
+            let (mut handle, mut spec, mut must_free) = (0usize, 0u32, 0i32);
+            // SAFETY: `next` is a live store-owned context from the call
+            // above; the out-pointers are locals alive across the call. The
+            // returned handle's family depends on `spec`, and every one of
+            // them is closed below before anything else can observe it:
+            // CERT_NCRYPT_KEY_SPEC means CNG (`NCryptFreeObject`), anything
+            // else a legacy CSP (`CryptReleaseContext`). SILENT keeps card
+            // PINs from being demanded while merely listing.
             let ok = unsafe {
                 CryptAcquireCertificatePrivateKey(
                     next,
-                    CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_PREFER_NCRYPT_KEY_FLAG,
+                    CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_SILENT_FLAG,
                     ptr::null(),
-                    &mut prov,
+                    &mut handle,
                     &mut spec,
                     &mut must_free,
                 )
@@ -219,7 +255,16 @@ impl SystemStore for WindowsStore {
                 continue;
             }
             if must_free != 0 {
-                unsafe { CryptReleaseContext(prov, 0) };
+                // SAFETY: caller-must-free says the handle belongs to us, and
+                // `spec` was just written by the same call that produced it.
+                unsafe {
+                    let freed = if spec == CERT_NCRYPT_KEY_SPEC {
+                        NCryptFreeObject(handle) != 0
+                    } else {
+                        CryptReleaseContext(handle, 0) != 0
+                    };
+                    let _ = freed; // neither API reports much on a close path
+                }
             }
             out.push(StoreCertificate {
                 cert,
@@ -255,11 +300,12 @@ impl SystemStore for WindowsStore {
             });
         }
         // Re-acquire the provider for this certificate's key and sign. The
-        // index in the handle selects position *i* of a fresh enumeration, so
-        // that concurrent store edits surface as a clean re-find failure
-        // instead of signing with a stale context.
+        // index in the handle records which entry of the listing this is (the
+        // message on failure); the key itself is always freshly re-found from
+        // the certificate DER, so a concurrent store edit surfaces as a clean
+        // "no longer available" error instead of signing with a stale context.
         let der = cert.cert.der().to_vec();
-        let mut prov = 0usize;
+        let mut handle = 0usize;
         let mut spec = 0u32;
         let mut must_free = 0i32;
         let ctx =
@@ -269,12 +315,19 @@ impl SystemStore for WindowsStore {
                 "the certificate at Windows store index {i} is no longer a valid context"
             )));
         }
+        // SAFETY: `ctx` was just created non-null and stays alive across the
+        // call; the out-pointers are locals. ALLOW (without PREFER) asks CAPI
+        // for the legacy provider when one exists, which is what this signer
+        // can drive; a key that only exists as CNG answers anyway — with
+        // CERT_NCRYPT_KEY_SPEC — and the branch below refuses it rather than
+        // misusing the handle. No SILENT here: signing is the moment the user
+        // may legitimately be asked for their card PIN.
         let ok = unsafe {
             CryptAcquireCertificatePrivateKey(
                 ctx,
-                CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_PREFER_NCRYPT_KEY_FLAG,
+                CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG,
                 ptr::null(),
-                &mut prov,
+                &mut handle,
                 &mut spec,
                 &mut must_free,
             )
@@ -285,9 +338,35 @@ impl SystemStore for WindowsStore {
                 "the private key for this certificate is no longer available".into(),
             ));
         }
-        let result = capi_sign_prehash(prov, spec, alg, prehash);
+        let result = if spec == CERT_NCRYPT_KEY_SPEC {
+            // A CNG key. Signing it needs a whole NCryptSignHash path (with
+            // the right BCRYPT_PKCS1_PADDING_INFO, and per-card decisions
+            // about NCRYPT_SILENT_FLAG), which does not exist yet; refusing
+            // here is honest, while continuing would feed an NCRYPT_KEY_HANDLE
+            // to CryptCreateHash and free it with CryptReleaseContext — the
+            // H-10 confusion. The listing saw the certificate because its key
+            // exists; only signing it waits for the CNG signer.
+            Err(Error::Keystore(
+                "this certificate's private key lives in the CNG store, and \
+                 openfirma's Windows signer drives legacy CSP providers only \
+                 (PKCS#1 v1.5 via CryptSignHash); a card or key whose provider \
+                 is CNG-only signs through its PKCS#11 interface instead"
+                    .into(),
+            ))
+        } else {
+            capi_sign_prehash(handle, spec, alg, prehash)
+        };
         if must_free != 0 {
-            unsafe { CryptReleaseContext(prov, 0) };
+            // SAFETY: same handle/family pairing as the acquire above; the
+            // CNG branch never signed anything with it, only refuses.
+            unsafe {
+                let freed = if spec == CERT_NCRYPT_KEY_SPEC {
+                    NCryptFreeObject(handle) != 0
+                } else {
+                    CryptReleaseContext(handle, 0) != 0
+                };
+                let _ = freed; // the sign result is what the caller needs
+            }
         }
         result
     }
@@ -316,24 +395,30 @@ fn capi_sign_prehash(prov: usize, spec: u32, alg: DigestAlg, prehash: &[u8]) -> 
     // HP_HASHVAL carries the digest into the object. The pointer is read-only
     // for CAPI on this parameter (it copies the value).
     if unsafe { CryptSetHashParam(hash, HP_HASHVAL, prehash.as_ptr() as *mut u8, 0) } == 0 {
-        unsafe { CryptDestroyHash(hash) };
-        return Err(last_error(
+        // Read the error before CryptDestroyHash: that call can overwrite
+        // GetLastError with whatever it hits on the way down, which used to
+        // report someone else's failure code (H-10).
+        let err = last_error(
             "CryptSetHashParam(HP_HASHVAL): this CSP will not sign a \
              caller-computed digest; its PKCS#11 interface is the way",
-        ));
+        );
+        unsafe { CryptDestroyHash(hash) };
+        return Err(err);
     }
     let mut len = 0u32;
     if unsafe { CryptSignHashW(hash, spec, ptr::null(), 0, ptr::null_mut(), &mut len) } == 0 {
+        let err = last_error("CryptSignHash(size probe)");
         unsafe { CryptDestroyHash(hash) };
-        return Err(last_error("CryptSignHash(size probe)"));
+        return Err(err);
     }
     let mut sig = vec![0u8; len as usize];
     // CAPI returns little-endian signatures (the raw private-key operation);
     // CMS wants big-endian, so reverse before handing it over — same rule the
     // .NET RSACryptoServiceProvider formatter applies.
     if unsafe { CryptSignHashW(hash, spec, ptr::null(), 0, sig.as_mut_ptr(), &mut len) } == 0 {
+        let err = last_error("CryptSignHash");
         unsafe { CryptDestroyHash(hash) };
-        return Err(last_error("CryptSignHash"));
+        return Err(err);
     }
     unsafe { CryptDestroyHash(hash) };
     sig.truncate(len as usize);
