@@ -1060,13 +1060,20 @@ fn main() -> Result<()> {
 
             let content =
                 std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+            // Never sign a signature (review 06's second pass moved the rule
+            // from the window into core so BOTH frontends answer from it):
+            // an input named like an openfirma output, or carrying CMS bytes,
+            // gets the refusal that names `verify` as what to do instead —
+            // before any key is opened and before anything is signed. Co-
+            // signing a PDF (a second signature into the same document) is
+            // NOT this rule; the content half of it is CMS only.
+            openfirma_core::workflow::check_not_signed_input(&input, Some(&content))
+                .map_err(anyhow::Error::msg)?;
             // One `Box<dyn Signer>` covers every source: the software paths
             // box up unchanged, and a system store's signer keeps its store
             // alive behind an Arc (see boxed_signer).
-            // B-6: `sign` is the one command allowed to ask a terminal for the
-            // container's password when nothing else supplied it.
-            let password = p12_password_ask(password, password_file, PasswordAsk::sign())?;
-            // The three sources are exclusive, checked before opening anything.
+            // The three sources are exclusive, checked before opening
+            // anything and before asking anyone for a secret.
             let named: Vec<&str> = [
                 store.as_ref().map(|_| "--store"),
                 p12.as_ref().map(|_| "--p12"),
@@ -1084,6 +1091,23 @@ fn main() -> Result<()> {
                     named.join(" and ")
                 );
             }
+            // B-6: `sign` is the one command allowed to ask a terminal for the
+            // container's password when nothing else supplied it — and it
+            // asks only of an invocation that actually NAMED a --p12 (the
+            // review's probe: with no source named at all, the old order put
+            // the question first and then blamed the user with "a password
+            // only makes sense together with --p12" for the secret the CLI
+            // itself had demanded). Resolution from flags/env never prompts.
+            let asks = p12.is_some();
+            let password = p12_password_ask(
+                password,
+                password_file,
+                if asks {
+                    PasswordAsk::sign()
+                } else {
+                    PasswordAsk::no_prompt()
+                },
+            )?;
             let signer: Box<dyn Signer> = if let Some(spec) = &store {
                 if alias.is_some() {
                     anyhow::bail!(
@@ -2163,7 +2187,8 @@ fn prompt_password(question: &str) -> Result<Zeroizing<String>> {
     // re-opened target itself. Neither handle ever wraps a descriptor std
     // owns: no fd race, and no "owned file descriptor already closed" abort.
     let toggle = EchoToggler::new();
-    let hidden = toggle.disable_and_confirm();
+    let echo_mode = toggle.disable_and_confirm();
+    let hidden = matches!(echo_mode, EchoMode::Disabled | EchoMode::WasOff);
     if !hidden {
         // The degraded path is still an answer — visible typing with a
         // warning that arrives BEFORE any key is pressed beats pretending the
@@ -2177,7 +2202,7 @@ fn prompt_password(question: &str) -> Result<Zeroizing<String>> {
     let _ = std::io::stderr().flush();
     let mut line = String::new();
     let read = std::io::stdin().read_line(&mut line);
-    toggle.restore();
+    toggle.restore(echo_mode);
     drop(toggle);
     if hidden {
         // The Enter the user pressed was swallowed with echo off; a newline
@@ -2201,6 +2226,18 @@ fn prompt_password(question: &str) -> Result<Zeroizing<String>> {
 /// owns. Where /proc does not exist (Windows, some BSDs) or no terminal is to
 /// be found, the handles are absent and every toggle is a no-op: the prompt
 /// degrades to visible typing with its warning, never to a wrong answer.
+/// What a prompt's echo toggle ended up doing to the terminal, so `restore`
+/// returns exactly what was taken and nothing else.
+enum EchoMode {
+    /// We turned echo off (it was on): the prompt must turn it back on.
+    Disabled,
+    /// The terminal arrived with echo already off: touch nothing.
+    WasOff,
+    /// No handle or no stty: nothing was ever disabled, and the caller warns
+    /// that typing is visible.
+    NoControl,
+}
+
 struct EchoToggler {
     /// A handle on the SAME target fd 0 currently points at (its /proc
     /// re-open). None when /proc cannot say what fd 0 is.
@@ -2253,21 +2290,43 @@ impl EchoToggler {
     /// Turn echo off and PROVE it: `stty -a` reads the live flag before and
     /// after, so a silent failure (non-tty handle, missing stty) still earns
     /// the visible-typing warning instead of leaving typed secrets on screen.
-    fn disable_and_confirm(&self) -> bool {
+    /// The returned flag says what the prompt's owner must do afterwards:
+    /// `WasOff` never turns echo back on (`restore` would flip ON a terminal
+    /// its owner deliberately left hidden — `stty -echo` shells and expect
+    /// harnesses exist); `Disabled` restores; `NoControl` never disabled
+    /// anything to begin with.
+    fn disable_and_confirm(&self) -> EchoMode {
         let before = self.echo_state();
         self.run("-echo");
         match (before, self.echo_state()) {
             // Was ON, now OFF: hidden typing, confirmed by the terminal itself.
-            (Some(true), Some(false)) => true,
+            (Some(true), Some(false)) => EchoMode::Disabled,
             // Already OFF when we arrived — hidden without our doing (a harness
-            // or shell that turned echo off needs no warning either).
-            (Some(false), Some(false)) => true,
-            _ => false,
+            // or shell that turned echo off needs no warning either), and no
+            // restoring on top of somebody else's choice.
+            (Some(false), Some(false)) => EchoMode::WasOff,
+            _ => EchoMode::NoControl,
         }
     }
 
-    fn restore(&self) {
-        self.run("echo");
+    /// Put echo back the way we found it — only if WE took it off. A restore
+    /// that fails after a successful disable leaves typing hidden, which the
+    /// user must hear about: silent invisible keys read as a hung terminal.
+    fn restore(&self, mode: EchoMode) {
+        match mode {
+            EchoMode::Disabled => {
+                self.run("echo");
+                if self.echo_state() != Some(true) {
+                    eprintln!(
+                        "warning: could not restore the terminal's echo; what you type may \
+                         stay invisible — run `stty echo` to put it back"
+                    );
+                }
+            }
+            // Nothing was taken, nothing is returned: a terminal that arrived
+            // hidden (or was never under our control) keeps its own state.
+            EchoMode::WasOff | EchoMode::NoControl => {}
+        }
     }
 
     /// `stty MODE` over each owned handle until one succeeds. stty acts on
@@ -3054,6 +3113,14 @@ fn autofirma_sign(p: CompatParams) {
         Ok(c) => c,
         Err(e) => compat_fail(&format!("cannot read the input file: {e}")),
     };
+    // Never sign a signature (core's rule, the same one `openfirma sign`
+    // and the window run): AutoFirma's own batch path takes any file it is
+    // pointed at, so this refusal is one of compat's documented deviations —
+    // a sede script that fed `-i` an old signature received 255 here instead
+    // of a signature-of-a-signature nobody ever wanted.
+    if let Err(e) = openfirma_core::workflow::check_not_signed_input(&input, Some(&content)) {
+        compat_fail(&e);
+    }
     let format = compat_format(p.format.as_deref(), &content);
     let signer: Box<dyn Signer> = match compat_store(p.store.as_deref().unwrap_or("auto")) {
         Err(e) => compat_fail(&e),

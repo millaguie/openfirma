@@ -618,6 +618,66 @@ pub fn is_signed_output(path: &Path) -> bool {
     })
 }
 
+/// Refuses signing a file that already IS a signature (review 06's second
+/// pass, finding: "if it looks like a decision, both frontends call it").
+/// A-3/B-3 wrote the rule in the GUI — verify a signature, never sign one —
+/// but kept it inside the window, so `openfirma sign -i x.csig` cheerfully
+/// built a signature of a signature. The rule belongs here: name (an
+/// openfirma output, [`is_signed_output`]) or content (CMS bytes, the same
+/// shape either frontend's inspector reads). Callers that have not read the
+/// file yet pass `None` and get the name half; once they have its bytes they
+/// call again with them. A PDF named here is NOT examined for signature
+/// dictionaries: signing a second signature into an existing PDF is what
+/// co-signing IS, so the content half of the rule is CMS only (the GUI's
+/// routing decision — verify a signed PDF at load — stays its own honest
+/// convenience and never a CLI prohibition). The sentence names what to do
+/// instead: verify it.
+pub fn check_not_signed_input(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
+    if is_signed_output(path) {
+        return Err(format!(
+            "{} is a signature (its name says so): openfirma signs documents, never \
+             signatures. To check this one, verify it (`openfirma verify`) or open it \
+             in the window's verify path",
+            path.display()
+        ));
+    }
+    let Some(bytes) = bytes else {
+        return Ok(());
+    };
+    if Format::detect(bytes) != Format::Pdf && looks_like_cms(bytes) {
+        return Err(format!(
+            "{} is CMS signature bytes, not a document: there is nothing to sign here. \
+             Verify it instead (`openfirma verify`), or verify it against the document \
+             it signed",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// A cheap shape test for detached/attached CMS bytes (the ContentInfo's
+/// first OID is `signedData`, 1.2.840.113549.1.7.2). The GUI routes such a
+/// load to its verify/detached path and the CLI refuses to sign it; both ask
+/// core, so the two frontends cannot disagree about what "this is already a
+/// signature" means (a rule each frontend invented for itself has been the
+/// drift this project's layering exists to prevent).
+pub fn looks_like_cms(bytes: &[u8]) -> bool {
+    // 30 82.. / 30 81.. / short form, then OID 1.2.840.113549.1.7.2.
+    if !bytes.starts_with(&[0x30]) {
+        return false;
+    }
+    const SIGNED_DATA_OID: &[u8] = &[
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02,
+    ];
+    let after_len = match bytes.get(1) {
+        Some(0x81) => 3,
+        Some(0x82) => 4,
+        Some(&l) if l < 0x80 => 2,
+        _ => return false,
+    };
+    bytes.get(after_len..after_len + SIGNED_DATA_OID.len()) == Some(SIGNED_DATA_OID)
+}
+
 /// Refuses writing an output that already exists, unless forced (review 06,
 /// A-3). An existing file is somebody's data: AutoFirma routes every save
 /// through its OS save dialog, which asks before replacing; a CLI or a window
