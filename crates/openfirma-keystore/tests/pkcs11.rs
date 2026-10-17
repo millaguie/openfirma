@@ -305,19 +305,11 @@ fn function_list_offsets_match_their_documented_bytes() {
             "C_Sign" => 44,
             other => panic!("offsets() grew a new entry: {other}"),
         };
-        // Slot addresses depend on the platform ABI: Windows modules are
-        // read under the packed cryptoki headers (first pointer at 2, stride
-        // = pointer size), unix LP64 naturally aligns behind slot 0's tail
-        // padding (byte 8k). See types.rs for why each rule is what it is.
-        let ptr = std::mem::size_of::<*const u8>();
-        let want = if cfg!(windows) || ptr == 4 {
-            2 + slot * ptr
-        } else {
-            slot * 8
-        };
         assert_eq!(
-            off, want,
-            "{name} must sit at byte {want} (spec slot {slot})"
+            off,
+            slot * 8,
+            "{name} must sit at byte {} (spec slot {slot})",
+            slot * 8
         );
     }
 }

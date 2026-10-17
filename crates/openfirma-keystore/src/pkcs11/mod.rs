@@ -10,11 +10,7 @@
 //! a PKCS#11 module is a plugin, not a library you link.
 
 mod nss_args;
-/// The v2.40 wire shapes, public so the ABI test suite (`tests/pkcs11_abi.rs`)
-/// can assert their byte layout for whichever target CI compiles it on —
-/// including the Windows jobs no live module can reach. Not openfirma's API:
-/// nothing outside this crate should grow to depend on them.
-pub mod types;
+pub(crate) mod types;
 
 use std::cell::Cell;
 use std::ffi::{CString, c_void};
@@ -521,30 +517,25 @@ fn load_and_init(path: &Path, init: InitShape, library_parameters: Option<&str>)
     // into it: every entry point we call must be non-null. v2.x requires
     // absent functions to be stubs rather than null, and NSS's 3.x lists keep
     // that promise for the whole v2 prefix, so a null here means the table is
-    // not what its version claims. Each slot is located through
-    // `function_slot_offset`, derived from this target's ABI (and, for LP64,
-    // from the very field offsets `types.rs` pins down), so the probe reads
-    // exactly what a call would read — including Windows' packed table, where
-    // slots do not sit on multiples of 8 and must be read unaligned.
+    // not what its version claims. The slots are byte offsets /8 — exactly
+    // the constants the offset asserts in `types.rs` pin down.
     let called: [(*const c_void, &str); 12] = unsafe {
-        let base = list.cast::<u8>();
-        let slot = |k| (base.add(function_slot_offset(k)) as *const *const c_void).read_unaligned();
+        let base = list.cast::<*const c_void>();
         [
-            (slot(1), "C_Initialize"),
-            (slot(5), "C_GetSlotList"),
-            (slot(7), "C_GetTokenInfo"),
-            (slot(13), "C_OpenSession"),
-            (slot(14), "C_CloseSession"),
-            (slot(19), "C_Login"),
-            (slot(25), "C_GetAttributeValue"),
-            (slot(27), "C_FindObjectsInit"),
-            (slot(28), "C_FindObjects"),
-            (slot(29), "C_FindObjectsFinal"),
-            (slot(43), "C_SignInit"),
-            (slot(44), "C_Sign"),
+            (base.add(1).read(), "C_Initialize"),
+            (base.add(5).read(), "C_GetSlotList"),
+            (base.add(7).read(), "C_GetTokenInfo"),
+            (base.add(13).read(), "C_OpenSession"),
+            (base.add(14).read(), "C_CloseSession"),
+            (base.add(19).read(), "C_Login"),
+            (base.add(25).read(), "C_GetAttributeValue"),
+            (base.add(27).read(), "C_FindObjectsInit"),
+            (base.add(28).read(), "C_FindObjects"),
+            (base.add(29).read(), "C_FindObjectsFinal"),
+            (base.add(43).read(), "C_SignInit"),
+            (base.add(44).read(), "C_Sign"),
         ]
     };
-
     for (ptr, name) in called {
         if ptr.is_null() {
             return Err(Error::Keystore(format!(
