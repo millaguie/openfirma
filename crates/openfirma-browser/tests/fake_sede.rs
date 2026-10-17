@@ -63,18 +63,25 @@ fn request(
     // is saturated and Windows discards answers most. Tests whose flow must
     // survive a discarded real answer call `ask`, which mints fresh per try.
     let may_reask = !path.starts_with("/sign/") || sign_path_may_reask(path);
-    let tries = if may_reask { 5 } else { 1 };
-    for _ in 0..tries {
+    // Three retries, not five: this sleep-retry loop replaces the old
+    // non-blocking storm that starved the endpoint's backlog under CPU load
+    // (that storm is what these helpers used to crash), so a bounded number
+    // of patient attempts suffices.
+    let tries = if may_reask { 3 } else { 1 };
+    for attempt in 0..tries {
         let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
         let answer = request_on(stream, addr, method, path, host, origin, body);
         if answer.0 != u16::MAX {
             return answer;
         }
+        // Give the listener a moment to reap its backlog before reconnecting;
+        // a bare hot loop mostly meets it while it is still buried in accept.
+        std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
     }
     panic!(
         "the endpoint's answer on {path:?} was discarded unread{}: a test that presents a \
          real token and must survive this race uses `ask`, which mints one per attempt",
-        if may_reask { " five times" } else { "" }
+        if may_reask { " three times" } else { "" }
     )
 }
 
