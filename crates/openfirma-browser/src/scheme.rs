@@ -1,59 +1,51 @@
-//! Registering `afirma://` with the operating system.
+//! Registering `afirma://` with the operating system, and the browser handler's
+//! own config file.
 //!
 //! The scheme itself needs no code beyond openfirma's argv parsing: what an OS
 //! "scheme handler" is, is one entry that maps `afirma:` to a command line
-//! receiving the URI as `%u`/`%1`. What AutoFirma ships is exactly that, and
-//! this module generates the same files — it does not write them into the
-//! system on its own, because a signing client installing itself from an
-//! arbitrary invocation is the kind of persistence the user asked for once at
-//! install time, not something a signature operation should do as a side
-//! effect. `openfirma afirma-uri --register` prints where each file belongs and
-//! installs it only with that flag; the files below are what CI can lint and
-//! a reviewer can read.
+//! receiving the URI. What AutoFirma ships is exactly that, and this module
+//! generates — and, when explicitly asked (`--register`), installs — the same
+//! files. Recorded sources (AutoFirma 1.9, same clone as everywhere else in
+//! this crate):
 //!
-//! Recorded sources (AutoFirma 1.9, same clone as everywhere else in this
-//! crate):
-//! - Linux: `afirma-simple-installer/linux/instalador_deb/src/usr/share/applications/afirma.desktop`
-//!   — `MimeType=x-scheme-handler/afirma;`, `Exec=/usr/bin/autofirma %u`. The
-//!   scheme mechanism itself is freedesktop's; openfirma's file differs from
-//!   AutoFirma's in the Exec path only, plus the NoDisplay flag AutoFirma's GUI
-//!   entry does not need and ours does (an application that exists to answer a
-//!   URI should not show up in the desktop menu).
+//! - Linux: the reference configurator registers
+//!   `Exec="/opt/AutoFirma/AutoFirma" afirma-uri %u` with
+//!   `MimeType=x-scheme-handler/afirma;`, i.e. the binary is quoted and the
+//!   browser expands `%u` itself. Finding A-1 (observed on Chrome under X11):
+//!   a `%u` inside double quotes arrives at the handler literally, with the
+//!   quotes; an unquoted path containing spaces splits into several argv
+//!   entries and nothing launches at all. The quoting is therefore part of
+//!   the interop contract, not cosmetics.
 //! - Windows: `afirma-simple-installer/Autofirma_NSIS_project_MSI_64.nsi`
 //!   lines 331–334 — `HKCR\afirma` with `URL Protocol` and an open command of
-//!   `Autofirma.exe "%1"`. The .reg file below is the same four values.
-//! - macOS: AutoFirma's installer registers through its app bundle; a `.desktop`-style
-//!   plist is not how macOS ships handlers (LaunchServices reads
-//!   `CFBundleURLTypes` inside a `.app`). openfirma is a bare binary, so on
-//!   macOS the documented route is wrapping it in a minimal .app once — we
-//!   provide the plist fragment and the one command that uses it, and no more.
+//!   `"Autofirma.exe" "%1"`. Finding A-2: registration is exclusive (one
+//!   default handler per scheme), so taking over from an installed AutoFirma
+//!   must be explicit and reversible, never a side effect.
+//! - macOS: LaunchServices reads `CFBundleURLTypes` inside a `.app`; a bare
+//!   binary cannot own a URL scheme there. We provide the plist fragment and
+//!   the one command that uses it, and no more.
 
 use std::path::{Path, PathBuf};
 
-/// Escape a path for the `Exec` value of a desktop entry. The desktop entry
-/// spec keeps quoting inside this one unquoted token: spaces are written
-/// `\s`, a tab `\t`, a newline `\n`, and the escaping character itself
-/// (`\\`) goes out doubled. Leaving any of them raw is how an install under
-/// `/home/Ana María/` used to produce an entry whose `Exec` the desktop
-/// environment could not parse at all (finding M-3): the registration looked
-/// installed and never fired.
-fn desktop_key(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 8);
-    for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            ' ' => out.push_str("\\s"),
-            '\t' => out.push_str("\\t"),
-            '\n' | '\r' => out.push_str("\\n"),
-            _ => out.push(c),
-        }
-    }
-    out
+/// URI scheme handled by the product.
+pub const SCHEME: &str = "afirma";
+
+/// MIME type registered for the scheme (RFC 6838 `x-` tree).
+pub const MIME_TYPE: &str = "x-scheme-handler/afirma";
+
+/// Desktop entry file name — unchanged from before A-1 so an upgraded
+/// openfirma replaces its own old entry instead of adding a second handler.
+#[cfg(target_os = "linux")]
+const DESKTOP_FILE: &str = "openfirma-afirma.desktop";
+
+fn browser_error(message: impl Into<String>) -> crate::dispatch::BrowserError {
+    crate::dispatch::BrowserError::new("scheme-registration", message)
 }
 
-/// Whether a path can appear in a desktop entry at all. The escaping above
-/// covers the characters the format represents; what it cannot represent is a
-/// line break inside the value or an empty path no desktop environment would
+/// Whether a path can appear in a desktop entry at all. The new Exec shape
+/// (A-1) quotes the whole path as one G_TOKEN_STRING, which represents spaces
+/// and backslashes directly; what no desktop entry format can hold is a line
+/// break inside the value or an empty path no desktop environment would
 /// resolve. `--register` refuses those at generation time rather than writing
 /// a file whose handling breaks on first use, which is the whole difference
 /// between a broken install and a silent one.
@@ -73,11 +65,29 @@ fn desktop_entry_usable(binary: &Path) -> Result<(), String> {
 }
 
 /// The Linux desktop entry that registers the scheme, as `--register` writes
-/// it to `~/.local/share/applications/openfirma-afirma.desktop`. An unusable
-/// path (empty, or one no desktop entry format can hold) is a refusal here,
-/// at generation time, instead of a file that installs and never fires.
+/// it to `<data home>/applications/openfirma-afirma.desktop`.
+///
+/// Finding A-1, recorded shape: AutoFirma's own registration runs
+///
+/// ```ini
+/// Exec="/opt/AutoFirma/AutoFirma" afirma-uri %u
+/// ```
+///
+/// and openfirma reproduces it exactly: the binary path in double quotes
+/// escaped as a G_TOKEN_STRING (backslashes and `"` doubled — what GNOME's
+/// GKeyFile unescapes back into the original path), the marker argument
+/// `afirma-uri` next, and `%u` OUTSIDE any quotes so the browser substitutes
+/// the URI itself. An earlier revision put `"%u"` in quotes with `\s`-escaped
+/// paths; Chrome under X11 hands the handler a leading double quote then, and
+/// every real sede call died on "URI does not start with afirma://" while the
+/// registration looked healthy (that is what A-1 observed).
 pub fn linux_desktop_entry(binary: &Path) -> Result<String, String> {
     desktop_entry_usable(binary)?;
+    let escaped = binary
+        .display()
+        .to_string()
+        .replace('\\', r"\\")
+        .replace('"', "\\\"");
     Ok(format!(
         "[Desktop Entry]\n\
          Version=1.0\n\
@@ -85,12 +95,10 @@ pub fn linux_desktop_entry(binary: &Path) -> Result<String, String> {
          Name=openfirma (afirma:// handler)\n\
          GenericName=Electronic signature client\n\
          Comment=Answers afirma:// browser calls with a CAdES/PAdES/XAdES signature\n\
-         Exec={binary} afirma-uri \"%u\"\n\
+         Exec=\"{escaped}\" afirma-uri %u\n\
          Terminal=false\n\
          NoDisplay=true\n\
-         Categories=Office;Utilities;Signature;\n\
-         MimeType=x-scheme-handler/afirma;\n",
-        binary = desktop_key(&binary.display().to_string()),
+         MimeType=x-scheme-handler/afirma;\n"
     ))
 }
 
@@ -133,15 +141,186 @@ pub fn macos_plist_fragment() -> &'static str {
 
 /// Where `--register` puts the Linux file and what to run afterwards so
 /// desktop environments re-read the database (xdg's cache does not notice a
-/// new file by itself).
+/// new file by itself). Finding B-1: `$XDG_DATA_HOME` overrides the
+/// `~/.local/share` default per the freedesktop spec, and an earlier revision
+/// wrote `~/.local/share` even when the variable said otherwise — registering
+/// into a directory no desktop environment reads.
 pub fn linux_install_paths() -> (PathBuf, &'static str) {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"));
-    (
-        home.join(".local/share/applications/openfirma-afirma.desktop"),
-        "update-desktop-database ~/.local/share/applications",
+    let dir = applications_dir();
+    let hint = "xdg-mime default openfirma-afirma.desktop x-scheme-handler/afirma";
+    (dir.join(DESKTOP_FILE), hint)
+}
+
+/// `$XDG_DATA_HOME/applications`, with the specification's fallback — the
+/// exact resolution XDG tells desktop environments to read ([finding B-1]).
+/// A non-absolute `XDG_DATA_HOME` is ignored, like every other XDG variable.
+#[cfg(target_os = "linux")]
+fn applications_dir() -> PathBuf {
+    applications_dir_in(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref().map(Path::new),
     )
+}
+
+/// The same rule on given inputs, so it is testable without racing sibling
+/// tests over the process environment (see browser_config_path_in).
+#[cfg(target_os = "linux")]
+fn applications_dir_in(xdg: Option<&std::ffi::OsStr>, home: Option<&Path>) -> PathBuf {
+    let mut dir = match xdg {
+        Some(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
+        _ => PathBuf::from(home.unwrap_or(Path::new("~"))).join(".local/share"),
+    };
+    dir.push("applications");
+    dir
+}
+
+/// Whether an AutoFirma installation is present whose `afirma://` registration
+/// `--register` would replace: the two places the reference packages live
+/// (the Unix package's `/opt/AutoFirma` and the JNLP installer's per-user
+/// directory — the same pair `~/.config/autofirma.last` tracks). Finding A-2:
+/// a scheme has exactly ONE default handler, so takeover must be visible.
+pub fn detect_autofirma_install() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if Path::new("/opt/AutoFirma").is_dir() {
+        found.push(PathBuf::from("/opt/AutoFirma"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let per_user = PathBuf::from(home).join(".local/share/autofirma");
+        if per_user.is_dir() {
+            found.push(per_user);
+        }
+    }
+    found
+}
+
+/// Which handler the OS would launch for an `afirma:` URI right now (Linux:
+/// what `xdg-mime query default` answers; elsewhere: None — the CLI prints
+/// each platform's own way of checking).
+pub fn get_current_handler() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let out = std::process::Command::new("xdg-mime")
+            .args(["query", "default", MIME_TYPE])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Whether THIS product is registered: our desktop entry exists (Linux). Not
+/// the same question as `get_current_handler` — another handler may be the
+/// default while our file still sits there, and vice versa.
+pub fn get_registered_scheme() -> bool {
+    linux_install_paths().0.is_file()
+}
+
+/// Install the Linux desktop entry AND register it as the scheme's default
+/// handler ([finding A-1]: writing the file is not registration; before xdg-mime
+/// recorded it, Firefox kept launching whatever handler was registered last).
+/// Creates the applications directory when missing ([finding B-1]). Returns
+/// whether `xdg-mime` accepted the registration (a false here with the file
+/// written means reindex/desktop-environment trouble the caller must report).
+#[cfg(target_os = "linux")]
+pub fn linux_install_and_register() -> Result<(), crate::dispatch::BrowserError> {
+    let (path, _reindex) = linux_install_paths();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| browser_error(format!("no se puede crear {}: {e}", dir.display())))?;
+    }
+    let exe = std::env::current_exe().map_err(|e| {
+        browser_error(format!(
+            "the registration must name openfirma's own absolute path: {e}"
+        ))
+    })?;
+    // The same generation-time refusal as before: an Exec no desktop
+    // environment can parse looks installed and never fires.
+    let contents = linux_desktop_entry(&exe)
+        .map_err(|e| browser_error(format!("el ejecutable no se puede registrar: {e}")))?;
+    std::fs::write(&path, contents)
+        .map_err(|e| browser_error(format!("writing {}: {e}", path.display())))?;
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(path.parent().unwrap())
+        .output();
+    if !is_xdg_mime_available() {
+        return Err(browser_error(
+            "xdg-mime no esta disponible: sin él el escritorio no sabe que \
+             afirma:// es nuestro; instala xdg-utils y repite --register",
+        ));
+    }
+    // `xdg-mime default` does the registration itself (it resolves the desktop
+    // file through the data dirs), and it also refreshes mimeapps.list — what
+    // earlier revisions left to a printed hint nobody ran.
+    let status = std::process::Command::new("xdg-mime")
+        .args(["default", DESKTOP_FILE, MIME_TYPE])
+        .output()
+        .map_err(|e| browser_error(format!("running xdg-mime: {e}")))?;
+    if !status.status.success() {
+        return Err(browser_error(format!(
+            "xdg-mime default {DESKTOP_FILE} {MIME_TYPE} fallo: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn linux_install_and_register() -> Result<(), crate::dispatch::BrowserError> {
+    Err(browser_error(
+        "there is no .desktop registration on this operating system",
+    ))
+}
+
+/// Whether `xdg-mime` can run here (the CLI's --register/--unregister paths
+/// name this when it cannot, instead of half-registering).
+pub fn is_xdg_mime_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-mime")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Remove THIS product's registration: our desktop entry, and the default
+/// association only while it still points at us ([finding A-2]: uninstalling
+/// openfirma must never unregister a reinstalled AutoFirma).
+#[cfg(target_os = "linux")]
+pub fn linux_unregister() -> Result<(), crate::dispatch::BrowserError> {
+    let (path, _) = linux_install_paths();
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| browser_error(format!("removing {}: {e}", path.display())))?;
+    }
+    if get_current_handler().as_deref() == Some(DESKTOP_FILE) && is_xdg_mime_available() {
+        // An empty application resets the association to "nothing registered".
+        let _ = std::process::Command::new("xdg-mime")
+            .args(["default", "", MIME_TYPE])
+            .output();
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn linux_unregister() -> Result<(), crate::dispatch::BrowserError> {
+    Err(browser_error(
+        "there is no .desktop registration on this operating system",
+    ))
 }
 
 /// Where `--register` writes the browser config so the registered handler can
@@ -176,21 +355,27 @@ fn browser_config_path_in(xdg: Option<&std::ffi::OsStr>, home: Option<&Path>) ->
     Some(dir)
 }
 
-/// The two values one browser handler needs to be able to sign: the PKCS#12
-/// container, and a file whose first line is its password. Only those two —
-/// an environment variable name would put a secret's location inside a
-/// install-time file whose whole point is surviving without a terminal (no
-/// caller's environment can be assumed there), and a store/PIN story belongs
-/// to `--store` invocations, not to the one key the scheme channel signs with.
+/// What one browser handler needs to be able to sign: the PKCS#12 container,
+/// a file whose first line is its password, and — finding A-3 — whether that
+/// key may sign a browser call WITHOUT asking anybody. AutoFirma asks at every
+/// call (its certificate dialog plus the PIN prompt); openfirma's headless
+/// handler has no dialog, so it refuses to sign quietly unless the key's owner
+/// wrote `allow_unattended = true` here. The opt-in is per key file and only
+/// ever explicit: nothing defaults to it, and `--register` prints what it
+/// means when it writes it.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BrowserConfig {
     pub p12: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
+    /// A-3: the owner's standing consent for THIS key to sign browser calls
+    /// without a prompt. `false` (the default) means every call must be
+    /// confirmed by a human or refused.
+    pub allow_unattended: bool,
 }
 
 /// Parse the config file's own tiny grammar: `key = "value"` lines, comments
 /// from `#` to end of line, blank lines ignored. Deliberately not a TOML
-/// dependency — two keys do not need a parser crate and the vendor offline
+/// dependency — three keys do not need a parser crate and the vendor offline
 /// rule says the same thing. The value is either a double-quoted string (a
 /// plain `\` escapes the next character) or bare text taken to the end of the
 /// line, trimmed. Anything unrepresentable refuses at the key that broke it:
@@ -211,13 +396,28 @@ fn parse_config(text: &str) -> Result<BrowserConfig, String> {
             ));
         };
         let key = key.trim();
+        // The boolean keys take their own values, never a path quote.
+        if key == "allow_unattended" {
+            out.allow_unattended = match value.trim() {
+                "true" => true,
+                "false" => false,
+                other => {
+                    return Err(format!(
+                        "línea {}: allow_unattended solo admite true o false, no {other:?}",
+                        n + 1
+                    ));
+                }
+            };
+            continue;
+        }
         let value = parse_value(value.trim()).map_err(|e| format!("línea {}: {e}", n + 1))?;
         match key {
             "p12" => out.p12 = Some(PathBuf::from(value)),
             "password_file" => out.password_file = Some(PathBuf::from(value)),
             other => {
                 return Err(format!(
-                    "línea {}: clave desconocida {other:?} (solo p12 y password_file)",
+                    "línea {}: clave desconocida {other:?} (solo p12, password_file y \
+                     allow_unattended)",
                     n + 1
                 ));
             }
@@ -282,8 +482,8 @@ fn parse_value(value: &str) -> Result<String, String> {
 }
 
 /// The preamble every generated config carries: what the file is and which
-/// two keys exist. A const so the writer, its escaping, and the test all read
-/// the same bytes back.
+/// keys exist. A const so the writer, its escaping, and the test all read the
+/// same bytes back.
 const CONFIG_PREAMBLE: &str = "# openfirma's browser handler configuration.\n\
 # Written by `openfirma afirma-uri --register`; edit freely.\n\
 # The key a browser call signs with: one PKCS#12 and a file whose\n\
@@ -296,7 +496,8 @@ impl BrowserConfig {
     /// that exists and cannot be read or understood is the opposite: the user
     /// asked for a key by writing it, and answering `Ok(None)` would sign
     /// with nothing after being told otherwise, so load refuses with what
-    /// exactly broke.
+    /// exactly broke. The file also has to be owner-private on unix — see
+    /// [`check_private`].
     pub fn load(path: &Path) -> Result<Option<Self>, String> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -308,6 +509,7 @@ impl BrowserConfig {
                 ));
             }
         };
+        check_private(path)?;
         let parsed = parse_config(&text)?;
         if parsed.p12.is_none() && parsed.password_file.is_none() {
             return Err(format!(
@@ -322,7 +524,9 @@ impl BrowserConfig {
     /// and the test round-trips it, so what the installer ships cannot drift
     /// from what the handler parses. Paths are quoted with a doubled backslash
     /// and an escaped hash, the same rule that makes an install under
-    /// `/home/Ana María/` work for the desktop entry.
+    /// `/home/Ana María/` work for the desktop entry. `allow_unattended` is
+    /// written only when true: a file without it means false, which is the
+    /// state whose meaning nobody has to remember.
     pub fn to_toml(&self) -> String {
         let mut out = String::from(CONFIG_PREAMBLE);
         if let Some(p) = &self.p12 {
@@ -337,8 +541,42 @@ impl BrowserConfig {
                 quote_value(&p.display().to_string())
             ));
         }
+        if self.allow_unattended {
+            out.push_str(
+                "# A-3: this line is the owner's standing consent. Every browser call\n\
+                 # signs with this key WITHOUT asking anybody first.\n\
+                 allow_unattended = true\n",
+            );
+        }
         out
     }
+}
+
+/// Owner-private or refuse ([finding B-2]): both this config and a password
+/// file name — or are — the material that opens a signing key. The XDG user
+/// dirs on a multi-user machine (a shared /home, an NFS mount with defaults)
+/// regularly arrive world-readable; a handler that read them anyway would
+/// sign whatever any other account asked for. Group- or world-readable modes
+/// refuse; the fix is one `chmod` and the message says which.
+pub fn check_private(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{} es legible por otros usuarios (modo {:04o}): este archivo protege \
+                 una clave de firma; ejecuta chmod go-rwx {} y repite",
+                path.display(),
+                mode & 0o777,
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn quote_value(text: &str) -> String {
@@ -362,22 +600,24 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn linux_entry_registers_the_scheme_and_calls_the_real_subcommand() {
+    fn linux_entry_matches_autofirmas_recorded_exec_shape() {
+        // [finding A-1] recorded reference shape:
+        //   Exec="/opt/AutoFirma/AutoFirma" afirma-uri %u
+        // The path quoted, the marker next, %u outside quotes.
         let entry = linux_desktop_entry(Path::new("/usr/local/bin/openfirma")).unwrap();
         assert!(entry.contains("MimeType=x-scheme-handler/afirma;"));
-        // The Exec must name a subcommand the CLI actually has: a registration
-        // pointing at an argument AutoFirma's binary took and ours does not is
-        // the quietest possible way for scheme handling to be broken.
-        assert!(entry.contains("Exec=/usr/local/bin/openfirma afirma-uri \"%u\""));
+        assert!(entry.contains(r#"Exec="/usr/local/bin/openfirma" afirma-uri %u"#));
         assert!(entry.contains("NoDisplay=true"));
     }
 
     #[test]
-    fn linux_entry_survives_the_paths_real_installs_have() {
-        // Finding M-3: spaces and other escaping characters used to go out
-        // raw, which is an Exec no desktop environment reassembles. Each of
-        // these is a directory someone actually installs into.
+    fn exec_path_quoted_and_placeholder_never_inside_quotes() {
+        // The two halves of finding A-1, checked on the paths real installs
+        // have: a quoted `%u` arrives at Chrome literally (the URI reached the
+        // handler as `""afirma://…"` and died on the scheme check), and an
+        // unquoted path with spaces never launches anything.
         for path in [
+            "/home/user/bin/openfirma",
             "/home/Ana María/bin/openfirma",
             "/opt/Local Tools/openfirma",
             r"C:\Archivos\openfirma",
@@ -387,33 +627,40 @@ mod tests {
             let exec = entry
                 .lines()
                 .find(|l| l.starts_with("Exec="))
-                .expect("el entry lleva siempre su Exec");
-            // The value is the spec's escaped form, checked by round-trip at
-            // the end of this block: whatever escaping we choose, re-reading
-            // the entry has to hand back the binary path exactly.
-            let value = exec.strip_prefix("Exec=").unwrap();
-            let command = value
-                .split(" afirma-uri ")
-                .next()
-                .expect("el Exec siempre llama a afirma-uri");
-            if path.contains(' ') {
-                assert!(
-                    command.contains("\\s"),
-                    "un espacio debe salir como \\s: {exec}"
-                );
+                .expect("el entry lleva siempre su Exec")
+                .strip_prefix("Exec=")
+                .unwrap();
+            assert!(
+                exec.starts_with('"'),
+                "la ruta debe ir entrecomillada: {exec}"
+            );
+            // The closing quote is the last `"` before the marker argument.
+            let marker = " afirma-uri %u";
+            assert!(
+                exec.ends_with(marker),
+                "el Exec debe terminar en el marcador exacto, con %u fuera de \
+                 comillas: {exec}"
+            );
+            let quoted_path = &exec[1..exec.len() - marker.len() - 1];
+            assert!(
+                !quoted_path.contains("%u"),
+                "%u no puede caer dentro de la comilla de la ruta: {exec}"
+            );
+            // G_TOKEN_STRING unescaping (what GKeyFile does): `\\` → `\`,
+            // `\"` → `"`, everything else literal. Round-tripping must give
+            // the original path back, spaces included.
+            let mut restored = String::new();
+            let mut chars = quoted_path.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.next() {
+                        Some(n) => restored.push(n),
+                        None => panic!("escape suelto en {exec}"),
+                    }
+                } else {
+                    restored.push(c);
+                }
             }
-            if path.contains('\\') {
-                assert!(
-                    command.contains(r"\\"),
-                    "una barra invertida debe ir duplicada: {exec}"
-                );
-            }
-            // and what the escaping produced is reversible: unescaping gives
-            // back exactly the binary path
-            let restored = command
-                .replace(r"\\", "\u{0}")
-                .replace("\\s", " ")
-                .replace('\u{0}', "\\");
             assert_eq!(restored, path, "{exec}");
         }
     }
@@ -441,6 +688,38 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn applications_dir_follows_the_xdg_data_home_rule() {
+        // [finding B-1] the same pure-input style as browser_config_path_in:
+        // no environment mutation, every branch reachable.
+        let absolute = Path::new("/xdg-data-root").is_absolute();
+        let got = applications_dir_in(Some("/xdg-data-root".as_ref()), Some(Path::new("/home/x")));
+        if absolute {
+            assert_eq!(got, PathBuf::from("/xdg-data-root/applications"));
+        }
+        // a relative XDG_DATA_HOME is never a data root (spec: ignore it).
+        let got = applications_dir_in(Some("relative/path".as_ref()), Some(Path::new("/home/x")));
+        assert_eq!(got, PathBuf::from("/home/x/.local/share/applications"));
+        // unset: the ~/.local/share fallback.
+        let got = applications_dir_in(None, Some(Path::new("/home/ana")));
+        assert_eq!(got, PathBuf::from("/home/ana/.local/share/applications"));
+        // and the live resolution ends where XDG says, whichever branch ran.
+        let live = linux_install_paths().0;
+        assert_eq!(live.file_name().unwrap(), DESKTOP_FILE);
+    }
+
+    #[test]
+    fn autofirma_detection_names_known_layouts_only() {
+        for p in detect_autofirma_install() {
+            let text = p.display().to_string();
+            assert!(
+                text.contains("AutoFirma") || text.ends_with(".local/share/autofirma"),
+                "deteccion fuera de los directorios registrados: {text}"
+            );
+        }
+    }
+
     #[test]
     fn browser_config_round_trips_the_paths_real_installs_have() {
         // What the installer writes must be what the handler reads, byte for
@@ -458,6 +737,7 @@ mod tests {
             let config = BrowserConfig {
                 p12: Some(PathBuf::from(p12)),
                 password_file: Some(PathBuf::from(format!("{p12}.pw"))),
+                allow_unattended: true,
             };
             let text = config.to_toml();
             let back =
@@ -467,7 +747,33 @@ mod tests {
     }
 
     #[test]
+    fn allow_unattended_is_explicit_and_never_defaulted() {
+        // [finding A-3] the opt-in is a value with exactly two spellings; no
+        // parse branch invents `true`.
+        assert!(!parse_config("p12 = \"/x.p12\"\n").unwrap().allow_unattended);
+        assert!(
+            parse_config("allow_unattended = true\n")
+                .unwrap()
+                .allow_unattended
+        );
+        assert!(
+            !parse_config("allow_unattended = false\n")
+                .unwrap()
+                .allow_unattended
+        );
+        let err = parse_config("allow_unattended = yes\n").unwrap_err();
+        assert!(err.contains("true o false"), "{err}");
+        // to_toml writes the key only when it means it.
+        assert!(
+            !BrowserConfig::default()
+                .to_toml()
+                .contains("allow_unattended")
+        );
+    }
+
+    #[test]
     fn browser_config_load_distinguishes_absent_from_broken() {
+        use std::os::unix::fs::PermissionsExt;
         // Absent is the normal state (nothing registered yet) and no error.
         let missing = std::env::temp_dir().join("openfirma-no-such-config-ever.toml");
         let _ = std::fs::remove_file(&missing);
@@ -483,6 +789,10 @@ mod tests {
             "# a comment\np12 = \"/home/x/clave.p12\" # trailing\npassword_file = \"/home/x/pw\"\n",
         )
         .unwrap();
+        // The private tmp dir's umask is not ours to trust (B-2 refuses a
+        // group/world-readable config, and /tmp here is 0777-umask), so the
+        // fixture starts in the mode a real handler would only ever accept.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let got = BrowserConfig::load(&path).unwrap().expect("config exists");
         assert_eq!(got.p12, Some(PathBuf::from("/home/x/clave.p12")));
         assert_eq!(got.password_file, Some(PathBuf::from("/home/x/pw")));
@@ -504,6 +814,36 @@ mod tests {
         let err = BrowserConfig::load(&path).unwrap_err();
         assert!(err.contains("neither p12 nor password_file"), "{err}");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_readable_config_or_password_file_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        // [finding B-2] mode 0644 config = any local user can point everyone's
+        // handler at their key; the handler refuses to read it until chmod.
+        let dir = std::env::temp_dir().join("openfirma-private-check");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.toml");
+        std::fs::write(
+            &path,
+            "p12 = \"/home/x/clave.p12\"\npassword_file = \"/home/x/pw\"\n",
+        )
+        .unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = BrowserConfig::load(&path).unwrap_err();
+        assert!(err.contains("go-rwx"), "debe decir el chmod exacto: {err}");
+
+        // 0640 (group-readable) refuses too — on a shared machine "group" is
+        // as public as "other".
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(BrowserConfig::load(&path).unwrap_err().contains("go-rwx"));
+
+        // 0600 is the state the message asks for, and loads.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(BrowserConfig::load(&path).unwrap().is_some());
         std::fs::remove_file(&path).ok();
     }
 

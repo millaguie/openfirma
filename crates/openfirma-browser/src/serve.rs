@@ -603,10 +603,20 @@ fn handle_connection(
     // scheme-channel cap: it never travelled through a URI hand-off here, so
     // only the document-size caps apply; a sede that POSTs a large document
     // would otherwise be refused by a limit that exists for another channel.
-    let result = match crate::dispatch::handle_endpoint_body(&body, &key.as_ref_key()) {
-        Ok(result) => result,
-        Err(e) => return write_error_wire(&mut stream, &e),
+    // B-4: the token was already consumed by a complete, authenticated request,
+    // so every failure from here on is an OPERATION failure and answers in the
+    // wire form for the version the message announced (finding M-2; one writer,
+    // chosen once). A parse-level refusal carries no version — that reader never
+    // got a URI to read it from — and takes the modern default, like every
+    // unknown client does.
+    let (result, version) = match handle_endpoint_call(&body, &key.as_ref_key()) {
+        Ok(ok) => ok,
+        Err(e) => {
+            let version = crate::uri::endpoint_message_version(&body);
+            return write_error_wire(&mut stream, &e, version.as_deref());
+        }
     };
+    let _ = &version; // the success payload needs no version: only refusals do
     write_bytes(
         &mut stream,
         200,
@@ -811,18 +821,44 @@ fn write_refusal(
     )
 }
 
-fn write_error_wire(stream: &mut TcpStream, e: &BrowserError) -> std::io::Result<()> {
-    // The AutoFirma-shaped error payload the pages parse out of a 200 they
-    // were not expecting. Our own pages check the status first; an operation
-    // that failed is *not* an HTTP failure, exactly like AutoFirma replying
-    // `err-00:=…` over a healthy WebSocket.
+fn write_error_wire(
+    stream: &mut TcpStream,
+    e: &BrowserError,
+    protocol_version: Option<&str>,
+) -> std::io::Result<()> {
+    // The endpoint's one error writer: AutoFirma's refusal text for the given
+    // protocol version — `err-00:=AFxxxxxx - …` for 4.1+ callers, `SAF_xx:`
+    // legacy text below (finding M-2) — over a 200 the pages did not expect;
+    // an operation that failed is *not* an HTTP failure, exactly like AutoFirma
+    // answering `err-00:=…` over a healthy WebSocket. B-6: the reason header
+    // quotes the same catalogue number the body carries.
+    let target = crate::dispatch::wire_target(protocol_version);
     write_bytes(
         stream,
         200,
         "text/plain; charset=utf-8",
-        e.wire().as_bytes(),
-        Some(e.code),
+        e.wire(target).as_bytes(),
+        Some(crate::dispatch::error_reason_header(e)),
     )
+}
+
+/// The endpoint's operation step: parse the body and run it. A parse-level
+/// refusal travels as a structured `BrowserError` — never as pre-rendered wire
+/// text — so this writer, and only this writer, decides which form (modern or
+/// legacy) reaches the page (finding M-2: one door, chosen once).
+fn handle_endpoint_call(
+    body: &[u8],
+    key: &crate::dispatch::KeySource<'_>,
+) -> Result<(crate::dispatch::BrowserResult, Option<String>), BrowserError> {
+    let uri = crate::uri::parse_endpoint_body(body)?;
+    // The consent decision for the loopback endpoint lives with its operator:
+    // `OwnedKeySource` only ever carries keys whose owner opted them in (the
+    // CLI refuses to start an endpoint over a key without `allow_unattended`),
+    // so `Granted` here restates an existing decision rather than making one —
+    // the browser-scheme path, where nobody opted in anything, prompts or
+    // refuses instead. See docs/adr/0005-browser-protocol.md and finding A-3.
+    let result = crate::dispatch::execute(&uri, key)?;
+    Ok((result, uri.protocol_version))
 }
 
 fn write_bytes(

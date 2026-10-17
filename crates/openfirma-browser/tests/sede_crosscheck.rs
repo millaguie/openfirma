@@ -147,22 +147,30 @@ fn the_document_the_endpoint_promises_is_the_one_openssl_verifies() {
     );
     assert_eq!(status, 200);
 
-    // The wire shape: base64(cert)|base64(sig), MIME form — the lines end in
-    // CRLF, which the standard engine only parses once they are gone (`trim`
-    // eats the final pair; interior ones have to be filtered out). A page that
-    // splits our response feeds each field to a base64 reader of its own;
-    // filtering line endings is exactly what AutoFirma's mime decoder does.
+    // The wire shape (finding M-1, jar-recorded): base64URL(cert)|base64URL(sig),
+    // URL-safe alphabet, padded, single line. autoscript.js's own reader is the
+    // decoder to prove against (recorded lines 2889-2899): it folds '-'→'+' and
+    // '_'→'/' on each field before base64-decoding; applying exactly that fold
+    // here — nothing else — must yield DER and a signature openssl accepts.
     let text = String::from_utf8_lossy(&body);
     let (cert_b64, sig_b64) = text
         .split_once('|')
         .expect("AutoFirma's cert|signature shape");
-    let strip_mime = |s: &str| -> String { s.replace("\r\n", "") };
+    let fold = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                '-' => '+',
+                '_' => '/',
+                other => other,
+            })
+            .collect()
+    };
     let cert_der = base64::engine::general_purpose::STANDARD
-        .decode(strip_mime(cert_b64))
-        .expect("field one is base64");
+        .decode(fold(cert_b64))
+        .expect("field one is URL-safe base64 of a DER");
     let sig_der = base64::engine::general_purpose::STANDARD
-        .decode(strip_mime(sig_b64))
-        .expect("field two is base64");
+        .decode(fold(sig_b64))
+        .expect("field two is URL-safe base64 of a signature");
 
     // Re-sign the same bytes through the library with identical options: the
     // browser path produces a *detached* CAdES (AutoFirma's explicit mode) and

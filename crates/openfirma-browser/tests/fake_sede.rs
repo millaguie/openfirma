@@ -349,14 +349,16 @@ fn uri_body(doc: &[u8]) -> String {
 }
 
 /// The response shapes pinned by construction (no hand-rolled base64 in the
-/// test to be wrong about): a sign body contains exactly one `|` between two
-/// standard-alphabet segments, and every MIME newline sits at the 78th column
-/// of each encoded field, which is what AutoFirma's mime encoder produces. A
-/// selectcert body has no separator at all. The byte-level truth of those
-/// fields — that they *decode* to the signer's certificate and a signature
-/// openssl accepts over the document — is proven by `sede_crosscheck.rs`,
-/// which checks it against an independent implementation rather than against
-/// another parser from this repository.
+/// test to be wrong about). Finding M-1 corrected what the shape IS: measured
+/// against the shipped jar, `Base64.encode(x, true)` is **URL-safe alphabet,
+/// '=' padding, a single line** (`es.gob.afirma.core.misc.Base64.encode(_,
+/// true)` → the URL_SAFE option with no break-lines flag — recorded: 200 bytes
+/// → 268 chars, no CR/LF, `-` present). A sign body is therefore two URL-safe
+/// fields around one `|`, with no newline anywhere; a selectcert body is one
+/// such field. The byte-level truth of those fields — that they *decode* to the
+/// signer's certificate and a signature openssl accepts over the document — is
+/// proven by `sede_crosscheck.rs`, which checks it against an independent
+/// implementation rather than against another parser from this repository.
 #[test]
 fn the_sign_and_selectcert_response_shapes_are_autofirma_s_own() {
     let Some(key) = p12() else {
@@ -388,32 +390,55 @@ fn the_sign_and_selectcert_response_shapes_are_autofirma_s_own() {
         .expect("the separator is there");
     let (cert_field, sig_field) = (&body[..sep], &body[sep + 1..]);
     for field in [cert_field, sig_field] {
-        // The field ends in its MIME CRLF; before it: standard-alphabet lines
-        // of at most 76 characters joined by CRLF. That shape is AutoFirma's,
-        // and an off-by-one line ending would fail the exact-column check.
-        assert!(field.ends_with(b"\r\n"), "MIME fields end in CRLF");
-        let content = &field[..field.len() - 2];
-        let mut cursor: &[u8] = content;
-        while let Some(pos) = cursor.windows(2).position(|w| w == b"\r\n") {
-            assert!(
-                pos <= 76,
-                "a MIME line may not be longer than 76 characters"
-            );
-            assert!(
-                cursor[..pos]
-                    .iter()
-                    .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/'),
-                "the alphabet before a line ending is base64's standard one"
-            );
-            cursor = &cursor[pos + 2..];
-        }
+        // URL-safe and single-line: no CRLF anywhere (the jar's encoder never
+        // breaks lines), and only the RFC 4648 §5 alphabet plus padding. A
+        // MIME line-break here is exactly the M-1 regression.
         assert!(
-            cursor
+            !field.contains(&b'\r') && !field.contains(&b'\n'),
+            "AutoFirma's fields are a single line: {:?}",
+            String::from_utf8_lossy(field)
+        );
+        assert!(
+            field
                 .iter()
-                .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'='),
-            "the final line is base64 too, padding included"
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_' || *b == b'='),
+            "the alphabet is RFC 4648 §5 URL-safe plus padding: {:?}",
+            String::from_utf8_lossy(field)
+        );
+        // '+' and '/' of the standard alphabet must NOT appear either: a field
+        // mixing alphabets could not have come from encode(_, true).
+        assert!(
+            !field.contains(&b'+') && !field.contains(&b'/'),
+            "a URL-safe field carries no standard-alphabet characters"
         );
     }
+
+    // autoscript.js's own success path proves the same thing from the page
+    // side (recorded lines 2889-2899): it converts '-'→'+' and '_'→'/' on the
+    // two fields before using them — a rewrite that only makes sense for
+    // URL-safe input. Pin that the wire agrees with the page's decoder: the
+    // fields round-trip through exactly that fold.
+    let folded: Vec<u8> = body
+        .iter()
+        .map(|b| match b {
+            b'-' => b'+',
+            b'_' => b'/',
+            other => *other,
+        })
+        .collect();
+    let sep = folded.iter().position(|b| *b == b'|').unwrap();
+    use base64::Engine;
+    let cert = base64::engine::general_purpose::STANDARD
+        .decode(&folded[..sep])
+        .expect("the folded certificate field is standard base64");
+    let sig = base64::engine::general_purpose::STANDARD
+        .decode(&folded[sep + 1..])
+        .expect("the folded signature field is standard base64");
+    assert!(
+        cert.starts_with(&[0x30]),
+        "the cert field is a DER SEQUENCE"
+    );
+    assert!(!sig.is_empty(), "a signature travelled back to the page");
 
     // selectcert answers with the leaf certificate alone: no separator at all,
     // and one field's worth of bytes (one DER, base64'd).
@@ -430,6 +455,13 @@ fn the_sign_and_selectcert_response_shapes_are_autofirma_s_own() {
     assert!(
         !body.contains(&b'|'),
         "a selected certificate carries no separator"
+    );
+    // Same URL-safe single-line rule on the lone field.
+    assert!(
+        body.iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_' || *b == b'='),
+        "a selected certificate is one URL-safe base64 field: {:?}",
+        String::from_utf8_lossy(&body)
     );
 }
 
@@ -598,13 +630,16 @@ fn cross_site_and_rebinding_attempts_are_refused_by_name() {
     );
     assert_eq!(status, 200);
     assert_eq!(
+        // The broken URI never reached an operation parser, so it is the
+        // socket-level refusal AutoFirma answers with 620016 (and SAF_03 below
+        // 4.1); B-6 made this header the same catalogue number the body carries.
         header(&headers, "x-openfirma-reason"),
-        Some("malformed-uri")
+        Some("620016")
     );
     let text = String::from_utf8_lossy(&body);
     assert!(
-        text.contains("no dat parameter"),
-        "the refusal names what the URI lacks: {text}"
+        text.starts_with("err-00:=AF620016 - "),
+        "AutoFirma's error shape with ITS code: {text}"
     );
 
     // A URI naming an operation this client does not speak is still a broken
@@ -623,7 +658,14 @@ fn cross_site_and_rebinding_attempts_are_refused_by_name() {
     );
     assert_eq!(status, 200);
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("not one this client implements"), "{text}");
+    // M-2: an unknown operation is the socket-level refusal AutoFirma names
+    // 620016 / SAF_03 for, and autoscript.js parses EXACTLY that shape (its
+    // " - " must sit at index 8 of the err text) — openfirma's own words may
+    // only live beside the code, never instead of it.
+    assert!(
+        text.starts_with("err-00:=AF620016 - "),
+        "AutoFirma's error shape with ITS code: {text}"
+    );
 
     // An executed operation that fails for its own reason comes back in
     // AutoFirma's error wire form over a 200 — the socket was healthy, the
@@ -650,8 +692,10 @@ fn cross_site_and_rebinding_attempts_are_refused_by_name() {
         "AutoFirma's error shape: {text}"
     );
     assert_eq!(
+        // B-6: the header quotes the same catalogue number the wire body
+        // carries — 600002, AutoFirma's UNSUPPORTED_OPERATION.
         header(&headers, "x-openfirma-reason"),
-        Some("unsupported-operation")
+        Some("600002")
     );
 }
 
@@ -837,14 +881,19 @@ fn a_json_message_body_signs_and_a_json_without_one_is_refused_by_name() {
         br#"{"idsession":"abc"}"#,
     );
     assert_eq!(status, 200, "a broken call over a valid request");
+    let text = String::from_utf8_lossy(&body);
+    // M-2: the page reads the AF code out of the body (autoscript.js's error
+    // parser splits on the " - " at position 8), so the refusal arrives as the
+    // socket-level wire form — header and body quote the SAME catalogue number
+    // (B-6). openfirma's own explanation stays in its logs, not on the wire.
     assert_eq!(
         header(&headers, "x-openfirma-reason"),
-        Some("malformed-uri")
+        Some("620016"),
+        "the header quotes the catalogue number: {text}"
     );
-    let text = String::from_utf8_lossy(&body);
     assert!(
-        text.contains("\"message\""),
-        "names what is missing: {text}"
+        text.starts_with("err-00:=AF620016 - "),
+        "AutoFirma's error shape with ITS code: {text}"
     );
 }
 

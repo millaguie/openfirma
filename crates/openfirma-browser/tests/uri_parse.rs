@@ -3,7 +3,7 @@
 //! they came from, because "the parser we wrote agrees with the spec we read"
 //! proves nothing; agreeing with bytes a real sede sends does.
 //!
-//! The reference is the AutoFirma 1.9.1 clone (`/tmp/opencode/autofirma-src`),
+//! The reference is the AutoFirma 1.9.1 clone (`docs/validation.md#reference-corpus`),
 //! not openfirma: each URI below carries `file:line`, and the expectations
 //! carry the file that decides them (the parsers under
 //! `afirma-core/src/main/java/es/gob/afirma/core/misc/protocol`).
@@ -260,14 +260,15 @@ fn session_ids_keep_autofirma_own_limits() {
     let err = parse("afirma://selectcert?idsession=not-valid!")
         .expect_err("non-alphanumeric ids are refused by AutoFirma and here alike");
     assert!(err.to_string().contains("alphanumeric"), "{err}");
-    // uppercase is what AutoFirma's check would pass on the *lower-cased*
-    // copy; here it stays refused: a mixed-case id reaching the callback as a
-    // file name differs from the one that was checked, which is exactly the
-    // mismatch the lower-casing in Java papers over. Refusing is the honest
-    // rule for a token we will compare byte for byte.
-    let err = parse("afirma://selectcert?idsession=Abc123")
-        .expect_err("mixed case must refuse: our token comparison is exact");
-    assert!(err.to_string().contains("lower case"), "{err}");
+    // Mixed case is ACCEPTED and kept verbatim (finding A-5). AutoFirma's
+    // `checkIdSession` tests the LOWER-CASED copy (`id.toLowerCase().matches(
+    // "([a-z0-9])+")`, UrlParametersToSign:231) but stores the original value,
+    // which is what every follow-up (getresult, the callback file name) carries
+    // byte for byte. The old revision refused mixed case outright and thus
+    // rejected URIs AutoFirma signs happily; the autoscript_wire suite pins the
+    // accepted/rejected sets against the page's own recorded predicate.
+    let parsed = parse("afirma://selectcert?idsession=AbC123").expect("mixed case parses");
+    assert_eq!(parsed.id_session.as_deref(), Some("AbC123"));
     assert!(parse("afirma://selectcert?idsession=abc123").is_ok());
 }
 

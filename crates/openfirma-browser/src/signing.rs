@@ -225,6 +225,98 @@ pub fn execute_with_detection(
     execute_request(req, Format::detect(content), content, signer)
 }
 
+/// The pre-computed-hash shape of the browser protocol (`properties` key
+/// `precalculatedHashAlgorithm`, finding A-4): a detached CAdES whose
+/// `messageDigest` is the sede's own hash, never re-hashed — exactly AutoFirma's
+/// `CAdESParameters.load` branch (`dataDigest = data`). Dispatch only reaches
+/// this for format names that resolve to CAdES: XAdES and PAdES carry the hash
+/// inside their own document shapes, which openfirma cannot compute from a bare
+/// imprint, and the browser dispatch refuses those combinations by name instead
+/// of quietly signing something else.
+pub fn dispatch_prehashed_cades(
+    req: &mut SignRequest<'_>,
+    message_imprint: &[u8],
+    signer: &dyn Signer,
+) -> Result<Vec<u8>> {
+    if req.format != "cades-b-b" {
+        return Err(Error::Other(format!(
+            "a pre-computed hash can only be signed as a detached CAdES ({} cannot carry \
+             an imprint this client did not compute: AutoFirma's own signers restrict hash \
+             signing to the CMS/CAdES/XMLdSig/XAdES shapes and openfirma implements the CAdES \
+             one)",
+            req.format
+        )));
+    }
+    // The knob-by-knob mirror of dispatch's cades arm, with the digest replaced
+    // by the caller's imprint. It MUST stay a mirror: any attribute added to
+    // `dispatch`'s CAdES shape that is missing here would make pre-hashed
+    // browser signatures structurally different from terminal ones (M-4 again,
+    // one level down). The shared pieces are assembled once, in cades_options();
+    // the only difference between the two paths is the messageDigest bytes, so
+    // that stays provable by reading the two calls.
+    let opts = cades_options(req)?;
+    // The first argument is the (unsent) content: `sign_with_digest` never puts
+    // it anywhere in a detached signature, so passing the imprint keeps one
+    // value where none is read.
+    openfirma_cades::sign_with_digest(message_imprint, message_imprint, signer, &opts)
+}
+
+/// The CAdES options table for one request, exactly as dispatch builds them;
+/// split out so `dispatch_prehashed_cades` cannot drift from the normal path.
+/// A malformed policy OID refuses with the same sentence the normal path uses
+/// (never a silent drop).
+fn cades_options(req: &mut SignRequest<'_>) -> Result<openfirma_cades::CadesOptions> {
+    let signature_policy = parse_policy_oid(req.cades_signature_policy.as_deref())?;
+    let commitment_type = parse_policy_oid(req.cades_commitment_type.as_deref())?;
+    let mut opts = openfirma_cades::CadesOptions {
+        digest: req.digest,
+        encapsulate_content: req.cades_encapsulate_content,
+        mime_type: req.cades_mime_type.clone(),
+        content_hint: if req.cades_include_content_hint {
+            Some(req.cades_content_hint.clone().unwrap_or_else(|| {
+                openfirma_cades::AUTOFIRMA_DEFAULT_CONTENT_DESCRIPTION.to_string()
+            }))
+        } else {
+            None
+        },
+        include_issuer_serial: req.cades_include_issuer_serial,
+        include_certificate_policies: req.cades_include_certificate_policies,
+        signature_policy,
+        signature_policy_hash: req.cades_signature_policy_hash.clone(),
+        commitment_type,
+        algorithms: if req.cades_allow_weak_algorithms {
+            openfirma_cades::verify::AlgorithmPolicy::All
+        } else {
+            openfirma_cades::verify::AlgorithmPolicy::Conservative
+        },
+        ..openfirma_cades::CadesOptions::default()
+    };
+    opts.timestamp = req.timestamp.clone();
+    if req.cades_no_signing_time {
+        opts.signing_time = None;
+    } else if let Some(t) = req.cades_signing_time {
+        opts.signing_time = Some(t);
+    }
+    Ok(opts)
+}
+
+/// [`dispatch`] with the file-shape gate lifted. The browser protocol uses
+/// this (finding M-3): AutoFirma's launcher never filters a format by what the
+/// document happens to be — a sede signs PDF bytes as detached CAdES every day
+/// and AutoFirma signs them; only its GUI menus restrict, and openfirma's GUI
+/// keeps that restriction through [`execute_request`]. A format the shared
+/// dispatcher does not know still answers "unknown signature format", and a
+/// shape it knows but cannot build from these bytes (PAdES over non-PDF) fails
+/// inside that codec for its own true reason. Nothing here weakens a refusal:
+/// it moves them where AutoFirma's are.
+pub fn execute_protocol(
+    req: &mut SignRequest<'_>,
+    content: &[u8],
+    signer: &dyn Signer,
+) -> Result<Vec<u8>> {
+    dispatch(req, content, signer)
+}
+
 /// Parses the optional OID strings of the two policy knobs. An empty string
 /// means "not set"; anything that is not a dotted OID is an error naming the
 /// value, because silently dropping it would sign without the attribute the
@@ -241,9 +333,11 @@ fn parse_policy_oid(value: Option<&str>) -> Result<Option<const_oid::ObjectIdent
     }
 }
 
-/// The dispatcher itself: format string in, signature bytes out. Callers gate
-/// on the file shape first (`execute_request`/`execute_with_detection`).
-fn dispatch(req: &mut SignRequest<'_>, content: &[u8], signer: &dyn Signer) -> Result<Vec<u8>> {
+/// The dispatcher itself: format string in, signature bytes out. `pub` so the
+/// browser protocol reaches it through `execute_protocol` without re-deriving
+/// any rule (finding M-4: one dispatch for every frontend). Callers that must
+/// gate on file shape use [`execute_request`]/[`execute_with_detection`].
+pub fn dispatch(req: &mut SignRequest<'_>, content: &[u8], signer: &dyn Signer) -> Result<Vec<u8>> {
     match req.format {
         // The CLI's CAdES defaults, verbatim (docs/pades.md records why PAdES
         // pins its own shape): encapsulation is the caller's choice and the
