@@ -56,9 +56,14 @@ fn ck_ulong_is_c_unsigned_long_on_every_target() {
     );
     if cfg!(windows) {
         // the exact mistake C1 was: usize (8 on x64) standing in for a
-        // 4-byte unsigned long.
+        // 4-byte unsigned long. Windows is LLP64, so `unsigned long` is
+        // always 4 bytes; the width divergence from usize holds everywhere
+        // this crate can build for Windows except i686, where both are
+        // 4 and only the first assert carries the rule.
         assert_eq!(size_of::<CkUlong>(), 4);
-        assert_ne!(size_of::<CkUlong>(), size_of::<usize>());
+        if size_of::<usize>() > 4 {
+            assert_ne!(size_of::<CkUlong>(), size_of::<usize>());
+        }
     }
 }
 
