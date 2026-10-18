@@ -12,6 +12,9 @@
 //!   and SHA-512, which is how a wrong password is detected before any
 //!   decryption is trusted; an empty password in either of the two encodings
 //!   the real writers use (Java's zero bytes, OpenSSL/NSS's BMP terminator);
+//!   and MD5, which no current writer defaults to but old Windows tooling and
+//!   `openssl pkcs12 -macalg md5` do write — reading it is a compatibility
+//!   need, the MAC being a password check and never a trust decision;
 //! - PBES2 with PBKDF2 (any of those hashes as PRF) over AES-128/192/256-CBC
 //!   and 3DES-CBC, which is what OpenSSL 3 and current Java write — including
 //!   the optional `keyLength` INTEGER that Java 11+ writes in every set of
@@ -81,6 +84,7 @@ const OID_DES_EDE3_CBC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840
 /// 04 finding A2). Its parameters carry the IV as an INTEGER, unlike AES's
 /// OCTET STRING.
 const OID_RC2_CBC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.3.2");
+const OID_MD5: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.5");
 const OID_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
 const OID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 const OID_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
@@ -873,8 +877,8 @@ fn pbes2_password_candidates(password: &str) -> Vec<Zeroizing<Vec<u8>>> {
 
 fn check_one_mac(mac: &MacData, auth_safe: &[u8], pw: &[u8]) -> bool {
     // instantiated per hash rather than generic over it: Hmac's bounds in this
-    // digest generation are a thicket, and there are exactly four hashes a
-    // PKCS#12 MAC can use
+    // digest generation are a thicket, and there are exactly five hashes a
+    // PKCS#12 MAC can use (MD5 the legacy one)
     macro_rules! check {
         ($d:ty, $v:expr) => {{
             let key = pkcs12_kdf::<$d>(
@@ -898,6 +902,11 @@ fn check_one_mac(mac: &MacData, auth_safe: &[u8], pw: &[u8]) -> bool {
         }};
     }
     match mac.digest_oid {
+        // MD5 is here to READ legacy containers, never to write one, and it is
+        // a password check like the others: what it protects is not a trust
+        // decision. openssl opens these files (with `-legacy`); refusing them as
+        // a wrong password sent people to re-export a container that was fine.
+        OID_MD5 => check!(md5::Md5, 64),
         OID_SHA1 => check!(sha1::Sha1, 64),
         OID_SHA256 => check!(sha2::Sha256, 64),
         OID_SHA384 => check!(sha2::Sha384, 128),

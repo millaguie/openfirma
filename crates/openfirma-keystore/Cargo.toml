@@ -17,6 +17,7 @@ pkcs8.workspace = true
 digest.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+md-5.workspace = true
 hmac.workspace = true
 pbkdf2.workspace = true
 aes.workspace = true

@@ -44,6 +44,13 @@ des = "0.9"
 rc2 = "0.9"
 sha1 = "0.11"
 sha2 = { version = "0.11", features = ["oid"] }
+# MD5: one use only, and it is a read. A PKCS#12 container may carry an
+# HMAC-MD5 integrity check — what old Windows and `openssl pkcs12 -macalg md5`
+# write — and refusing the file as "wrong password" is a compatibility bug, not
+# a security decision: the MAC is a password check, never a trust decision (the
+# certificate's trust is judged separately), and openssl and Java both open
+# these files. Nothing here ever *writes* an MD5 MAC.
+md-5 = "0.11"
 
 # --- asymmetric ---
 # rsa pinned to 0.10.0-rc.19 for generation coherence (digest 0.11 /

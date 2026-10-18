@@ -87,6 +87,21 @@ if ! authsafe_is_pbdes "$FIX/openssl-empty-legacy.p12"; then
   fi
 fi
 
+# --- HMAC-MD5 MAC (round 2, keystore) ----------------------------------------
+# `-macalg md5` is what old Windows tooling and OpenSSL's own legacy exports
+# wrote. openfirma refused those files as "wrong password" while openssl opened
+# them: the MAC is a password check, never a trust decision (the certificate's
+# trust is judged separately). Probed like RC2 rather than assumed: an openssl
+# built without MD5 (a FIPS build) cannot mint one, and under REQUIRE_TESTS an
+# absent fixture is the loud failure it always was.
+if openssl pkcs12 -export -out "$FIX/openssl-md5mac.p12" -inkey "$KEY" -in "$CRT" \
+     -name "md5 mac" -passout pass:openfirma -macalg md5 2>/dev/null; then
+  :
+else
+  rm -f "$FIX/openssl-md5mac.p12"
+  echo "warning: this openssl cannot write an HMAC-MD5 MAC; openssl-md5mac.p12 absent, its test skips" >&2
+fi
+
 # --- Java 11+ keytool (A1) ---------------------------------------------------
 # The modern default PKCS12 store: PBES2 with AES-256-CBC, HMAC-SHA256 MAC and
 # — the part openfirma refused — a keyLength INTEGER in every PBKDF2 parameters.
@@ -230,6 +245,7 @@ check_openssl() {
 [ -f "$FIX/java-legacy.p12" ] && check_keytool java-legacy.p12 openfirma
 check_openssl openssl-empty.p12 ""
 check_openssl openssl-empty-legacy.p12 ""
+[ -f "$FIX/openssl-md5mac.p12" ] && check_openssl openssl-md5mac.p12 openfirma
 [ -f "$FIX/rc2-certs.p12" ] && check_openssl rc2-certs.p12 openfirma
 [ -f "$FIX/rc2-both.p12" ] && check_openssl rc2-both.p12 openfirma
 if [ "$fail" -ne 0 ]; then

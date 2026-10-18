@@ -273,6 +273,7 @@ fn every_fixture_yields_an_entry_whose_key_matches_its_certificate() {
         "java-legacy.p12",
         "rc2-certs.p12",
         "rc2-both.p12",
+        "openssl-md5mac.p12",
     ] {
         let Some(store) = load(name, "openfirma") else {
             continue;
@@ -301,4 +302,40 @@ fn every_fixture_yields_an_entry_whose_key_matches_its_certificate() {
     // spellings, pk12util two more. Four is the floor any openssl-only runner
     // reaches; below it, nothing meaningful ran.
     assert!(opened >= 4, "expected to open most of the fixture set");
+}
+
+/// Round 2 (keystore): the MAC of the container may be HMAC-MD5 — what old
+/// Windows tooling and `openssl pkcs12 -macalg md5` write. Built here for
+/// reading, never for writing: the MAC is how a wrong password is caught before
+/// any decryption is trusted, not a trust decision (the certificate's own trust
+/// is judged when it is used). openfirma called these files "wrong password"
+/// while openssl opened them.
+///
+/// The fixture's own bytes are checked for the MD5 digest OID first, so the
+/// test cannot pass because the writer quietly ignored `-macalg md5`.
+#[test]
+fn checks_a_legacy_hmac_md5_mac_instead_of_calling_it_a_wrong_password() {
+    const MD5_OID: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x05];
+    let Some(path) = require_or_skip("openssl-md5mac.p12") else {
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("fixture readable");
+    assert!(
+        bytes.windows(MD5_OID.len()).any(|w| w == MD5_OID),
+        "the fixture must really carry an MD5 digest OID, or this test proves nothing"
+    );
+
+    let store = Pkcs12::load(&bytes, "openfirma")
+        .expect("an HMAC-MD5 MAC is a password check openfirma can perform");
+    let entry = store.entry(None).expect("the container yields its entry");
+    assert!(!entry.chain.is_empty(), "with its certificate");
+
+    // And MD5 does not become a skeleton key: a wrong password still fails.
+    let error = Pkcs12::load(&bytes, "not-it")
+        .expect_err("a wrong password must not pass an MD5 MAC either");
+    let text = error.to_string();
+    assert!(
+        text.contains("integrity") || text.contains("password"),
+        "the refusal reads as a wrong password, not as garbage: {text}"
+    );
 }
