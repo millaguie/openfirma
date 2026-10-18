@@ -427,7 +427,10 @@ fn certification_gate(pdf: &[u8]) -> Result<()> {
                 Some(0) => return Ok(()),
                 Some(i) => {
                     return Err(Error::Verification(format!(
-                        "the document was certified with /Perms /DocMDP /P 1 (no changes                          permitted) by the signature at object {v_ref}, and {i} revision(s)                          were appended after that certification: every reader that honours                          it shows the certification as broken"
+                        "the document was certified with /Perms /DocMDP /P 1 (no changes \
+                         permitted) by the signature at object {v_ref}, and {i} revision(s) \
+                         were appended after that certification: every reader that honours \
+                         it shows the certification as broken"
                     )));
                 }
                 None => {}
@@ -435,7 +438,9 @@ fn certification_gate(pdf: &[u8]) -> Result<()> {
         }
     }
     Err(Error::Verification(format!(
-        "the final catalog certifies this document with /Perms /DocMDP /P 1 (no changes          permitted), and the document has {} revisions whose order the certification does          not explain: whatever was appended after the certification breaks it",
+        "the final catalog certifies this document with /Perms /DocMDP /P 1 (no changes \
+         permitted), and the document has {} revisions whose order the certification does \
+         not explain: whatever was appended after the certification breaks it",
         chain.len()
     )))
 }

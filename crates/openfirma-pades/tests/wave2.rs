@@ -577,6 +577,18 @@ fn verify_flags_revisions_after_a_p1_certification() {
         text.contains("was followed by changes no archive may append"),
         "the revisions gate still speaks too: {text}"
     );
+    // N-6: the sentence a user reads is one sentence. The literals of the
+    // certification gate were missing their line continuations, so the message
+    // carried a strip of ~25 spaces where the source wrapped; this pins both
+    // the shape of the text and that nothing else in it grew a run of spaces.
+    assert!(
+        text.contains("(no changes permitted), and the document has"),
+        "the certification sentence reads as one: {text:?}"
+    );
+    assert!(
+        !text.contains("  "),
+        "no run of spaces from a line break that was not continued: {text:?}"
+    );
 }
 
 /// M-4: AutoFirma strips usage rights (`removeUsageRights`) before signing;
