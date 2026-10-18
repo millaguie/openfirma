@@ -220,6 +220,72 @@ fn an_identical_copy_of_a_signed_object_does_not_trip_the_gate() {
     pades_verify(&copied, &anchors()).expect("a copy that changes nothing still verifies");
 }
 
+/// Overwrite the FIRST `startxref <n> %%EOF` record of a document in place, so
+/// the bytes stop being a record while every offset after them is untouched.
+/// Readers do not need that record — the `/Prev` chain walks past it — which is
+/// what makes this a real-world shape and not a fiction.
+fn strip_first_record(pdf: &[u8]) -> Vec<u8> {
+    let mut out = pdf.to_vec();
+    let at = out
+        .windows(9)
+        .position(|window| window == b"startxref")
+        .expect("a startxref record");
+    let eof = at
+        + 5
+        + out[at + 5..]
+            .windows(5)
+            .position(|window| window == b"%%EOF")
+            .expect("%%EOF");
+    let end = if out[eof..].starts_with(b"\r\n") {
+        eof + 2
+    } else if eof < out.len() && matches!(out[eof], b'\n' | b'\r') {
+        eof + 1
+    } else {
+        eof
+    };
+    out[at..end].fill(b'#');
+    out
+}
+
+/// Attribution fails closed on a revision whose own closing record is missing.
+/// The oldest section of a chain falls back to `end = the end of the FILE`, and
+/// `revision_of` is a `rposition` over the newest-first list: in a document
+/// whose oldest section has no honest record, EVERY offset resolves to that
+/// section, so `same_pass` is vacuously true for every pair of objects and the
+/// plumbing rules license whatever a later pass writes — "a font this pass
+/// wrote and a signature of this pass names", for a pass that carries no
+/// signature at all.
+///
+/// Flagged by the round-5 reviewer (`R5-A1`), whose own payload (filling a
+/// `/F2` slot the covered bytes named) is refused by the covered-name rule
+/// already; this test pins the collapse itself, on the one shape that survives
+/// that rule — an inert font — where the only thing that can refuse it is
+/// knowing WHICH pass wrote it.
+#[test]
+fn attribution_fails_closed_when_the_oldest_revision_has_no_closing_record() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // Two sections, the older one stripped of its record, so the chain has an
+    // oldest section whose end is the fallback rather than its own boundary.
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+                 /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>";
+    let two_sections = append_written(INPUT, 6, page);
+    let stripped = strip_first_record(&two_sections);
+    let signed = pades_sign(&stripped, &signer, &PadesOptions::default()).expect("signing failed");
+    // A font nobody names, written by a pass that carries no signature: an
+    // addition nothing attests, and the pass that wrote it is not signed.
+    let attacked = append_written(
+        &signed,
+        97,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    let error = pades_verify(&attacked, &anchors()).expect_err("a font nobody signed");
+    let text = format!("{error}");
+    assert!(text.contains("object 97 0 R"), "names the object: {text}");
+}
+
 /// A rewritten page-content PAYLOAD is a rewrite even when its dictionary does
 /// not move an inch: `/Length 61` stays `61` while the 61 bytes a reader draws
 /// are replaced. Measured before the fix — resolving an object answers with its

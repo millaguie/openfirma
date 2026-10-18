@@ -44,6 +44,15 @@ pub struct Revision {
     /// too large) otherwise — a coverage landing in the slack falls outside every
     /// boundary and fails closed.
     pub end: usize,
+    /// Whether that `end` came from the revision's OWN `startxref`/`%%EOF`
+    /// record. The oldest section of a chain can be missing one — readers do
+    /// not need it, the `/Prev` walk skips it — and then `end` is the end of
+    /// the FILE, which is no boundary of that revision's at all. Attribution
+    /// ([`revision_of`]) refuses to guess when it is false: a revision whose
+    /// bytes cannot be delimited cannot be told apart from the ones appended
+    /// after it, and every `same_pass` question that involved it would answer
+    /// yes for the whole document.
+    pub has_record: bool,
 }
 
 /// The revisions of the document, newest first, each with the offset its bytes
@@ -154,8 +163,8 @@ pub fn revisions(pdf: &[u8]) -> Result<Vec<Revision>> {
         // `testdata/golden/simple.autofirma.pdf`, AutoFirma's own single
         // revision output: appending an archive to it was refused with "the
         // /ByteRange ends at 55424, which is not the end of any revision".
-        let end = match (closing[i], i + 1 < sections.len()) {
-            (Some(boundary), _) => boundary,
+        let (end, has_record) = match (closing[i], i + 1 < sections.len()) {
+            (Some(boundary), _) => (boundary, true),
             (None, true) => {
                 return Err(Error::Pdf(format!(
                     "the revision whose cross-reference starts at {startxref} has no closing \
@@ -167,10 +176,15 @@ pub fn revisions(pdf: &[u8]) -> Result<Vec<Revision>> {
             // The oldest revision of a chain whose own record is missing or
             // names a cross-reference this walk never reached: the end of the
             // file is the only boundary left, and a coverage claiming it claims
-            // the whole document (`covering_revision`).
-            (None, false) => pdf.len(),
+            // the whole document (`covering_revision`). It is NOT a boundary for
+            // attribution, and `has_record` says so.
+            (None, false) => (pdf.len(), false),
         };
-        out.push(Revision { startxref, end });
+        out.push(Revision {
+            startxref,
+            end,
+            has_record,
+        });
     }
     Ok(out)
 }
@@ -1057,7 +1071,8 @@ fn revision_of(
             Location::InObjectStream { .. } => return None,
         },
     };
-    revs.iter().rposition(|rev| rev.end > offset)
+    revs.iter()
+        .rposition(|rev| rev.has_record && rev.end > offset)
 }
 
 /// Whether the signature's own pass wrote the object: the signature's revision
