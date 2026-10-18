@@ -97,6 +97,22 @@ that really changes is rewritten; the page's `/Annots`, when it is an
 indirect array (the shape iText writes), stays an indirect array with our
 field merged into the new revision under its own number.
 
+Signing a field the form already has. When the caller NAMES a field that is in
+the form — AutoFirma's `signatureField`, which its own GUI drives — the
+signature goes INTO that field instead of beside it: the field object is
+written back under its own number with its rectangle, its name and its page
+untouched, gaining `/V` and, for a visible signature, an `/AP` sized to the
+field's own box. `/Fields` does not move and the page gains no second
+annotation. Measured against AutoFirma 1.9.1 on a two-field form signed twice:
+the second pass adds `/V` and `/AP` to the second field and leaves the first
+exactly where it was. Two shapes are refused rather than guessed at: a field
+that already carries a value (filling it would replace the signature a reader
+shows there) and a parent field with `/Kids` (the value belongs on the parent
+and the appearance on a widget child, while openfirma signs a field whose own
+dictionary IS its widget). The revisions gate that guards our own output
+licenses exactly this write, and only when the covered bytes left the field
+empty (`docs/review-findings.md`, and `tests/revisions.rs`).
+
 The trailer of the appended revision carries over everything the previous one
 said (`/ID`, a custom key like a DSS tool's `/Enforce`, and yes an older
 `/Encrypt`, which the check above has already refused). The writer owns

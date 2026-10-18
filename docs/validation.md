@@ -254,7 +254,20 @@ adversarial review produced against it (the two hardening waves, tests under
 `crates/openfirma-pades/tests/`). The revisions gate classifies every object a
 revision after a signature redefines against the whitelist of what an archive
 may append (ETSI EN 319 142-1): new signature dictionaries, document
-time-stamps, `/DSS` validation data, signature field plumbing. Validation data
+time-stamps, `/DSS` validation data, signature field plumbing. Signature field
+plumbing includes FILLING a field the signed bytes left empty — the value and,
+for a visible signature, the appearance the field was waiting for, with the
+rectangle, the name and the page that say where the field is untouched. That is
+the reference tool's own flow for a form with a box per signer (measured against
+AutoFirma 1.9.1: its second pass adds `/V` and `/AP` to the second field and
+leaves the first exactly where it was), and this crate's writer produces the same
+shape when the caller names a field the form already has. Round 3's shape stays
+refused: a widget whose covered bytes DID carry a value may not gain a rectangle
+and an appearance of its own. An object a pass packed into an object stream — the
+way iText writes a second signature — is judged on the bytes its container holds,
+because those are the only bytes it has: the container is where its bytes and the
+entry that maps them live, and a container a signature covers is one that existed
+when it was made. Validation data
 is the narrow part, and getting it narrow took four review rounds: an object may
 be excused as such only when it is NEW and a reader reaches it through the
 archive and nowhere else — the dictionary the catalog's `/DSS` names, or an
