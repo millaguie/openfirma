@@ -35,6 +35,9 @@ printf 'guard probe content\n' > "$WORK/doc.txt"
 cp "$WORK/rogue.key" "$WORK/notes.md"        # the H-3 markdown-key probe
 
 # sign <flags...> — run openfirma from the repo root so relative testdata works.
+# `>/dev/null` on purpose for stdout only: an honest failure message (a missing
+# input, a refused overwrite) is what distinguishes "the guard missed this shape"
+# from "the probe never existed", and swallowing stderr hid exactly that in CI.
 sign() { ( cd "$ROOT" && "$OF" sign --force >/dev/null "$@" ); }
 
 sign -i "$WORK/doc.txt" -o "$WORK/probe.bin" \
@@ -50,8 +53,19 @@ cp "$WORK/rogue.crt" "$WORK/rogue-cert.bin"                  # bare cert, lying 
 
 must_block() {
   local why="$1" path="$2"
-  if ( cd "$ROOT" && ./tools/check-no-real-certs.sh "$path" ) >/dev/null 2>&1; then
-    echo "FAIL: guard let $why through ($path)" >&2
+  if ! [ -s "$path" ]; then
+    # The probe itself never landed (a signing failure the `sign` wrapper would
+    # have printed, an unwritable temp): that is NOT a guard verdict, and
+    # reporting it as one sends the investigation to the wrong file — CI run
+    # 39081753322's "guard let XAdES through" on macOS was this shape.
+    echo "FAIL: probe $path does not exist or is empty; the guard never saw a file" >&2
+    fails=$((fails + 1))
+    return
+  fi
+  local out
+  if out="$( cd "$ROOT" && ./tools/check-no-real-certs.sh "$path" 2>&1 )"; then
+    echo "FAIL: guard let $why through ($path): the guard exited clean on a file it must block. Its output:" >&2
+    printf '%s\n' "$out" | sed 's/^/        /' >&2
     fails=$((fails + 1))
   else
     echo "ok, blocked: $why"

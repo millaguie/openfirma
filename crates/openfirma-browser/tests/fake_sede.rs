@@ -302,6 +302,12 @@ fn ask(
     );
 }
 
+/// A /sign/ path whose id can never have been minted by `issue_token`: the
+/// hyphen is not in the lowercase-alphanumeric alphabet tokens are drawn from,
+/// so credential-free host/origin probes that ride a /sign/ URL retry their
+/// answer instead of dying with tries=1 on Windows' socket-layer discard.
+const UNMINTABLE_SIGN_PATH: &str = "/sign/NO-TOKEN-SHAPE";
+
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -314,6 +320,13 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// or truncated id can only ever be refused, burning nothing. `request` trusts
 /// nothing else: every other /sign path is treated as carrying a real one-shot
 /// token and must go through [`ask`] instead. Test-harness bookkeeping alone.
+///
+/// Note what counts as mintable: `/sign/deadbeefdeadbeef` — the id several probes
+/// used to carry — IS 16 lowercase hex chars, so it was never credential-free and
+/// those requests got tries=1. They now pass UNMINTABLE_SIGN_PATH below, whose
+/// hyphen no token generator emits, so a socket-layer answer discard retries
+/// instead of panicking (CI run 39081681732: Windows discarded the refused
+/// answer once and the "credential-free" probe had no retry left).
 fn sign_path_may_reask(path: &str) -> bool {
     match path.strip_prefix("/sign/") {
         Some(id) => {
@@ -492,7 +505,7 @@ fn cross_site_and_rebinding_attempts_are_refused_by_name() {
     let (status, headers, body) = request(
         addr,
         "POST",
-        "/sign/deadbeefdeadbeef",
+        UNMINTABLE_SIGN_PATH,
         "evil.example",
         Some("https://evil.example"),
         uri_body(&doc).as_bytes(),
@@ -512,7 +525,7 @@ fn cross_site_and_rebinding_attempts_are_refused_by_name() {
     let (status, headers, _) = request(
         addr,
         "POST",
-        "/sign/deadbeefdeadbeef",
+        UNMINTABLE_SIGN_PATH,
         &good_host,
         Some("http://evil-rebound.test"),
         uri_body(&doc).as_bytes(),

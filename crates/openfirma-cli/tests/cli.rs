@@ -373,7 +373,26 @@ fn cert_guard_blocks_every_nested_signature_shape() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/test-check-no-real-certs.sh");
     let require = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
     let allowed = std::env::var("OPENFIRMA_ALLOW_NONKEYSTORE_SKIP").is_ok();
-    let out = match Command::new("bash").arg(&script).output() {
+    // The script derives ROOT from its own path, so the child has to start in
+    // the repo root: it signs probes with relative testdata paths and runs
+    // ./tools/check-no-real-certs.sh. Under cargo test the working directory is
+    // the crate's manifest dir (cargo sets CARGO_MANIFEST_DIR for exactly this
+    // correction); cd'ing through ROOT would then land in crates/openfirma-cli,
+    // where `./tools/...` does not exist — and with set -e the very first
+    // must_block died silently to stderr. CI run 39081681732 showed that shape:
+    // a bare "the cert guard failed its own probes:" on Windows with no probe
+    // output at all, where cargo test starts in the workspace root and got
+    // further before failing elsewhere.
+    let script_abs = std::path::absolute(&script).expect("the guard self-test path is absolute");
+    let repo_root = script_abs
+        .parent() // tools/
+        .and_then(|p| p.parent())
+        .expect("tools/ lives in the repo root");
+    let out = match Command::new("bash")
+        .arg(&script_abs)
+        .current_dir(repo_root)
+        .output()
+    {
         Ok(out) => out,
         Err(_) if !require || allowed => {
             eprintln!("skipped, no bash to run the guard self-test");
