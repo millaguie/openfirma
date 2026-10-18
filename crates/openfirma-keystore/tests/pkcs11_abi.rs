@@ -106,6 +106,33 @@ fn function_list_slots_sit_where_this_abi_puts_them() {
     assert_eq!(offset_of!(CkFunctionList, find_objects_final), abi_slot(29));
 }
 
+/// Review M-1: the raw `C_GetSlotInfo` read (the one slot handled outside the
+/// typed prefix) must address the table through the SAME ABI rule as every
+/// other slot — `function_slot_offset`, exposed as `slot_byte_offset`. The old
+/// loader used `add(6)`, i.e. `6·sizeof(pointer)`, which is 48 on LP64 Unix and
+/// therefore "looked right" on every Linux dev box, but is wrong on Windows'
+/// packed table (slot 6 at byte 42 on x64, 22 on i686) and read a garbage
+/// pointer that was then transmuted to a function and called. This asserts the
+/// rule directly, so the Windows CI jobs catch any regression even though no
+/// live module exists there to exhibit it.
+#[test]
+fn every_slot_is_addressed_through_the_abi_rule_including_the_raw_one() {
+    // slot 6 is the raw one; the assertion must hold on every target
+    assert_eq!(
+        openfirma_keystore::pkcs11::slot_byte_offset(6),
+        abi_slot(6),
+        "the raw C_GetSlotInfo read must use the packed/ABI offset, not 6·ptr"
+    );
+    // and the typed loader's own slots still agree, so the two paths cannot drift
+    for k in [1usize, 5, 7, 13, 14, 19, 25, 27, 28, 29, 43, 44] {
+        assert_eq!(
+            openfirma_keystore::pkcs11::slot_byte_offset(k),
+            abi_slot(k),
+            "spec slot {k} must sit where this target's ABI puts it"
+        );
+    }
+}
+
 #[test]
 fn version_pair_is_two_bytes_and_heads_the_table() {
     assert_eq!(size_of::<CkVersion>(), 2);

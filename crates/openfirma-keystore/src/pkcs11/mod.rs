@@ -533,9 +533,37 @@ fn slots_with_tokens(module: &Module) -> Result<Vec<CkSlotId>> {
 /// absent function as unsupported rather than call through it. Unlike the
 /// functions openfirma requires, which `load_and_init` checks by name.
 fn slot_info_ptr(module: &Module) -> *const c_void {
-    // Read the pointer stored in slot 6 of the table (byte offset 48): no
-    // dereference at all — `add` walks the array, `read` copies the entry.
-    unsafe { (module.raw_table().cast::<*const c_void>()).add(6).read() }
+    // Read the pointer at slot 6 through the SAME offset rule the rest of this
+    // crate uses (`function_slot_offset`, `types.rs`), and unaligned like
+    // `load_and_init` does. The old code used `add(6)` — pointer arithmetic
+    // that assumes 8-byte slots from the table base — which is correct only on
+    // LP64 Unix. On Windows the table is packed with 4-byte `CK_ULONG`s, so
+    // slot 6 sits at byte 42 (x64) / 22 (i686), not 48/24: `add(6)` read the
+    // tail of one function and the head of the next, producing a garbage
+    // pointer that was then transmuted to `extern "C" fn` and CALLED on the
+    // first `keystores list` against a real module (review M-1). Deriving the
+    // offset from the declared struct keeps this slot and the others in step.
+    function_slot_at(module.raw_table(), 6)
+}
+
+/// Reads spec function slot `k` out of a function-list base pointer, using this
+/// target's real ABI. The ONE place that turns a slot number into an address:
+/// both the typed loader and the raw `C_GetSlotInfo` read go through it, so the
+/// two can never drift. `function_slot_offset` is the ABI (packed on Windows,
+/// 8-byte-aligned elsewhere), and the read is unaligned because the packed
+/// Windows table has no alignment to promise.
+fn function_slot_at(base: *const c_void, k: usize) -> *const c_void {
+    unsafe {
+        (base.cast::<u8>().add(function_slot_offset(k)) as *const *const c_void).read_unaligned()
+    }
+}
+
+/// The byte offset of spec slot `k` in the function table on this target. Public
+/// so `tests/pkcs11_abi.rs` — which runs on the Windows CI jobs where the bug
+/// this pins (review M-1) actually bites — can assert it matches the ABI
+/// formula, whether or not a live module exists to call.
+pub fn slot_byte_offset(k: usize) -> usize {
+    function_slot_offset(k)
 }
 
 /// Loads (or reuses) the process-wide handle for one module and makes sure it
@@ -627,9 +655,8 @@ fn load_and_init(path: &Path, init: InitShape, library_parameters: Option<&str>)
     // `types.rs` pins down), so the probe reads exactly what a call would
     // read — including Windows' packed table, where slots do not sit on
     // multiples of 8 and must be read unaligned.
-    let called: [(*const c_void, &str); 12] = unsafe {
-        let base = list.cast::<u8>();
-        let slot = |k| (base.add(function_slot_offset(k)) as *const *const c_void).read_unaligned();
+    let called: [(*const c_void, &str); 12] = {
+        let slot = |k| function_slot_at(list, k);
         [
             (slot(1), "C_Initialize"),
             (slot(5), "C_GetSlotList"),
