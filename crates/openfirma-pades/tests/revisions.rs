@@ -439,6 +439,52 @@ fn an_object_named_only_inside_a_vri_entry_is_not_validation_data() {
     );
 }
 
+/// A second pass that draws its own signature writes its own Helvetica and names
+/// it in the appearance's `/Resources` — the shape the font rule licenses only
+/// because ONE signature covers the font and the object that names it. Every
+/// other co-signature the suite makes is invisible, so its appearance carries no
+/// font and the pass's own two fonts go unnamed (inert, and licensed for that
+/// reason); this is the shape that would break first if the rule were ever
+/// tightened to "a font nothing names", which is a false refusal for every writer
+/// of visible signatures. Measured: with that tightening, this test is the only
+/// one in the suite that fails.
+#[test]
+fn a_second_pass_may_draw_its_own_signature_with_a_font_it_named() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let plain = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("B-B failed");
+    let visible = openfirma_pades::appearance::Appearance {
+        page: 1,
+        rect: [50.0, 700.0, 300.0, 760.0],
+        label: None,
+    };
+    let twice = pades_sign(
+        &plain,
+        &signer,
+        &PadesOptions {
+            visible: Some(visible),
+            ..PadesOptions::default()
+        },
+    )
+    .expect("co-signing with a visible signature");
+    // The pass really did write fonts of its own, and the second one is the
+    // shape under test: if this stops holding, the test has stopped reaching the
+    // rule and must be revisited rather than left looking green.
+    let fonts = |pdf: &[u8]| {
+        pdf.windows(b"/BaseFont /Helvetica".len())
+            .filter(|window| *window == b"/BaseFont /Helvetica")
+            .count()
+    };
+    assert!(
+        fonts(&twice) > fonts(&plain),
+        "the visible pass writes and names a Helvetica of its own"
+    );
+    pades_verify(&twice, &anchors())
+        .expect("a pass may name the font it draws its own signature with");
+}
+
 /// A writer may store the `/VRI` dictionary as an object of its own — ISO 32000
 /// 12.7.4.4 lets any value in the `/DSS` dictionary be an indirect reference,
 /// ETSI EN 319 142 writers do exactly that, and `read_dss` resolves it — and the
