@@ -199,3 +199,66 @@ fn subtree_canonicalization_carries_the_xades_namespace_layout() {
         "the subtree root must render the inherited xmlns:ds: {text}"
     );
 }
+
+/// Round 2, N-1 — a regression of the M-2 fix, and a panic on plain XML.
+///
+/// `Scope::ascend` restored the *visibility* of the entry an element had
+/// shadowed but not the `innermost` index of the prefix, so that map kept
+/// pointing at the entry it had just removed. The next sibling that declared
+/// the same prefix read `visible[that index]`: usually past the truncated
+/// stack, which aborted the process (`index out of bounds`), and — when a
+/// declaration in the same element put the stale index back inside the stack —
+/// silently marked an unrelated binding invisible and dropped it from the
+/// canonical form. The auto-invoicing shape that reaches it is ordinary: a root
+/// with a default namespace and several children that declare `xmlns=""`
+/// (AutoFirma's own `sample-facturae.xml` is exactly this, and so are hundreds
+/// of generated namespace documents).
+///
+/// Every expected value below is libxml2's (`xmllint --c14n`), so this also
+/// pins the canonical form, not only the absence of the panic.
+#[test]
+fn a_sibling_that_redeclares_a_prefix_leaves_no_dangling_index() {
+    let cases: &[(&str, &str)] = &[
+        // the plain panic: no declaration in between
+        (
+            "<a xmlns=\"urn:1\"><b xmlns=\"urn:2\"/><c xmlns=\"urn:3\"/></a>",
+            "<a xmlns=\"urn:1\"><b xmlns=\"urn:2\"></b><c xmlns=\"urn:3\"></c></a>",
+        ),
+        (
+            "<a xmlns:p=\"urn:1\"><b xmlns:p=\"urn:2\"/><c xmlns:p=\"urn:3\"/></a>",
+            "<a xmlns:p=\"urn:1\"><b xmlns:p=\"urn:2\"></b><c xmlns:p=\"urn:3\"></c></a>",
+        ),
+        // the silent half: q is declared before p inside c, so the stale index
+        // lands on q's entry and used to hide it, losing xmlns:q entirely
+        (
+            "<a xmlns:p=\"urn:1\"><b xmlns:p=\"urn:2\"/><c xmlns:q=\"urn:9\" xmlns:p=\"urn:3\"/></a>",
+            "<a xmlns:p=\"urn:1\"><b xmlns:p=\"urn:2\"></b><c xmlns:p=\"urn:3\" \
+             xmlns:q=\"urn:9\"></c></a>",
+        ),
+        // and one hop deeper, so the exit happens inside a nested subtree
+        (
+            "<a xmlns:p=\"urn:1\"><b xmlns:p=\"urn:2\"><d xmlns:p=\"urn:4\"/></b>\
+             <c xmlns:p=\"urn:3\"/></a>",
+            "<a xmlns:p=\"urn:1\"><b xmlns:p=\"urn:2\"><d xmlns:p=\"urn:4\"></d></b>\
+             <c xmlns:p=\"urn:3\"></c></a>",
+        ),
+        // the invoicing shape: root default namespace, siblings undeclaring it
+        (
+            "<Facturae xmlns=\"urn:facturae\" xmlns:xsd=\"urn:xsd\">\
+             <FileHeader xmlns=\"\"><Version>3.1</Version></FileHeader>\
+             <Parties xmlns=\"\"><Seller/></Parties>\
+             <Invoices xmlns=\"\"><Invoice/></Invoices></Facturae>",
+            "<Facturae xmlns=\"urn:facturae\" xmlns:xsd=\"urn:xsd\">\
+             <FileHeader xmlns=\"\"><Version>3.1</Version></FileHeader>\
+             <Parties xmlns=\"\"><Seller></Seller></Parties>\
+             <Invoices xmlns=\"\"><Invoice></Invoice></Invoices></Facturae>",
+        ),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(
+            doc_c14n(input.as_bytes(), false),
+            *expected,
+            "canonical form of {input}"
+        );
+    }
+}

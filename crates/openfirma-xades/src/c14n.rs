@@ -101,7 +101,15 @@ impl Scope {
         while n > mark {
             let (prefix, outer) = self.undo.pop().expect("one undo per pushed decl");
             match outer {
-                Some(at) => self.visible[at] = true,
+                Some(at) => {
+                    // the shadowed entry becomes the innermost binding of this
+                    // prefix again: leaving `innermost` pointing at the entry
+                    // being removed left a dangling index behind, and the next
+                    // sibling that declared the same prefix indexed past the
+                    // truncated stack (round 2, N-1: a panic on plain XML).
+                    self.visible[at] = true;
+                    self.innermost.insert(prefix, at);
+                }
                 None => {
                     self.innermost.remove(&prefix);
                 }

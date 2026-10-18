@@ -239,6 +239,20 @@ fn xmlsec_verifies_signatures_over_documents_with_namespaced_roots() {
         // an xml:lang on the root propagates into both canonical subtrees
         // per C14N 1.0 §2.4
         ("xmllang.xml", br#"<doc xml:lang="es"><a>x</a></doc>"#),
+        // round 2, N-1: a sibling that redeclares a prefix already in scope
+        // used to leave the walking scope's index map pointing at the entry it
+        // had just removed — a panic at the next redeclaration, or a silently
+        // lost xmlns:q when another declaration landed on the stale index
+        (
+            "siblings.xml",
+            br#"<a xmlns:p="urn:1"><b xmlns:p="urn:2"/><c xmlns:q="urn:9" xmlns:p="urn:3"/></a>"#,
+        ),
+        // the same rule in the shape an invoice has: a default namespace on
+        // the root and three children undeclaring it
+        (
+            "facturae-siblings.xml",
+            br#"<Facturae xmlns="urn:facturae"><FileHeader xmlns=""><SchemaVersion>3.1</SchemaVersion></FileHeader><Parties xmlns=""><Seller/></Parties><Invoices xmlns=""><Invoice/></Invoices></Facturae>"#,
+        ),
     ];
     for (name, input) in cases {
         let signed = xades_sign(input, &signer, &XadesOptions::default())
