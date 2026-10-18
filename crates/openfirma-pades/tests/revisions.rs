@@ -439,6 +439,59 @@ fn an_object_named_only_inside_a_vri_entry_is_not_validation_data() {
     );
 }
 
+/// The `/VRI` dictionary is licensed as archive bytes, and archive bytes are
+/// still candidates: a covered page that already draws `/Xm1 97 0 R` makes 97 a
+/// reference a reader resolves, so a brand-new `/Type /DSS` whose `/VRI` names it
+/// is refused exactly as the object the page points at is refused when the
+/// catalog calls it an archive (the shape of R3-C1, by this route). Measured
+/// before the test existed: "object 97 0 R: a dictionary outside the archive
+/// whitelist was rewritten". What makes the assertion load-bearing is that the
+/// new rule adds the dictionary to the CANDIDATE set, not to the answer: the
+/// fixpoint's pruning still governs it.
+#[test]
+fn a_vri_dictionary_the_covered_bytes_named_is_not_licensed() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> /XObject << /Xm1 97 0 R >> >> \
+                 /Contents 4 0 R >>";
+    let drawing = b"/Xm1 Do";
+    let plain = pades_sign(
+        &append_two(INPUT, &[(3, page.as_slice()), (4, &stream_body(drawing))]),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing a page that draws an object the file does not have");
+    pades_verify(&plain, &anchors()).expect("an empty /XObject slot is not an attack");
+
+    let text = "BT /F1 24 Tf 72 700 Td (PAGUESE 9999 EUR) Tj ET";
+    let form = format!(
+        "<< /BBox [ 0 0 300 60 ] /FormType 1 /Length {} /Matrix [ 1 0 0 1 0 0 ] \
+         /Resources << /Font << /F1 5 0 R >> >> /Subtype /Form /Type /XObject >>\n\
+         stream\n{text}\nendstream",
+        text.len()
+    );
+    let catalog = b"<< /Type /Catalog /Pages 2 0 R /DSS 99 0 R >>";
+    let dss = b"<< /Type /DSS /VRI 97 0 R >>";
+    let attacked = append_two(
+        &plain,
+        &[
+            (1, catalog.as_slice()),
+            (99, dss.as_slice()),
+            (97, form.as_bytes()),
+        ],
+    );
+    let error = pades_verify(&attacked, &anchors()).expect_err(
+        "the covered bytes named 97, so carrying it as the /VRI dictionary is a change they see",
+    );
+    assert!(
+        error.to_string().contains("97 0 R"),
+        "the refusal names the object the page draws: {error}"
+    );
+}
+
 /// A second pass that draws its own signature writes its own Helvetica and names
 /// it in the appearance's `/Resources` — the shape the font rule licenses only
 /// because ONE signature covers the font and the object that names it. Every
