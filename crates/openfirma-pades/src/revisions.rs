@@ -288,6 +288,12 @@ pub enum Change {
     /// `/Fields` with such fields, or a page `/Annots` array that only grew
     /// with widgets of real signatures.
     SignaturePlumbing(ObjRef),
+    /// A writer of the same lineage re-stamping its own mark into a dictionary
+    /// it otherwise left alone: `/ITXT`, which iText writes into the page tree
+    /// of every document it saves, is not a key of ISO 32000 and nothing about
+    /// the document renders differently because of it. See
+    /// `adds_only_the_itxt_mark`.
+    Bookkeeping(ObjRef),
     /// The transport a revision writes its objects through: an object stream,
     /// or the cross-reference stream that indexes them. Neither carries
     /// anything a reader renders — the objects INSIDE an object stream are
@@ -320,6 +326,12 @@ impl std::fmt::Display for Change {
             Change::ValidationData(o) => write!(f, "object {o} is validation data (/DSS)"),
             Change::SignaturePlumbing(o) => {
                 write!(f, "object {o} carries a newer signature's field or widget")
+            }
+            Change::Bookkeeping(o) => {
+                write!(
+                    f,
+                    "object {o} is a dictionary a writer re-stamped with its own marker"
+                )
             }
             Change::Transport(o) => {
                 write!(
@@ -602,10 +614,14 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
         // writer that packs its appearance into its own object stream, whose bytes
         // are addressed only through the container (round 4, A-7).
         if let Some(appearance) = widget_appearance(&final_state, body) {
-            if attesting
-                .is_some_and(|signature| same_pass(&locations, &revs, signature, appearance))
-            {
-                appearances.insert(appearance);
+            if let Some(signature) = attesting {
+                appearances.extend(appearance_chain(
+                    &locations,
+                    &final_state,
+                    &revs,
+                    signature,
+                    appearance,
+                ));
             }
         }
     }
@@ -702,6 +718,24 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     // (the round-3 form XObject that put a text of its own on the page).
     if brand_new && validation_data.contains(object) {
         return Change::ValidationData(*object);
+    }
+    // A writer re-stamping its own mark: iText records the version that last
+    // wrote a document as a non-standard `/ITXT` entry, and it re-serializes the
+    // dictionary around an otherwise untouched set of entries. Measured with
+    // AutoFirma 1.9.1 co-signing a document THIS crate signed: the covered
+    // `/Pages` node went from `<< /Type /Pages /Kids [3 0 R] /Count 1 >>` to
+    // `<</Type/Pages/Kids[3 0 R]/Count 1/ITXT(2.1.7)>>` — every entry byte for
+    // byte what it was, plus the marker. `/ITXT` is not a key of ISO 32000 and
+    // nothing renders differently; refusing it refused the co-signature of the
+    // very tool this crate replaces.
+    //
+    // Deliberately narrow: a BARE DICTIONARY (`is_bare_dictionary` — a stream's
+    // dictionary never qualifies, whatever its payload does), whose entries are
+    // pairwise identical in order, with exactly one entry added and its key
+    // `/ITXT`. Anything else stays refused, which is why the round-3 fixture —
+    // a page whose `/Annots` array was rewritten — still is.
+    if !brand_new && adds_only_the_itxt_mark(older, newer) {
+        return Change::Bookkeeping(*object);
     }
     // The catalog: /DSS gaining (fresh or merged), AcroForm appearing through a
     // signature pass, and nothing else changing. Each key an archive may touch
@@ -1237,6 +1271,94 @@ fn carries_attested_signature_value(
 
 /// The appearance stream a widget names under `/AP` → `/N`, the thing a reader
 /// draws in its rectangle. `None` unless the object is a widget naming one.
+/// Every object the appearance rooted at `root` draws: `root` itself, and — one
+/// hop at a time — the form XObjects its own `/Resources` names, each of them
+/// only if the signature that owns the widget wrote it too.
+///
+/// A signature's visible appearance is a form XObject, and a form XObject draws
+/// what its `/Resources /XObject` names. One hop is not a rendering: the
+/// reference tool's field appearance is `/AP /N → 21 0 R → 18/19 0 R` (measured
+/// with AutoFirma 1.9.1 filling the second field of a two-field form), so
+/// licensing only the direct `/AP /N` refused the reference tool's own visible
+/// fill while the objects that actually draw the ink went unjudged (round 6, X).
+///
+/// The safety argument does not weaken per hop. An object is reached only when
+/// `same_pass` holds — it is named by the very signature whose widget this
+/// appearance belongs to — and the licensing rule downstream still asks that the
+/// object be BRAND NEW in that pass, so a hop that REWROTE a covered object is
+/// refused there however it was reached. Every byte a reader draws is therefore
+/// a byte that signature attests, which is the argument the direct `/AP /N` has
+/// rested on since round 3.
+///
+/// Only `/Resources` the form carries itself is followed. A form's inherited
+/// resources are the PAGE's, whose objects are covered bytes `same_pass` refuses
+/// anyway — following them could only re-name what the document already had,
+/// never license what this pass wrote — so leaving them out loses nothing and
+/// keeps the walk to what the pass itself built.
+///
+/// The walk is bounded, and the bound fails closed: what it leaves unlicensed is
+/// refused, not licensed.
+fn appearance_chain(
+    locations: &BTreeMap<ObjRef, Location>,
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    revs: &[Revision],
+    signature: ObjRef,
+    root: ObjRef,
+) -> BTreeSet<ObjRef> {
+    const CHAIN_LIMIT: usize = 64;
+    let mut licensed: BTreeSet<ObjRef> = BTreeSet::new();
+    if !same_pass(locations, revs, signature, root) {
+        return licensed;
+    }
+    let mut queue = vec![root];
+    while let Some(object) = queue.pop() {
+        if licensed.contains(&object) || licensed.len() >= CHAIN_LIMIT {
+            continue;
+        }
+        licensed.insert(object);
+        let Some(body) = final_state.get(&object) else {
+            continue;
+        };
+        for nested in form_xobjects(final_state, body) {
+            if same_pass(locations, revs, signature, nested) {
+                queue.push(nested);
+            }
+        }
+    }
+    licensed
+}
+
+/// The `/XObject` entries of a form XObject's own `/Resources`: the objects its
+/// content stream may draw one level down, whether those bytes are spelling
+/// `<< … >>` inline or naming a dictionary object.
+fn form_xobjects(final_state: &BTreeMap<ObjRef, Vec<u8>>, body: &[u8]) -> Vec<ObjRef> {
+    let Some(resources) = resolve_dict(final_state, pdf::get(body, "/Resources")) else {
+        return Vec::new();
+    };
+    let Some(xobjects) = resolve_dict(final_state, pdf::get(&resources, "/XObject")) else {
+        return Vec::new();
+    };
+    let Ok(items) = pdf::items(&xobjects) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|(_, value)| pdf::parse_ref(pdf::trim_ws(&xobjects[value.clone()])))
+        .collect()
+}
+
+/// A dictionary value that may be inline (`<< … >>`) or an indirect reference
+/// the final state holds. Anything else — a number, a string, a reference
+/// nothing defines — is no dictionary, and the caller gets nothing to walk.
+fn resolve_dict(final_state: &BTreeMap<ObjRef, Vec<u8>>, value: Option<&[u8]>) -> Option<Vec<u8>> {
+    let value = pdf::trim_ws(value?);
+    if value.starts_with(b"<<") {
+        return Some(value.to_vec());
+    }
+    let reference = pdf::parse_ref(value)?;
+    final_state.get(&reference).cloned()
+}
+
 fn widget_appearance(final_state: &BTreeMap<ObjRef, Vec<u8>>, body: &[u8]) -> Option<ObjRef> {
     if pdf::get(body, "/Subtype").is_none_or(|t| pdf::trim_ws(t) != b"/Widget") {
         return None;
@@ -1286,6 +1408,63 @@ fn references_in(value: Option<&[u8]>) -> Vec<ObjRef> {
 /// name and value.
 fn other_keys_equal(older: &[u8], newer: &[u8], except: &[u8]) -> bool {
     keys_equal_except(older, newer, &[except])
+}
+
+/// Whether `body` is a dictionary and nothing else: no `stream` keyword, no
+/// data behind it. The `/ITXT` rule below asks this of both states, because a
+/// stream's dictionary is only ever the head of the object — what a reader
+/// takes from a stream includes its payload, which `rendered_body` carries
+/// separately and which no marker licenses.
+fn is_bare_dictionary(body: &[u8]) -> bool {
+    if !body.starts_with(b"<<") {
+        return false;
+    }
+    match pdf::dict_end(body, 0) {
+        Ok(end) => pdf::trim_ws(&body[end..]).is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Whether `newer` is `older` with exactly one entry added, and that entry is
+/// the producer's own `/ITXT` mark — iText's version stamp, a key ISO 32000 does
+/// not define and no reader renders. Measured: AutoFirma 1.9.1 co-signing a
+/// document this crate signed rewrote the covered `/Pages` node as
+/// `<</Type/Pages/Kids[3 0 R]/Count 1/ITXT(2.1.7)>>`, its entries byte for byte
+/// what they were plus the marker.
+///
+/// Entries are compared as the raw bytes `pdf::items` hands back, IN ORDER: a
+/// re-serialized value, a reordered dictionary or a second added key is not this
+/// shape and stays refused, and a stream never qualifies however little its
+/// dictionary changed.
+fn adds_only_the_itxt_mark(older: &[u8], newer: &[u8]) -> bool {
+    if !is_bare_dictionary(older) || !is_bare_dictionary(newer) {
+        return false;
+    }
+    let (Ok(before), Ok(after)) = (pdf::items(older), pdf::items(newer)) else {
+        return false;
+    };
+    if after.len() != before.len() + 1 {
+        return false;
+    }
+    let mut mark_seen = false;
+    let mut expected = before.iter();
+    for (key, value) in &after {
+        let name = &newer[key.clone()];
+        if !mark_seen && name == b"/ITXT" {
+            mark_seen = true;
+            continue;
+        }
+        match expected.next() {
+            Some((older_key, older_value))
+                if &older[older_key.clone()] == name
+                    && older[older_value.clone()] == newer[value.clone()] =>
+            {
+                continue;
+            }
+            _ => return false,
+        }
+    }
+    mark_seen && expected.next().is_none()
 }
 
 /// Whether every key of both dictionaries except those in `except` is

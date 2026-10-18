@@ -17,6 +17,19 @@
  indirect-annots.pdf  PDF cuyo /Annots de pagina es un objeto indirecto, la
                       forma que escribe iText. Comprueba que sigue siendo
                       indirecto despues de firmar.
+ twofields.pdf        Formulario con /AcroForm y DOS campos de firma vacios
+                      (Firma1, Firma2), cada uno con su /Rect para que quien
+                      firme pueda dibujar su apariencia donde el campo dice.
+                      Generado por `tools/gen-testpdf.py --two-fields`.
+                      Entra en la prueba de interoperabilidad con AutoFirma
+                      (`crates/openfirma-pades/tests/autofirma_cosign.rs`):
+                      AutoFirma firma Firma1 y despues Firma2 sobre su propia
+                      salida, y en sentido contrario firma Firma2 sobre un
+                      documento firmado por nosotros. La segunda pasada
+                      construye la cadena de apariencia (`/AP /N`, y lo que esa
+                      forma dibuja) que la puerta de revisiones tiene que
+                      juzgar, y ademas iText re-sella el arbol de paginas con
+                      `/ITXT (2.1.7)`.
 
  ns-root.xml        XML cuyo elemento raiz declara espacios de nombres (la
                     forma FacturaE) y un prefijo ds propio. Entra en el golden

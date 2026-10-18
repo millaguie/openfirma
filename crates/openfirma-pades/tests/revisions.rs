@@ -14,6 +14,11 @@ use openfirma_pades::{Appearance, PadesOptions, pades_sign, pades_verify, pdf};
 
 const INPUT: &[u8] = include_bytes!("../../../testdata/inputs/simple.pdf");
 
+/// The fixed width of a `/ByteRange` number in a hand-written signature: enough
+/// digits for any test document, and the same width on both sides of the patch
+/// so pointing the range at the pass moves no byte.
+const PAD: &str = "0000000000";
+
 fn certs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
 }
@@ -194,6 +199,54 @@ fn append_written(pdf: &[u8], num: u32, body: &[u8]) -> Vec<u8> {
     let xref_at = out.len();
     let size = declared_size(pdf).max(num + 1);
     out.extend_from_slice(format!("xref\n{num} 1\n{object_at:010} 00000 n \n").as_bytes());
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Prev {} >>\nstartxref\n{xref_at}\n%%EOF\n",
+            last_xref(pdf)
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// Append one revision that redefines exactly the numbers given, with a classic
+/// cross-reference TABLE whose subsections are the runs of numbers the pass
+/// writes — ISO 32000 lets one section carry several subsections. `append_written`
+/// writes one number and `append_packed_pass` a contiguous run; a pass that
+/// rewrites a covered object AND adds its own (which is what a fill is) needs
+/// both in one revision, and they are almost never adjacent.
+fn append_pieces(pdf: &[u8], objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut out = pdf.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let mut offsets: Vec<(u32, usize)> = Vec::new();
+    for (num, body) in objects {
+        offsets.push((*num, out.len()));
+        out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_at = out.len();
+    let mut xref = String::from("xref\n");
+    let mut i = 0;
+    while i < offsets.len() {
+        let start = i;
+        while i + 1 < offsets.len() && offsets[i + 1].0 == offsets[i].0 + 1 {
+            i += 1;
+        }
+        xref.push_str(&format!("{} {}\n", offsets[start].0, i - start + 1));
+        for (_, at) in &offsets[start..=i] {
+            xref.push_str(&format!("{at:010} 00000 n \n"));
+        }
+        i += 1;
+    }
+    let size = offsets
+        .last()
+        .map(|(num, _)| num + 1)
+        .unwrap_or(0)
+        .max(declared_size(pdf));
+    out.extend_from_slice(xref.as_bytes());
     out.extend_from_slice(
         format!(
             "trailer\n<< /Size {size} /Root 1 0 R /Prev {} >>\nstartxref\n{xref_at}\n%%EOF\n",
@@ -2017,6 +2070,46 @@ fn append_packed_pass(pdf: &[u8], packed: &[(u32, Vec<u8>)], direct: &[(u32, Vec
     out
 }
 
+/// The signature dictionary a hand-written pass carries: a well-formed
+/// `/Type /Sig` whose `/ByteRange` placeholder [`patch_byte_range`] fills. The
+/// gate reads the range and the bytes it covers; a real CMS adds only the
+/// cryptographic checks the other tests cover.
+fn padded_signature() -> Vec<u8> {
+    format!(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached \
+         /ByteRange [ 0 {PAD} {PAD} {PAD} ] /Contents <{}> /M (D:20260101000000Z) >>",
+        "a5".repeat(64)
+    )
+    .into_bytes()
+}
+
+/// Point a hand-written pass's `/ByteRange` at the pass itself: everything but
+/// the `/Contents` hex, which is what a detached signature covers. Same width as
+/// the placeholder, so no offset in the pass moves.
+fn patch_byte_range(pass: &mut [u8]) {
+    let hex = pass
+        .windows(b"/Contents <".len())
+        .rposition(|window| window == b"/Contents <")
+        .expect("the signature's /Contents")
+        + b"/Contents ".len();
+    let contents_end = hex + 128 + 1; // 64 bytes of hex, then the closing >
+    let patched = format!(
+        "[ 0 {hex:010} {contents_end:010} {:010} ]",
+        pass.len() - contents_end
+    );
+    let placeholder = format!("[ 0 {PAD} {PAD} {PAD} ]");
+    let at = pass
+        .windows(placeholder.len())
+        .position(|window| window == placeholder.as_bytes())
+        .expect("the /ByteRange placeholder");
+    assert_eq!(
+        placeholder.len(),
+        patched.len(),
+        "the patch keeps the layout"
+    );
+    pass[at..at + patched.len()].copy_from_slice(patched.as_bytes());
+}
+
 /// A pass that saves COMPRESSED — its field, its font and therefore its
 /// appearance inside a `/Type /ObjStm`, which is how iText writes the second
 /// signature of a form, and what the reference tool produced when it filled a
@@ -2050,11 +2143,7 @@ fn a_pass_that_packs_its_plumbing_into_an_object_stream_is_judged_on_the_contain
     // Revision 1 is a document this crate's own writer signed, so the judge is
     // a real signature with a real /ByteRange and a real coverage end.
     let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing");
-    let coverage_end = {
-        let sigs = openfirma_pades::inspect::signatures(&signed).expect("signatures");
-        let range = sigs[0].byte_range;
-        range[2] + range[3]
-    };
+    let coverage_end = coverage_end_of(&signed);
 
     // The pass, numbered 20 upward: the field it fills (20) and the font its
     // appearance draws with (21) are packed; the appearance (22), the signature
@@ -2071,40 +2160,14 @@ fn a_pass_that_packs_its_plumbing_into_an_object_stream_is_judged_on_the_contain
         .to_vec();
     // The /ByteRange numbers are written at a fixed width so the layout survives
     // the patch below: the covered bytes are everything but the /Contents hex.
-    const PAD: &str = "0000000000";
-    let signature = format!(
-        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached \
-         /ByteRange [ 0 {PAD} {PAD} {PAD} ] /Contents <{}> /M (D:20260101000000Z) >>",
-        "a5".repeat(64)
-    )
-    .into_bytes();
+    let signature = padded_signature();
 
     let mut pass = append_packed_pass(
         &signed,
         &[(20, field), (21, font)],
         &[(22, appearance), (23, signature)],
     );
-    let hex = pass
-        .windows(b"/Contents <".len())
-        .rposition(|window| window == b"/Contents <")
-        .expect("the signature's /Contents")
-        + b"/Contents ".len();
-    let contents_end = hex + 128 + 1; // 64 bytes of hex, then the closing >
-    let patched = format!(
-        "[ 0 {hex:010} {contents_end:010} {:010} ]",
-        pass.len() - contents_end
-    );
-    let placeholder = format!("[ 0 {PAD} {PAD} {PAD} ]");
-    let at = pass
-        .windows(placeholder.len())
-        .position(|window| window == placeholder.as_bytes())
-        .expect("the /ByteRange placeholder");
-    assert_eq!(
-        placeholder.len(),
-        patched.len(),
-        "the patch keeps the layout"
-    );
-    pass[at..at + patched.len()].copy_from_slice(patched.as_bytes());
+    patch_byte_range(&mut pass);
 
     let revs = revisions(&pass).expect("the packed revision parses");
     let redefined = redefinitions_after(&pass, &revs, coverage_end).expect("redefinitions");
@@ -2126,4 +2189,335 @@ fn a_pass_that_packs_its_plumbing_into_an_object_stream_is_judged_on_the_contain
             .filter(|(object, _)| object.num == 20)
             .collect::<Vec<_>>()
     );
+}
+
+/// A visible fill draws through a CHAIN, not through one hop: the widget's
+/// `/AP /N` is a form XObject whose own `/Resources /XObject` names what
+/// actually paints. Measured against the reference tool — iText 2.1.7 writing
+/// the second signature of a two-field form for AutoFirma 1.9.1 builds
+/// `/AP /N → 22 0 R → 18/19 0 R` — so licensing only the direct `/AP /N`
+/// refused the reference tool's own visible fill, the document AutoFirma signs
+/// with itself in `tests/autofirma_cosign.rs`, while the objects that paint the
+/// ink went unjudged.
+///
+/// Every hop the attesting signature's own pass wrote is plumbing, judged by the
+/// rule the direct appearance has used since round 3. The safety does not weaken
+/// per hop: an object is reached only through `same_pass` (the signature's own
+/// bytes cover it), and the rule downstream still asks that the object be brand
+/// new in that pass, so a hop that REWROTE a covered object is refused however
+/// it was reached.
+#[test]
+fn a_visible_fill_is_judged_on_every_object_its_appearance_draws() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing");
+    let coverage_end = coverage_end_of(&signed);
+
+    // The pass, numbered 20 upward: the field it fills (20) and the font it
+    // draws with (21) are packed; the appearance (22), the signature (23) and
+    // the form XObject the appearance draws (24) are direct.
+    let field = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma2) \
+                  /Rect [ 72 400 400 460 ] /F 132 /P 3 0 R /V 23 0 R \
+                  /AP << /N 22 0 R >> >>"
+        .to_vec();
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+                 /Encoding /WinAnsiEncoding >>"
+        .to_vec();
+    let nested = b"<< /Type /XObject /Subtype /Form /BBox [ 0 0 328 60 ] /Length 4 >>\n\
+                   stream\nq Q\nendstream"
+        .to_vec();
+    let drawn = b"q /Fm0 Do Q";
+    let mut appearance = Vec::new();
+    appearance.extend_from_slice(
+        format!(
+            "<< /Type /XObject /Subtype /Form /BBox [ 0 0 328 60 ] /Length {} \
+             /Resources << /Font << /F1 21 0 R >> /XObject << /Fm0 24 0 R >> >> >>\nstream\n",
+            drawn.len()
+        )
+        .as_bytes(),
+    );
+    appearance.extend_from_slice(drawn);
+    appearance.extend_from_slice(b"\nendstream");
+    let signature = padded_signature();
+
+    let mut pass = append_packed_pass(
+        &signed,
+        &[(20, field), (21, font)],
+        &[(22, appearance), (23, signature), (24, nested)],
+    );
+    patch_byte_range(&mut pass);
+
+    let revs = revisions(&pass).expect("the pass parses");
+    let redefined = redefinitions_after(&pass, &revs, coverage_end).expect("redefinitions");
+    let verdicts = classify(&pass, &redefined).expect("classify");
+    for (object, change) in &verdicts {
+        assert!(
+            !matches!(change, Change::NotAllowed { .. }),
+            "every object of the drawn fill is plumbing, {object} came back {change:?}"
+        );
+    }
+    for number in [22, 24] {
+        assert!(
+            verdicts.iter().any(|(object, change)| object.num == number
+                && matches!(change, Change::SignaturePlumbing(_))),
+            "the object {number} the appearance draws is licensed as plumbing: {:?}",
+            verdicts
+                .iter()
+                .filter(|(object, _)| object.num == number)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The chain is closed through `same_pass` at every hop, and this is what that
+/// buys: a widget whose appearance names a number that does not exist yet, and a
+/// later pass that defines it, is the round-3 shape (a dangling reference filled
+/// after the fact) reached one hop deeper. The later object is brand new in the
+/// FINAL state and parses as a form XObject — everything the appearance rule
+/// asks for — but the signature that owns the widget never covered its bytes, so
+/// it is refused.
+#[test]
+fn a_hop_of_an_appearance_chain_written_by_a_later_pass_is_not_plumbing() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing");
+    let coverage_end = coverage_end_of(&signed);
+
+    // Object 30 is past the /Size this pass declares: nothing defines it until
+    // the NEXT revision does, which is what makes it the attack and not a fill.
+    let field = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma2) \
+                  /Rect [ 72 400 400 460 ] /F 132 /P 3 0 R /V 23 0 R \
+                  /AP << /N 22 0 R >> >>"
+        .to_vec();
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+                 /Encoding /WinAnsiEncoding >>"
+        .to_vec();
+    let appearance = b"<< /Type /XObject /Subtype /Form /BBox [ 0 0 328 60 ] /Length 4 \
+                       /Resources << /XObject << /Fm0 30 0 R >> >> >>\nstream\nq Q\nendstream"
+        .to_vec();
+    let signature = padded_signature();
+
+    let mut pass = append_packed_pass(
+        &signed,
+        &[(20, field), (21, font)],
+        &[(22, appearance), (23, signature)],
+    );
+    patch_byte_range(&mut pass);
+
+    let nested = b"<< /Type /XObject /Subtype /Form /BBox [ 0 0 328 60 ] /Length 11 >>\n\
+                   stream\n(PAGO UNO)\nendstream"
+        .to_vec();
+    let document = append_written(&pass, 30, &nested);
+
+    let revs = revisions(&document).expect("both passes parse");
+    let redefined = redefinitions_after(&document, &revs, coverage_end).expect("redefinitions");
+    let verdicts = classify(&document, &redefined).expect("classify");
+    assert!(
+        verdicts.iter().any(|(object, change)| object.num == 30
+            && matches!(change, Change::NotAllowed { .. })),
+        "a chain hop no signature covered is refused: {:?}",
+        verdicts
+            .iter()
+            .filter(|(object, _)| object.num == 30)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A writer may re-stamp its own mark into a dictionary it leaves otherwise
+/// alone: iText records the version that last wrote a document as a `/ITXT`
+/// entry, and it re-serializes the dictionary around entries it did not change.
+/// Measured with AutoFirma 1.9.1 co-signing a document THIS crate signed: the
+/// covered `/Pages` node came back as
+/// `<</Type/Pages/Kids[3 0 R]/Count 1/ITXT(2.1.7)>>` — every entry byte for byte
+/// what it was, plus the marker. `/ITXT` is not a key of ISO 32000 and nothing
+/// about the document renders differently because of it.
+#[test]
+fn a_writer_may_restamp_its_own_marker_into_a_dictionary_it_left_alone() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing");
+    let coverage_end = coverage_end_of(&signed);
+
+    // Object 2 of the input is the page tree node.
+    let restamped = b"<</Type/Pages/Kids[3 0 R]/Count 1/ITXT(2.1.7)>>".to_vec();
+    let document = append_written(&signed, 2, &restamped);
+
+    let revs = revisions(&document).expect("the pass parses");
+    let redefined = redefinitions_after(&document, &revs, coverage_end).expect("redefinitions");
+    let verdicts = classify(&document, &redefined).expect("classify");
+    assert!(
+        verdicts
+            .iter()
+            .any(|(object, change)| object.num == 2 && matches!(change, Change::Bookkeeping(_))),
+        "the page tree's own re-stamp is bookkeeping: {:?}",
+        verdicts
+            .iter()
+            .filter(|(object, _)| object.num == 2)
+            .collect::<Vec<_>>()
+    );
+    for (object, change) in &verdicts {
+        assert!(
+            !matches!(change, Change::NotAllowed { .. }),
+            "{object} came back {change:?}"
+        );
+    }
+}
+
+/// The marker rule is narrow, and this is what "narrow" has to mean: whatever
+/// else moves, the verdict moves with it. A `/Count` that no longer matches its
+/// `/Kids`, a reordered dictionary, a value respelled — and a STREAM whose
+/// dictionary merely gained the mark, because what a reader takes from a stream
+/// is its dictionary AND the data it declares.
+#[test]
+fn a_restamped_dictionary_may_not_change_anything_else() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing");
+    let coverage_end = coverage_end_of(&signed);
+
+    let refused = |what: &str, number: u32, body: &[u8]| {
+        let document = append_written(&signed, number, body);
+        let revs = revisions(&document).expect("the pass parses");
+        let redefined = redefinitions_after(&document, &revs, coverage_end).expect("redefinitions");
+        let verdicts = classify(&document, &redefined).expect("classify");
+        assert!(
+            verdicts.iter().any(|(object, change)| object.num == number
+                && matches!(change, Change::NotAllowed { .. })),
+            "{what} is refused: {:?}",
+            verdicts
+                .iter()
+                .filter(|(object, _)| object.num == number)
+                .collect::<Vec<_>>()
+        );
+    };
+
+    // Object 2 is the page tree node, object 5 the page content stream.
+    refused(
+        "a /Count that disagrees with /Kids",
+        2,
+        b"<</Type/Pages/Kids[3 0 R]/Count 2/ITXT(2.1.7)>>",
+    );
+    refused(
+        "a reordered dictionary",
+        2,
+        b"<</Count 1/Kids[3 0 R]/Type/Pages/ITXT(2.1.7)>>",
+    );
+    refused(
+        "a value respelled around its reference",
+        2,
+        b"<</Type/Pages/Kids[ 3 0 R ]/Count 1/ITXT(2.1.7)>>",
+    );
+    let payload = b"BT /F1 12 Tf 72 770 Td (the attacker's page) Tj ET\n";
+    let mut stream =
+        format!("<< /Length {} /ITXT (2.1.7) >>\nstream\n", payload.len()).into_bytes();
+    stream.extend_from_slice(payload);
+    stream.extend_from_slice(b"endstream");
+    refused("a stream whose payload was replaced", 5, &stream);
+}
+
+/// The declared residual around a fill: a signature that takes up a field the
+/// covered bytes left EMPTY may repaint that field. Its pre-drawn appearance is
+/// the document author's, it is bytes the earlier signature attested, and
+/// filling the field replaces it — which is what a form field IS: its `/AP` is
+/// the presentation of its value. Measured: AutoFirma 1.9.1 does exactly this
+/// when it signs a field of a pre-drawn form, and so does this crate's own
+/// writer when a caller names a field the form already offers.
+///
+/// Not narrowed further, on purpose: requiring the covered field to carry no
+/// `/AP` at all would refuse the reference tool's own flow (round 6, R6-A1).
+/// Licensing the chain the FILLING pass writes is a different question, and it
+/// is answered by `appearance_chain`.
+#[test]
+fn a_fill_may_repaint_the_pre_drawn_appearance_of_an_empty_signature_field() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+
+    // A form the covered bytes carry: one empty signature field (8) whose
+    // pre-drawn appearance (9) is the author's ink.
+    let field = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma2) \
+                   /Rect [ 72 400 400 460 ] /F 132 /P 3 0 R /AP << /N 9 0 R >> >>"
+        .to_vec();
+    let ink = b"<< /Type /XObject /Subtype /Form /BBox [ 0 0 328 60 ] /Length 30 >>\n\
+                stream\nBT (PAGO UN CERO UNO) Tj ET\nendstream"
+        .to_vec();
+    let with_form = append_written(INPUT, 8, &field);
+    let with_form = append_written(&with_form, 9, &ink);
+
+    let signed = pades_sign(&with_form, &signer, &PadesOptions::default()).expect("signing");
+    let coverage_end = coverage_end_of(&signed);
+
+    // A later pass fills the field: /V and a fresh /AP, everything else the
+    // bytes the signature covered. Its own objects go above every number the
+    // document already declares.
+    let ink_number = declared_size(&signed);
+    let signature_number = ink_number + 1;
+    let filled = format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma2) \
+         /Rect [ 72 400 400 460 ] /F 132 /P 3 0 R /V {signature_number} 0 R \
+         /AP << /N {ink_number} 0 R >> >>"
+    )
+    .into_bytes();
+    let drawn = b"<< /Type /XObject /Subtype /Form /BBox [ 0 0 328 60 ] /Length 3 >>\n\
+                  stream\nq Q\nendstream"
+        .to_vec();
+    let signature = padded_signature();
+
+    let mut pass = append_pieces(
+        &signed,
+        &[
+            (8, filled),
+            (ink_number, drawn),
+            (signature_number, signature),
+        ],
+    );
+    patch_byte_range(&mut pass);
+
+    let revs = revisions(&pass).expect("the pass parses");
+    let redefined = redefinitions_after(&pass, &revs, coverage_end).expect("redefinitions");
+    let verdicts = classify(&pass, &redefined).expect("classify");
+    for (object, change) in &verdicts {
+        assert!(
+            !matches!(change, Change::NotAllowed { .. }),
+            "the fill of an empty field is plumbing, {object} came back {change:?}"
+        );
+    }
+    assert!(
+        verdicts
+            .iter()
+            .any(|(object, change)| object.num == 8
+                && matches!(change, Change::SignaturePlumbing(_))),
+        "the field is the plumbing of the signature that filled it: {:?}",
+        verdicts
+            .iter()
+            .filter(|(object, _)| object.num == 8)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The end of the first signature's `/ByteRange`: where the bytes it attests
+/// stop, and therefore the state a later revision's changes are judged against.
+fn coverage_end_of(signed: &[u8]) -> usize {
+    let sigs = openfirma_pades::inspect::signatures(signed).expect("signatures");
+    let range = sigs[0].byte_range;
+    range[2] + range[3]
 }
