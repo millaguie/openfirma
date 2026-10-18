@@ -77,15 +77,15 @@ list_files() {
 # than 300 chars cannot hold a real certificate's DER headers anyway; the DER
 # reader, not the length guess, decides what is a certificate.
 extract_base64_certs() {
-  # Read through a variable and a here-string. Every direct channel took its
-  # turn being blind on this repo's CI witnesses — BSD grep intervals, `file`
-  # output shapes, and in run 39088995737 even `tr < file` reported no long
-  # base64 run in a probe whose md5 matched byte-for-byte. A variable read by
-  # bash's own builtin, piped through printf, is the one path with no child
-  # process opening anything; if it still disagrees with the candidate scan,
-  # the contradiction tripwire in check_embedded_certs blocks instead of
-  # passing. The trailing-`x` dance keeps command substitution from eating a
-  # newline that might sit inside a run.
+  # Read through a variable. Every direct channel took its turn being blind
+  # on this repo's CI witnesses — BSD grep intervals, `file` output shapes,
+  # `tr < file` and even `cat |` (run 39089691658: the guard passed an XAdES
+  # whose probe the witness measured through bash's own variable at 342 base64
+  # chars in the very same failure). `$(cat f; printf x)` is one builtin read
+  # of the whole file; if THAT still disagrees with the candidate scan below,
+  # there are no more channels to fall back on and the contradiction tripwire
+  # fires instead of passing clean. The trailing-`x` dance keeps command
+  # substitution from eating a newline that might sit inside a run.
   local data run
   data="$(cat "$1" 2>/dev/null; printf x)" || return 0
   data="${data%$'\x'}"
@@ -99,6 +99,30 @@ extract_base64_certs() {
         echo "### cert"
       fi
     done
+}
+
+# Whether any base64 run of $1 decodes as an X.509 certificate at all, with
+# no synthetic PKI in sight — the raw-CMS branch asks this after openssl's
+# pkcs7 parser took a bite. Run detection is byte arithmetic in awk (split on
+# non-alphabet bytes, measure): zero child processes touching the file, so no
+# tr/base64 dialect gets a vote. A single false from either probe once leaked
+# a full XAdES through this branch on macOS (runs 39088995737/39089691658);
+# it now answers from bytes and fails closed when the answer is no.
+cms_hides_foreign_certs() {
+  local f="$1" n
+  n="$(awk '
+    { line = $0; start = 0
+      for (i = 1; i <= length(line) + 1; i++) {
+        c = (i <= length(line)) ? substr(line, i, 1) : "\n"
+        if (c ~ /[A-Za-z0-9+\/]/) { if (!run) start = i; run++ }
+        else {
+          if (run >= 300) { print "candidate"; exit }
+          run = 0
+        }
+      }
+    }' "$f" 2>/dev/null)" || n=""
+  [ "$n" = candidate ] || return 1
+  ! extract_base64_certs "$f" | grep -q '### cert'
 }
 
 check_embedded_certs() {
@@ -125,6 +149,16 @@ check_embedded_certs() {
     # any line would hide a foreign leaf.
     blocks="$(openssl pkcs7 -print_certs -inform DER -in "$f" 2>/dev/null |
       awk '/^-+BEGIN/{print "### cert"; skip=1; next} /^-+END/{skip=0; next} skip{next} {print}')" || blocks=""
+    if [ -z "$blocks" ] && cms_hides_foreign_certs "$f"; then
+      # openssl parsed this as a PKCS#7 and printed no certificates, while
+      # the file carries 300+ base64 runs that no reader resolves to the
+      # synthetic PKI. Our XAdES is exactly this shape (the DER IS a parsable
+      # ContentInfo under some Homebrew openssl builds), so "no certs" here
+      # cannot be trusted as absence — refuse instead of passing (runs
+      # 39088995737/39089691658 let one through).
+      block "$f parses as a PKCS#7 whose certificates no reader on this machine can print while carrying unresolvable base64 material — refusing to certify it clean"
+      return 1
+    fi
   else
     # Candidate scan: does this file hold ANY long base64 run (300+ chars, so
     # big enough to be a certificate) or name a certificate at all? Written

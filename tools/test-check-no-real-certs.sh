@@ -113,10 +113,24 @@ must_block() {
         # Witness the extractor's OWN channel, not grep's: a 400+-run probe
         # still showed first-run-len=0 after grep left the guard (witness run
         # 39088995737), so what matters is whether tr sees the file at all.
-        N="$( { tr -c 'A-Za-z0-9+/' '\n' < "$path" 2>/dev/null | awk 'length >= 300 { print length; exit }'; true; } )"
-        echo "        tr-first-long-run=${N:-none}"
-        M="$( { cat "$path" 2>/dev/null | tr -c 'A-Za-z0-9+/' '\n' | awk 'length >= 300 { print length; exit }'; true; } )"
-        echo "        cat-piped-long-run=${M:-none}"
+        N="$( { printf '%s' "$(cat "$path" 2>/dev/null; printf x)" | tr -c 'A-Za-z0-9+/' '\n' | awk 'length >= 300 { print length; exit }'; true; } )"
+        echo "        var-channel-first-run=${N:-none}"
+        # And decode that run through the SAME channel the guard uses, so a
+        # witness can never again say "run visible" while the guard's copy of
+        # the same pipeline answered differently (run 39089691658: var-channel
+        # said 342 and the guard still passed — that gap is what this section
+        # exists to close).
+        RUNS="$WORK/runs.$$"
+        printf '%s' "$(cat "$path" 2>/dev/null; printf x)" | tr -c 'A-Za-z0-9+/' '\n' | awk 'length >= 300' > "$RUNS" || true
+        echo "        runs-file=$(wc -c <"$RUNS") lines=$(wc -l <"$RUNS")"
+        while IFS= read -r R || [ -n "$R" ]; do
+          D="$WORK/dec.$$"
+          bst=0; { printf '%s' "$R" | base64 -d 2>/dev/null || printf '%s' "$R" | base64 -D 2>/dev/null; } > "$D" 2>/dev/null || bst=$?
+          xs=0; xo="$(openssl x509 -inform DER -in "$D" -noout -subject -issuer 2>&1)" || xs=$?
+          echo "        run=${#R} b64-status=$bst der-bytes=$(wc -c <"$D") x509-status=$xs out=$(printf '%s' "$xo" | head -1)"
+          rm -f "$D"
+        done < "$RUNS"
+        rm -f "$RUNS"
       else
         echo "        unreadable-at-witness-time"
       fi
@@ -155,6 +169,21 @@ python3 -c 'import base64,sys; sys.stdout.write(base64.b64encode(open("'"$WORK"'
 must_block "certificate as one raw base64 run, no header, no keyword (the BSD grep witness shape)" \
   "$WORK/rogue-singleline.dat" cp "$WORK/rogue.crt" "$WORK/rogue-singleline.dat"
 
+# The macOS pkcs7-branch shape (runs 39088995737/39089691658): openfirma's
+# XAdES is a text file that also PARSES as a DER ContentInfo under Homebrew
+# openssl — it took the raw-CMS branch, printed no certificates there, and
+# passed while its ds:X509Certificate run sat unread. The tripwire now asks
+# "any long base64 here?" with byte arithmetic before trusting either answer;
+# this probe reproduces the exact container end to end (it is literally the
+# file the CI probe was).
+must_block "XAdES whose bytes also parse as a DER ContentInfo (the macOS pkcs7-branch shape)" \
+  "$WORK/probe-xades-en.bin" resign testdata/inputs/simple.xml xades-b-b
+
+sign -i testdata/inputs/simple.xml -o "$WORK/synth-ok.xml" --format xades-b-b \
+  --cert "$WORK/syn.crt" --key "$WORK/syn.key"
+must_pass "synthetic-marker XAdES through the same double-parse branch" "$WORK/synth-ok.xml"
+sign -i "$WORK/doc.pdf" -o "$WORK/synth-ok.bin" --format pades-b-b \
+  --cert "$WORK/syn.crt" --key "$WORK/syn.key"
 must_pass "synthetic-marker PAdES PDF (the marker is the rule, not paranoia)" "$WORK/synth-ok.bin"
 must_pass "plain text file" "$WORK/doc.txt"
 # a markdown copy of a benign script passes the content rules too: docs stay
