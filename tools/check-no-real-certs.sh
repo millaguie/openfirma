@@ -71,24 +71,23 @@ list_files() {
 # these shapes; the probes' exit status says so.
 check_embedded_certs() {
   local f="$1" blocks part tmpblocks mime
-  # NOT `file -b`: some file(1) builds — macOS among them, measured on the CI
-  # runners — print "PATH: type" even with -b, so a whole-line `case` matched
-  # nothing and every XAdES/XML probe fell into the binary branch, where a text
-  # file is neither %PDF- nor parsable CMS: return 0, guard silently blind.
-  # Stripping the invocation's own path prefix and taking the first token works
-  # on both spellings (`--mime-type` also never wraps long names, unlike -b).
-  # `${f##*/}` strips the directory because some file(1) builds (and any alias
-  # or wrapper script in PATH — CI proved one existed on the macOS runners)
-  # print "path: type" even for --mime-type WITHOUT -b; anchoring on the bare
-  # basename covers relative and absolute invocations alike. And `command`
-  # pins the search to executables, past any function of the same name.
-  mime="$(command file --mime-type "$f" 2>/dev/null | head -n 1 | sed "s|.*[/\\]${f##*/}: *||; s|[[:space:]].*||")"
-  case "${mime:-unknown}" in
-    text/*|application/xml|text/xml|text) ;;
+  # file(1) is only consulted to decide what NOT to bother reading; the probe
+  # itself decides what IS readable, and a text file always answers to it. Two
+  # dialects of `file --mime-type` were measured failing on CI's macOS (a PATH
+  # wrapper that prints "path: type" even without -b, sed then misanchoring on
+  # it; plus per-platform mime guesses), and each one silently routed a probe
+  # into the binary-only branch where nothing matched — fail-open. So file(1)
+  # may only ever SAY NO here (an explicit "text/xml" answer lets the binary
+  # fast-paths stay cheap), never be trusted to skip content: anything unknown
+  # runs the full inspection below, whose branch conditions are magic bytes and
+  # openssl — not a guesser. One extra `openssl pkcs7` per binary source file in
+  # the tree scan is the price of no platform tool getting a veto.
+  mime="$(command file --mime-type "$f" 2>/dev/null | head -n 1)"
+  case "$mime" in
+    */*xml*|text/*) ;;
     *)
-      # binary: PDF and raw CMS paths only make sense there, and asking about
-      # them costs one openssl call per real binary file, none per source file.
-      head -c 5 "$f" | grep -qa %PDF- || openssl pkcs7 -inform DER -in "$f" -noout 2>/dev/null || return 0
+      # every other answer — including "no file(1) here", which leaves $mime
+      # empty — inspects the content anyway.
       ;;
   esac
   blocks=""
@@ -125,6 +124,38 @@ check_embedded_certs() {
           echo "### cert"
         fi
       done)" || blocks=""
+    # A candidate loop that produced NOTHING while the file's own text names a
+    # certificate is a broken decoder, not a clean file — this function has been
+    # fooled twice (grep dialects, read dialects) exactly by answering zero
+    # candidates on files full of them. Two things have to hold before calling
+    # it a machinery failure: the candidate extractor must report at least one
+    # run at all (`grep -c`, not the pipeline — an empty set genuinely means
+    # prose mentioning X509Certificate, e.g. docs), and the first long run must
+    # be decodable material (a base64 alphabet plus `=` padding) whose decoded
+    # bytes begin with a plausible certificate: DER SEQUENCE/CONTEXT tag 0x30,
+    # or ASCII PEM armor that `openssl x509 -inform PEM` refuses only because
+    # it was truncated mid-run. Anything else — a minified asset's long run of
+    # JS identifiers, docs prose — is what it claims to be and passes quietly;
+    # anything matching decodes through openssl below, whose verdict stands.
+    if [ -z "$blocks" ]; then
+      candidates="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null | head -5)" || candidates=""
+      if [ -n "$candidates" ]; then
+        blocks="$(printf '%s\n' "$candidates" |
+          while read -r run || [ -n "$run" ]; do
+            if printf '%s' "$run" | base64 -d 2>/dev/null |
+               openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
+              echo "### cert"
+            fi
+          done)" || blocks=""
+        if [ -z "$blocks" ] && printf '%s\n' "$candidates" | head -1 |
+           grep -qE '^(MI[0-9A-Za-z+/]|LS0t[A-Za-z0-9+/])'; then
+          # the run looks exactly like certificate material (PKCS#15 DER and PEM
+          # armor both start this way) yet nothing decoded it: machinery failure.
+          block "$f carries what looks like base64 certificate material that no decoder could read (file(1) said '${mime:-nothing}'): refusing to call unseen material clean"
+          return 1
+        fi
+      fi
+    fi
     [ -n "$blocks" ] || return 0
   elif openssl pkcs7 -inform DER -in "$f" -noout 2>/dev/null; then
     # same chunking as the PDF path, so a chain of several certificates is
