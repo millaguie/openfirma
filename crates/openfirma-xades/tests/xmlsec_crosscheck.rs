@@ -297,3 +297,43 @@ fn xmlsec_notices_a_tampered_document() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// The root-element scan feeds `--id-attr:Id <root>` on 1.2.x, and getting it
+/// wrong silently mis-verifies nothing useful: an XML comment before the root
+/// used to be read as the element name (`<!--`), stopping the scan at a decoy.
+/// These are every shape that bug class produced during review 07's iterations.
+#[test]
+fn root_element_scan_skips_prolog_and_comments() {
+    let cases: &[(&[u8], Option<&str>)] = &[
+        (br#"<documento Id="x"/>"#, Some("documento")),
+        (br#"<?xml version="1.0"?><documento/>"#, Some("documento")),
+        (
+            br#"<!-- a comment --><fe:Facturae x="1">y</fe:Facturae>"#,
+            Some("fe:Facturae"),
+        ),
+        (
+            br#"<!DOCTYPE doc SYSTEM "d.dtd"><doc>text</doc>"#,
+            Some("doc"),
+        ),
+        // the decoys stacked, in prolog order plus a trailing comment inside:
+        // the scan must land on the element after ALL of them
+        (
+            br#"<?xml version="1.0"?>
+<!-- c1 --><!--c2--><ns:root attr=">">"#,
+            Some("ns:root"),
+        ),
+        // no element at all: a comment-only document has no root to name
+        (br#"<!-- just a comment -->"#, None),
+        // not XML at all
+        (b"plain text", None),
+    ];
+    for (doc, want) in cases {
+        let got = root_element_name(doc);
+        assert_eq!(
+            got.as_deref(),
+            *want,
+            "root scan over {}/",
+            String::from_utf8_lossy(doc)
+        );
+    }
+}
