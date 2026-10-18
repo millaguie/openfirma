@@ -267,7 +267,19 @@ and an appearance of its own. An object a pass packed into an object stream — 
 way iText writes a second signature — is judged on the bytes its container holds,
 because those are the only bytes it has: the container is where its bytes and the
 entry that maps them live, and a container a signature covers is one that existed
-when it was made. Validation data
+when it was made. Two things that gate compares are worth stating, because
+reading did not catch either of them going wrong. What an object HOLDS is its
+dictionary and — when the object is a stream — the data that dictionary declares:
+comparing dictionaries alone called a rewritten page-content payload unchanged,
+because `/Length` stays the same number while the bytes a reader draws are
+replaced. And an object the new section declares that nothing can read is
+refused rather than skipped: the covering state decides whether silence is
+defensible, and bytes that could be read before and cannot be read now are the
+change. Attribution is closed the same way: a revision whose own
+`startxref`/`%%EOF` record is missing has no boundary of its own, so nothing is
+charged to it — without that, every offset in such a file belonged to the
+revision whose end had fallen back to the end of the file, and "the pass that
+wrote this" answered yes for the whole document. Validation data
 is the narrow part, and getting it narrow took four review rounds: an object may
 be excused as such only when it is NEW and a reader reaches it through the
 archive and nowhere else — the dictionary the catalog's `/DSS` names, or an
