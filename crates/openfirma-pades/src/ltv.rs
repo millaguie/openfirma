@@ -108,9 +108,9 @@ pub fn read_dss(pdf: &[u8]) -> Result<Option<Dss>> {
         return Err(Error::Pdf("the catalog's /DSS is not a dictionary".into()));
     }
     Ok(Some(Dss {
-        certs: stream_array(pdf, &offsets, dict, "/Certs")?,
-        crls: stream_array(pdf, &offsets, dict, "/CRLs")?,
-        ocsps: stream_array(pdf, &offsets, dict, "/OCSPs")?,
+        certs: stream_array(pdf, &offsets, &mut cache, dict, "/Certs")?,
+        crls: stream_array(pdf, &offsets, &mut cache, dict, "/CRLs")?,
+        ocsps: stream_array(pdf, &offsets, &mut cache, dict, "/OCSPs")?,
         vri: match pdf::get(dict, "/VRI") {
             Some(v) => Some(match pdf::parse_ref(v) {
                 Some(r) => pdf::resolve(pdf, &offsets, Some(&mut cache), r)?.into_owned(),
@@ -124,11 +124,27 @@ pub fn read_dss(pdf: &[u8]) -> Result<Option<Dss>> {
 fn stream_array(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
+    cache: &mut pdf::ObjectStreamCache,
     dict: &[u8],
     key: &str,
 ) -> Result<Vec<(ObjRef, Vec<u8>)>> {
-    let Some(array) = pdf::get(dict, key) else {
+    let Some(value) = pdf::get(dict, key) else {
         return Ok(Vec::new());
+    };
+    // `/Certs 20 0 R`: the array as an object of its own. ISO 32000 lets a value
+    // be indirect almost anywhere, and the gate licenses exactly this shape (the
+    // array object and the streams it names), so calling it malformed here made
+    // the reader refuse an archive the gate had already accepted — a legal
+    // document, refused with "expected an array". Round 3, from the reviewer's
+    // question about indirect arrays: the same archive inlined verifies, and the
+    // difference is one hop that no specification forbids.
+    let resolved;
+    let array: &[u8] = match pdf::parse_ref(value) {
+        Some(reference) => {
+            resolved = pdf::resolve(pdf, offsets, Some(cache), reference)?.into_owned();
+            &resolved
+        }
+        None => value,
     };
     let mut out = Vec::new();
     for r in pdf::array_refs(array)? {

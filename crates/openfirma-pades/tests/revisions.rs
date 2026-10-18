@@ -514,21 +514,7 @@ fn a_dangling_page_tree_kid_filled_with_a_rendered_page_is_refused_whole() {
     pades_verify(&signed, &anchors()).expect("a dangling kid is harmless on its own");
 
     // the catalog of the signed file, to re-point its /DSS at the new page
-    let marker = b"\n1 0 obj\n";
-    let at = signed
-        .windows(marker.len())
-        .rposition(|window| window == marker)
-        .expect("the signed file carries a catalog")
-        + 1;
-    let start = at + b"1 0 obj\n".len();
-    let end = start
-        + signed[start..]
-            .windows(b"endobj".len())
-            .position(|window| window == b"endobj")
-            .expect("the catalog ends");
-    let body = std::str::from_utf8(&signed[start..end])
-        .expect("the catalog is written as text")
-        .trim();
+    let body = last_catalog_body(&signed);
     let catalog = format!("<< /DSS 100 0 R {}", &body[2..]);
 
     let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
@@ -564,6 +550,94 @@ fn a_dangling_page_tree_kid_filled_with_a_rendered_page_is_refused_whole() {
         t.contains("101 0 R"),
         "the refusal names the stream the page exposed: {t}"
     );
+}
+
+/// The catalog body of the LAST revision, which is the one a reader resolves.
+fn last_catalog_body(pdf: &[u8]) -> String {
+    let marker = b"\n1 0 obj\n";
+    let at = pdf
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .expect("the file carries a catalog")
+        + 1;
+    let start = at + b"1 0 obj\n".len();
+    let end = start
+        + pdf[start..]
+            .windows(b"endobj".len())
+            .position(|window| window == b"endobj")
+            .expect("the catalog ends");
+    std::str::from_utf8(&pdf[start..end])
+        .expect("the catalog is written as text")
+        .trim()
+        .to_string()
+}
+
+/// One `/Length`-sized stream object body.
+fn stream_body(blob: &[u8]) -> Vec<u8> {
+    let mut out = format!("<< /Length {} >>\nstream\n", blob.len()).into_bytes();
+    out.extend_from_slice(blob);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+/// The counterpart of the refusals above, and the shape round 3 asked about: a
+/// LEGITIMATE archive must not be refused for HOW it names its data. ISO 32000
+/// lets a value be indirect almost anywhere, so a writer may build `/Certs` and
+/// `/CRLs` as objects of their own. The same hand-built archive verified with the
+/// arrays inline and failed with them indirect (`pdf: expected an array`), while
+/// the gate was already licensing that shape — the reader refusing what the door
+/// had accepted.
+#[test]
+fn an_archive_that_names_its_arrays_indirectly_is_read_too() {
+    let (Some(signer), Some(revocation)) = (signer(), crls()) else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let plain = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("B-B failed");
+
+    let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut cert_refs = Vec::new();
+    for (i, cert) in [handle("signer-rsa.crt"), handle("intermediate.crt")]
+        .iter()
+        .enumerate()
+    {
+        let number = 201 + i as u32;
+        objects.push((number, stream_body(cert.der())));
+        cert_refs.push(number);
+    }
+    let mut crl_refs = Vec::new();
+    for (i, revocation) in revocation.iter().enumerate() {
+        let RevocationBytes::Crl(der) = revocation else {
+            continue;
+        };
+        let number = 211 + i as u32;
+        objects.push((number, stream_body(der)));
+        crl_refs.push(number);
+    }
+    let array = |refs: &[u32]| {
+        let mut out = String::from("[");
+        for number in refs {
+            out.push_str(&format!(" {number} 0 R"));
+        }
+        out.push_str(" ]");
+        out
+    };
+    objects.push((101, array(&cert_refs).into_bytes()));
+    objects.push((102, array(&crl_refs).into_bytes()));
+    objects.push((
+        100,
+        b"<< /Type /DSS /Certs 101 0 R /CRLs 102 0 R >>".to_vec(),
+    ));
+    let body = last_catalog_body(&plain);
+    objects.push((1, format!("<< /DSS 100 0 R {}", &body[2..]).into_bytes()));
+
+    let as_refs: Vec<(u32, &[u8])> = objects
+        .iter()
+        .map(|(number, body)| (*number, body.as_slice()))
+        .collect();
+    let archived = append_two(&plain, &as_refs);
+    pades_verify(&archived, &anchors())
+        .expect("an archive that names its arrays indirectly is the same archive");
 }
 
 /// Append one revision that (re)defines SEVERAL objects at once. The shadow
