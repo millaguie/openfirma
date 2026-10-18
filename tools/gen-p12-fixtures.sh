@@ -27,9 +27,65 @@ openssl pkcs12 -export -out "$FIX/openssl-empty.p12" -inkey "$KEY" -in "$CRT" \
   -name "empty openssl" -passout pass: -macalg sha1
 # Same with the legacy PBEs, so the empty password is exercised on the PBES1
 # path too (this is what setup-test-keystores.sh writes into the NSS DB).
-openssl pkcs12 -export -out "$FIX/openssl-empty-legacy.p12" -inkey "$KEY" -in "$CRT" \
-  -name "empty openssl legacy" -passout pass: \
-  -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+# OpenSSL 3.6 silently DROPS -keypbe/-certpbe unless built with, or given, the
+# legacy provider: the container comes out AES-wrapped while its own `-info`
+# and `pkcs12` reads still happily report pbeWithSHA1And3DES, so only a second
+# reader of the real shape notices (CI run 39088995737 minted an AES file from
+# exactly these flags and our PBES1-strict parser refused it — correctly).
+# Generate, demand the promise from a strict second reader, and re-run with
+# -legacy when openssl did not honour the PBEs. The inner PKCS#7 lives inside
+# the data bag's OCTET STRING (openssl's "PKCS7 Data" line above proves that
+# is what it writes there), so the peel reads the outer structure directly:
+# walk to `cont [0] > prim OCTET STRING` and take its hex dump. A naive "first
+# long OCTET STRING" would peel the wrong element — RC2 containers carry the
+# ciphertext as exactly such a run. The strict reader is openssl's own pkcs7
+# parser: an AES/PBES2-wrapped authSafe never parses under PBE-SHA1-3DES.
+authsafe_is_pbdes() {
+  # $1 = p12 file. True when the data bag's inner ContentInfo is an
+  # EncryptedData over PBE-SHA1-3DES, read from bytes, not from openssl's
+  # opinion about its own output. No `-strhex`: this openssl build does not
+  # have it. The peel walks the printed tree instead — outer SEQUENCE,
+  # INTEGER version, the data bag's SEQUENCE, and the OCTET STRING under
+  # `cont [0]` carry their full hex in the `[HEX DUMP]:` text that even this
+  # build prints. A naive "first long OCTET STRING" would peel the wrong
+  # element; RC2 containers carry ciphertext as exactly such a run. The
+  # strict reader is openssl's own pkcs7 parser: an AES/PBES2-wrapped
+  # authSafe never parses under PBE-SHA1-3DES.
+  local der="$1" hex inner
+  hex="$(openssl asn1parse -inform DER -in "$der" 2>/dev/null |
+    awk '/cons: cont \[ 0 \]/ { want = 1; next }
+         want && /prim: OCTET STRING/ { sub(/^.*HEX DUMP]:/, ""); print; exit }')" || hex=""
+  [ -n "$hex" ] || return 1
+  inner="$der.inner.$$"
+  printf '%s' "$hex" | python3 -c 'import sys,binascii; sys.stdout.buffer.write(binascii.unhexlify(sys.stdin.read().strip()))' > "$inner" 2>/dev/null || { rm -f "$inner"; return 1; }
+  # The inner ContentInfo is an AuthSafe (a bare SEQUENCE of SafeBags), not a
+  # PKCS7; the strict reader runs on the pieces. It must contain exactly one
+  # EncryptedData — the wrapped authSafe, whose encryption algorithm must be
+  # pbeWithSHA1And3DES — and the key bag's shrouding must be PBES1 too. An
+  # AES/PBES2-wrapped container fails this at once: that is exactly the drift
+  # CI run 39088995737 minted.
+  local info ok=0 n_enc
+  info="$(openssl asn1parse -inform DER -in "$inner" 2>/dev/null)"
+  rm -f "$inner"
+  n_enc="$(printf '%s' "$info" | grep -c 'pkcs7-encryptedData')" || n_enc=0
+  [ "$n_enc" -eq 1 ] || ok=1
+  printf '%s' "$info" | grep -qiE 'pbeWithSHA1And3|PBE-SHA1-3DES' || ok=1
+  return "$ok"
+}
+gen_empty_legacy() {
+  openssl pkcs12 -export -out "$FIX/openssl-empty-legacy.p12" -inkey "$KEY" -in "$CRT" \
+    -name "empty openssl legacy" -passout pass: \
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 "$@" 2>/dev/null ||
+    { echo "error: openssl pkcs12 -export failed for openssl-empty-legacy.p12" >&2; return 1; }
+}
+gen_empty_legacy
+if ! authsafe_is_pbdes "$FIX/openssl-empty-legacy.p12"; then
+  gen_empty_legacy -legacy || exit 1
+  if ! authsafe_is_pbdes "$FIX/openssl-empty-legacy.p12"; then
+    echo "error: openssl cannot write a PBE-SHA1-3DES container even with -legacy on this machine; the PBES1 fixtures cannot be generated here" >&2
+    exit 1
+  fi
+fi
 
 # --- Java 11+ keytool (A1) ---------------------------------------------------
 # The modern default PKCS12 store: PBES2 with AES-256-CBC, HMAC-SHA256 MAC and
