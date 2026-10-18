@@ -580,21 +580,11 @@ fn stream_body(blob: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The counterpart of the refusals above, and the shape round 3 asked about: a
-/// LEGITIMATE archive must not be refused for HOW it names its data. ISO 32000
-/// lets a value be indirect almost anywhere, so a writer may build `/Certs` and
-/// `/CRLs` as objects of their own. The same hand-built archive verified with the
-/// arrays inline and failed with them indirect (`pdf: expected an array`), while
-/// the gate was already licensing that shape — the reader refusing what the door
-/// had accepted.
-#[test]
-fn an_archive_that_names_its_arrays_indirectly_is_read_too() {
-    let (Some(signer), Some(revocation)) = (signer(), crls()) else {
-        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
-        return;
-    };
-    let plain = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("B-B failed");
-
+/// A legitimate archive pass built by hand over a B-B signature: brand-new
+/// certificate and CRL streams, named by a brand-new `/DSS` the catalog points
+/// at. `indirect` names `/Certs` and `/CRLs` through objects of their own
+/// instead of inlining the arrays.
+fn hand_built_archive(plain: &[u8], revocation: &[RevocationBytes], indirect: bool) -> Vec<u8> {
     let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut cert_refs = Vec::new();
     for (i, cert) in [handle("signer-rsa.crt"), handle("intermediate.crt")]
@@ -622,22 +612,105 @@ fn an_archive_that_names_its_arrays_indirectly_is_read_too() {
         out.push_str(" ]");
         out
     };
-    objects.push((101, array(&cert_refs).into_bytes()));
-    objects.push((102, array(&crl_refs).into_bytes()));
-    objects.push((
-        100,
-        b"<< /Type /DSS /Certs 101 0 R /CRLs 102 0 R >>".to_vec(),
-    ));
-    let body = last_catalog_body(&plain);
+    let dss = if indirect {
+        objects.push((101, array(&cert_refs).into_bytes()));
+        objects.push((102, array(&crl_refs).into_bytes()));
+        b"<< /Type /DSS /Certs 101 0 R /CRLs 102 0 R >>".to_vec()
+    } else {
+        format!(
+            "<< /Type /DSS /Certs {} /CRLs {} >>",
+            array(&cert_refs),
+            array(&crl_refs)
+        )
+        .into_bytes()
+    };
+    objects.push((100, dss));
+    let body = last_catalog_body(plain);
     objects.push((1, format!("<< /DSS 100 0 R {}", &body[2..]).into_bytes()));
-
     let as_refs: Vec<(u32, &[u8])> = objects
         .iter()
         .map(|(number, body)| (*number, body.as_slice()))
         .collect();
-    let archived = append_two(&plain, &as_refs);
+    append_two(plain, &as_refs)
+}
+
+/// A LEGITIMATE archive must not be refused for HOW it names its data. ISO 32000
+/// lets a value be indirect almost anywhere, so a writer may build `/Certs` and
+/// `/CRLs` as objects of their own. The same archive verified with the arrays
+/// inline and failed with them indirect (`pdf: expected an array`), while the
+/// gate was already licensing that shape — the reader refusing what the door had
+/// accepted.
+#[test]
+fn an_archive_that_names_its_arrays_indirectly_is_read_too() {
+    let (Some(signer), Some(revocation)) = (signer(), crls()) else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let plain = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("B-B failed");
+    let archived = hand_built_archive(&plain, &revocation, true);
     pades_verify(&archived, &anchors())
         .expect("an archive that names its arrays indirectly is the same archive");
+}
+
+/// A number run that only LOOKS like a reference is not one, and must not cost a
+/// legitimate archive its document. `refs_in` scanned raw bytes, so a body
+/// carrying the text "201 0 R" made object 201 look like something a reader
+/// resolves, and the certificate stream the archive wrote was dropped as a
+/// rewritten object: a real archive, refused over digits in a string.
+#[test]
+fn a_string_that_looks_like_a_reference_is_not_one() {
+    let (Some(signer), Some(revocation)) = (signer(), crls()) else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R \
+                 /PieceInfo << /Nota (ver el objeto 201 0 R de este documento) >> >>";
+    let crafted = append_two(INPUT, &[(3, page.as_slice())]);
+    let plain = pades_sign(&crafted, &signer, &PadesOptions::default()).expect("signing failed");
+    let archived = hand_built_archive(&plain, &revocation, false);
+    pades_verify(&archived, &anchors()).expect("a string that reads like a reference is not one");
+}
+
+/// And the other direction of the same scanner: a comment is a separator, so a
+/// reference SPLIT by one still resolves for a reader — `100 % note` newline
+/// `0 R`. It did not for the gate, so an appended object a page resolves through
+/// such a reference was licensed, and its text rendered over bytes no signature
+/// covered.
+#[test]
+fn a_reference_split_by_a_comment_is_still_a_reference() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> /XObject << /Xm1 100 % nota\n0 R >> >> \
+                 /Contents 4 0 R >>";
+    let body = b"BT /F1 12 Tf 72 770 Td (openfirma PAdES test document) Tj ET /Xm1 Do";
+    let content = format!(
+        "<< /Length {} >>\nstream\n{}\nendstream",
+        body.len(),
+        std::str::from_utf8(body).expect("ascii")
+    );
+    let crafted = append_two(INPUT, &[(3, page.as_slice()), (4, content.as_bytes())]);
+    let plain = pades_sign(&crafted, &signer, &PadesOptions::default()).expect("signing failed");
+    pades_verify(&plain, &anchors()).expect("a comment-split reference is harmless on its own");
+
+    let text = b"BT /F1 24 Tf 72 400 Td (PAGUESE 9999 EUR) Tj ET";
+    let xobject = format!(
+        "<< /Type /DSS /Subtype /Form /BBox [ 0 0 595 842 ] \
+         /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+        text.len(),
+        std::str::from_utf8(text).expect("ascii")
+    );
+    let attacked = append_two(&plain, &[(100, xobject.as_bytes())]);
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a reference a reader resolves is a reference, comment or not");
+    let t = error.to_string();
+    assert!(
+        t.contains("100 0 R"),
+        "the refusal names the rendered object: {t}"
+    );
 }
 
 /// Append one revision that (re)defines SEVERAL objects at once. The shadow

@@ -975,6 +975,46 @@ pub fn refs_in(body: &[u8]) -> Vec<ObjRef> {
     let mut i = 0usize;
     while i < body.len() {
         let b = body[i];
+        // A comment runs to the end of the line and a reader treats it as a
+        // single space, so it separates tokens WITHOUT breaking a reference
+        // already half read: `100 % note` newline `0 R` resolves. Round 3: an
+        // appended XObject aimed at from a comment-split reference rendered its
+        // text while verify answered OK, because this scanner reset there.
+        if b == b'%' {
+            while i < body.len() && body[i] != b'\n' && body[i] != b'\r' {
+                i += 1;
+            }
+            continue;
+        }
+        // Inside a string a reader resolves nothing, so nothing in one may be
+        // read as a reference here: a phantom reference would drop a candidate
+        // the document needs (a content stream whose text literally says
+        // "123 0 R" is a false refusal, not a shadow attack).
+        if b == b'(' {
+            i = skip_literal_string(body, i);
+            pending_reset(&mut first, &mut second);
+            continue;
+        }
+        if b == b'<' {
+            if body.get(i + 1) == Some(&b'<') {
+                // a dictionary opens: `<` then `<`, neither is a string (reading
+                // them one at a time made the second one look like a hex string
+                // and swallow the references inside the dictionary)
+                i += 2;
+                pending_reset(&mut first, &mut second);
+                continue;
+            }
+            // a hex string: hex digits and whitespace up to the closing `>`
+            i += 1;
+            while i < body.len() && body[i] != b'>' {
+                i += 1;
+            }
+            if i < body.len() {
+                i += 1;
+            }
+            pending_reset(&mut first, &mut second);
+            continue;
+        }
         if b.is_ascii_digit() && (i == 0 || !body[i - 1].is_ascii_digit()) {
             let start = i;
             while i < body.len() && body[i].is_ascii_digit() {
@@ -987,9 +1027,10 @@ pub fn refs_in(body: &[u8]) -> Vec<ObjRef> {
                 pending_reset(&mut first, &mut second);
                 continue;
             };
-            // a run may follow the previous one only across whitespace
-            let gap_ok =
-                |prev: &(u64, usize)| body[prev.1..start].iter().all(u8::is_ascii_whitespace);
+            // a run may follow the previous one only across what a reader
+            // reads as a separator: whitespace, and comments (a `%` to the end
+            // of the line, which a reader treats as a single space)
+            let gap_ok = |prev: &(u64, usize)| gap_is_separator(&body[prev.1..start]);
             match (first, second) {
                 (None, _) => first = Some((value, i)),
                 (Some(p), None) if gap_ok(&p) => second = Some((value, i)),
@@ -1016,7 +1057,7 @@ pub fn refs_in(body: &[u8]) -> Vec<ObjRef> {
             };
             // only whitespace between the generation and the R (the byte before
             // this one was checked not to be a digit above)
-            if body[g.1..i].iter().all(u8::is_ascii_whitespace)
+            if gap_is_separator(&body[g.1..i])
                 && a.0 > 0
                 && a.0 <= u64::from(u32::MAX)
                 && g.0 <= u64::from(u16::MAX)
@@ -1043,6 +1084,49 @@ pub fn refs_in(body: &[u8]) -> Vec<ObjRef> {
 fn pending_reset(first: &mut Option<(u64, usize)>, second: &mut Option<(u64, usize)>) {
     *first = None;
     *second = None;
+}
+
+/// Whether `gap` is only what a reader reads as a separator between two
+/// tokens: whitespace and comments (`%` to the end of the line).
+fn gap_is_separator(gap: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < gap.len() {
+        match gap[i] {
+            b'%' => {
+                while i < gap.len() && gap[i] != b'\n' && gap[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b if b.is_ascii_whitespace() => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// One past the closing `)` of the literal string that starts at `at`, honouring
+/// backslash escapes and balanced parentheses — the way a reader tokenizes it.
+fn skip_literal_string(body: &[u8], at: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = at;
+    while i < body.len() {
+        match body[i] {
+            b'\\' => i += 2,
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    body.len()
 }
 
 /// The offset of the `stream` keyword that begins an object's payload, if the
