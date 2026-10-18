@@ -556,14 +556,23 @@ fn an_archive_that_stores_its_vri_dictionary_as_an_object_passes_the_gate() {
     let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
     let cert = handle("signer-rsa.crt");
     let stream = stream_body(cert.der());
-    let catalog = b"<< /Type /Catalog /Pages 2 0 R /DSS 99 0 R >>";
+    // The archive takes the catalog it was handed and adds /DSS to it, exactly
+    // as a real archive pass does: the document's form stays where it was (a
+    // revision that removes it changes what a reader shows, and is refused —
+    // measured in `a_form_the_document_had_cannot_be_swapped_for_another`).
+    let handed = last_catalog_body(&signed);
+    let inner = handed
+        .strip_suffix(">>")
+        .expect("the catalog is a dictionary")
+        .trim_end();
+    let catalog = format!("{inner} /DSS 99 0 R >>");
     let dss = b"<< /Type /DSS /Certs 97 0 R /VRI 96 0 R >>";
     let array = b"[ 98 0 R ]";
     let vri = b"<< /ABCDEF0123456789ABCDEF0123456789ABCDEF01 << /Cert [ 98 0 R ] >> >>";
     let archived = append_two(
         &signed,
         &[
-            (1, catalog.as_slice()),
+            (1, catalog.as_bytes()),
             (99, dss.as_slice()),
             (97, array.as_slice()),
             (96, vri.as_slice()),
@@ -572,6 +581,101 @@ fn an_archive_that_stores_its_vri_dictionary_as_an_object_passes_the_gate() {
     );
     pades_verify(&archived, &anchors())
         .expect("a writer may store the /VRI dictionary as an object of its own");
+}
+
+/// Round 4, C-1: a catalog's `/AcroForm` is not free to move.
+///
+/// A signing pass may INTRODUCE a form into a document that had none, and it
+/// may GROW the form the document had with signature fields; it may not swap the
+/// form for another dictionary, however it spells it (inline for a reference,
+/// one reference for another). What a viewer draws an existing field's text with
+/// comes out of that dictionary: the field's own `/DA` names an entry of the
+/// form's `/DR`, and a viewer generates the appearance of a field that has none
+/// of its own from exactly that.
+///
+/// Measured on this document at 200 dpi, with a gate that licensed the swap and
+/// therefore verified both variants: the honest form's `/DR` names a serif face
+/// and "IMPORTE TOTAL MIL" renders serif (13256 dark pixels under the field);
+/// the same signed bytes with the catalog repointed at a covered dictionary
+/// whose `/DR` names a sans face render sans (14799), and a `/DR` whose font
+/// carries a `/Differences` remap changes the text OCR reads back. No covered
+/// byte moved: the glyphs did.
+#[test]
+fn a_form_the_document_had_cannot_be_swapped_for_another_dictionary() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // The document handed to the signer carries a text field whose appearance a
+    // viewer generates, the honest face its `/DA` names, a face with a remapping
+    // `/Encoding`, and a dictionary shaped like a form whose `/DR` names that
+    // one instead.
+    let field = b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (concepto) \
+                  /V (IMPORTE TOTAL MIL) /DA (/Helv 0 Tf 0 g) \
+                  /Rect [ 72 600 400 630 ] /F 4 /P 3 0 R >>";
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R \
+                 /Annots [ 13 0 R ] >>";
+    let honest = b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>";
+    let remapped = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+                     /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding \
+                     /Differences [ 65 /B 66 /C 67 /D 68 /E 69 /F 70 /G 71 /H \
+                     72 /I 73 /J 74 /K 75 /L 76 /M 77 /N 78 /O 79 /P 80 /Q ] >> >>";
+    let spare = b"<< /NeedAppearances true /DR << /Font << /Helv 10 0 R >> >> >>";
+    let catalog = b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /DA (/Helv 0 Tf 0 g) \
+                    /DR << /Font << /Helv 12 0 R >> >> /Fields [ 13 0 R ] >> >>";
+    let dressed = append_two(
+        INPUT,
+        &[
+            (1, catalog.as_slice()),
+            (3, page.as_slice()),
+            (10, remapped.as_slice()),
+            (11, spare.as_slice()),
+            (12, honest.as_slice()),
+            (13, field.as_slice()),
+        ],
+    );
+    let signed = pades_sign(&dressed, &signer, &PadesOptions::default()).expect("signing failed");
+    pades_verify(&signed, &anchors()).expect("the form the signer was handed is honest");
+
+    let handed = last_catalog_body(&signed);
+    let repointed = repointed_acroform(&handed, "11 0 R");
+    let attacked = append_two(&signed, &[(1, repointed.as_bytes())]);
+    let error = pades_verify(&attacked, &anchors()).expect_err(
+        "a covered dictionary is not a licence to swap the font signed field text is drawn with",
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains("no archive may append"),
+        "the refusal says what was violated: {text}"
+    );
+    assert!(
+        text.contains("1 0 R"),
+        "the refusal names the catalog the form was swapped in: {text}"
+    );
+}
+
+/// The same rule from the other side: an appended revision may not take the
+/// document's form away, because a viewer that had a form and now has none draws
+/// the fields differently — the ones whose appearance it generated stop being
+/// generated — and an archive pass has no business doing that.
+#[test]
+fn a_revision_that_takes_the_documents_form_away_is_refused() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    let handed = last_catalog_body(&signed);
+    let stripped = repointed_acroform(&handed, "");
+    let attacked = append_two(&signed, &[(1, stripped.as_bytes())]);
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a revision that removes the form changes what a reader shows");
+    let text = error.to_string();
+    assert!(
+        text.contains("1 0 R"),
+        "the refusal names the catalog the form was taken from: {text}"
+    );
 }
 
 /// Round 3, C-1 once more: licensing every brand-new `/Type /DSS` dictionary
@@ -851,6 +955,44 @@ fn last_catalog_body(pdf: &[u8]) -> String {
         .expect("the catalog is written as text")
         .trim()
         .to_string()
+}
+
+/// The catalog `catalog` with its `/AcroForm` value replaced by `value` — or,
+/// with `value` empty, with the key taken out entirely — and the rest of the
+/// dictionary untouched.
+fn repointed_acroform(catalog: &str, value: &str) -> String {
+    let after_key = catalog
+        .find("/AcroForm")
+        .expect("the catalog carries a form")
+        + "/AcroForm".len();
+    let (head, tail) = catalog.split_at(after_key);
+    let tail = tail.trim_start();
+    let bytes = tail.as_bytes();
+    let (mut depth, mut at, mut cut) = (0usize, 0usize, None);
+    while at < bytes.len() {
+        if bytes[at] == b'<' && bytes.get(at + 1) == Some(&b'<') {
+            depth += 1;
+            at += 2;
+            continue;
+        }
+        if bytes[at] == b'>' && bytes.get(at + 1) == Some(&b'>') {
+            depth -= 1;
+            at += 2;
+            if depth == 0 {
+                cut = Some(at);
+                break;
+            }
+            continue;
+        }
+        at += 1;
+    }
+    let cut = cut.expect("the form value is a balanced dictionary");
+    let rest = tail[cut..].trim_start();
+    if value.is_empty() {
+        format!("{} {rest}", head.trim_end_matches("/AcroForm").trim_end())
+    } else {
+        format!("{head} {value} {rest}")
+    }
 }
 
 /// One `/Length`-sized stream object body.

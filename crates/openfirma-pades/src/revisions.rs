@@ -604,31 +604,16 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
         // The keys a later revision may introduce into the catalog: /DSS (an
         // archive pass) and /AcroForm (a signature pass that first made the doc-
         // ument a form). Nothing else — /PageLabels, /Names, a re-pointed /Pages
-        // or a value change of an existing key — is licensed.
-        let dss_change = differs
+        // or a value that means something else — is licensed, and the /AcroForm
+        // VALUE is held to the same question the AcroForm object below answers:
+        // did a form appear, or did the form the document had grow signature
+        // fields? See `acroform_change_is_plumbing`.
+        if differs
             .iter()
-            .all(|key| key == b"/DSS" || key == b"/AcroForm");
-        if dss_change {
-            return Change::ValidationData(*object);
-        }
-        // A signature pass that introduced /AcroForm pointing at a dictionary
-        // whose fields are all signature fields: the catalog change is plumbing.
-        let older_acro = pdf::get(older, "/AcroForm").and_then(pdf::parse_ref);
-        let newer_acro = pdf::get(newer, "/AcroForm").and_then(pdf::parse_ref);
-        if older_acro.is_none()
-            && newer_acro.is_some_and(|a| {
-                final_state.get(&a).is_some_and(|body| {
-                    references_in(Some(body))
-                        .into_iter()
-                        .all(|f| is_signature_field(pdf, locations, final_state, &f))
-                        || pdf::get(body, "/Fields")
-                            .map(|v| references_in(Some(v)).is_empty())
-                            .unwrap_or(false)
-                })
-            })
-            && only_new_key_differs(older, newer, b"/AcroForm")
+            .all(|key| key == b"/DSS" || key == b"/AcroForm")
+            && acroform_change_is_plumbing(pdf, locations, final_state, older, newer)
         {
-            return Change::SignaturePlumbing(*object);
+            return Change::ValidationData(*object);
         }
     }
     // AcroForm dictionaries: may grow /Fields with signature fields and change
@@ -1088,12 +1073,19 @@ fn references_in(value: Option<&[u8]>) -> Vec<ObjRef> {
 /// Whether every key of both dictionaries except `except` is byte-identical on
 /// name and value.
 fn other_keys_equal(older: &[u8], newer: &[u8], except: &[u8]) -> bool {
+    keys_equal_except(older, newer, &[except])
+}
+
+/// Whether every key of both dictionaries except those in `except` is
+/// byte-identical on name and value.
+fn keys_equal_except(older: &[u8], newer: &[u8], except: &[&[u8]]) -> bool {
     let (Ok(a), Ok(b)) = (pdf::items(older), pdf::items(newer)) else {
         return false;
     };
+    let skipped = |name: &[u8]| except.contains(&name);
     for (ka, va) in &a {
         let name = &older[ka.clone()];
-        if name == except {
+        if skipped(name) {
             continue;
         }
         match b.iter().find(|(kb, _)| &newer[kb.clone()] == name) {
@@ -1107,7 +1099,7 @@ fn other_keys_equal(older: &[u8], newer: &[u8], except: &[u8]) -> bool {
     }
     for (kb, _) in &b {
         let name = &newer[kb.clone()];
-        if name == except {
+        if skipped(name) {
             continue;
         }
         if !a.iter().any(|(ka, _)| &older[ka.clone()] == name) {
@@ -1117,37 +1109,127 @@ fn other_keys_equal(older: &[u8], newer: &[u8], except: &[u8]) -> bool {
     true
 }
 
-/// Whether `newer` differs from `older` by exactly one new key, and it is `only`.
-fn only_new_key_differs(older: &[u8], newer: &[u8], only: &[u8]) -> bool {
-    let (Ok(a), Ok(b)) = (pdf::items(older), pdf::items(newer)) else {
+/// The dictionary a reader reads as the document's form: the catalog's
+/// `/AcroForm` value, which may be an inline dictionary or a reference.
+fn acroform_dict<'a>(
+    final_state: &'a BTreeMap<ObjRef, Vec<u8>>,
+    catalog: &'a [u8],
+) -> Option<&'a [u8]> {
+    let value = pdf::get(catalog, "/AcroForm")?;
+    match pdf::parse_ref(value) {
+        Some(reference) => final_state.get(&reference).map(Vec::as_slice),
+        None => Some(value),
+    }
+}
+
+/// Whether the catalog's `/AcroForm` moved the way a signing pass moves it:
+/// a form APPEARS in a document that had none, or the form the document had
+/// grows signature fields. A value that moves in any other way is a different
+/// form, however it spells itself — an inline dictionary rewritten as a
+/// reference to somebody else's, or the other way round, is still a swap.
+///
+/// What a reader resolves the drawing of EXISTING field text through is pinned,
+/// because that is text an earlier signature signed: the form's `/DA` (the
+/// appearance a field with none of its own is drawn with), its `/Q` (that
+/// appearance's alignment), its `/XFA` (a packet a viewer renders INSTEAD of the
+/// pages), and its `/DR`. The `/DR` may only GAIN font entries — a pass that
+/// writes the font of its own visible signature hangs it there — and gaining one
+/// cannot change how a field draws: the field's `/DA` names the entry, and a
+/// name that already bound a font object keeps binding it. `/SigFlags` may be
+/// set (a pass marks that signatures exist) and `/NeedAppearances` may go from
+/// true to false or absent — a viewer regenerating LESS than before — but not
+/// the other way, which is a viewer drawing text this document did not show.
+///
+/// Measured before this rule (`docs/review-findings.md`, R4-C1): a covered form
+/// whose `/DR` names a serif face renders the signed field text in serif (13256
+/// dark pixels under the field at 200 dpi) and the same document with the
+/// catalog repointed at a covered dictionary naming a sans face renders it in
+/// sans (14799) — same signed bytes, `verify` answered OK over both. A `/DR`
+/// whose font carries a `/Differences` remap changes the text OCR reads.
+///
+/// A form INTRODUCED into a document that had none is licensed wholesale as
+/// before, and that is a named residual rather than a measured one: a document
+/// signed without an AcroForm cannot be built with this crate's own writer
+/// (every PAdES pass writes one), so no test can hold a tighter condition here
+/// to account. It is listed as an open question instead of guessed at.
+fn acroform_change_is_plumbing(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    older: &[u8],
+    newer: &[u8],
+) -> bool {
+    let Some(new_form) = acroform_dict(final_state, newer) else {
         return false;
     };
-    for (ka, va) in &a {
-        match b
+    let Some(old_form) = acroform_dict(final_state, older) else {
+        // the document had no form: the pass that introduced this one is the
+        // pass that made the document a form (residual, see above)
+        return true;
+    };
+    let grew = added_references(old_form, new_form, b"/Fields");
+    let lost = removed_references(old_form, new_form, b"/Fields");
+    let regenerates = |form: &[u8]| {
+        pdf::get(form, "/NeedAppearances").is_some_and(|v| pdf::trim_ws(v) == b"true")
+    };
+    lost.is_empty()
+        && grew
             .iter()
-            .find(|(kb, _)| newer[kb.clone()] == older[ka.clone()])
-        {
-            Some((_, vb)) => {
-                if older[va.clone()] != newer[vb.clone()] {
-                    return false;
-                }
-            }
-            None => return false,
+            .all(|field| is_signature_field(pdf, locations, final_state, field))
+        && !(regenerates(new_form) && !regenerates(old_form))
+        && dr_keeps_its_fonts(final_state, old_form, new_form)
+        && keys_equal_except(
+            old_form,
+            new_form,
+            &[b"/Fields", b"/SigFlags", b"/NeedAppearances", b"/DR"],
+        )
+}
+
+/// Whether the form's `/DR` still offers every font it offered, each entry bound
+/// to the same font object (new entries are fine — a signing pass hangs the font
+/// of its own visible signature there). The other resources of a `/DR` (an
+/// `/XObject`, a `/ColorSpace`) may not move: the appearance a viewer generates
+/// is drawn with those too.
+fn dr_keeps_its_fonts(
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    old_form: &[u8],
+    new_form: &[u8],
+) -> bool {
+    let (Some(old_dr), Some(new_dr)) = (pdf::get(old_form, "/DR"), pdf::get(new_form, "/DR"))
+    else {
+        // no /DR before: nothing was bound that could be rebound; a /DR that
+        // vanished took the fonts its fields' /DA names with it.
+        return pdf::get(old_form, "/DR").is_none();
+    };
+    let kept = match (
+        font_entries(final_state, old_dr),
+        font_entries(final_state, new_dr),
+    ) {
+        (None, _) => true,
+        (Some(old), Some(new)) => old.iter().all(|entry| new.contains(entry)),
+        (Some(_), None) => false,
+    };
+    kept && other_keys_equal(old_dr, new_dr, b"/Font")
+}
+
+/// The `name -> font object` entries of a resource dictionary's `/Font`, as the
+/// pairs a reader binds when it resolves a field's `/DA`.
+fn font_entries(
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    resources: &[u8],
+) -> Option<Vec<(Vec<u8>, ObjRef)>> {
+    let value = pdf::get(resources, "/Font")?;
+    let fonts = match pdf::parse_ref(value) {
+        Some(reference) => final_state.get(&reference).map(Vec::as_slice)?,
+        None => value,
+    };
+    let mut entries = Vec::new();
+    for (name_at, value_at) in pdf::items(fonts).ok()? {
+        if let Some(font) = pdf::parse_ref(&fonts[value_at]) {
+            entries.push((fonts[name_at].to_vec(), font));
         }
     }
-    let mut fresh = 0usize;
-    for (kb, _) in &b {
-        if !a
-            .iter()
-            .any(|(ka, _)| older[ka.clone()] == newer[kb.clone()])
-        {
-            fresh += 1;
-            if &newer[kb.clone()] != only {
-                return false;
-            }
-        }
-    }
-    fresh == 1
+    Some(entries)
 }
 
 /// Collect the objects the catalog's archive names as validation data, reading
