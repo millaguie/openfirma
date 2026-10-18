@@ -406,12 +406,15 @@ fn cert_guard_blocks_every_nested_signature_shape() {
         }
         Err(e) => panic!("cannot run the guard self-test: {e}"),
     };
-    // A `bash` that exists but is NOT a shell: on Windows runners PATH's bash
-    // may be the WSL dispatcher, which prints "Windows Subsystem for Linux
-    // must be updated…" and exits nonzero without ever running a probe (CI run
-    // 39091143744's windows jobs). That is a missing prerequisite like any
-    // other, not a guard verdict — the same skip/require rules apply, judged
-    // from its own message because it produces no probe output to judge.
+    // A `bash` that exists but is NOT a shell: on Windows runners PATH's
+    // bash may be the WSL dispatcher — "has no installed distributions" or
+    // "must be updated to the latest version" — which exits nonzero without
+    // ever running a probe (runs 39091143744 and 39106701806; the message
+    // lands on stderr, so both channels are joined below). That is a missing
+    // prerequisite like any other, not a guard verdict: it follows the same
+    // skip/require rules as a bash that is absent entirely. The ci.yml PKI
+    // step puts Git's real bash.exe first on PATH to keep this from firing
+    // on healthy runners; the panic message names the way out either way.
     fn decode(bytes: &[u8]) -> String {
         // Both channels, decoded: a Windows tooling error (a WSL dispatcher
         // message, a loader complaint) lands on stdout in UTF-16LE — and
@@ -430,7 +433,7 @@ fn cert_guard_blocks_every_nested_signature_shape() {
             String::from_utf8_lossy(bytes).into_owned()
         }
     }
-    if !out.status.success() && !out.stdout.is_empty() {
+    if !out.status.success() && !(out.stdout.is_empty() && out.stderr.is_empty()) {
         let combined = format!("{}{}", decode(&out.stdout), decode(&out.stderr));
         if combined.contains("Subsystem for Linux") {
             if require && !allowed {
