@@ -52,8 +52,13 @@ very lockfile the artifact was built from (`tools/ABOUT_TEMPLATE.hbs` and
 regenerates the same list with:
 
 ```
-cargo install cargo-about && cargo about generate tools/ABOUT_TEMPLATE.hbs > THIRD-PARTY-LICENSES.html
+cargo install cargo-about --locked --version "^0.9" --features cli
+cargo about generate tools/ABOUT_TEMPLATE.hbs > THIRD-PARTY-LICENSES.html
 ```
+
+`--features cli` is required on cargo-about 0.9.x: the binary lives behind a
+feature that is off by default, so the install otherwise succeeds, ships no
+`cargo about` command, and the generate line fails with `no such command`.
 
 The tree is NOT "Apache-2.0 OR MIT (RustCrypto)" as an earlier revision of this
 file claimed; the lockfile's census (measured with `cargo metadata`, 495

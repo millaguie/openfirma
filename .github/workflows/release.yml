@@ -106,7 +106,17 @@ jobs:
       - name: third-party licence report
         shell: bash
         run: |
-          cargo install cargo-about --locked --version "^0.9"
+          # `--features cli` is NOT optional on 0.9.x: the feature that builds
+          # the cargo-about binary is off by default, so a plain install ends
+          # with `warning: none of the package's binaries are available for
+          # install using the selected features / bin "cargo-about" requires
+          # the features: cli` and the next line dies with
+          # `error: no such command: about` (exit 101). This step and the
+          # config it drives never ran before the first release dispatch
+          # (run 39128074408), where all eight legs failed here: the ci
+          # workflow's `licences` job now runs these exact commands on every
+          # push, so the gate is exercised before a tag exists.
+          cargo install cargo-about --locked --version "^0.9" --features cli
           cargo about generate tools/ABOUT_TEMPLATE.hbs > THIRD-PARTY-LICENSES.html
           grep -q "epaint_default_fonts" THIRD-PARTY-LICENSES.html  # the GUI fonts must appear
 

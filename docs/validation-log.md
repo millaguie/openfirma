@@ -33,6 +33,7 @@ platforms that provision them; the golden diff is a pre-release local gate.
 | cert-material guard over every tracked file and every blob in history, incl. nested PAdES/XAdES/CMS shapes and the guard's own self-test | `no-real-certs` job + `cert_guard_blocks_every_nested_signature_shape` | pass | 2026-10-15 (shapes extended 2026-10-17) |
 | RustSec audit against `.cargo/audit.toml` (every accepted advisory documented) | `audit` job | pass, with the two documented exceptions listed there | 2026-10-17 |
 | MSRV floors checked: everything but the GUI at 1.85, the GUI at 1.95 | `msrv` job | pass | 2026-10-17 |
+| Third-party licence report renders with the release workflow's exact commands (`cargo install cargo-about … --features cli` + `cargo about generate`) and contains the GUI's font crates | `licences` job | pass | 2026-10-18 — the job exists because the release workflow's first dispatch (run 39128074408) showed the step could not run at all on any of its eight legs; see review 07 H-12 |
 
 ## Automated locally (pre-release), not in CI
 

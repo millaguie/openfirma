@@ -89,6 +89,39 @@ jobs:
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
+  # Third-party licence report gate. release.yml renders
+  # THIRD-PARTY-LICENSES.html from about.toml + tools/ABOUT_TEMPLATE.hbs and
+  # ships it inside every artifact, because shipping the notices is a condition
+  # of distributing MIT/Apache-2.0/OFL binaries, not a courtesy. Nothing
+  # exercised that pipeline until the release workflow's first real dispatch
+  # (run 39128074408), where all eight legs died in it: `cargo install
+  # cargo-about` without `--features cli` installs no binary at all, and
+  # about.toml listed six SPDX *expressions* where cargo-about parses a list of
+  # single licensees, so the config did not even deserialize. This job runs the
+  # release step's EXACT commands on every push, so the release gate is
+  # exercised long before a tag exists — a gate nobody has run is not a gate.
+  licences:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      # rust-cache also caches ~/.cargo/bin, so cargo-about is compiled once
+      # rather than on every run.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # cargo-about resolves the lockfile through cargo metadata itself, which
+      # unpacks every dependency into the registry cache — no build step here.
+      - name: third-party licence report (the release workflow's own commands)
+        run: |
+          set -euo pipefail
+          cargo install cargo-about --locked --version "^0.9" --features cli
+          cargo about generate tools/ABOUT_TEMPLATE.hbs > THIRD-PARTY-LICENSES.html
+          grep -q "epaint_default_fonts" THIRD-PARTY-LICENSES.html  # the GUI fonts must appear
+          # The greps can only pass on a real render; this bound makes an empty
+          # or truncated report loud instead of silently greeting-less.
+          test "$(wc -c < THIRD-PARTY-LICENSES.html)" -gt 20000
+
   # MSRV gate (review 07, H-8). The workspace declares two floors: everything
   # but the GUI builds on 1.85; eframe/egui 0.37 demand 1.95, so openfirma-gui
   # carries that rust-version itself. Each floor is checked at its own

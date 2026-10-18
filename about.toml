@@ -7,12 +7,19 @@
 # lawfully combine with; anything new that lands outside it makes the report
 # FAIL to generate — which is the point: an unacceptable licence cannot enter a
 # release quietly.
+#
+# Every entry must be a single SPDX licence identifier, optionally with a `WITH
+# <exception>` clause — cargo-about parses this list as `spdx::Licensee`, not as
+# an expression. A crate declared `MIT OR Apache-2.0` needs just "MIT" and
+# "Apache-2.0" listed: an OR-chain is satisfied by any one accepted term, while
+# an AND-chain needs every term. Compound entries ("MIT OR Apache-2.0",
+# "(MIT OR Apache-2.0) AND OFL-1.1") are a config error and make the whole file
+# fail to deserialize — which is how this list was found broken: it had six of
+# them and the release job could not produce a report at all.
 
 accepted = [
   "MIT",
   "Apache-2.0",
-  "MIT OR Apache-2.0",
-  "Apache-2.0 OR MIT",
   "Unicode-3.0",
   "Zlib",
   "ISC",
@@ -22,18 +29,15 @@ accepted = [
   "BSL-1.0",
   "Unlicense",
   "0BSD",
+  # the font crates: epaint_default_fonts declares
+  # `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0`, whose AND-parts are
+  # these two plus MIT/Apache-2.0 above — there is no license *exception* here,
+  # so a `[crate-name]` table with `accepted` is not the way to spell it (that
+  # table configures a crate by name, and no crate is called this).
   "OFL-1.1",
-  # the font crates' real expressions; cargo-about satisfies OR-chains by
-  # picking one accepted term, AND-chains need every part listed:
-  "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0",
-  "(MIT OR Apache-2.0) AND Unicode-3.0",
-  "Apache-2.0 AND MIT",
-  "Apache-2.0 OR GPL-2.0-only",
+  "Ubuntu-font-1.0",
   "Apache-2.0 WITH LLVM-exception",
 ]
 
 ignore-dev-dependencies = true
 private = { ignore = true }
-
-[ubuntu-font-licence]
-accepted = ["Ubuntu-font-1.0"]
