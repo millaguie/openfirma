@@ -254,9 +254,17 @@ adversarial review produced against it (the two hardening waves, tests under
 `crates/openfirma-pades/tests/`). The revisions gate classifies every object a
 revision after a signature redefines against the whitelist of what an archive
 may append (ETSI EN 319 142-1): new signature dictionaries, document
-time-stamps, `/DSS` validation data, signature field plumbing — anything else,
-a rewritten page or content stream included, is the incremental saving attack
-and fails the document. The certification gate reports a final catalog
+time-stamps, `/DSS` validation data, signature field plumbing. Validation data
+is the narrow part, and getting it narrow took four review rounds: an object may
+be excused as such only when it is NEW and a reader reaches it through the
+archive and nowhere else — the dictionary the catalog's `/DSS` names, or an
+object named directly by the `/Certs`, `/CRLs` or `/OCSPs` array that dictionary
+carries, or a brand-new `/Type /DSS` dictionary nothing outside points at (an
+earlier archive pass a later merge left behind). A reference a reader resolves
+is a rendered object: a page whose `/XObject` or `/Contents` names an object a
+later revision defines is showing that object, not archiving it, and the gate
+drops it however it is named. Anything else, a rewritten page or content stream
+included, is the incremental saving attack and fails the document. The certification gate reports a final catalog
 carrying `/Perms /DocMDP /P 1` whose certifying signature sits in an older
 revision: revisions after a P=1 certification break it, and AutoFirma's own
 validator says so over those same files. Signing refuses what verification
