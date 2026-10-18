@@ -2521,3 +2521,207 @@ fn coverage_end_of(signed: &[u8]) -> usize {
     let range = sigs[0].byte_range;
     range[2] + range[3]
 }
+
+/// Append one revision whose classic cross-reference table marks object `num`
+/// FREE, appending no object at all: the way an incremental update deletes an
+/// object (ISO 32000-1 7.5.4). Every reader resolves `num 0 R` to nothing after
+/// it, so whatever the object rendered is gone from the document.
+fn append_free(pdf: &[u8], num: u32) -> Vec<u8> {
+    let mut out = pdf.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let xref_at = out.len();
+    let size = declared_size(pdf).max(num + 1);
+    out.extend_from_slice(format!("xref\n{num} 1\n0000000000 00000 f \n").as_bytes());
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Prev {} >>\nstartxref\n{xref_at}\n%%EOF\n",
+            last_xref(pdf)
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// Append one revision redefining object `num` under a generation number of its
+/// own: readers resolve the newest entry for a number, see a generation the
+/// reference they hold does not match, and treat `num 0 R` as null. The other
+/// spelling of the same deletion.
+fn append_written_generation(pdf: &[u8], num: u32, generation: u16, body: &[u8]) -> Vec<u8> {
+    let mut out = pdf.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let object_at = out.len();
+    out.extend_from_slice(format!("{num} {generation} obj\n").as_bytes());
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\nendobj\n");
+    let xref_at = out.len();
+    let size = declared_size(pdf).max(num + 1);
+    out.extend_from_slice(
+        format!("xref\n{num} 1\n{object_at:010} {generation:05} n \n").as_bytes(),
+    );
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Prev {} >>\nstartxref\n{xref_at}\n%%EOF\n",
+            last_xref(pdf)
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// Round 2, N-1: object 5 is the page's content stream — the bytes the
+/// signature covers. A later revision that only marks the number free rewrites
+/// no byte at all, so every digest and every signature still verifies, and the
+/// gate used to answer OK. qpdf and Ghostscript render the file with the page
+/// empty: the object is not there for any conforming reader.
+#[test]
+fn a_revision_that_frees_a_signed_object_is_refused() {
+    let (Some(signer), Some(revocation)) = (signer(), crls()) else {
+        require_or_skip("test PKI or CRLs missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(
+        INPUT,
+        &signer,
+        &PadesOptions {
+            revocation,
+            ..PadesOptions::default()
+        },
+    )
+    .expect("signing failed");
+    pades_verify(&signed, &anchors()).expect("the clean archive verifies");
+
+    let deleted = append_free(&signed, 5);
+    // the reader's own view first: the object is gone
+    let at = pdf::last_startxref(&deleted).expect("the appended revision has an xref");
+    let locations = pdf::object_locations(&deleted, at).expect("the xref reads");
+    assert!(
+        !locations.keys().any(|r| r.num == 5),
+        "after a free entry, 5 0 R resolves to nothing for a reader"
+    );
+
+    let error = pades_verify(&deleted, &anchors()).expect_err(
+        "a revision that deletes a covered object is not something a signature attests",
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains("deleted"),
+        "the refusal says what happened: {text}"
+    );
+    assert!(
+        text.contains("5 0 R"),
+        "the refusal names the deleted object: {text}"
+    );
+}
+
+/// The same deletion spelled with a generation number instead of a free entry:
+/// the page still holds `5 0 R`, and the newest definitions of object 5 belong
+/// to generation 1, which that reference does not resolve to.
+#[test]
+fn a_signed_object_reused_under_another_generation_is_refused() {
+    let (Some(signer), Some(revocation)) = (signer(), crls()) else {
+        require_or_skip("test PKI or CRLs missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(
+        INPUT,
+        &signer,
+        &PadesOptions {
+            revocation,
+            ..PadesOptions::default()
+        },
+    )
+    .expect("signing failed");
+    pades_verify(&signed, &anchors()).expect("the clean archive verifies");
+
+    let body = b"<< /Length 0 >>\nstream\n\nendstream";
+    let reused = append_written_generation(&signed, 5, 1, body);
+    let at = pdf::last_startxref(&reused).expect("the appended revision has an xref");
+    let locations = pdf::object_locations(&reused, at).expect("the xref reads");
+    assert!(
+        !locations
+            .get(&pdf::ObjRef::new(5, 0))
+            .is_some_and(|_| locations.contains_key(&pdf::ObjRef::new(5, 0))),
+        "5 0 R must not resolve once object 5 lives at generation 1"
+    );
+    assert!(
+        locations.contains_key(&pdf::ObjRef::new(5, 1)),
+        "the new generation is the one readers see"
+    );
+
+    let error = pades_verify(&reused, &anchors())
+        .expect_err("reusing a signed object's number is a deletion of it, not a new object");
+    let text = error.to_string();
+    assert!(
+        text.contains("5 0 R"),
+        "the refusal names the object the reference no longer reaches: {text}"
+    );
+}
+
+/// The one shape where a stream and a table describe the same section: a
+/// hybrid-reference file marks the objects it puts in `/XRefStm` free in the
+/// classic table, so that readers which know nothing of cross-reference streams
+/// ignore them (ISO 32000-1 7.5.8.4). The stream wins, so this document is
+/// unchanged and the gate may not read a deletion into it.
+#[test]
+fn a_hybrid_reference_revision_is_read_from_its_stream() {
+    let (Some(signer), Some(revocation)) = (signer(), crls()) else {
+        require_or_skip("test PKI or CRLs missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(
+        INPUT,
+        &signer,
+        &PadesOptions {
+            revocation,
+            ..PadesOptions::default()
+        },
+    )
+    .expect("signing failed");
+    pades_verify(&signed, &anchors()).expect("the clean archive verifies");
+
+    // object 5, unchanged, in a cross-reference stream of our own (/W [1 2 1]:
+    // type, offset, generation) that the classic table then marks free
+    let offset = object_at(&signed, 5) as u32;
+    let row = [1u8, (offset >> 8) as u8, offset as u8, 0u8];
+    let mut out = signed.clone();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let stream_at = out.len();
+    let size = declared_size(&signed) + 1;
+    out.extend_from_slice(
+        format!(
+            "{size} 0 obj\n<< /Type /XRef /Size {} /W [1 2 1] /Index [5 1] /Root 1 0 R \
+             /Length {} >>\nstream\n",
+            size + 1,
+            row.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&row);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_at = out.len();
+    out.extend_from_slice(b"xref\n5 1\n0000000000 00000 f \n");
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /XRefStm {stream_at} /Prev {} >>\nstartxref\n\
+             {xref_at}\n%%EOF\n",
+            size + 1,
+            last_xref(&signed)
+        )
+        .as_bytes(),
+    );
+
+    // the stream's entry is the one that counts
+    let at = pdf::last_startxref(&out).expect("the hybrid revision has an xref");
+    let locations = pdf::object_locations(&out, at).expect("the xref reads");
+    assert!(
+        locations.contains_key(&pdf::ObjRef::new(5, 0)),
+        "the /XRefStm entry wins over the free entry the classic table carries for old readers"
+    );
+    pades_verify(&out, &anchors()).expect("an unchanged hybrid revision is not a modification");
+}

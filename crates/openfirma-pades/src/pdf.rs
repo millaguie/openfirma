@@ -12,7 +12,7 @@
 //! parsed model is a chance to silently alter a legal document.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use openfirma_core::{Error, Result};
@@ -389,6 +389,16 @@ pub enum Location {
 /// The in-use objects of one cross-reference section.
 type XrefEntries = Vec<(ObjRef, Location)>;
 
+/// The object numbers one cross-reference section declares FREE (a classic
+/// entry of type `f`, or a cross-reference stream row of type 0). A reader
+/// resolves an indirect reference by looking up the newest section that names
+/// the number: a free entry there means the number is not in use, and NO older
+/// definition of it resolves any more (ISO 32000-1 7.5.4). Ignoring these was
+/// round 2's N-1: an appended revision could mark a signed object free and
+/// `verify` still answered OK, while qpdf, Ghostscript and Acrobat showed the
+/// document without it.
+type XrefFrees = Vec<u32>;
+
 /// What the last trailer of a document says.
 #[derive(Clone, Debug)]
 pub struct Trailer {
@@ -699,10 +709,23 @@ pub fn trailer_dict(data: &[u8], xref_at: usize) -> Result<Vec<u8>> {
 /// Every in-use object of the document, following `/Prev` through earlier
 /// revisions.
 ///
-/// Later revisions are walked first, so `entry().or_insert()` keeps the newest
-/// definition of an object that a previous revision also defined.
+/// Later revisions are walked first, and **the newest section that names an
+/// object number decides it**: a newer in-use entry wins over an older
+/// definition (with whichever generation it carries — a reference to the old
+/// generation no longer resolves), and a newer FREE entry means the object is
+/// gone, so no older definition of that number may be restored. Round 2's N-1
+/// was the missing second half of that rule: the map only ever grew, so a
+/// revision that marked a signed object free changed nothing for `verify` while
+/// every conforming reader dropped the object and the content it held with it.
+///
+/// A hybrid-reference file is the one place a stream and a table describe the
+/// same section: the classic table marks the hybrid objects free so old readers
+/// ignore them, and `/XRefStm` carries their real entries. The stream is read
+/// first for exactly that reason.
 pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, Location>> {
     let mut map = BTreeMap::new();
+    // object numbers a newer section has already decided (in use or free)
+    let mut decided: BTreeSet<u32> = BTreeSet::new();
     let mut cur = Some(xref_at);
     let mut revisions = 0;
     while let Some(at) = cur {
@@ -723,32 +746,52 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
             )));
         }
         let i = skip_ws(data, at);
-        let (entries, dict) = if data[i..].starts_with(b"xref") {
+        let (entries, frees, dict) = if data[i..].starts_with(b"xref") {
             read_xref_table(data, i)?
         } else {
             read_xref_stream(data, i)?
         };
-        for (r, loc) in entries {
-            map.entry(r).or_insert(loc);
-        }
         // A hybrid reference file carries a classic table for old readers and
         // points at a cross-reference stream for the objects only it knows
-        // about. Both have to be read, or those objects look missing.
+        // about. The stream's entries come first: the classic table of such a
+        // file marks those same numbers free on purpose.
+        let mut stream: Option<(XrefEntries, XrefFrees)> = None;
         if let Some(stm) = get(&dict, "/XRefStm").and_then(parse_uint) {
             // same bounds rule as above: /XRefStm is the file's claim. The
             // nesting keeps this under the 1.85 floor: `let ... && ...` in an
             // if head is a let-chain, stable only from 1.88 (review 07 H-8).
             if (stm as usize) <= data.len() {
-                if let Ok((extra, _)) = read_xref_stream(data, stm as usize) {
-                    for (r, loc) in extra {
-                        map.entry(r).or_insert(loc);
-                    }
+                if let Ok((extra, extra_frees, _)) = read_xref_stream(data, stm as usize) {
+                    stream = Some((extra, extra_frees));
                 }
             }
         }
+        if let Some((sentries, sfrees)) = stream {
+            record_section(&mut map, &mut decided, sentries, sfrees);
+        }
+        record_section(&mut map, &mut decided, entries, frees);
         cur = get(&dict, "/Prev").and_then(parse_uint).map(|v| v as usize);
     }
     Ok(map)
+}
+
+/// Fold one cross-reference section into the map: the first decision about an
+/// object number wins (sections are walked newest first), and a free entry is a
+/// decision too — the numbers it lists may not be restored by an older section.
+fn record_section(
+    map: &mut BTreeMap<ObjRef, Location>,
+    decided: &mut BTreeSet<u32>,
+    entries: XrefEntries,
+    frees: XrefFrees,
+) {
+    for (r, loc) in entries {
+        if decided.insert(r.num) {
+            map.insert(r, loc);
+        }
+    }
+    for num in frees {
+        decided.insert(num);
+    }
 }
 
 /// One classic cross-reference table: its in-use entries and its trailer.
@@ -757,15 +800,16 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
 /// specification mandates, because a writer that gets the layout wrong still
 /// produces a file that every reader accepts, and refusing to sign one is a
 /// worse outcome than being lenient here.
-fn read_xref_table(data: &[u8], i: usize) -> Result<(XrefEntries, Vec<u8>)> {
+fn read_xref_table(data: &[u8], i: usize) -> Result<(XrefEntries, XrefFrees, Vec<u8>)> {
     let mut entries = Vec::new();
+    let mut frees = Vec::new();
     let mut j = skip_ws(data, i + 4);
     loop {
         j = skip_ws(data, j);
         if data[j..].starts_with(b"trailer") {
             let t = skip_ws(data, j + 7);
             let end = dict_end(data, t)?;
-            return Ok((entries, data[t..end].to_vec()));
+            return Ok((entries, frees, data[t..end].to_vec()));
         }
         let first_end = token_end(data, j);
         // A table that runs out of its own subsection headers before any
@@ -804,7 +848,7 @@ fn read_xref_table(data: &[u8], i: usize) -> Result<(XrefEntries, Vec<u8>)> {
             if data[k..].starts_with(b"trailer") {
                 let t = skip_ws(data, k + 7);
                 let end = dict_end(data, t)?;
-                return Ok((entries, data[t..end].to_vec()));
+                return Ok((entries, frees, data[t..end].to_vec()));
             }
             let off_end = token_end(data, k);
             let gen_start = skip_ws(data, off_end);
@@ -823,8 +867,12 @@ fn read_xref_table(data: &[u8], i: usize) -> Result<(XrefEntries, Vec<u8>)> {
                 )));
             };
             // object 0 is always the head of the free list, never an object
-            if kind == b'n' && num > 0 {
-                entries.push((ObjRef::new(num, generation), Location::Direct(offset)));
+            if num > 0 {
+                if kind == b'n' {
+                    entries.push((ObjRef::new(num, generation), Location::Direct(offset)));
+                } else if kind == b'f' {
+                    frees.push(num);
+                }
             }
             k = type_start + 1;
         }
@@ -860,7 +908,7 @@ fn max_xref_entries(data_len: usize) -> usize {
 ///
 /// This is what iText writes, so without it a document AutoFirma has already
 /// signed cannot be read, let alone signed again.
-fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, Vec<u8>)> {
+fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, XrefFrees, Vec<u8>)> {
     let dict_span = object_body(data, obj_at)?;
     let dict = data[dict_span].to_vec();
     let is_xref = get(&dict, "/Type")
@@ -928,6 +976,7 @@ fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, Vec<u8>)
     ];
 
     let mut entries = Vec::new();
+    let mut frees = Vec::new();
     let mut pos = 0usize;
     for pair in index.chunks_exact(2) {
         let (first, count) = (pair[0], pair[1]);
@@ -961,7 +1010,7 @@ fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, Vec<u8>)
                 continue; // the head of the free list
             }
             match kind {
-                0 => {} // free, nothing to record
+                0 => frees.push(num), // free: it hides every older definition
                 1 => entries.push((
                     ObjRef::new(num, third as u16),
                     Location::Direct(second as usize),
@@ -981,7 +1030,7 @@ fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, Vec<u8>)
             }
         }
     }
-    Ok((entries, dict))
+    Ok((entries, frees, dict))
 }
 
 /// The integers of an array value.

@@ -361,6 +361,14 @@ pub struct Redefinition {
 /// reads a shape out of it.
 const UNREADABLE: &[u8] = b"\x00openfirma: these bytes cannot be read";
 
+/// The `after` of an object a later revision DELETED: the covering revision
+/// defined it and the final state does not, because its number was marked free
+/// (or reused with another generation). Every reader resolves the reference to
+/// nothing, so whatever the object rendered disappeared from the document
+/// (round 2, N-1). Like [`UNREADABLE`], it is a statement and no licensing
+/// branch may read a shape out of it.
+const DELETED: &[u8] = b"\x00openfirma: this object was deleted after the signature";
+
 /// The bytes a reader takes from an object: its dictionary, plus — for a stream
 /// — the data its `/Length` (or an `endstream` that `endobj` follows) says is
 /// its own.
@@ -436,7 +444,26 @@ pub fn redefinitions_after(
     // against the covering state directly — anything differing changed after it.
     let mut out = Vec::new();
     let mut cache = pdf::ObjectStreamCache::new();
-    for object in merged.keys() {
+    // Both states, not only the final one: an object the covering revision
+    // resolved and the final state does not resolve any more was DELETED by a
+    // later revision — its number marked free, or reused with another
+    // generation. Walking the final state alone never saw those, which is
+    // round 2's N-1: `verify` answered OK over a document whose signed content
+    // every conforming reader, qpdf and Ghostscript included, showed without.
+    let mut objects: BTreeSet<ObjRef> = merged.keys().copied().collect();
+    objects.extend(covering_bodies.keys().copied());
+    for object in objects {
+        if !merged.contains_key(&object) {
+            if let Some(previous) = covering_bodies.get(&object) {
+                out.push(Redefinition {
+                    object,
+                    before: previous.clone(),
+                    after: DELETED.to_vec(),
+                });
+            }
+            continue;
+        }
+        let object = &object;
         // only objects a newer revision touched can differ from the covering
         // state; but an object that lives inside an OLDER section keeps resolving
         // to old bytes and matches. This is exactly the wanted test.
@@ -683,6 +710,16 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     // particular `/Sig` on the OLD side may not license losing a signature
     // dictionary's bytes, which is why this comes before the branch below.
     if newer == UNREADABLE {
+        return Change::NotAllowed {
+            object: *object,
+            detail: describe_change(newer),
+        };
+    }
+    if newer == DELETED {
+        // A deleted object takes whatever it rendered away from the document
+        // and nothing a later revision may license: no archive, no signature
+        // and no time-stamp is a deletion. Refused before any shape is read,
+        // like the unreadable case (round 2, N-1).
         return Change::NotAllowed {
             object: *object,
             detail: describe_change(newer),
@@ -1922,6 +1959,11 @@ fn describe_change(body: &[u8]) -> String {
     if body == UNREADABLE {
         "the new bytes of this object cannot be read: no signature attests what \
          they render, and no writer's shape may be assumed for them"
+            .into()
+    } else if body == DELETED {
+        "this object was deleted after the signature (its number is free, or was \
+         reused with another generation, so every reader resolves the reference \
+         to nothing); what it rendered is not in the document any more"
             .into()
     } else if body.windows(6).any(|w| w == b"stream") {
         "a stream object was rewritten after the signature; readers render its \
