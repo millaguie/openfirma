@@ -153,7 +153,7 @@ fn stream_array(
     Ok(out)
 }
 
-fn stream_bytes(
+pub(crate) fn stream_bytes(
     pdf: &[u8],
     offsets: &BTreeMap<ObjRef, Location>,
     r: ObjRef,

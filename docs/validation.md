@@ -353,7 +353,10 @@ last part is the expected outcome for test material and is exactly what
 VeraPDF (`verapdf/cli` on Docker Hub) is **not** a PAdES validator. It checks
 PDF/A conformance, and a signed PDF that is not PDF/A fails its default
 flavour for reasons that have nothing to do with the signature. It is useful
-only if we ever claim PDF/A output, which we do not.
+only if we claim PDF/A output, which we do not: signing a PDF/A source leaves
+its `/Info` and its XMP packet exactly as the producer wrote them, but whether
+the signed result is still conformant is something only veraPDF can say, and it
+has not been run here. Named rather than assumed.
 
 ## 4. VALIDe and the real portals
 

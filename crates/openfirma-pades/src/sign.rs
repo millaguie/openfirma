@@ -303,29 +303,20 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     // /Metadata XMP packet to equal /Info /ModDate, and openfirma does not
     // rewrite the XMP stream — AutoFirma likewise changes behaviour for PDF/A
     // sources. The simplest conforming choice (docs/pades.md): when a PDF/A
-    // identity declaration exists, write no new /ModDate at all and leave the
-    // /Info object exactly where it is — its bytes are already covered by the
-    // earlier revisions' /ByteRanges. Detecting on the declaration rather than
-    // trusting every /Metadata keeps every ordinary document (a plain XMP
-    // stream, an OpenMetadata package) stamping dates as before.
+    // identity declaration exists, write no new /Info at all and leave the one
+    // the original had exactly where it is — its bytes are already covered by
+    // the earlier revisions' /ByteRanges.
+    //
+    // The declaration lives in the XMP *packet's* data, which is where
+    // ISO 19005-1 puts it (`pdfaid:part` in the `http://www.aiim.org/pdfa/ns/id/`
+    // namespace); round 2's N-2 was the detection looking for it as a key of
+    // the stream dictionary instead, a shape no producer writes, so every real
+    // PDF/A was signed as an ordinary document and got a /ModDate the XMP knew
+    // nothing about. The packet is read through the stream's own filter chain,
+    // because producers compress it.
     let metadata_ref = pdf::get(&catalog, "/Metadata").and_then(pdf::parse_ref);
     let pdfa = match metadata_ref {
-        Some(m) => {
-            let dict = pdf::resolve(pdf, &offsets, Some(&mut cache), m)?;
-            // The key spells itself pdfaid:part in ISO 32000-2 and every
-            // PDF/A packet; compared case-insensitively without its leading
-            // slash because namespace prefixes are the XMP's business.
-            pdf::items(&dict)
-                .map(|items| {
-                    items.iter().any(|(k, _)| {
-                        let key = &dict[k.clone()];
-                        key.len() > 1
-                            && String::from_utf8_lossy(&key[1..]).to_ascii_lowercase()
-                                == "pdfaid:part"
-                    })
-                })
-                .unwrap_or(false)
-        }
+        Some(m) => metadata_declares_pdfa(pdf, &offsets, m)?,
         None => false,
     };
 
@@ -672,6 +663,36 @@ fn build_sig_dict(signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<u8>> {
 fn push_entry(out: &mut Vec<u8>, key: &str, value: &[u8]) {
     out.extend_from_slice(format!(" {key} ").as_bytes());
     out.extend_from_slice(value);
+}
+
+/// Whether the catalog's `/Metadata` stream declares PDF/A conformance.
+///
+/// The declaration is `pdfaid:part` in the XMP *packet*, inside the
+/// `http://www.aiim.org/pdfa/ns/id/` namespace, and ISO 19005-1 puts it there;
+/// the stream's dictionary is an ordinary `/Type /Metadata /Subtype /XML` and
+/// says nothing about conformance. Round 2's N-2 was the detection asking the
+/// dictionary for a key no producer writes, which left every real PDF/A signed
+/// as an ordinary document — a fresh `/ModDate` in `/Info` against an XMP
+/// `xmp:ModifyDate` the signature never touched.
+///
+/// The packet is read through the stream's filter chain because producers
+/// compress it, and a `/Metadata` whose bytes cannot be read is an error: the
+/// answer decides whether `/Info` may be rewritten, and guessing it wrong is
+/// how a conforming document stops being one.
+fn metadata_declares_pdfa(
+    pdf: &[u8],
+    offsets: &BTreeMap<ObjRef, pdf::Location>,
+    metadata: ObjRef,
+) -> Result<bool> {
+    let packet = crate::ltv::stream_bytes(pdf, offsets, metadata, "/Metadata")?;
+    // `pdfaid:part` and its `pdfaid:conformance` sibling are element names or
+    // attributes; both spell the declaration, and the prefix is the packet's
+    // business, so the search is for the qualified name as ISO 19005-1 writes
+    // it. Nothing else in an XMP packet carries this string by accident.
+    const DECLARATION: &[u8] = b"pdfaid:part";
+    Ok(packet
+        .windows(DECLARATION.len())
+        .any(|w| w.eq_ignore_ascii_case(DECLARATION)))
 }
 
 fn build_acroform(fields: &[ObjRef], helv: ObjRef, zadb: ObjRef) -> String {

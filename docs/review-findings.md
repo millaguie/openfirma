@@ -41,7 +41,7 @@ proof of concept or nothing.
 | ID | Finding | Status |
 |---|---|---|
 | M-1 | Orphan `/Info` object left by signing | fixed (wave 2: revisions carry the previous trailer, `7d3c732`) |
-| M-2 | PDF/A: XMP not updated | fixed with the honest alternative (`e1a13b4`: PDF/A documents are refused rather than silently broken) |
+| M-2 | PDF/A: XMP not updated | fixed (`e1a13b4`, detection corrected in `R2-02-N-2`: a PDF/A source keeps its `/Info` — and its XMP packet — exactly as the producer wrote them, so the pair the conformance rule compares is never split. An earlier note here said such documents are "refused", which the code never did: docs/pades.md has described the real policy since `e1a13b4`) |
 | M-3 | `/ByteRange` hole not bound to its dictionary's `/Contents` | fixed (`32b797c`: say what the hole holds before calling it a signature) |
 | M-4 | No check of unregistered signatures / `/Perms /UR3` removal | fixed (`e1a13b4`: document's own rules honoured before signing; `66d60e6` reports certification broken by later revisions) |
 | M-5 | Page-tree walk without visited memory (exponential on hostile files) | fixed (wave 2 bounds/budget work, `753a444`, `3154e84`) |
@@ -186,6 +186,24 @@ not get lost:
   vulnerability: the sentence sent the holder of a good certificate looking for
   a password they had. Fixed (`499597b`: the MD5 MAC is checked like the others,
   reading only, with the fixture's digest OID asserted before anything else).
+
+## Round 2 of the adversarial review (the fixed tree)
+
+The review ran again on the fixed tree, frozen at `ae53c6d`, and filed 25
+blocking points across the same seven areas. Its reports are not in this
+repository either. Every point closes the way the rounds above do: with a test
+that fails when the fix is reverted. The IDs carry the area number, because
+`R2-*` is already taken by the round of *fixes* review above.
+
+| ID | Finding | Status |
+|---|---|---|
+| 01-N1 | `pathLenConstraint` off by one: `depth_below` counted the end entity, so every chain ending on a `pathlen:0` CA (AC FNMT Usuarios and most Spanish intermediates) was refused — a regression of C1's fix, and unreachable by the suite because the shared test PKI carries no `pathlen` at all | fixed (`d67f5e0`: only non-self-issued intermediates count, RFC 5280 6.1.4 (l)/(m); tests mint the chains with openssl and check both directions against `openssl verify`) |
+| 01-N2 | `nameConstraints`, `policyMappings` and `policyConstraints` were listed as extensions this verifier understood and never applied: a sub-CA permitted only under `C=FR` issued for a `C=ES` signer and `verify` answered OK while `openssl verify` said "permitted subtree violation" | fixed (`1898e40`: all three are refused, critical or not, with the extension named. Fail-closed: a chain inside its permitted subtree is refused too, pinned as a declared residual until the subtrees are implemented) |
+| 01-N3 | A CRL counted when *some* certificate of the archive carried the issuer's name and its key verified the signature, so a self-signed impostor copying the CA's subject, archived in the same `/Certs` pool, signed an empty CRL over a really-revoked signer | fixed (`678d114`: the CRL that speaks for a link must verify under that link's parent certificate, not under a name) |
+| 01-N4 | An OCSP responder was any certificate chaining to the named CA, and an absent `extendedKeyUsage` was read as "any purpose", so any certificate the CA ever issued could answer for every other one | fixed (`f0d2e77`: `id-kp-OCSPSigning` is required and the delegate must be issued by the CA directly) |
+| 01-N5 | An OCSP response only had to name the CA: the serial it answered about was read for the "revoked" verdict but never required to be the child's, so the CA's public responder answering about another certificate counted | fixed (`678d114`: the response must name the parent *and* the child's serial number) |
+| 02-N-1 | A cross-reference entry marking a signed object free deleted it for every reader — qpdf and Ghostscript render the file without it — while every digest still verified and the gate never saw the object disappear | fixed (`e7dc7b9`: every section is the authority on the numbers it names, a free entry hides older definitions, and an object the covering revision resolved that the final state does not is refused as deleted; the hybrid-reference shape that marks such numbers free on purpose is folded in `/XRefStm`-first, and the test fails if that order is swapped) |
+| 02-N-2 | PDF/A was never detected: the declaration was looked for as a key of the `/Metadata` *stream dictionary*, a shape no producer writes, so a real PDF/A (`gs -dPDFA=2`) was signed with a fresh `/ModDate` against an XMP packet the signature never touched — and two of the three documents describing the policy said the document is "refused" | fixed: the packet's own data is read through the filter chain, and the policy docs now say the one thing the code does |
 
 ## What remains unverifiable from this repository
 

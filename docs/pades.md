@@ -165,7 +165,14 @@ refusals are part of the contract. Each is a test in
   document whose `/Metadata` stream declares `pdfaid:part` gets no `/Info`
   rewrite at all — a stale `/ModDate` is one old date, while a fresh `/Info`
   next to an XMP that says otherwise is two answers. Documents without the
-  declaration keep the `/ModDate` stamp.
+  declaration keep the `/ModDate` stamp. The declaration is read where ISO
+  19005-1 puts it: inside the XMP packet, through the stream's filter chain
+  (producers compress it), not from a key of the stream dictionary — reading
+  the dictionary was round 2's finding N-2, under which a real PDF/A was signed
+  as an ordinary document. A `/Metadata` whose bytes cannot be read is an
+  error, not an answer: guessing wrong is how a conforming document stops being
+  one. Whether the *signed* result is still PDF/A-conformant is not verifiable
+  from this repository (it needs veraPDF), see docs/validation.md.
 
 ## What we deliberately do differently
 

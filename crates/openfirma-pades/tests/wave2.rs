@@ -209,66 +209,67 @@ fn the_info_object_the_signature_writes_is_the_one_the_trailer_names() {
 
 /// M-2: PDF/A. ISO 19005-1 requires xmp:ModifyDate in the /Metadata stream to
 /// equal /Info /ModDate, and openfirma does not rewrite the XMP packet (the
-/// simpler conforming choice, docs/pades.md). A document whose metadata
-/// stream declares a conformance part (a /pdfaid:part key — PDF/A and PDF/UA
-/// declare identity that way) therefore gets NO new ModDate: the /Info object
-/// is not rewritten at all. An ordinary XMP stream without the declaration is
-/// not a PDF/A identity claim, so normal documents keep stamping dates.
+/// simpler conforming choice, docs/pades.md). A document whose XMP packet
+/// declares a conformance part therefore gets NO new /Info at all, so the pair
+/// the producer wrote stays as it was.
+///
+/// Round 2's N-2: the declaration is `pdfaid:part` in the packet's *data*
+/// (that is where ISO 19005-1 puts it), and the detection used to look for it
+/// as a key of the stream dictionary — a shape no producer writes. The review
+/// built a real PDF/A with `gs -dPDFA=2`, signed it, and the file came out with
+/// a fresh /ModDate against an XMP the signature never touched. The packets
+/// below are the shape Ghostscript writes, both uncompressed and
+/// FlateDecode-compressed, because producers compress them and the detection
+/// has to read through the filter chain.
 #[test]
 fn a_pdf_a_identity_declaration_stops_the_moddate_rewrite() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
         return;
     };
-    // /Info is object 5 (build_pdf numbers in order); its bytes must survive
-    // untouched inside the signed file.
-    let doc = build_pdf(
-        &[
-            "<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>",
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>",
-            "<< /Type /Metadata /Subtype /XML /pdfaid:part 1 /Length 10 >>\nstream\n<xmp/>\nendstr",
-            "<< /ModDate (D:20000101000000Z) /Producer (author) >>",
-        ],
-        "/Size 6 /Root 1 0 R /Info 5 0 R",
-    );
-    let at = pdf::last_startxref(&doc).unwrap();
-    let info_at = {
-        let locations = pdf::object_locations(&doc, at).unwrap();
-        match locations[&pdf::ObjRef::new(5, 0)] {
-            pdf::Location::Direct(off) => off,
-            _ => panic!("classic table names direct offsets"),
-        }
-    };
-    let old_info = {
-        let span = pdf::object_body(&doc, info_at).unwrap();
-        doc[span].to_vec()
-    };
+    for (packet, compress) in [
+        (PDFA_PACKET, false),
+        (PDFA_PACKET, true),
+        // the same declaration as an attribute, the other spelling producers
+        // write (`pdfaid:part='2'` on the rdf:Description)
+        (PDFA_PACKET_ATTRIBUTES, true),
+    ] {
+        let doc = with_metadata(packet.as_bytes(), compress);
+        // /Info is object 5 (with_metadata numbers in order); its bytes must
+        // survive untouched inside the signed file
+        let at = pdf::last_startxref(&doc).unwrap();
+        let info_at = {
+            let locations = pdf::object_locations(&doc, at).unwrap();
+            match locations[&pdf::ObjRef::new(5, 0)] {
+                pdf::Location::Direct(off) => off,
+                _ => panic!("classic table names direct offsets"),
+            }
+        };
+        let old_info = {
+            let span = pdf::object_body(&doc, info_at).unwrap();
+            doc[span].to_vec()
+        };
 
-    let signed = openfirma_pades::pades_sign(&doc, &signer, &opts()).expect("signing failed");
-    assert!(signed.starts_with(&doc), "the original revision survives");
-    let at = pdf::last_startxref(&signed).unwrap();
-    let tr = pdf::trailer(&signed, at).unwrap();
-    let locations = pdf::object_locations(&signed, at).unwrap();
-    // the newest definition of object 5 is still exactly the author's bytes:
-    // no rewrite happened (a rewritten one would carry today's ModDate).
-    let current = pdf::resolve(&signed, &locations, None, tr.info.unwrap()).unwrap();
-    assert_eq!(
-        current.as_ref(),
-        old_info.as_slice(),
-        "a PDF/A document's /Info keeps its bytes: the XMP ModifyDate would be left behind"
-    );
+        let signed = openfirma_pades::pades_sign(&doc, &signer, &opts()).expect("signing failed");
+        assert!(signed.starts_with(&doc), "the original revision survives");
+        let at = pdf::last_startxref(&signed).unwrap();
+        let tr = pdf::trailer(&signed, at).unwrap();
+        let locations = pdf::object_locations(&signed, at).unwrap();
+        // the newest definition of object 5 is still exactly the author's
+        // bytes: no rewrite happened (a rewritten one would carry today's
+        // ModDate, which the XMP ModifyDate would contradict)
+        let current = pdf::resolve(&signed, &locations, None, tr.info.unwrap()).unwrap();
+        assert_eq!(
+            current.as_ref(),
+            old_info.as_slice(),
+            "a PDF/A document's /Info keeps its bytes (compressed={compress}): the XMP \
+             ModifyDate would be left behind"
+        );
+    }
 
-    // control: the same document without the identity declaration IS stamped
-    let plain = build_pdf(
-        &[
-            "<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>",
-            "<< /ModDate (D:20000101000000Z) /Producer (author) >>",
-        ],
-        "/Size 5 /Root 1 0 R /Info 4 0 R",
-    );
+    // control: the same document whose packet carries no conformance
+    // declaration IS stamped — an XMP without pdfaid:part is not a PDF/A claim
+    let plain = with_metadata(PLAIN_PACKET.as_bytes(), true);
     let signed = openfirma_pades::pades_sign(&plain, &signer, &opts()).expect("signing failed");
     let at = pdf::last_startxref(&signed).unwrap();
     let tr = pdf::trailer(&signed, at).unwrap();
@@ -280,6 +281,105 @@ fn a_pdf_a_identity_declaration_stops_the_moddate_rewrite() {
         "an ordinary document keeps being stamped: {}",
         String::from_utf8_lossy(&current)
     );
+}
+
+/// The packet `gs -dPDFA=2` writes, trimmed to what matters: the declaration
+/// lives in the `http://www.aiim.org/pdfa/ns/id/` namespace inside the RDF, as
+/// an ordinary element. `xmp:ModifyDate` is the date the /Info copy has to
+/// agree with.
+const PDFA_PACKET: &str = r#"<?xpacket begin="&#xFEFF;" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="GPL Ghostscript">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">
+   <pdfaid:part>2</pdfaid:part>
+   <pdfaid:conformance>B</pdfaid:conformance>
+  </rdf:Description>
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:ModifyDate>2000-01-01T00:00:00Z</xmp:ModifyDate>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+/// The same declaration in its other spelling: the `pdfaid` namespace is
+/// declared on the `rdf:Description` and `pdfaid:part` is an attribute of it,
+/// which is how some producers (and the review's own `gs` output) write it.
+const PDFA_PACKET_ATTRIBUTES: &str = r#"<?xpacket begin="&#xFEFF;" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/"
+    pdfaid:part="2" pdfaid:conformance="B"
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:ModifyDate>2000-01-01T00:00:00Z</xmp:ModifyDate>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+/// The same packet for an ordinary document: XMP that says nothing about PDF/A
+/// conformance.
+const PLAIN_PACKET: &str = r#"<?xpacket begin="&#xFEFF;" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:CreatorTool>openfirma tests</xmp:CreatorTool>
+   <xmp:ModifyDate>2000-01-01T00:00:00Z</xmp:ModifyDate>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+/// The same minimal document as `common::build_pdf`, with a real `/Metadata`
+/// stream carrying `packet` as its data — compressed with FlateDecode when
+/// `compress`, the way every producer stores it. `build_pdf` takes `&str`
+/// bodies, and a compressed packet is not text.
+fn with_metadata(packet: &[u8], compress: bool) -> Vec<u8> {
+    let data = if compress {
+        deflate(packet)
+    } else {
+        packet.to_vec()
+    };
+    let filter = if compress {
+        " /Filter /FlateDecode"
+    } else {
+        ""
+    };
+    let mut metadata = format!(
+        "<< /Type /Metadata /Subtype /XML{filter} /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    metadata.extend_from_slice(&data);
+    metadata.extend_from_slice(b"\nendstream");
+
+    let bodies: [&[u8]; 5] = [
+        b"<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>",
+        &metadata,
+        b"<< /ModDate (D:20000101000000Z) /Producer (author) >>",
+    ];
+    let mut out = Vec::from(&b"%PDF-1.4\n"[..]);
+    let mut offsets = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    common::write_xref(&mut out, &offsets, "/Size 6 /Root 1 0 R /Info 5 0 R");
+    out
+}
+
+fn deflate(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data).expect("zlib encoder");
+    enc.finish().expect("zlib encoder")
 }
 
 /// A-2, the signing half: `/Perms /DocMDP` with `/TransformParams /P 1` says
