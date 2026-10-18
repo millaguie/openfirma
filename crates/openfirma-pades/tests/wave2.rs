@@ -136,13 +136,15 @@ fn the_appended_trailer_carries_the_previous_id_and_extra_keys() {
         text.contains("/MyVendorKey 42"),
         "every key survives: {text}"
     );
-    // and the revision still reads back through its own chain
+    // and the revision still reads back through its own chain. The identifier
+    // itself is carried by the WRITER (asserted byte for byte above, which is
+    // what PDF/A and PDF 2.0 ask of one); it is not part of the reader's
+    // immutability rule any more, because iText regenerates it on every append
+    // and a document AutoFirma signed twice must stay readable — measured, and
+    // `an_append_that_regenerates_the_file_id_is_still_read` in revisions.rs
+    // holds the other end of it.
     let tr = pdf::trailer(&signed, at).unwrap();
     assert!(tr.prev.is_some());
-    assert_eq!(
-        tr.immutable.get("/ID".as_bytes()).map(|v| v.as_slice()),
-        Some(&b"[<0011> <0011>]"[..])
-    );
 }
 
 /// M-1: the reviewer's s1.pdf had object 11 — a fresh `/Info` with /ModDate —

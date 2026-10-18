@@ -1007,7 +1007,12 @@ fn stream_body(blob: &[u8]) -> Vec<u8> {
 /// certificate and CRL streams, named by a brand-new `/DSS` the catalog points
 /// at. `indirect` names `/Certs` and `/CRLs` through objects of their own
 /// instead of inlining the arrays.
-fn hand_built_archive(plain: &[u8], revocation: &[RevocationBytes], indirect: bool) -> Vec<u8> {
+fn hand_built_archive(
+    plain: &[u8],
+    revocation: &[RevocationBytes],
+    indirect: bool,
+    trailer_extra: &str,
+) -> Vec<u8> {
     let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut cert_refs = Vec::new();
     for (i, cert) in [handle("signer-rsa.crt"), handle("intermediate.crt")]
@@ -1054,7 +1059,37 @@ fn hand_built_archive(plain: &[u8], revocation: &[RevocationBytes], indirect: bo
         .iter()
         .map(|(number, body)| (*number, body.as_slice()))
         .collect();
-    append_two(plain, &as_refs)
+    append_two_with(plain, &as_refs, trailer_extra)
+}
+
+/// The reference tool regenerates the file identifier on every stamp. iText
+/// 2.1.7, which is what AutoFirma 1.9.1 signs with, writes a brand-new `/ID`
+/// array in the incremental update it appends for a second signature: measured
+/// on a document AutoFirma signed twice through the `tools/golden` driver, both
+/// signatures its own, openfirma refused to READ it — "revision 2 changes /ID,
+/// which the newest revision already fixed to a different value" — so the
+/// reference tool's own document could be neither verified nor co-signed, over
+/// a key no verdict in this crate reads. What judges an appended revision is the
+/// archive gate, and it still does.
+#[test]
+fn an_append_that_regenerates_the_file_id_is_still_read() {
+    let (Some(signer), Some(revocation)) = (signer(), crls()) else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // The document handed to the signer carries an /ID, as nearly every real
+    // document does, and those bytes are what the signature covers.
+    let identified = append_two_with(
+        INPUT,
+        &[(6, b"<< /Nota (identidad) >>".as_slice())],
+        " /ID [<00112233> <00112233>]",
+    );
+    let plain = pades_sign(&identified, &signer, &PadesOptions::default()).expect("B-B failed");
+    // The archive pass regenerates it, the way iText's own append does.
+    let archived = hand_built_archive(&plain, &revocation, false, " /ID [<44556677> <44556677>]");
+    pades_verify(&archived, &anchors()).expect(
+        "an archive pass that regenerates the file identifier appends what an archive appends",
+    );
 }
 
 /// A LEGITIMATE archive must not be refused for HOW it names its data. ISO 32000
@@ -1070,7 +1105,7 @@ fn an_archive_that_names_its_arrays_indirectly_is_read_too() {
         return;
     };
     let plain = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("B-B failed");
-    let archived = hand_built_archive(&plain, &revocation, true);
+    let archived = hand_built_archive(&plain, &revocation, true, "");
     pades_verify(&archived, &anchors())
         .expect("an archive that names its arrays indirectly is the same archive");
 }
@@ -1091,7 +1126,7 @@ fn a_string_that_looks_like_a_reference_is_not_one() {
                  /PieceInfo << /Nota (ver el objeto 201 0 R de este documento) >> >>";
     let crafted = append_two(INPUT, &[(3, page.as_slice())]);
     let plain = pades_sign(&crafted, &signer, &PadesOptions::default()).expect("signing failed");
-    let archived = hand_built_archive(&plain, &revocation, false);
+    let archived = hand_built_archive(&plain, &revocation, false, "");
     pades_verify(&archived, &anchors()).expect("a string that reads like a reference is not one");
 }
 
@@ -1403,6 +1438,13 @@ fn a_font_slot_the_page_left_dangling_cannot_be_filled_with_a_remapping_font() {
 /// attack needs the rewrite and the hanging dictionary in a single update so
 /// the covering signature sees both as its successors.
 fn append_two(pdf: &[u8], objects: &[(u32, &[u8])]) -> Vec<u8> {
+    append_two_with(pdf, objects, "")
+}
+
+/// The same, with `extra` written inside the appended trailer dictionary — how
+/// a writer that regenerates `/ID` (iText does, on every stamp) or adds a
+/// vendor key writes its trailer.
+fn append_two_with(pdf: &[u8], objects: &[(u32, &[u8])], extra: &str) -> Vec<u8> {
     let mut out = pdf.to_vec();
     out.push(b'\n');
     let mut entries = Vec::new();
@@ -1421,12 +1463,9 @@ fn append_two(pdf: &[u8], objects: &[(u32, &[u8])]) -> Vec<u8> {
     for (num, at) in &entries {
         out.extend_from_slice(format!("{num} 1\n{at:010} 00000 n \n").as_bytes());
     }
+    let trailer = format!("/Size {size} /Root 1 0 R {extra} /Prev {}", last_xref(pdf));
     out.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {size} /Root 1 0 R /Prev {} >>\nstartxref\n{xref_at}\n%%EOF\n",
-            last_xref(pdf)
-        )
-        .as_bytes(),
+        format!("trailer\n<< {trailer} >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
     );
     out
 }

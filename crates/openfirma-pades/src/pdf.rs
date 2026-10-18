@@ -407,18 +407,29 @@ pub struct Trailer {
     /// different value, changes the document without saying so in its new
     /// cross-reference section. `/Encrypt` is the one a signature must never
     /// smuggle past (finding C-2), because the new strings would not be
-    /// encrypted; `/ID` is the one PDF/A and PDF 2.0 require to be carried
-    /// over (finding A-1).
+    /// encrypted.
     pub immutable: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl Trailer {
     /// Keys of a trailer that the revision appended on top must not change.
-    /// `/ID`, `/Encrypt` and every future key in this family. `/Root`,
-    /// `/Info`, `/Size` and `/Prev` are deliberately absent: those are exactly
-    /// what an incremental update legitimately rewrites.
+    /// `/Encrypt` and every future key in this family. `/Root`, `/Info`,
+    /// `/Size` and `/Prev` are deliberately absent: those are exactly what an
+    /// incremental update legitimately rewrites.
+    ///
+    /// `/ID` was in this list and is not any more. Refusing a trailer whose
+    /// `/ID` differs from the newest one's was measured throwing away documents
+    /// the reference tool itself writes: iText 2.1.7, which is what AutoFirma
+    /// 1.9.1 signs with, regenerates the whole `/ID` array on the incremental
+    /// update it appends for a second signature, so a document AutoFirma signed
+    /// twice could not be read at all — not verified, not co-signed — with
+    /// "revision 2 changes /ID". Nothing in this crate reads `/ID` (our own
+    /// writer still carries it over byte for byte, which is what PDF/A and
+    /// PDF 2.0 ask of a *writer*, finding A-1: `anonymous_comment` in the
+    /// tests), and for the unencrypted documents this crate touches the
+    /// identifier is an identity hint, not a rule a verdict rests on.
     fn immutable_keys(dict: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        const FIXED: [&str; 2] = ["/ID", "/Encrypt"];
+        const FIXED: [&str; 1] = ["/Encrypt"];
         let mut out = BTreeMap::new();
         for (k, v) in items(dict)? {
             let key = &dict[k];
