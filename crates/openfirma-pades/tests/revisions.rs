@@ -439,6 +439,57 @@ fn an_object_named_only_inside_a_vri_entry_is_not_validation_data() {
     );
 }
 
+/// Round 3, C-1 once more: licensing every brand-new `/Type /DSS` dictionary
+/// let one dress as an archive while being something a page renders. A reader
+/// resolves references from the LAST revision, so a document that names an
+/// object it does not have — `/XObject << /Xm1 100 0 R >>` in the page, used by
+/// the content stream's `/Xm1 Do` — shows that object the moment a later
+/// revision defines it. One appended revision defining it as a form XObject
+/// with a text of its own AND `/Type /DSS` in its dictionary put "PAGUESE 9999
+/// EUR" on a page no signature covered, and verify answered OK.
+#[test]
+fn a_brand_new_object_the_page_points_at_cannot_dress_as_an_archive() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // The document handed to the signer already references object 100, which
+    // does not exist: the viewer shows nothing there, and the signature covers
+    // the reference, so no later revision may repoint it.
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> /XObject << /Xm1 100 0 R >> >> \
+                 /Contents 4 0 R >>";
+    let body = b"BT /F1 12 Tf 72 770 Td (openfirma PAdES test document) Tj ET /Xm1 Do";
+    let content = format!(
+        "<< /Length {} >>\nstream\n{}\nendstream",
+        body.len(),
+        std::str::from_utf8(body).expect("ascii")
+    );
+    let dangling = append_two(INPUT, &[(3, page.as_slice()), (4, content.as_bytes())]);
+    let signed = pades_sign(&dangling, &signer, &PadesOptions::default()).expect("signing failed");
+    pades_verify(&signed, &anchors()).expect("a dangling reference is harmless on its own");
+
+    let text = b"BT /F1 24 Tf 72 400 Td (PAGUESE 9999 EUR) Tj ET";
+    let xobject = format!(
+        "<< /Type /DSS /Subtype /Form /BBox [ 0 0 595 842 ] \
+         /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+        text.len(),
+        std::str::from_utf8(text).expect("ascii")
+    );
+    let attacked = append_two(&signed, &[(100, xobject.as_bytes())]);
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("an object the page renders is not an archive, whatever its dictionary claims");
+    let t = error.to_string();
+    assert!(
+        t.contains("no archive may append"),
+        "the refusal says what was violated: {t}"
+    );
+    assert!(
+        t.contains("100 0 R"),
+        "the refusal names the rendered object: {t}"
+    );
+}
+
 /// Append one revision that (re)defines SEVERAL objects at once. The shadow
 /// attack needs the rewrite and the hanging dictionary in a single update so
 /// the covering signature sees both as its successors.

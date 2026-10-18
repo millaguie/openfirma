@@ -387,30 +387,86 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
     }
     let trailer = pdf::trailer(pdf, xref_at)?;
     let catalog = final_state.get(&trailer.root).cloned().unwrap_or_default();
-    // Validation data: only the archive the CATALOG names, and only the objects
-    // that archive names through the keys a validation-data reader consumes.
+    // Validation data: the objects a reader reaches through an archive, and
+    // only ever as ADDITIONS — an archive pass appends the bytes it archives
+    // (that is what the `before` state tells apart); it never replaces a byte a
+    // reader already rendered.
     //
-    // Three review rounds narrowed this the hard way (round 1 C-1, round 2 C-1
-    // again):
+    // Four review rounds narrowed this the hard way (round 1 C-1, round 2 C-1,
+    // round 3 C-1):
     //   - seeding from every object whose /Type is /DSS let a HANGING dictionary
     //     whitelist a rewritten payload, referenced by nothing;
     //   - seeding from *everything reachable* from the catalog's archive let a
     //     `<< /Type /DSS /Foo [<payload> 0 R] >>` — or one hop through a free
     //     object — do the same, because no reader ever looks at a key the archive
-    //     is not allowed to name validation data with. What the reader consumes
-    //     is `/Certs`, `/CRLs`, `/OCSPs` (arrays of stream references) and `/VRI`
-    //     (`ltv::Dss::read`); everything else a dictionary carries is inert.
-    // So the walk follows exactly those three keys, and classify_one licenses
-    // them only as ADDITIONS — an archive pass appends the bytes it archives
-    // (that is what the `before` state tells apart), it never replaces a byte a
-    // reader already rendered. The archive dictionary itself is licensed the
-    // same way, and so is a `/Type /DSS` dictionary the catalog does not point
-    // at yet (an earlier pass's archive, left in place by a later merge) — see
-    // classify_one for why that one is inert.
+    //     is not allowed to name validation data with: `ltv::Dss::read` consumes
+    //     `/Certs`, `/CRLs`, `/OCSPs` and `/VRI`, and the walk follows exactly
+    //     the three arrays now, following nothing found inside a named object;
+    //   - licensing every brand-new `/Type /DSS` dictionary for the claim in its
+    //     own body let one be an object a page renders (below).
+    //
+    // So the walk is not enough on its own (round 3). What makes an object
+    // validation data is not only WHO NAMES IT but also WHO ELSE POINTS AT IT: a
+    // reader resolves references from the last revision, so an object the
+    // covered bytes already named — `/XObject << /Xm1 100 0 R >>` in a page and
+    // `/Xm1 Do` in its content stream, a dangling `/Contents`, a page-tree kid —
+    // was a reference to nothing when the signature was made and becomes a
+    // RENDERED object the moment a later revision defines it. An appended
+    // revision that defined it as a form XObject carrying a text of its own AND
+    // `/Type /DSS` in its dictionary put that text on the page while verify
+    // answered OK, because the `/Type /DSS` branch licensed it for the claim.
+    //
+    // So the licensed set is a fixpoint, not a walk: start from the archive the
+    // catalog names, the objects it names data with, and every brand-new
+    // `/Type /DSS` dictionary (an earlier pass's archive, left behind by a later
+    // merge — the second B-LT pass test is what makes that one load bearing),
+    // then DROP any candidate some object outside the candidate set points at.
+    // Dropping one can expose another, so it repeats to a fixpoint. What
+    // survives is validation data under the only definition that matters: bytes
+    // a reader never resolves from anywhere but the archive.
+    //
+    // The catalog's own `/DSS` entry is the exception: pointing at the archive
+    // is what makes it the archive. Every other reference from any object — the
+    // catalog's other keys included — counts as an outside one.
     let archive = pdf::get(&catalog, "/DSS").and_then(pdf::parse_ref);
     let mut archive_data: BTreeSet<ObjRef> = BTreeSet::new();
     if let Some(dss) = archive {
         collect_archive_data(&final_state, dss, &mut archive_data);
+    }
+    let mut referrers: BTreeMap<ObjRef, BTreeSet<ObjRef>> = BTreeMap::new();
+    for (num, body) in &final_state {
+        for reference in refs_in(body) {
+            if *num == trailer.root && Some(reference) == archive {
+                continue;
+            }
+            referrers.entry(reference).or_default().insert(*num);
+        }
+    }
+    let mut validation_data: BTreeSet<ObjRef> = archive_data.clone();
+    if let Some(dss) = archive {
+        validation_data.insert(dss);
+    }
+    for change in redefined {
+        if change.before.is_empty() && is_type(&change.after, "/DSS") {
+            validation_data.insert(change.object);
+        }
+    }
+    loop {
+        let dropped: Vec<ObjRef> = validation_data
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                referrers
+                    .get(candidate)
+                    .is_some_and(|refs| refs.iter().any(|from| !validation_data.contains(from)))
+            })
+            .collect();
+        if dropped.is_empty() {
+            break;
+        }
+        for object in dropped {
+            validation_data.remove(&object);
+        }
     }
 
     let mut out = Vec::new();
@@ -420,8 +476,7 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
             classify_one(
                 &final_state,
                 trailer.root,
-                archive,
-                &archive_data,
+                &validation_data,
                 &change.object,
                 &change.after,
                 &change.before,
@@ -434,8 +489,7 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
 fn classify_one(
     final_state: &BTreeMap<ObjRef, Vec<u8>>,
     root: ObjRef,
-    archive: Option<ObjRef>,
-    archive_data: &BTreeSet<ObjRef>,
+    validation_data: &BTreeSet<ObjRef>,
     object: &ObjRef,
     newer: &[u8],
     older: &[u8],
@@ -454,29 +508,22 @@ fn classify_one(
     if is_type(newer, "/DocTimeStamp") || is_type(older, "/DocTimeStamp") {
         return Change::DocTimeStamp(*object);
     }
-    // Validation data: the objects the catalog's archive names as such (see the
-    // walk in `classify`), and only ever as ADDITIONS. A pass that archives
-    // bytes appends the objects it archives; it does not replace an object a
-    // reader already rendered — and that is the whole difference between an
-    // archive pass and the shadow attack, whose payload is by construction a
-    // REWRITE of a covered object.
+    // Validation data, under the fixpoint `classify` computed: the archive
+    // dictionary, an object one of its taxed keys names, or a brand-new
+    // `/Type /DSS` dictionary nothing outside points at. And only ever as an
+    // ADDITION: a pass that archives bytes appends the objects it archives; it
+    // does not replace an object a reader already rendered — the whole
+    // difference between an archive pass and the shadow attack, whose payload is
+    // by construction a REWRITE of a covered object.
     //
-    // So a rewritten object is never validation data, however it got named:
-    // not by being pointed at from a taxed key (`/Certs [<payload> 0 R]`), not
-    // by carrying `/Type /DSS` in its own body, not by being the dictionary the
-    // catalog's own `/DSS` points at. Only brand-new objects pass.
-    //
-    // The `brand_new && /Type /DSS` clause covers an ADDED archive dictionary a
-    // reader's merge left behind: a later archive pass writes its own `/DSS` and
-    // re-points the catalog, so the dictionary of the earlier pass stays in the
-    // file — added, never rewritten, and seen by the signature that preceded it
-    // as a brand-new object. It is inert: reachability starts at the catalog's
-    // archive and follows only taxed keys, so it can whitelist nothing but its
-    // own dictionary. A *rewritten* object claiming `/Type /DSS` is still
-    // refused: the payload of every shadow attack is a rewrite.
-    if brand_new
-        && (Some(*object) == archive || archive_data.contains(object) || is_type(newer, "/DSS"))
-    {
+    // So a rewritten object is never validation data, however it got named: not
+    // by being pointed at from a taxed key (`/Certs [<payload> 0 R]`), not by
+    // carrying `/Type /DSS` in its own body, not by being the dictionary the
+    // catalog's own `/DSS` points at. And a brand-new object something outside
+    // the archive points at is not validation data either, whatever it is
+    // named or claims to be: a reference a reader resolves is a rendered object
+    // (the round-3 form XObject that put a text of its own on the page).
+    if brand_new && validation_data.contains(object) {
         return Change::ValidationData(*object);
     }
     // The catalog: /DSS gaining (fresh or merged), AcroForm appearing through a
