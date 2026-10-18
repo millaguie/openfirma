@@ -1570,3 +1570,95 @@ fn a_later_signature_does_not_bless_a_font_an_earlier_pass_filled_in() {
         "the refusal names the font the earlier pass filled in: {error}"
     );
 }
+
+/// The object number the pass that wrote `pdf` gave its own `/Helvetica`: the
+/// last one in the file, since every pass appends after the previous one.
+fn last_helvetica(pdf: &[u8]) -> u32 {
+    let text = String::from_utf8_lossy(pdf);
+    let mut found = None;
+    for (pos, _) in text.match_indices(" 0 obj") {
+        let head = &text[..pos];
+        let start = head
+            .rfind(|c: char| !c.is_ascii_digit())
+            .map_or(0, |p| p + 1);
+        let Ok(number) = head[start..].trim_start().parse::<u32>() else {
+            continue;
+        };
+        let end = text[pos..].find("endobj").map_or(text.len(), |e| pos + e);
+        if text[pos..end].contains("/BaseFont /Helvetica") {
+            found = Some(number);
+        }
+    }
+    found.expect("the writer always writes a /Helvetica")
+}
+
+/// Round 4's A-4 one step further out: the name the signed bytes carried is in
+/// the FORM, and the pass that fills it is also the pass that rewrites the form —
+/// which is exactly what a signature pass does to add its field.
+///
+/// The text field below has no appearance of its own, so a viewer generates one
+/// from its `/DA` and the form's `/DR`: the mechanism C-1 measured. The document
+/// binds `/FZ` to a number nobody defines, so at the revision that signs it the
+/// name resolves to nothing and the field's value draws with whatever the viewer
+/// substitutes. The namer check that closed A-4 reads the FINAL state's namers,
+/// and the pass's own body is the one namer a reader sees afterwards: the covered
+/// name left the question with the body that carried it. What remains is the
+/// state the signature was made over, where that name is there and points at
+/// nothing — and a font that appears at its number changes what those covered
+/// bytes render.
+///
+/// The number is the writer's to choose, so the fixture asks it: the same
+/// document with the name aimed past the pass is signed and co-signed, and the
+/// number its own `/Helvetica` came out with is what the second document's `/DR`
+/// binds before it is signed. The writer's face is a plain Helvetica where an
+/// attacker's carries a `/Differences` remap; that is the difference between the
+/// two documents, not between the two rules.
+#[test]
+fn a_name_the_signed_bytes_already_carried_is_not_a_place_for_a_font() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let build = |fz: u32| {
+        let field = b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (concepto) \
+                      /V (IMPORTE TOTAL MIL) /DA (/FZ 0 Tf 0 g) \
+                      /Rect [ 72 600 400 630 ] /F 4 /P 3 0 R >>";
+        let catalog = format!(
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /DA (/FZ 0 Tf 0 g) \
+               /DR << /Font << /FZ {fz} 0 R >> >> /NeedAppearances true \
+               /Fields [ 13 0 R ] >> >>"
+        );
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                     /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R \
+                     /Annots [ 13 0 R ] >>";
+        append_two(
+            INPUT,
+            &[
+                (1, catalog.as_bytes()),
+                (3, page.as_slice()),
+                (13, field.as_slice()),
+            ],
+        )
+    };
+    let sign_twice = |fz: u32| {
+        let once = pades_sign(&build(fz), &signer, &PadesOptions::default())
+            .expect("signing a form whose /DR binds a name to nothing");
+        pades_sign(&once, &signer, &PadesOptions::default()).expect("co-signing")
+    };
+
+    // the control first: the same document, the name aimed past both passes
+    let control = sign_twice(999_999);
+    pades_verify(&control, &anchors())
+        .expect("a name that points nowhere near the pass is not an attack");
+    let claimed = last_helvetica(&control);
+
+    // and now the name the co-signing pass itself will answer to
+    let error = pades_verify(&sign_twice(claimed), &anchors()).expect_err(
+        "a font that appears where the signed bytes had a name changes what they render",
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("{claimed} 0 R")),
+        "the refusal names the font that filled the covered name: {text}"
+    );
+}

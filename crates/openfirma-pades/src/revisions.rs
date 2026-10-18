@@ -532,7 +532,7 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
         }
     }
 
-    let fonts = plumbing_fonts(&locations, &final_state, &referrers, &revs);
+    let fonts = plumbing_fonts(&locations, &final_state, &referrers, &revs, redefined);
     let transport = transport_containers(redefined, &locations, &referrers);
 
     let mut out = Vec::new();
@@ -999,11 +999,25 @@ fn same_pass(
 /// every object that names it. A font nobody names renders nothing, so it is
 /// inert; a font a namer from another revision points at is text that pass never
 /// set.
+///
+/// The namers are read off the FINAL state, though, and a signature pass is a
+/// pass that rewrites the form: adding its field leaves its own body as the one
+/// namer of `/DR` a reader sees, and the name the covered bytes carried is gone
+/// from the question. That is the same fill one step further out — the review's
+/// A-4 measured it through a co-signature, and a pass that rewrites the form and
+/// signs in the same run reaches it without one. So the state the signature was
+/// made over is asked too, and a number the covered bytes already pointed at is
+/// not a place a font may appear at all: that reference resolved to nothing
+/// when the signature was made — the covered field's own `/DA` drew with
+/// whatever the viewer substitutes — and resolves to a font now, so what those
+/// covered bytes render changes with it. C-1's measurement is that change with
+/// the form swapped instead of filled.
 fn plumbing_fonts(
     locations: &BTreeMap<ObjRef, Location>,
     final_state: &BTreeMap<ObjRef, Vec<u8>>,
     referrers: &BTreeMap<ObjRef, BTreeSet<ObjRef>>,
     revs: &[Revision],
+    redefined: &[Redefinition],
 ) -> BTreeSet<ObjRef> {
     let signatures: Vec<ObjRef> = final_state
         .iter()
@@ -1013,6 +1027,17 @@ fn plumbing_fonts(
     let mut out = BTreeSet::new();
     for (object, body) in final_state {
         if !is_type(body, "/Font") {
+            continue;
+        }
+        // the state the judged signature was made over: a body that changed kept
+        // its earlier shape in `before`, a body that did not is still its own.
+        let named_by_the_covered_bytes = referrers
+            .get(object)
+            .is_some_and(|from| from.iter().any(|namer| !changed(redefined, *namer)))
+            || redefined
+                .iter()
+                .any(|change| refs_in(&change.before).contains(object));
+        if named_by_the_covered_bytes {
             continue;
         }
         let names_it = referrers.get(object);
@@ -1027,6 +1052,12 @@ fn plumbing_fonts(
         }
     }
     out
+}
+
+/// Whether this pass changed the object: its body differs from the one the
+/// covering revision carried.
+fn changed(redefined: &[Redefinition], object: ObjRef) -> bool {
+    redefined.iter().any(|change| change.object == object)
 }
 
 /// `/V`, when it names a `/Sig` dictionary or a document time-stamp: the two
