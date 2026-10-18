@@ -187,6 +187,27 @@ jobs:
           export PATH="$dir:$PATH"
           if command -v cygpath >/dev/null 2>&1; then dir="$(cygpath -w "$dir")"; fi
           echo "$dir" >> "$GITHUB_PATH"
+          # Same trick for bash itself on Windows: the runner's PATH carries a
+          # WSL *dispatcher* as `bash` — it prints "Windows Subsystem for
+          # Linux …" and dies without running anything (runs 39091143744 and
+          # 39106701806). The test step runs in pwsh, cargo test inherits that
+          # PATH, and the cert-guard self-test spawns the dispatcher instead
+          # of a shell. This step only reaches here inside Git Bash (its shell
+          # is bash and openssl came out of that install), so prepend Git's
+          # bin directory — where bash.exe lives next to git.exe — to the
+          # persisted PATH and `bash` resolves to a real shell in every later
+          # step. cygpath'd like openssl above; a no-op on Linux/macOS, where
+          # /bin/bash already wins (no bash.exe sits next to their git). The
+          # self-test's contract stays honest: without a real bash it refuses
+          # loudly under REQUIRE_TESTS rather than riding the dispatcher.
+          if command -v git >/dev/null 2>&1; then
+            gitbin="$(dirname "$(command -v git)")"
+            if [ -x "$gitbin/bash.exe" ]; then
+              bdir="$gitbin"
+              if command -v cygpath >/dev/null 2>&1; then bdir="$(cygpath -w "$bdir")"; fi
+              echo "$bdir" >> "$GITHUB_PATH"
+            fi
+          fi
           openssl version
           ./tools/gen-testcert.sh
           # gen-p12-fixtures.sh also needs a python3 (re-MACs the java-empty
@@ -236,6 +257,20 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc libnss3 qpdf poppler-utils xmlsec1
 
+      # The crosscheck pair on macOS (H-1): qpdf and pdfsig (poppler) have no
+      # base-system equivalent there, and require_or_skip now fails the suite
+      # when REQUIRE_TESTS is set and one is absent — which it is (run
+      # 39106701806). Homebrew carries both on either arch. The ltv job died
+      # before its xades binaries ran, so whether brew's xmlsec1 verifies our
+      # documents under REQUIRE_TESTS was never observed; install it too and
+      # let the next run say so with its result lines instead of a comment.
+      # Windows keeps xmlsec absent — no packaged xmlsec exists there, and
+      # those tests skip like every other non-keystore crosscheck does under
+      # the platform allowance (a platform fact, recorded honestly).
+      - name: install crosscheck tools (macos)
+        if: runner.os == 'macOS'
+        run: brew install qpdf poppler xmlsec1
+
       # eframe's sys crates need the windowing client libraries to LINK on
       # Linux even for a headless build (the kittest tests never open a
       # window, but the binary does). macOS carries Metal/OpenGL in the SDK
@@ -259,7 +294,13 @@ jobs:
           conf=$(sed -n "s/^SOFTHSM2_CONF=\([^ ]*\).*/\1/p" /tmp/keystore-setup.log)
           [ -n "$conf" ] && echo "SOFTHSM2_CONF=$conf" >> "$GITHUB_ENV"
           echo "OPENFIRMA_TEST_PKCS11_MODULE=/usr/lib/softhsm/libsofthsm2.so" >> "$GITHUB_ENV"
-          echo 'OPENFIRMA_TEST_NSS_DB=sql:/tmp/opencode/keystores/nssdb' >> "$GITHUB_ENV"
+          # Same dotenv rule as SOFTHSM2_CONF two lines above: derive the NSS
+          # DB from the TESTDIR the setup script actually used (it prints
+          # "NSS DB: sql:<path>"), never a path remembered from a local run —
+          # the hardcoded /tmp/opencode/keystores/nssdb this line carried made
+          # the NSS tests look at a directory the runner never had.
+          nss="$(sed -n 's/^NSS DB: \(sql:[^ ]*\).*/\1/p' /tmp/keystore-setup.log)"
+          [ -n "$nss" ] && echo "OPENFIRMA_TEST_NSS_DB=$nss" >> "$GITHUB_ENV"
 
       - name: build
         run: cargo build --all-targets --target ${{ matrix.target }}
