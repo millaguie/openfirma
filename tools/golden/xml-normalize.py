@@ -394,11 +394,12 @@ def integrity(path, trusted):
     # id(), per xmlsec version — both forms measured against real binaries
     # (Arch 1.3.12, Ubuntu 24.04's 1.2.39): 1.3+ takes `--add-id-attr Id
     # --verbose`; 1.2.x knows only `--id-attr:Id <root>` — it has no built-in
-    # knowledge of Id and gets zero references verified without it — and
-    # refuses both --add-id-attr and --verbose. An unknown flag answers
-    # "is not supported" on stderr; the usage banner it also dumps goes to
-    # stdout, so keying off one stream reads that backwards. Counters only
-    # print in verbose mode, hence refs (?,?) tolerated on 1.2.x.
+    # knowledge of Id and verifies zero references without it — and refuses
+    # both --add-id-attr and --verbose. An unknown flag answers "is not
+    # supported" on stderr; the usage banner it also dumps goes to stdout, so
+    # keying off one stream reads that backwards. Both version lines print
+    # the reference counters on verify; the twins in
+    # crates/openfirma-xades/tests/xmlsec_crosscheck.rs carry the same facts.
     def _accepts(option: str) -> bool:
         probe = subprocess.run([xmlsec, "--verify", option, "/nonexistent.xml"],
                                capture_output=True, text=True)
