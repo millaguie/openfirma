@@ -263,7 +263,34 @@ AutoFirma 1.9.1: its second pass adds `/V` and `/AP` to the second field and
 leaves the first exactly where it was), and this crate's writer produces the same
 shape when the caller names a field the form already has. Round 3's shape stays
 refused: a widget whose covered bytes DID carry a value may not gain a rectangle
-and an appearance of its own. An object a pass packed into an object stream — the
+and an appearance of its own. An appearance is judged on EVERY object it draws,
+not on the one the widget names: `/AP /N` is a form XObject, a form XObject draws
+through its own `/Resources /XObject`, and iText writes that chain (measured:
+AutoFirma 1.9.1's second signature over a two-field form builds
+`/AP /N → 21 0 R → 18/19 0 R`), so a gate that stopped at the first hop refused
+the reference tool's own visible fill while the objects that paint the ink went
+unjudged. The walk is bounded and fails closed, and its safety does not weaken
+per hop: a hop is reached only when the pass that wrote it is the pass of the
+signature that owns the widget, and the licensing branch still asks that it be
+brand new, so a hop that rewrote a covered object is refused however it was
+reached. One widening is bookkeeping rather than rendering: a writer of the same
+lineage re-stamps its own mark — iText records the version that last wrote a
+document as a non-standard `/ITXT` entry and re-serializes the dictionary around
+entries it did not change (measured: co-signing a document this crate signed
+turned the covered `/Pages` node into
+`<</Type/Pages/Kids[3 0 R]/Count 1/ITXT(2.1.7)>>`). `/ITXT` is not a key of ISO
+32000 and nothing renders differently, and the rule is deliberately narrow: a
+bare dictionary (never a stream, whose data a reader also takes), its entries
+pairwise identical in order and spelling, exactly one entry added and its key
+`/ITXT`. Anything else stays refused, which is where the declared residual of
+this gate sits: a NESTED value respelled inside a rewritten object — iText
+re-serializing a page's `/Resources` as well as growing its `/Annots` when it
+appends an annotation of its own — is still the incremental saving attack, and
+closing it means deciding an appended revision by what a reader RESOLVES rather
+than by object bytes. A second declared residual is the fill's: taking up a field
+the signed bytes left empty repaints the appearance they carried, which is what
+filling a form field is and what AutoFirma 1.9.1 itself does on a pre-drawn form.
+An object a pass packed into an object stream — the
 way iText writes a second signature — is judged on the bytes its container holds,
 because those are the only bytes it has: the container is where its bytes and the
 entry that maps them live, and a container a signature covers is one that existed
