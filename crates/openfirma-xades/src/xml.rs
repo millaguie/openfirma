@@ -186,81 +186,66 @@ fn encoding_is(declared: &str, wanted: &[u8]) -> bool {
             .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
-/// The value of the `name=` pseudo-attribute of the XML declaration (trimmed,
-/// single quotes accepted), or None when absent. Production [24] of the spec
-/// is strict — Name Eq OptSp AttValue — and every real declaration begins
-/// with version, so only the spelling anchored at the start of the content
-/// (or right after the leading whitespace) is recognized: a `version=` that
-/// appears anywhere else inside the declaration is not this attribute.
-fn declared_pseudo_attribute<'a>(content: &'a str, name: &str) -> Option<&'a str> {
-    let rest = content.trim_start_matches([' ', '\t', '\r', '\n']);
-    if !rest.starts_with(name) {
-        return None;
-    }
-    // the character right after the name may only be whitespace or '='
-    let after_name = &rest[name.len()..];
-    let next = *after_name.as_bytes().first()?;
-    if !(next.is_ascii_whitespace() || next == b'=') {
-        return None;
-    }
-    declared_attvalue(after_name)
-}
-
-/// The `Eq OptSp AttValue` part of a pseudo-attribute: given the text that
-/// begins right after its name, return the quoted value or None. Shared by
-/// the two callers so the grammar lives in one place.
-fn declared_attvalue(rest: &str) -> Option<&str> {
-    let rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
-    let rest = rest.strip_prefix('=')?;
-    let rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
-    let quote = *rest.as_bytes().first()?;
-    if quote != b'"' && quote != b'\'' {
-        // version=1.0 without quotes is not an AttValue (production [24]), so
-        // it is not this pseudo-attribute at all
-        return None;
-    }
-    let end = rest[1..].find(quote as char)?;
-    Some(rest[1..end + 1].trim())
-}
-
-/// The declaration's attributes are checked in order, so `encoding` has to be
-/// found wherever it sits: scan the content for a whitespace-delimited
-/// `name=` occurrence.
-fn declared_attribute_anywhere<'a>(content: &'a str, name: &str) -> Option<&'a str> {
-    // the declaration's names are case-insensitive tokens (production [24]
-    // and namespaces in general): compare a lowercased copy at ASCII byte
-    // boundaries so the returned slice keeps the exact spelling to echo back
-    let haystack = content.to_ascii_lowercase();
-    let bytes = haystack.as_bytes();
-    let name = &name.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(offset) = haystack[from..].find(name) {
-        let at = from + offset;
-        let before_ok = at == 0 || matches!(bytes[at - 1], b' ' | b'\t' | b'\r' | b'\n');
-        let after = at + name.len();
-        let next = bytes.get(after).copied();
-        if before_ok && next.is_none_or(|b| b == b'=') {
-            // an AttValue is quoted, and the value ends at its OWN closing
-            // quote: searching from the opening one matched the hyphen inside
-            // UTF-8 as a delimiter and handed back "UTF-" (the byte/char mix
-            // this replaced was the real story; the shape is production [24])
-            // the scan found `name=` (lowercased) at byte `at`; the VALUE is
-            // not lowercased data, so re-reading it from the real content at
-            // the same offset is what echoes back the document's spelling.
-            // ASCII-only tokens make both slices start at a char boundary;
-            // the defensive get avoids any panic if that ever changes.
-            let value = content.get(at..).and_then(|rest| {
-                let rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
-                // `rest` begins with the lowercased name at exactly `name.len()`
-                // ASCII bytes; everything after is Eq OptSp AttValue
-                let rest = rest.get(name.len()..)?;
-                declared_attvalue(rest)
-            })?;
-            return Some(value);
+/// The pseudo-attributes of an XML declaration, in order, each with its value
+/// when it follows production [24]'s `Name Eq AttValue` (`Eq ::= S? '=' S?`,
+/// so whitespace is allowed on both sides of the `=`) and `None` when it does
+/// not.
+///
+/// A name whose value cannot be read is kept rather than dropped: round 2's
+/// N-3 showed why. The old scan demanded the `=` immediately after the name,
+/// so `encoding ="ISO-8859-1"` — a spelling production [25] allows — looked
+/// like a declaration with no encoding at all, and the document was signed as
+/// UTF-8 while every parser that obeys the declaration reads Latin-1. Callers
+/// see the difference between "absent" and "present but unreadable" and can
+/// fail closed on the second.
+fn declaration_attributes(content: &str) -> Vec<(&str, Option<&str>)> {
+    let bytes = content.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
-        from = after;
+        // production [5]: NameStartChar then NameChar. The names a declaration
+        // may carry are ASCII, so the ASCII subset of that production is what
+        // this scan understands.
+        let starts_name = bytes
+            .get(i)
+            .is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b':'));
+        if !starts_name {
+            break;
+        }
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b':' | b'.' | b'-'))
+        {
+            i += 1;
+        }
+        let name = &content[start..i];
+        // Name Eq AttValue, with the optional spaces [25] allows around the '='
+        let rest = &content[i..];
+        let after_ws = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        let mut consumed = i + (rest.len() - after_ws.len());
+        let value = after_ws.strip_prefix('=').and_then(|after_eq| {
+            let after_ws2 = after_eq.trim_start_matches([' ', '\t', '\r', '\n']);
+            let quote = *after_ws2.as_bytes().first()?;
+            if quote != b'"' && quote != b'\'' {
+                // production [24] requires a quoted AttValue; an unquoted one is
+                // not this pseudo-attribute (and is reported as unreadable)
+                return None;
+            }
+            let end = after_ws2[1..].find(quote as char)?;
+            consumed = consumed + 1 + (after_eq.len() - after_ws2.len()) + 1 + end + 1;
+            Some(&after_ws2[1..end + 1])
+        });
+        out.push((name, value));
+        if value.is_none() {
+            // whatever follows is not a declaration this reader understands
+            break;
+        }
+        i = consumed;
     }
-    None
+    out
 }
 
 impl<'a> Parser<'a> {
@@ -410,13 +395,19 @@ impl<'a> Parser<'a> {
     /// certainty (UTF-8 itself, or US-ASCII, whose bytes are all single-char
     /// in both readings) or the document is refused with the name it declares.
     fn check_declaration(&self, content: &str) -> Result<()> {
-        // production [24] puts version first; real-world producers always do.
-        let version = declared_pseudo_attribute(content, "version").ok_or_else(|| {
-            self.err(
-                "the XML declaration carries no version, or spells it without the \
-                 quoted value the specification requires",
-            )
-        })?;
+        // production [24] puts version first; real-world producers always do,
+        // and a declaration that puts something else there is not this
+        // document's version at all (review 03, M-3: libxml2 refuses those).
+        let attrs = declaration_attributes(content);
+        let version = match attrs.first() {
+            Some((name, Some(value))) if name.eq_ignore_ascii_case("version") => *value,
+            _ => {
+                return Err(self.err(
+                    "the XML declaration does not begin with a quoted version \
+                     pseudo-attribute, which XML 1.0 production [24] requires",
+                ));
+            }
+        };
         if !encoding_is(version, b"1.0") {
             return Err(self.err(&format!(
                 "the XML declaration declares version=\"{version}\"; openfirma signs \
@@ -424,7 +415,22 @@ impl<'a> Parser<'a> {
                  your content)"
             )));
         }
-        if let Some(encoding) = declared_attribute_anywhere(content, "encoding") {
+        if let Some((_, value)) = attrs
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("encoding"))
+        {
+            // A name we cannot read is not a name we may ignore: `encoding
+            // ="ISO-8859-1"` (spaces around the `=`, which production [25]
+            // allows) used to read as "declares no encoding" and be signed as
+            // UTF-8 over text every other parser reads as Latin-1 (round 2,
+            // N-3). Fail closed instead.
+            let Some(encoding) = *value else {
+                return Err(self.err(
+                    "the XML declaration names an encoding it does not spell as a quoted \
+                     name (XML 1.0 production [24]: Name Eq AttValue), so openfirma cannot \
+                     tell which text your bytes mean and refuses the document",
+                ));
+            };
             // A declared UTF-8 encoding over bytes that are not valid UTF-8
             // is refused by the whole-file UTF-8 check in `parse` before this
             // method ever runs, so it cannot reach here.
