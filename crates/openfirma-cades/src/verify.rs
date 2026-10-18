@@ -966,8 +966,10 @@ pub enum CertRole {
     /// treats the trust anchor's properties as configuration data, and pre-v3
     /// roots exist in real PKIs. Anything else must say CA.
     Issuer {
-        /// How many certificates sit below this one in the chain being built;
-        /// `pathLenConstraint`, when present, must not be smaller.
+        /// How many non-self-issued intermediate certificates sit below this
+        /// one in the chain being built; `pathLenConstraint`, when present,
+        /// must not be smaller. The end-entity signer is not an intermediate
+        /// (RFC 5280 6.1.4 (l)/(m)).
         depth_below: usize,
     },
     /// A certificate that signs CRLs for some CA (a CRL issuer that is not
@@ -1038,15 +1040,16 @@ pub fn check_certificate_rules(cert: &CertificateHandle, role: CertRole) -> Resu
                         ));
                     }
                     if let Some(limit) = bc.path_len_constraint {
-                        // A pathLenConstraint of N allows at most N further certifications
-                        // below this CA; the chain asks it to make depth_below of them.
+                        // A pathLenConstraint of N allows at most N further
+                        // certifications below this CA; `depth_below` counts the
+                        // non-self-issued intermediates (never the end entity).
                         if depth_below > usize::from(limit) {
                             return Err(fail(
                                 CHECK_CERTIFICATE_CHAIN,
                                 format!(
                                     "\"{}\" carries pathLenConstraint {limit} but the chain \
-                                     below it has {depth_below} certificate(s); one \
-                                     certificate too many sit under this CA",
+                                     below it has {depth_below} intermediate certificate(s); \
+                                     one certificate too many sit under this CA",
                                     subject(cert)
                                 ),
                             ));
@@ -1174,6 +1177,29 @@ pub fn check_certificate_rules(cert: &CertificateHandle, role: CertRole) -> Resu
     Ok(())
 }
 
+/// How many certificates below a candidate issuer its `pathLenConstraint`
+/// bounds: RFC 5280 6.1.4 (l)/(m) counts the *non-self-issued intermediate*
+/// certificates that follow in the path, so the end-entity signer never counts
+/// and neither does a self-issued certificate (a CA that re-signs itself, as
+/// rollover and cross-signed material does). `chain` is signer first, so the
+/// first element is skipped. Round 2's finding N1: the walk handed the raw
+/// chain length here, which counted the signer and so refused every chain
+/// whose CA carries `pathlen:0` — the shape of AC FNMT Usuarios, AC
+/// Representación, the FNMT sealing CAs and Firmaprofesional's intermediates,
+/// i.e. every real Spanish citizen certificate and every FNMT time-stamp.
+fn intermediates_below(chain: &[&CertificateHandle]) -> usize {
+    chain
+        .iter()
+        .skip(1)
+        .filter(|cert| match (cert.subject_der(), cert.issuer_der()) {
+            (Ok(subject), Ok(issuer)) => subject != issuer,
+            // a name this build cannot re-encode is not assumed self-issued:
+            // it counts, which is the stricter direction
+            _ => true,
+        })
+        .count()
+}
+
 /// Walks from the signer certificate upwards. At each step the issuer is
 /// looked for first among the trust anchors and then among the certificates
 /// embedded in the signature, and every candidate has to verify the current
@@ -1239,7 +1265,7 @@ fn build_chain_refs<'c, 'a>(
             check_certificate_rules(
                 current,
                 CertRole::Issuer {
-                    depth_below: chain.len(),
+                    depth_below: intermediates_below(&chain),
                 },
             )?;
             return Ok((chain, anchor));
@@ -1247,9 +1273,15 @@ fn build_chain_refs<'c, 'a>(
         let issuer_der = current.issuer().to_der()?;
         let mut name_matches = 0usize;
         let mut signature_failures = 0usize;
-        // certificates below `current` (the signer counts as one): the
-        // candidate issuer's pathLenConstraint bounds exactly these
-        let depth_below = chain.len();
+        // certificates below `current` that its pathLenConstraint bounds: RFC
+        // 5280 6.1.4 (l)/(m) counts the INTERMEDIATE certificates between it
+        // and the end entity — never the end entity itself, and never a
+        // self-issued certificate. Round 2, N1: counting the signer rejected
+        // every chain whose CA carries `pathlen:0`, which is the shape of the
+        // real Spanish CAs (AC FNMT Usuarios, AC Representación, the FNMT
+        // sealing CAs, Firmaprofesional's intermediates), so `verify` refused
+        // every citizen certificate from FNMT and every FNMT time-stamp.
+        let depth_below = intermediates_below(&chain);
 
         for anchor in anchors {
             if anchor.subject().to_der()? != issuer_der {
