@@ -858,21 +858,38 @@ fn is_signature_field(
         .is_some_and(|value| signature_covers(pdf, locations, final_state, value, *field))
 }
 
-/// The bytes of an object written at a top-level offset: from its xref offset to
-/// the byte after the `endobj` that closes it. `None` for an object that lives
-/// inside an object stream, whose own bytes are not addressed anywhere.
+/// The bytes an object's definition lives in: from its xref offset to the byte
+/// after the `endobj` that closes it, or — for an object packed into an object
+/// stream, whose own bytes are addressed nowhere — the span of the container
+/// that carries them. The container is where the bytes and the entry that maps
+/// them live, which is the same hop `revision_of` reads, and for such an object
+/// it is the whole of what a signature can attest.
+///
+/// Read as "an object with no span of its own", the attestation the plumbing
+/// rules ask for could never be satisfied by a packed object, and a pass that
+/// saves compressed — iText's own save, `qpdf --object-streams=generate`, an
+/// Acrobat re-save, which is how AutoFirma's second signature writes the field,
+/// the appearance and the font it adds — was refused object by object. The
+/// container a signature covers is a container that existed when it was made,
+/// so an object it names through the cross-reference entries cannot be newer
+/// than the signature that attests it.
 fn object_span(
     pdf: &[u8],
     locations: &BTreeMap<ObjRef, Location>,
     object: ObjRef,
 ) -> Option<(usize, usize)> {
-    let Location::Direct(start) = locations.get(&object)? else {
-        return None;
+    let at = match locations.get(&object)? {
+        Location::Direct(at) => *at,
+        Location::InObjectStream { stream, .. } => match locations.get(stream)? {
+            Location::Direct(at) => *at,
+            // an object stream nested in another is not a thing ISO 32000-1
+            // allows, so one hop is all there is
+            Location::InObjectStream { .. } => return None,
+        },
     };
-    let start = *start;
-    let rest = pdf.get(start..)?;
-    let end = start + rest.windows(6).position(|window| window == b"endobj")? + 6;
-    Some((start, end))
+    let rest = pdf.get(at..)?;
+    let end = at + rest.windows(6).position(|window| window == b"endobj")? + 6;
+    Some((at, end))
 }
 
 /// The four numbers of a `/ByteRange`, when the value is one and parses.

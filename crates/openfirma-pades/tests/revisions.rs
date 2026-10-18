@@ -1750,3 +1750,192 @@ fn a_pass_that_fills_a_field_the_signed_bytes_left_empty_is_an_ordinary_signatur
         "and gained the value and the appearance: {text}"
     );
 }
+
+/// Append a revision the way a COMPRESSED saver writes one — iText's own save,
+/// `qpdf --object-streams=generate`, an Acrobat re-save, and the second
+/// signature of the reference tool: the dictionaries go inside a
+/// `/Type /ObjStm`, the streams and the cross-reference stream stay direct, and
+/// the closing xref is a stream with a type 2 row for each packed object. The
+/// packed objects and the direct ones must be contiguous numbers in increasing
+/// order, ending at the last direct object's number, so the container and the
+/// cross-reference stream take the two numbers after it and `/Index` is a
+/// single range.
+fn append_packed_pass(pdf: &[u8], packed: &[(u32, Vec<u8>)], direct: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let first = packed.first().expect("a packed object").0;
+    let last = direct.last().expect("a direct object").0;
+    let container = last + 1;
+    let xref_obj = last + 2;
+    let size = xref_obj + 1;
+
+    let mut header = String::new();
+    let mut payload: Vec<u8> = Vec::new();
+    for (num, body) in packed {
+        header.push_str(&format!("{num} {} ", payload.len()));
+        payload.extend_from_slice(body);
+        payload.push(b'\n');
+    }
+    let first_len = header.len();
+    let mut rows: Vec<(u32, u8, u32, u16)> = Vec::new();
+
+    let mut out = pdf.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let at = out.len();
+    out.extend(
+        format!(
+            "{container} 0 obj\n<< /Type /ObjStm /N {} /First {first_len} /Length {} >>\nstream\n",
+            packed.len(),
+            header.len() + payload.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    rows.push((container, 1, at as u32, 0));
+    for (i, (num, _)) in packed.iter().enumerate() {
+        rows.push((*num, 2, container, i as u16));
+    }
+    for (num, body) in direct {
+        let at = out.len();
+        out.extend(format!("{num} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+        rows.push((*num, 1, at as u32, 0));
+    }
+    let xref_at = out.len();
+    rows.push((xref_obj, 1, xref_at as u32, 0));
+    rows.sort_by_key(|(num, ..)| *num);
+    let mut bytes = Vec::new();
+    for (_, kind, f2, f3) in &rows {
+        bytes.push(*kind);
+        bytes.extend(f2.to_be_bytes());
+        bytes.extend(f3.to_be_bytes());
+    }
+    out.extend(
+        format!(
+            "{xref_obj} 0 obj\n<< /Type /XRef /Size {size} /Index [ {first} {} ] \
+             /W [ 1 4 2 ] /Root 1 0 R /Prev {} /Length {} >>\nstream\n",
+            rows.len(),
+            last_xref(pdf),
+            bytes.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&bytes);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    out.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// A pass that saves COMPRESSED — its field, its font and therefore its
+/// appearance inside a `/Type /ObjStm`, which is how iText writes the second
+/// signature of a form, and what the reference tool produced when it filled a
+/// two-field form — must be judged on the bytes its CONTAINER holds. Read as
+/// "an object with no span of its own", no packed object could ever satisfy the
+/// attestation the plumbing rules ask for: measured on that document, the
+/// filled field came back as "a form field value was rewritten" and each of the
+/// objects beside it as "a dictionary outside the archive whitelist was
+/// rewritten", while the same objects written directly are licensed by the
+/// tests above.
+///
+/// The container is the honest reading, the one `revision_of` already takes for
+/// the same reason: an object packed into an object stream has no bytes of its
+/// own anywhere, the container is where its bytes and the entry that maps them
+/// live, and a signature can only attest bytes that existed when it was made —
+/// so an object reached through a covered container's cross-reference entries
+/// is older than the signature that names it.
+///
+/// This test calls the gate directly: the plumbing rules are structural, and a
+/// real CMS would only add the cryptographic checks the other tests cover. The
+/// signature dictionary here is a well-formed `/Type /Sig` whose `/ByteRange`
+/// covers the pass, which is exactly what the gate reads.
+#[test]
+fn a_pass_that_packs_its_plumbing_into_an_object_stream_is_judged_on_the_container() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // Revision 1 is a document this crate's own writer signed, so the judge is
+    // a real signature with a real /ByteRange and a real coverage end.
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing");
+    let coverage_end = {
+        let sigs = openfirma_pades::inspect::signatures(&signed).expect("signatures");
+        let range = sigs[0].byte_range;
+        range[2] + range[3]
+    };
+
+    // The pass, numbered 20 upward: the field it fills (20) and the font its
+    // appearance draws with (21) are packed; the appearance (22), the signature
+    // (23), the container (24) and the cross-reference stream (25) are direct.
+    let field = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma2) \
+                  /Rect [ 72 400 400 460 ] /F 132 /P 3 0 R /V 23 0 R \
+                  /AP << /N 22 0 R >> >>"
+        .to_vec();
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+                 /Encoding /WinAnsiEncoding >>"
+        .to_vec();
+    let appearance = b"<< /Type /XObject /Subtype /Form /BBox [ 0 0 328 60 ] /Length 4 \
+                       /Resources << /Font << /F1 21 0 R >> >> >>\nstream\nq Q\nendstream"
+        .to_vec();
+    // The /ByteRange numbers are written at a fixed width so the layout survives
+    // the patch below: the covered bytes are everything but the /Contents hex.
+    const PAD: &str = "0000000000";
+    let signature = format!(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached \
+         /ByteRange [ 0 {PAD} {PAD} {PAD} ] /Contents <{}> /M (D:20260101000000Z) >>",
+        "a5".repeat(64)
+    )
+    .into_bytes();
+
+    let mut pass = append_packed_pass(
+        &signed,
+        &[(20, field), (21, font)],
+        &[(22, appearance), (23, signature)],
+    );
+    let hex = pass
+        .windows(b"/Contents <".len())
+        .rposition(|window| window == b"/Contents <")
+        .expect("the signature's /Contents")
+        + b"/Contents ".len();
+    let contents_end = hex + 128 + 1; // 64 bytes of hex, then the closing >
+    let patched = format!(
+        "[ 0 {hex:010} {contents_end:010} {:010} ]",
+        pass.len() - contents_end
+    );
+    let placeholder = format!("[ 0 {PAD} {PAD} {PAD} ]");
+    let at = pass
+        .windows(placeholder.len())
+        .position(|window| window == placeholder.as_bytes())
+        .expect("the /ByteRange placeholder");
+    assert_eq!(
+        placeholder.len(),
+        patched.len(),
+        "the patch keeps the layout"
+    );
+    pass[at..at + patched.len()].copy_from_slice(patched.as_bytes());
+
+    let revs = revisions(&pass).expect("the packed revision parses");
+    let redefined = redefinitions_after(&pass, &revs, coverage_end).expect("redefinitions");
+    let verdicts = classify(&pass, &redefined).expect("classify");
+    for (object, change) in &verdicts {
+        assert!(
+            !matches!(change, Change::NotAllowed { .. }),
+            "every object of the packed pass is plumbing or transport, {object} came back {change:?}"
+        );
+    }
+    assert!(
+        verdicts
+            .iter()
+            .any(|(object, change)| object.num == 20
+                && matches!(change, Change::SignaturePlumbing(_))),
+        "the packed field is licensed as plumbing: {:?}",
+        verdicts
+            .iter()
+            .filter(|(object, _)| object.num == 20)
+            .collect::<Vec<_>>()
+    );
+}
