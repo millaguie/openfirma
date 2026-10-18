@@ -220,6 +220,56 @@ fn an_identical_copy_of_a_signed_object_does_not_trip_the_gate() {
     pades_verify(&copied, &anchors()).expect("a copy that changes nothing still verifies");
 }
 
+/// A revision that adds nothing but a cross-reference section and a trailer: no
+/// object is redefined, so the gate has nothing to classify — what a chain of
+/// these measures is how many sections the reader is willing to walk.
+fn append_trailer_only(pdf: &[u8]) -> Vec<u8> {
+    let mut out = pdf.to_vec();
+    out.push(b'\n');
+    let xref_at = out.len();
+    out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Prev {} >>\nstartxref\n{xref_at}\n%%EOF\n",
+            declared_size(pdf),
+            last_xref(pdf)
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// The chain walk is guarded at 100 sections, and the guard is declared: a
+/// document at the limit is read, the next section is refused. 100 signatures is
+/// more than any real document carries, and the guard is what stops a file whose
+/// `/Prev` points at itself — or at a section it already walked — from being
+/// followed forever. This is the number made measured, so raising the limit
+/// deliberately fails a test instead of silently changing what is readable.
+///
+/// Flagged by the round-5 reviewer as an unpinned guard ("los tests actuales no
+/// lo fijan — ruido, no defecto").
+#[test]
+fn a_chain_at_the_revision_limit_is_read_and_one_past_it_is_refused() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    // the document's own section and the signature's: two, so 98 more is 100
+    let mut at_limit = signed;
+    for _ in 0..98 {
+        at_limit = append_trailer_only(&at_limit);
+    }
+    pades_verify(&at_limit, &anchors()).expect("100 sections are read");
+    let over = append_trailer_only(&at_limit);
+    let error = pades_verify(&over, &anchors()).expect_err("101 sections are refused");
+    let text = format!("{error}");
+    assert!(
+        text.contains("more than 100 revisions"),
+        "says why rather than misreading the file: {text}"
+    );
+}
+
 /// Overwrite the FIRST `startxref <n> %%EOF` record of a document in place, so
 /// the bytes stop being a record while every offset after them is untouched.
 /// Readers do not need that record — the `/Prev` chain walks past it — which is

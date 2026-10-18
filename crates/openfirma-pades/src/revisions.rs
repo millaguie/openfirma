@@ -48,7 +48,7 @@ pub struct Revision {
     /// record. The oldest section of a chain can be missing one — readers do
     /// not need it, the `/Prev` walk skips it — and then `end` is the end of
     /// the FILE, which is no boundary of that revision's at all. Attribution
-    /// ([`revision_of`]) refuses to guess when it is false: a revision whose
+    /// (`revision_of`) refuses to guess when it is false: a revision whose
     /// bytes cannot be delimited cannot be told apart from the ones appended
     /// after it, and every `same_pass` question that involved it would answer
     /// yes for the whole document.
@@ -337,7 +337,7 @@ impl std::fmt::Display for Change {
 /// One object whose bytes changed between two revisions, with what each state
 /// holds for it (`before` = covering revision, `after` = final state). For a
 /// stream object that is its dictionary AND the data the dictionary says
-/// belongs to it — see [`rendered_body`].
+/// belongs to it — see `rendered_body`.
 pub struct Redefinition {
     pub object: ObjRef,
     pub before: Vec<u8>,

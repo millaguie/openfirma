@@ -279,7 +279,10 @@ change. Attribution is closed the same way: a revision whose own
 `startxref`/`%%EOF` record is missing has no boundary of its own, so nothing is
 charged to it — without that, every offset in such a file belonged to the
 revision whose end had fallen back to the end of the file, and "the pass that
-wrote this" answered yes for the whole document. Validation data
+wrote this" answered yes for the whole document. The chain walk itself is
+declared: 100 sections are read and the 101st is refused, so a `/Prev` that
+points at itself, or back at a section already walked, stops instead of being
+followed forever. Validation data
 is the narrow part, and getting it narrow took four review rounds: an object may
 be excused as such only when it is NEW and a reader reaches it through the
 archive and nowhere else — the dictionary the catalog's `/DSS` names, or an
