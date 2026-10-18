@@ -109,16 +109,17 @@ check_embedded_certs() {
     # repetition" (measured on macOS runners, where the guard then blocked
     # nothing), while GNU grep silently truncates the match at n. Trivially slow
     # is fine here: candidates are rare, and a fail-open guard must never be one.
-    # Read the runs through NUL delimiters (`grep -z` output, `read -d ''`):
-    # a text-mode pipeline is exactly where platform line semantics bite — BSD
-    # read drops a newline-less final line (openfirma's XAdES carries its whole
-    # certificate run as one), and BSD tr(1) refuses NUL bytes in the input.
-    # With -z, grep emits `run\0` records for every match regardless of what
-    # newlines the file happens to contain, and read stops only at \0: no line
-    # story left for either dialect to get wrong. (Both bare-`read` and
-    # `tr '\n' '\0'` variants failed exactly this way on the CI's macOS.)
+    # Read the runs straight out of grep -z: every match arrives as one
+    # NUL-terminated record, so the loop has NO line story left for a platform
+    # dialect to get wrong — the two previous shapes (bare `| while read`, and
+    # re-feeding candidates through a second text pipeline) each lost content to
+    # BSD line semantics on the CI's macOS while every Linux measurement stayed
+    # green. Trailing `=` padding never matches `[^[:space:]]`, so a record ends
+    # exactly at it, wherever grep drew its line boundaries; printf's `%s` drops
+    # any stray CR a CRLF file left inside (base64 treats it as whitespace).
     blocks="$(grep -zoaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null |
       while IFS= read -r -d '' run; do
+        run="${run%$'\r'}"
         if printf '%s' "$run" | base64 -d 2>/dev/null |
            openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
           echo "### cert"
@@ -189,6 +190,16 @@ sys.stdout.write(raw[: off + int.from_bytes(raw[2:off], "big")].hex())
 check_file() {
   local f="$1"
   [ -e "$f" ] || return 0
+  # `test -e` passing and every reader below then answering "no such file" is
+  # not a contradiction on macOS: /var/folders (the default TMPDIR, where the
+  # self-test's probes live) is periodically purged of files whose *mtime*
+  # looks old — even while open. The probe generator now regenerates every run
+  # for that reason (tools/test-check-no-real-certs.sh), and a file that vanishes
+  # mid-scan is reported, not let through: fail closed, like everything else here.
+  if [ ! -r "$f" ]; then
+    block "$f cannot be read; the guard cannot certify what it cannot see"
+    return 1
+  fi
 
   # Files whose NAME is allowlisted (regenerated fixtures, documentation):
   # the extension rule may be skipped, but NEVER the content rules — review

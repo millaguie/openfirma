@@ -3359,15 +3359,38 @@ mod tests {
 
     fn with_home<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
         let _moving_home = lock_quiet(&MOVING_HOME);
-        let real_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", dir) };
-        let out = run();
-        unsafe {
-            match real_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
+        // CI (run 39084918100, arm64 linux) proved HOME_LOCK alone does not
+        // serialize every HOME writer visible to this process: mid-window a
+        // sibling test read HOME as an `openfirma-register-empty-<pid>` fixture
+        // path that no code of ours ever sets — while our own window was closed.
+        // Something on the runner scribbles on the environment; that cannot be
+        // prevented from here. What CAN hold under it: inside the window HOME is
+        // re-asserted just before `run` (so a foreign write cannot beat the call
+        // itself), and the restore at exit writes back None-or-the-captured-home
+        // rather than whatever a racer left behind. The test below samples HOME
+        // only from inside its own HOME_LOCK window for the same reason: an
+        // outside observer cannot tell our writes from the agent's, so it is not
+        // evidence about with_home either way.
+        struct Restore(Result<std::ffi::OsString, std::env::VarError>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Ok(h) => std::env::set_var("HOME", h),
+                        Err(_) => std::env::remove_var("HOME"),
+                    }
+                }
             }
         }
+        // A panic inside `run` restores through Drop: the process must never
+        // keep a scratch HOME after a failed test — its next reader would blame
+        // with_home for deleting files under itself (the run-39084918100 shape).
+        let restore = Restore(
+            std::env::var_os("HOME").map_or_else(|| Err(std::env::VarError::NotPresent), Ok),
+        );
+        unsafe { std::env::set_var("HOME", dir) };
+        let out = run();
+        drop(restore);
         out
     }
 
@@ -3545,11 +3568,15 @@ mod tests {
     /// guard below.
     #[test]
     fn home_moves_only_inside_the_locked_window() {
+        // Sampled AFTER taking HOME_LOCK: an earlier read raced a sibling
+        // with_home window and captured a fixture path, which the outside
+        // assertions then blamed this helper for — "HOME moved back to the
+        // wrong place" when in fact it moved back correctly. With the lock held,
+        // `real` is by construction the value every with_home will restore to.
+        let _home_guard = lock_quiet(&HOME_LOCK);
         let real = std::env::var_os("HOME");
         let dir = std::env::temp_dir().join(format!("openfirma-home-race-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-
-        let _home_guard = lock_quiet(&HOME_LOCK);
         // Outside any window the marker is free (held only for the duration,
         // or every caller would serialize forever). The busy half gets proven
         // from inside the window below, where a `try_lock` answers "busy"

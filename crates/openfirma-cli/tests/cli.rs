@@ -388,9 +388,15 @@ fn cert_guard_blocks_every_nested_signature_shape() {
         .parent() // tools/
         .and_then(|p| p.parent())
         .expect("tools/ lives in the repo root");
+    // Hand the script OUR freshly built binary: its own build-if-missing rule
+    // would happily reuse a $ROOT/target/debug/openfirma from an older commit,
+    // and probes signed by a stale signer measure yesterday's code. CARGO_BIN_EXE
+    // is exactly this compilation unit's binary, so probe content can never
+    // drift behind the code under test.
     let out = match Command::new("bash")
         .arg(&script_abs)
         .current_dir(repo_root)
+        .env("OPENFIRMA_GUARD_PROBE_BIN", env!("CARGO_BIN_EXE_openfirma"))
         .output()
     {
         Ok(out) => out,

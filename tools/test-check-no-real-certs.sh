@@ -24,11 +24,19 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/rogue.key" \
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/syn.key" \
   -out "$WORK/syn.crt" -days 1 -subj "/CN=openfirma Test Probe/serialNumber=IDCES-12345678Z" 2>/dev/null
 
-if [ ! -x "$ROOT/target/debug/openfirma" ]; then
-  echo "building openfirma for the probes…" >&2
-  ( cd "$ROOT" && cargo build -q --bin openfirma )
+# Under `cargo test`, cli.rs passes its own CARGO_BIN_EXE here: that binary is
+# guaranteed to be the one just compiled from this tree. Falling back to
+# $ROOT/target/debug means whatever a previous build left behind — probes signed
+# by a stale signer are not testing what you think they test.
+if [ -n "${OPENFIRMA_GUARD_PROBE_BIN:-}" ] && [ -x "$OPENFIRMA_GUARD_PROBE_BIN" ]; then
+  OF="$OPENFIRMA_GUARD_PROBE_BIN"
+else
+  if [ ! -x "$ROOT/target/debug/openfirma" ]; then
+    echo "building openfirma for the probes…" >&2
+    ( cd "$ROOT" && cargo build -q --bin openfirma )
+  fi
+  OF="$ROOT/target/debug/openfirma"
 fi
-OF="$ROOT/target/debug/openfirma"
 
 printf 'guard probe content\n' > "$WORK/doc.txt"
 [ -f "$WORK/doc.pdf" ] || python3 "$ROOT/tools/gen-testpdf.py" "$WORK/doc.pdf"
@@ -39,6 +47,14 @@ cp "$WORK/rogue.key" "$WORK/notes.md"        # the H-3 markdown-key probe
 # input, a refused overwrite) is what distinguishes "the guard missed this shape"
 # from "the probe never existed", and swallowing stderr hid exactly that in CI.
 sign() { ( cd "$ROOT" && "$OF" sign --force >/dev/null "$@" ); }
+
+# Sign every probe afresh, RIGHT NOW. The CI's macOS /var/folders purger evicts
+# files whose mtime drifts — even open ones (run 39084111486: the guard read its
+# own freshly-written probe as "no such file" seconds later and answered clean).
+# Probes are small and seconds matter, so regenerate immediately before judging.
+# re-sign a probe right now: $1 = input, $2 = format; output from $_RESIGN_OUT
+resign() { rm -f "$_RESIGN_OUT"; sign -i "$1" -o "$_RESIGN_OUT" --format "$2" \
+  --cert "$WORK/rogue.crt" --key "$WORK/rogue.key"; }
 
 sign -i "$WORK/doc.txt" -o "$WORK/probe.bin" \
   --cert "$WORK/rogue.crt" --key "$WORK/rogue.key"          # CMS under any name
@@ -53,6 +69,16 @@ cp "$WORK/rogue.crt" "$WORK/rogue-cert.bin"                  # bare cert, lying 
 
 must_block() {
   local why="$1" path="$2"
+  shift 2
+  # Any remaining arguments regenerate $path immediately before it is judged
+  # (see resign above), passed positionally: first this probe's own path as
+  # $_RESIGN_OUT, then whatever the rebuild helper needs. An argument scanner
+  # that consumed "$path" instead of "resign" once re-signed into the INPUT —
+  # positional here cannot repeat it.
+  if [ "$#" -gt 0 ]; then
+    _RESIGN_OUT="$path"
+    "$@"
+  fi
   if ! [ -s "$path" ]; then
     # The probe itself never landed (a signing failure the `sign` wrapper would
     # have printed, an unwritable temp): that is NOT a guard verdict, and
@@ -81,10 +107,10 @@ must_pass() {
   fi
 }
 
-must_block "CMS SignedData under a free extension" "$WORK/probe.bin"
-must_block "the same CMS under a second free extension" "$WORK/probe.dat"
-must_block "PAdES PDF with /Contents carrying a foreign CMS" "$WORK/probe-pdf.bin"
-must_block "XAdES XML with ds:SignatureValue + X509Certificate" "$WORK/probe-xml.bin"
+must_block "CMS SignedData under a free extension" "$WORK/probe.bin" resign "$WORK/doc.txt" cades-b-b
+must_block "the same CMS under a second free extension" "$WORK/probe.dat" cp "$WORK/probe.bin" "$WORK/probe.dat"
+must_block "PAdES PDF with /Contents carrying a foreign CMS" "$WORK/probe-pdf.bin" resign "$WORK/doc.pdf" pades-b-b
+must_block "XAdES XML with ds:SignatureValue + X509Certificate" "$WORK/probe-xml.bin" resign testdata/inputs/simple.xml xades-b-b
 must_block "PEM private key saved as markdown" "$WORK/notes.md"
 must_block "bare certificate renamed .bin" "$WORK/rogue-cert.bin"
 
