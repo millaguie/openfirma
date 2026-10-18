@@ -307,6 +307,7 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
         &pass1_doc.root,
         XADES_NS,
         "SignedProperties",
+        &format!("{sig_id}-Signature"),
         "internal error: no SignedProperties in the signed document",
     )?;
     let sp_c14n = c14n::subtree(sp, &sp_context, &root_xml_attrs, &sp_opts);
@@ -327,6 +328,7 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
         &pass2_doc.root,
         DS_NS,
         "SignedInfo",
+        &format!("{sig_id}-Signature"),
         "internal error: no SignedInfo in the signed document",
     )?;
     let root_xml_attrs = c14n::extend_xml_attrs(&[], &pass2_doc.root);
@@ -362,16 +364,27 @@ fn internal(e: openfirma_core::Error) -> openfirma_core::Error {
     ))
 }
 
-/// Finds `ns:local` in a parsed tree and returns it with the namespace axis
-/// of its ANCESTORS only — every declaration written on every element above
-/// it, outermost first, inner bindings last. The target's own declarations
-/// are not part of it: `c14n::subtree` merges them against this context,
-/// exactly like a validator's inclusive C14N re-emits what the subtree root
-/// inherits and prints its own over it.
+/// Finds `ns:local` **inside the `ds:Signature` this call is writing** — the
+/// one whose `Id` is `signature_id` — and returns it with the namespace axis of
+/// its ancestors only: every declaration written on every element above it,
+/// outermost first, inner bindings last. The target's own declarations are not
+/// part of it: `c14n::subtree` merges them against this context, exactly like a
+/// validator's inclusive C14N re-emits what the subtree root inherits and
+/// prints its own over it.
+///
+/// The signature is selected by `Id` and not by name because a document that
+/// already carries a signature has its own `ds:Signature`, `ds:SignedInfo` and
+/// `xades:SignedProperties`, and the first ones in document order belong to the
+/// *earlier* signature. Naming them was round 2's N-2: signing an already signed
+/// document referenced and signed the previous signature's signed properties —
+/// both digests came out equal across the two signatures — and xmlsec1 and
+/// AutoFirma rejected the file. `signature_id` is the fresh UUID this call put
+/// in the template, so it cannot match an element the document already had.
 fn subtree_in_context<'e>(
     root: &'e xml::Element,
     ns: &str,
     local: &str,
+    signature_id: &str,
     what: &str,
 ) -> Result<(&'e xml::Element, c14n::Axis)> {
     fn walk<'e>(
@@ -398,8 +411,40 @@ fn subtree_in_context<'e>(
         axis.truncate(base);
         None
     }
+
+    /// Descend to the `ds:Signature` carrying `id`, collecting the declarations
+    /// of its ancestors on the way; then look for `ns:local` inside it.
+    fn descend<'e>(
+        el: &'e xml::Element,
+        id: &str,
+        ns: &str,
+        local: &str,
+        axis: &mut c14n::Axis,
+    ) -> Option<&'e xml::Element> {
+        let is_the_signature = el.name.local == "Signature"
+            && el
+                .attributes
+                .iter()
+                .any(|a| a.name.local == "Id" && a.value == id);
+        if is_the_signature {
+            return walk(el, ns, local, axis);
+        }
+        let base = axis.len();
+        axis.extend(el.ns_decls.iter().cloned());
+        for child in &el.children {
+            if let xml::Child::Element(inner) = child {
+                if let Some(found) = descend(inner, id, ns, local, axis) {
+                    return Some(found);
+                }
+            }
+        }
+        axis.truncate(base);
+        None
+    }
+
     let mut axis = c14n::Axis::new();
-    let el = walk(root, ns, local, &mut axis).ok_or_else(|| Error::other(what.to_string()))?;
+    let el = descend(root, signature_id, ns, local, &mut axis)
+        .ok_or_else(|| Error::other(what.to_string()))?;
     Ok((el, axis))
 }
 

@@ -366,3 +366,83 @@ fn root_element_scan_skips_prolog_and_comments() {
         );
     }
 }
+
+/// The `ds:DigestValue` of every `ds:Reference` whose URI names an
+/// `xades:SignedProperties`, in document order: one per signature.
+fn signed_properties_digests(doc: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = doc;
+    while let Some(at) = rest.find("<ds:Reference ") {
+        let Some(end) = rest[at..].find("</ds:Reference>") else {
+            break;
+        };
+        let reference = &rest[at..at + end];
+        if reference.contains("SignedProperties") {
+            if let Some(dv_at) = reference.find("<ds:DigestValue>") {
+                let dv = &reference[dv_at + "<ds:DigestValue>".len()..];
+                if let Some(e) = dv.find("</ds:DigestValue>") {
+                    out.push(dv[..e].to_string());
+                }
+            }
+        }
+        rest = &rest[at + end..];
+    }
+    out
+}
+
+/// Round 2, N-2 (a regression of `b57f1fa`): a second signature over an
+/// already signed document used to be built from the *first* signature's
+/// elements, because the signer looked for "the first `xades:SignedProperties`"
+/// and "the first `ds:SignedInfo`" in document order. The file came out with a
+/// second signature whose signed-properties reference carried the earlier
+/// signature's digest and whose `ds:SignatureValue` signed the earlier
+/// `ds:SignedInfo`; xmlsec1 answered FAILED and AutoFirma NO_MATCH_DATA, and
+/// openfirma said nothing.
+///
+/// The signature is now selected by the `Id` the template gave it, so both
+/// signatures stand on their own: the two signed-properties digests differ, and
+/// xmlsec1 verifies every reference of both.
+#[test]
+fn xmlsec_verifies_a_second_signature_over_an_already_signed_document() {
+    if !xmlsec_available() {
+        tool_or_skip("xmlsec1", "xmlsec1 not found, install xmlsec1");
+        return;
+    }
+    let Some(signer) = load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let once = xades_sign(INPUT, &signer, &XadesOptions::default()).expect("first signing");
+    let twice = xades_sign(&once, &signer, &XadesOptions::default())
+        .expect("signing an already signed document");
+
+    // the structural symptom first, so a failure names the cause and not only
+    // xmlsec1's verdict
+    let text = String::from_utf8(twice.clone()).expect("our own output is utf-8");
+    let digests = signed_properties_digests(&text);
+    assert_eq!(
+        digests.len(),
+        2,
+        "one signed-properties reference per signature: {digests:?}"
+    );
+    assert_ne!(
+        digests[0], digests[1],
+        "each signature must digest its own xades:SignedProperties"
+    );
+
+    let path = write_tmp("twice.xml", &twice);
+    let (ok, out) = xmlsec_verify(&path);
+    assert!(
+        ok,
+        "xmlsec1 rejected the document signed twice; both signatures must verify:\n{out}"
+    );
+    assert!(
+        out.contains("SignedInfo References (ok/all): 2/2"),
+        "not every reference of every signature verified:\n{out}"
+    );
+    std::fs::remove_file(&path).ok();
+}
