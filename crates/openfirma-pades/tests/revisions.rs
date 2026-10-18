@@ -490,6 +490,82 @@ fn a_brand_new_object_the_page_points_at_cannot_dress_as_an_archive() {
     );
 }
 
+/// The same door by the page tree, and the one that makes the fixpoint ITERATE:
+/// the covered bytes already name a `/Kids` entry that does not exist, the
+/// catalog's `/DSS` is re-pointed at the page that fills it (an object a reader
+/// RESOLVES, so not validation data), and the content stream that page draws
+/// with claims `/Type /DSS` too. Dropping the page is what exposes the stream;
+/// a single pass would license the stream and refuse only the page.
+#[test]
+fn a_dangling_page_tree_kid_filled_with_a_rendered_page_is_refused_whole() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // the page tree the signature covers already counts a kid it does not have
+    let dangling = append_two(
+        INPUT,
+        &[(
+            2,
+            b"<< /Count 2 /Kids [ 3 0 R 100 0 R ] /Type /Pages >>".as_slice(),
+        )],
+    );
+    let signed = pades_sign(&dangling, &signer, &PadesOptions::default()).expect("signing failed");
+    pades_verify(&signed, &anchors()).expect("a dangling kid is harmless on its own");
+
+    // the catalog of the signed file, to re-point its /DSS at the new page
+    let marker = b"\n1 0 obj\n";
+    let at = signed
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .expect("the signed file carries a catalog")
+        + 1;
+    let start = at + b"1 0 obj\n".len();
+    let end = start
+        + signed[start..]
+            .windows(b"endobj".len())
+            .position(|window| window == b"endobj")
+            .expect("the catalog ends");
+    let body = std::str::from_utf8(&signed[start..end])
+        .expect("the catalog is written as text")
+        .trim();
+    let catalog = format!("<< /DSS 100 0 R {}", &body[2..]);
+
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 101 0 R >>";
+    let text = b"BT /F1 24 Tf 72 400 Td (PAGUESE 9999 EUR) Tj ET";
+    let content = format!(
+        "<< /Type /DSS /Length {} >>\nstream\n{}\nendstream",
+        text.len(),
+        std::str::from_utf8(text).expect("ascii")
+    );
+    let attacked = append_two(
+        &signed,
+        &[
+            (1, catalog.as_bytes()),
+            (100, page.as_slice()),
+            (101, content.as_bytes()),
+        ],
+    );
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a page the tree resolves is not an archive, whatever the catalog says");
+    let t = error.to_string();
+    assert!(
+        t.contains("no archive may append"),
+        "the refusal says what was violated: {t}"
+    );
+    assert!(
+        t.contains("100 0 R"),
+        "the refusal names the resolved page: {t}"
+    );
+    // and the stream that page draws with, exposed only once the page is gone:
+    // this is the assertion a single-pass rule fails
+    assert!(
+        t.contains("101 0 R"),
+        "the refusal names the stream the page exposed: {t}"
+    );
+}
+
 /// Append one revision that (re)defines SEVERAL objects at once. The shadow
 /// attack needs the rewrite and the hanging dictionary in a single update so
 /// the covering signature sees both as its successors.
