@@ -137,23 +137,31 @@ check_embedded_certs() {
     # it was truncated mid-run. Anything else — a minified asset's long run of
     # JS identifiers, docs prose — is what it claims to be and passes quietly;
     # anything matching decodes through openssl below, whose verdict stands.
-    if [ -z "$blocks" ]; then
-      candidates="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null | head -5)" || candidates=""
-      if [ -n "$candidates" ]; then
-        blocks="$(printf '%s\n' "$candidates" |
-          while read -r run || [ -n "$run" ]; do
-            if printf '%s' "$run" | base64 -d 2>/dev/null |
-               openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
-              echo "### cert"
-            fi
-          done)" || blocks=""
-        if [ -z "$blocks" ] && printf '%s\n' "$candidates" | head -1 |
-           grep -qE '^(MI[0-9A-Za-z+/]|LS0t[A-Za-z0-9+/])'; then
-          # the run looks exactly like certificate material (PKCS#15 DER and PEM
-          # armor both start this way) yet nothing decoded it: machinery failure.
-          block "$f carries what looks like base64 certificate material that no decoder could read (file(1) said '${mime:-nothing}'): refusing to call unseen material clean"
-          return 1
+    blocks="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null | head -50 |
+      while read -r run || [ -n "$run" ]; do
+        if printf '%s' "$run" | base64 -d 2>/dev/null |
+           openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
+          echo "### cert"
+        elif printf '%s' "$run" | openssl x509 -inform PEM -noout -subject -issuer 2>/dev/null; then
+          echo "### cert"
         fi
+      done)" || blocks=""
+    # Machinery-failure tripwire. Two independent witnesses, both computed with
+    # plain text tools and compared — no decoded artifact has to survive a
+    # platform's reader for the file to stay under judgment: (1) the extractor
+    # found at least one run; (2) some run carries the universal first 8 base64
+    # characters of X.509 material — PKCS#15 DER (`MII…`) and PEM armor (`LS0t`)
+    # both begin that way — yet not one run decoded as a certificate on this
+    # machine. That combination has meant only two things so far: a broken
+    # candidate pipeline (twice, macOS), or material deliberately fragmented to
+    # dodge exactly these greps. Either way the file is NOT clean: block it and
+    # say why, instead of letting a dialect difference masquerade as an ok.
+    if [ -z "$blocks" ]; then
+      candidates="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null | head -50)" || candidates=""
+      if [ -n "$candidates" ] && printf '%s\n' "$candidates" |
+         grep -qE '^(MII|LS0t)[A-Za-z0-9+/]{6}'; then
+        block "$f carries runs that open exactly like base64 certificate material yet no decoder on this machine read one (file(1): '${mime:-nothing}') — refusing to call material I cannot fully inspect clean"
+        return 1
       fi
     fi
     [ -n "$blocks" ] || return 0
@@ -171,11 +179,18 @@ check_embedded_certs() {
   # lines, terminated by the "### cert" marker each decoder emits. Every
   # chunk must mention the synthetic PKI on both of its lines — a real leaf
   # issued BY a test CA is still somebody's identity and fails the rule.
+  # Read $blocks through printf, never `<<<`: a here-string's word before awk
+  # is subject to assignment-style interpretation in some shells (and awk's
+  # redirect target under any shell must not pass through a variable expanded
+  # from the DATA — a crafted "### cert" chunk could rewrite arbitrary files).
+  # Piped input kills both birds. The marker test below also runs per-LINE, so
+  # no single-line format assumption survives here either.
   tmpblocks="$(mktemp -d)"
-  awk -v dir="$tmpblocks" '
+  printf '%s\n' "$blocks" | awk -v dir="$tmpblocks" '
+    function out(i) { return dir "/" i ".part" }
     /^### cert$/ { idx++; next }
-    /^(subject|issuer)=/ { idx = (idx ? idx : 1); print >> (dir "/" idx ".part"); next }
-  ' <<< "$blocks"
+    /^(subject|issuer)=/ { if (!idx) idx = 1; print >> out(idx); next }
+  '
   for part in "$tmpblocks"/*.part; do
     [ -e "$part" ] || continue
     if ! grep -q "$TEST_CA_MARKER" "$part"; then
