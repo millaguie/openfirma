@@ -52,6 +52,23 @@ question. The honest gate is therefore: MATCH before every release, recorded
 here with its date, plus the independent verifiers (openssl, pdfsig, qpdf,
 xmlsec1) that DO run per push in CI.
 
+## Release artifacts (`.github/workflows/release.yml`)
+
+The workflow gained `workflow_dispatch`, so it can be exercised without a tag
+(the `publish` job stays skipped when the ref is not `v*`). It ran end to end
+for the first time on 2026-10-18 — and could not have before that: every leg
+died in the licence step, see review 07 H-12 in `docs/review-findings.md`.
+
+| Check | Where | Result | Since |
+|---|---|---|---|
+| All eight matrix targets build, package and upload their artifact | release run 39129111129 (`workflow_dispatch`, no tag) | 8/8 green; `publish` skipped as designed | 2026-10-18 |
+| `x86_64-unknown-linux-gnu` artifact: sha256 matches, binary runs (`openfirma 0.1.0`), carries `openfirma-gui`, `LICENSES/`, `NOTICE.md`, `README.md` and a 93 KB `THIRD-PARTY-LICENSES.html` | artifact downloaded with `gh run download` | pass | 2026-10-18 |
+| `x86_64-unknown-linux-musl` artifact: sha256 matches, binary is `static-pie`, runs, and carries the CLI only — exactly what the release note promises | same | pass | 2026-10-18 |
+| `openfirma-gui` from the Linux artifact starts on a real X server and stays alive | `xvfb-run` (1280x1024x24), 15 s watch | pass on a **virtual** display; a real desktop is still the manual checklist item below | 2026-10-18 |
+| `i686-pc-windows-msvc` artifact: sha256 matches, `openfirma.exe` present, CLI only (no GUI), as the note says | same | inspected only — a Windows PE **cannot be executed on this machine** | 2026-10-18 |
+| Windows x64/arm64 and both macOS artifacts run on their own platforms | — | **not verifiable here**: cross-built, no such host | |
+| The `publish` job (release page, checksums attached, generated notes) | needs a tag | **never run** — creating `v0.1.0` is the owner's call | |
+
 ## Manual
 
 | Run | Date | Verdict |
