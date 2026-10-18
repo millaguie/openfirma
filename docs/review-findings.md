@@ -172,10 +172,11 @@ not get lost:
 - The window's B-LTA wording for the mixed case (a verified signature plus a
   document time-stamp that is not) has no test of its own; the library verdict
   it renders does. Noted, not a defect.
-- A PKCS#12 whose MAC is HMAC-MD5 is refused as "wrong password" — openssl opens
-  it. Pre-existing, low, and a compatibility gap rather than a vulnerability;
-  the honest fix is to check the MD5 MAC rather than to keep the misleading
-  sentence.
+- A PKCS#12 whose MAC is HMAC-MD5 was refused as "wrong password" — openssl
+  opens it. Pre-existing, low, and a compatibility gap rather than a
+  vulnerability: the sentence sent the holder of a good certificate looking for
+  a password they had. Fixed (`499597b`: the MD5 MAC is checked like the others,
+  reading only, with the fixture's digest OID asserted before anything else).
 
 ## What remains unverifiable from this repository
 
