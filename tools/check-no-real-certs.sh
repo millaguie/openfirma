@@ -105,7 +105,7 @@ extract_base64_certs() {
   # decode as nothing — cost: openssl attempts, never a missed candidate: a
   # line is only skipped if its exact 96-char head never appeared flagged,
   # and the scanner walks EVERY line, so no ≥300 run escapes.
-  local f="$1" big td line rest tail w run prefix
+  local f="$1" big td line rest tail w run prefix pad
   read_whole_file "$f" || { block "$f cannot be read whole; refusing to certify it clean"; return 1; }
   [ -n "$REPLY_DATA" ] || return 0
   if [ "$REPLY_TRUNC" = 1 ]; then
@@ -163,7 +163,24 @@ $REPLY_DATA
 EOF2
   [ -s "$td/runs" ] || { rm -rf "$td"; return 0; }
   while IFS= read -r run || [ -n "$run" ]; do
-    printf '%s' "$run" > "$td/run.b64"
+    # Rebuild the padding before decoding. A run cut out of a longer base64
+    # line ends without `=` (the padding sat after it, or the run is a
+    # fragment), and `base64 -d`'s tolerance for that is a coreutils VERSION
+    # trait: 9.12 (this host) decodes a length-≡2 run, 9.4 (CI's Ubuntu
+    # 24.04) refuses it and prints nothing. That silent refusal WAS a
+    # security fail-open: the XAdES probe's certificate run (1130 chars,
+    # 1130 % 4 == 2) decoded here and not in CI, so CI certified a file
+    # carrying a foreign certificate as clean (H-3, reproduced in an
+    # ubuntu:24.04 container against this very probe). Padding is pure
+    # arithmetic on the run's length — 0/2/3 trailing bits — so it is rebuilt
+    # here, never guessed from a decoder's dialect.
+    case $(( ${#run} % 4 )) in
+      0) pad="" ;;
+      2) pad="==" ;;
+      3) pad="=" ;;
+      *) pad="=" ;;   # mod4==1 cannot be valid base64; let the decoder refuse it
+    esac
+    printf '%s%s' "$run" "$pad" > "$td/run.b64"
     base64 -d < "$td/run.b64" > "$td/run.der" 2>/dev/null || rm -f "$td/run.der"
     if [ -s "$td/run.der" ] &&
        openssl x509 -inform DER -in "$td/run.der" -noout -subject -issuer 2>/dev/null; then
@@ -570,7 +587,13 @@ sys.stdout.write(raw[: off + int.from_bytes(raw[2:off], "big")].hex())
 ' 2>/dev/null)" || return 0
   [ -n "$cms_der" ] || return 0
   if [ -n "$PDFCMS_TMP" ]; then
-    printf '%s' "$cms_der" | xxd -r -p > "$PDFCMS_TMP" 2>/dev/null || return 0
+    # hex -> DER via python3, not xxd: the guard already depends on python3
+    # (the length walk immediately above), and xxd ships in vim-common, which
+    # a CI runner does not install. A guard that silently returns clean when
+    # its helper is missing is a fail-open, so the helpers it leans on must be
+    # the ones guaranteed present. python3 -c reads the hex on stdin and
+    # writes raw bytes, no temporary of its own.
+    printf '%s' "$cms_der" | python3 -c 'import sys,binascii; sys.stdout.buffer.write(binascii.unhexlify(sys.stdin.read().strip()))' > "$PDFCMS_TMP" 2>/dev/null || return 0
     # `openssl pkcs7 -print_certs` without -noout emits, per certificate, its
     # subject/issuer pair followed by the PEM body; dropping the PEM leaves
     # exactly one chunk per certificate for the chunker. The marker line is
