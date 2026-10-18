@@ -439,6 +439,42 @@ fn an_object_named_only_inside_a_vri_entry_is_not_validation_data() {
     );
 }
 
+/// A writer may store the `/VRI` dictionary as an object of its own — ISO 32000
+/// 12.7.4.4 lets any value in the `/DSS` dictionary be an indirect reference,
+/// ETSI EN 319 142 writers do exactly that, and `read_dss` resolves it — and the
+/// dictionary is archive bytes like the rest. Round 3b measured the cost of not
+/// saying so: this file was refused twice over, `96 0 R` (the dictionary) and
+/// `98 0 R` (the certificate stream the taxed `/Certs` array had already
+/// licensed) because the stream's namer sat outside the licensed set. Licensing
+/// the dictionary puts that edge back inside it without licensing what an entry
+/// names — the test above keeps that out.
+#[test]
+fn an_archive_that_stores_its_vri_dictionary_as_an_object_passes_the_gate() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    let cert = handle("signer-rsa.crt");
+    let stream = stream_body(cert.der());
+    let catalog = b"<< /Type /Catalog /Pages 2 0 R /DSS 99 0 R >>";
+    let dss = b"<< /Type /DSS /Certs 97 0 R /VRI 96 0 R >>";
+    let array = b"[ 98 0 R ]";
+    let vri = b"<< /ABCDEF0123456789ABCDEF0123456789ABCDEF01 << /Cert [ 98 0 R ] >> >>";
+    let archived = append_two(
+        &signed,
+        &[
+            (1, catalog.as_slice()),
+            (99, dss.as_slice()),
+            (97, array.as_slice()),
+            (96, vri.as_slice()),
+            (98, stream.as_slice()),
+        ],
+    );
+    pades_verify(&archived, &anchors())
+        .expect("a writer may store the /VRI dictionary as an object of its own");
+}
+
 /// Round 3, C-1 once more: licensing every brand-new `/Type /DSS` dictionary
 /// let one dress as an archive while being something a page renders. A reader
 /// resolves references from the LAST revision, so a document that names an

@@ -1192,6 +1192,20 @@ fn collect_archive_data(
             }
         }
     }
+    // `/VRI` is not a taxed key: what an ENTRY of it names is not validation
+    // data, and the test above keeps it that way. The dictionary itself is
+    // archive bytes all the same, and a writer may store it as an object of its
+    // own — ISO 32000 12.7.4.4 lets any value in the /DSS dictionary be an
+    // indirect reference, and ETSI EN 319 142 writers do exactly that. Round 3b
+    // measured what not saying so costs: a legitimate file with `/VRI 207 0 R`
+    // was refused twice over — 207 itself, and, through the fixpoint, the
+    // certificate stream the entries name and the taxed `/Certs` array had
+    // already licensed, because that stream's namer sat outside the set.
+    // Licensing the dictionary closes both: the edge 207 -> 201 is then inside
+    // the set, and an entry's own objects still are not.
+    if let Some(dictionary) = pdf::get(body, "/VRI").and_then(pdf::parse_ref) {
+        out.insert(dictionary);
+    }
 }
 
 /// Every `N G R` reference inside an object body, stopping at each `stream`
