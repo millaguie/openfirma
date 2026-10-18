@@ -552,6 +552,152 @@ fn a_dangling_page_tree_kid_filled_with_a_rendered_page_is_refused_whole() {
     );
 }
 
+/// A LEGITIMATE archiving pass whose transport is the one
+/// `qpdf --object-streams=generate`, iText's compressed save and an Acrobat
+/// re-save write: the new dictionary lives inside an object stream, and the
+/// revision is indexed by a cross-reference stream. The archive is the one
+/// `hand_built_archive` builds — certificate stream 201 (direct: a stream cannot
+/// live inside an object stream), the `/DSS` dictionary in the container, the
+/// catalog rewritten so a reader resolves it through the newest section.
+fn archive_in_object_stream(plain: &[u8], container: u32, dss: u32) -> Vec<u8> {
+    /// One cross-reference entry: a direct object at an offset, or the `index`th
+    /// object of the object stream `stream`.
+    enum Row {
+        AtOffset(usize),
+        InStream(u32, u32),
+    }
+    const SECTION: u32 = 300;
+    let mut out = plain.to_vec();
+    out.push(b'\n');
+    let mut direct: Vec<(u32, usize)> = Vec::new();
+
+    let cert = handle("signer-rsa.crt");
+    let at = out.len();
+    out.extend_from_slice(b"201 0 obj\n");
+    out.extend_from_slice(&stream_body(cert.der()));
+    out.extend_from_slice(b"\nendobj\n");
+    direct.push((201, at));
+
+    let body = last_catalog_body(plain);
+    let at = out.len();
+    out.extend_from_slice(
+        format!("1 0 obj\n<< /DSS {dss} 0 R {}\nendobj\n", &body[2..]).as_bytes(),
+    );
+    direct.push((1, at));
+
+    let header = format!("{dss} 0 ").into_bytes();
+    let mut content = header.clone();
+    content.extend_from_slice(b"<< /Type /DSS /Certs [ 201 0 R ] /CRLs [ ] >>");
+    let at = out.len();
+    out.extend_from_slice(format!("{container} 0 obj\n").as_bytes());
+    out.extend_from_slice(
+        format!(
+            "<< /Type /ObjStm /N 1 /First {} /Length {} >>",
+            header.len(),
+            content.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(b"\nstream\n");
+    out.extend_from_slice(&content);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    direct.push((container, at));
+
+    let xref_at = out.len();
+    direct.push((SECTION, xref_at));
+    let mut rows: Vec<(u32, Row)> = direct
+        .iter()
+        .map(|(number, offset)| (*number, Row::AtOffset(*offset)))
+        .collect();
+    rows.push((dss, Row::InStream(container, 0)));
+    rows.sort_by_key(|(number, _)| *number);
+
+    let mut index = String::new();
+    let mut stream = Vec::new();
+    for (number, row) in &rows {
+        index.push_str(&format!(" {number} 1"));
+        match row {
+            Row::AtOffset(offset) => {
+                stream.push(1u8);
+                stream.extend_from_slice(&(*offset as u32).to_be_bytes());
+                stream.extend_from_slice(&0u16.to_be_bytes());
+            }
+            Row::InStream(container, at) => {
+                stream.push(2u8);
+                stream.extend_from_slice(&container.to_be_bytes());
+                stream.extend_from_slice(&(*at as u16).to_be_bytes());
+            }
+        }
+    }
+    let size = rows.last().map(|(number, _)| number + 1).unwrap_or(1);
+    let dict = format!(
+        "<< /Type /XRef /Size {size} /Root 1 0 R /Prev {} /W [1 4 2] \
+         /Index [{index} ] /Length {} >>",
+        last_xref(plain),
+        stream.len()
+    );
+    out.extend_from_slice(format!("{SECTION} 0 obj\n").as_bytes());
+    out.extend_from_slice(dict.as_bytes());
+    out.extend_from_slice(b"\nstream\n");
+    out.extend_from_slice(&stream);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    out.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// The same archive, packed the way an incremental writer that compresses its
+/// save writes it. Round 3b measured this refused as "changes no archive may
+/// append" over an object stream and a cross-reference stream — the two objects
+/// that carry no content at all — while `qpdf --check` saw nothing wrong with
+/// the file. Transport is not content: the objects INSIDE an object stream are
+/// classified one by one from the resolved final state, and a cross-reference
+/// section is the section.
+#[test]
+fn an_archive_packed_into_an_object_stream_passes_the_gate() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let plain = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("B-B failed");
+    let archived = archive_in_object_stream(&plain, 110, 100);
+    pades_verify(&archived, &anchors())
+        .expect("bounding certificates in an object stream is a legitimate save");
+}
+
+/// ... and transport is licensed on the fixpoint's premise too: a container is
+/// reached through cross-reference entries that carry offsets, never through a
+/// reference, so a brand-new container that some covered object DOES name is a
+/// dangling slot being filled, not transport. Here the covered page names
+/// `/Xm1 97 0 R` under `/XObject` and its content stream draws it; nothing in the
+/// signature made 97 an object, and the appended revision makes it the container
+/// its `/DSS` rides in.
+#[test]
+fn a_container_the_covered_bytes_named_is_not_transport() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> /XObject << /Xm1 97 0 R >> >> \
+                 /Contents 4 0 R >>";
+    let drawing = b"/Xm1 Do";
+    let plain = pades_sign(
+        &append_two(INPUT, &[(3, page.as_slice()), (4, &stream_body(drawing))]),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing a page that draws an object the file does not have");
+    pades_verify(&plain, &anchors()).expect("an empty /XObject slot is not an attack");
+
+    let archived = archive_in_object_stream(&plain, 97, 100);
+    let error = pades_verify(&archived, &anchors())
+        .expect_err("the covered bytes named 97, so filling it is a change they see");
+    assert!(
+        error.to_string().contains("97 0 R"),
+        "the refusal names the container that filled the slot: {error}"
+    );
+}
+
 /// The catalog body of the LAST revision, which is the one a reader resolves.
 fn last_catalog_body(pdf: &[u8]) -> String {
     let marker = b"\n1 0 obj\n";

@@ -258,6 +258,12 @@ pub enum Change {
     /// `/Fields` with such fields, or a page `/Annots` array that only grew
     /// with widgets of real signatures.
     SignaturePlumbing(ObjRef),
+    /// The transport a revision writes its objects through: an object stream,
+    /// or the cross-reference stream that indexes them. Neither carries
+    /// anything a reader renders — the objects INSIDE an object stream are
+    /// classified one by one from the resolved final state, and a
+    /// cross-reference section is the section.
+    Transport(ObjRef),
     /// Anything else — content streams, pages, `/Resources`, other annota-
     /// tions, form field values, a catalog whose keys other than `/DSS` chan-
     /// ged: outside what an archive may append.
@@ -284,6 +290,12 @@ impl std::fmt::Display for Change {
             Change::ValidationData(o) => write!(f, "object {o} is validation data (/DSS)"),
             Change::SignaturePlumbing(o) => {
                 write!(f, "object {o} carries a newer signature's field or widget")
+            }
+            Change::Transport(o) => {
+                write!(
+                    f,
+                    "object {o} is the transport a newer revision indexes its objects with"
+                )
             }
             Change::NotAllowed { object, detail } => {
                 write!(f, "object {object}: {detail}")
@@ -497,6 +509,7 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
     }
 
     let fonts = plumbing_fonts(pdf, &locations, &final_state, &referrers);
+    let transport = transport_containers(redefined, &locations, &referrers);
 
     let mut out = Vec::new();
     for change in redefined {
@@ -511,6 +524,7 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
                     validation_data: &validation_data,
                     appearances: &appearances,
                     fonts: &fonts,
+                    transport: &transport,
                 },
                 &change.object,
                 &change.after,
@@ -534,6 +548,7 @@ struct Gate<'a> {
     validation_data: &'a BTreeSet<ObjRef>,
     appearances: &'a BTreeSet<ObjRef>,
     fonts: &'a BTreeSet<ObjRef>,
+    transport: &'a BTreeSet<ObjRef>,
 }
 
 fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Change {
@@ -544,6 +559,7 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     let validation_data = gate.validation_data;
     let appearances = gate.appearances;
     let fonts = gate.fonts;
+    let transport = gate.transport;
     let brand_new = older.is_empty();
     // A pass that rewrites a body it did not change (an xref-only touch, or the
     // trailer's /Info pointing at a fresh timestamp dictionary of its own): no
@@ -706,6 +722,9 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     // files, XObjects reached from rewritten /Resources — stays off this rule and
     // lands below as NotAllowed.
     if brand_new {
+        if transport.contains(object) {
+            return Change::Transport(*object);
+        }
         if is_type(newer, "/Font") && fonts.contains(object) {
             return Change::SignaturePlumbing(*object);
         }
@@ -875,6 +894,40 @@ fn signature_covers(
     };
     (start >= head_start && end <= head_start.saturating_add(head_len))
         || (start >= tail_start && end <= tail_start.saturating_add(tail_len))
+}
+
+/// The containers a revision writes its objects through: the object streams its
+/// entries point into, and the cross-reference streams that index them. Every
+/// writer that saves incrementally produces transport — `qpdf
+/// --object-streams=generate`, iText's compressed save, an Acrobat re-save — so
+/// refusing it refuses legitimate documents (round 3b measured a hand-built B-LT
+/// pass with an `/ObjStm` and an `/XRef`, `qpdf --check` clean, refused as
+/// "changes no archive may append"). Transport is licensed when it is brand-new
+/// and NO object names it — a container is reached through the cross-reference
+/// entries that carry offsets, never through a reference — because a container
+/// the covered bytes already named is the dangling-reference fill the fixpoint
+/// exists to refuse (the same premise as `936196b`).
+fn transport_containers(
+    redefined: &[Redefinition],
+    locations: &BTreeMap<ObjRef, Location>,
+    referrers: &BTreeMap<ObjRef, BTreeSet<ObjRef>>,
+) -> BTreeSet<ObjRef> {
+    let object_streams: BTreeSet<ObjRef> = locations
+        .values()
+        .filter_map(|location| match location {
+            Location::InObjectStream { stream, .. } => Some(*stream),
+            Location::Direct(_) => None,
+        })
+        .collect();
+    redefined
+        .iter()
+        .filter(|change| {
+            change.before.is_empty()
+                && !referrers.contains_key(&change.object)
+                && (is_type(&change.after, "/XRef") || object_streams.contains(&change.object))
+        })
+        .map(|change| change.object)
+        .collect()
 }
 
 /// The font dictionaries that are plumbing: a pass writes its font and the
