@@ -211,6 +211,16 @@ jobs:
               bdir="$git_home/bin"
               if command -v cygpath >/dev/null 2>&1; then bdir="$(cygpath -w "$bdir")"; fi
               echo "$bdir" >> "$GITHUB_PATH"
+              # Witness (run 39109200143): the prepends above did not
+              # observably win for the later pwsh step, and silent guessing
+              # cost two more runs. Print the derivation and what PATH will
+              # look like for the test step: persisted GITHUB_PATH entries go
+              # BEFORE the job env, so this concatenation is what cargo test
+              # inherits — if the WSL stub's directory still sits in it, this
+              # line names who wins.
+              echo "git_exe=$git_exe"
+              echo "prepended to PATH: $bdir"
+              echo "persisted PATH order: $bdir : $dir : $PATH"
             fi
           fi
           openssl version

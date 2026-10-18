@@ -435,14 +435,38 @@ fn cert_guard_blocks_every_nested_signature_shape() {
     }
     if !out.status.success() && !(out.stdout.is_empty() && out.stderr.is_empty()) {
         let combined = format!("{}{}", decode(&out.stdout), decode(&out.stderr));
+        // Which bash the child actually spawned, straight from Get-Command:
+        // run 39109200143 proved PATH ordering alone is not observable enough
+        // — the persisted GITHUB_PATH prepend never beat System32's WSL stub
+        // for a Rust-spawned `bash`, and guessing that cost two more runs.
+        // One line of witness turns "why did it die" into an answer instead
+        // of a hypothesis. (cmd /c where bash cannot answer: the stub writes
+        // its complaint to stderr with exit 0, so only PS's resolver sees it.)
+        let which_bash = if std::env::consts::OS == "windows" {
+            match Command::new("powershell")
+                .args(["-NoProfile", "-Command", "(Get-Command bash).Source"])
+                .output()
+            {
+                Ok(w) => decode(&w.stdout).trim().to_string(),
+                Err(_) => "<powershell unavailable>".to_string(),
+            }
+        } else {
+            // POSIX shells only: `command` is a shell builtin, never an
+            // executable to spawn. Ask the shell itself.
+            match Command::new("sh").args(["-c", "command -v bash"]).output() {
+                Ok(w) => decode(&w.stdout).trim().to_string(),
+                Err(_) => String::new(),
+            }
+        };
         if combined.contains("Subsystem for Linux") {
             if require && !allowed {
                 panic!(
-                    "bash is the Windows WSL dispatcher, not a shell; install Git Bash \
-                     or grant the skip allowance OPENFIRMA_ALLOW_NONKEYSTORE_SKIP.\n{combined}"
+                    "bash is the Windows WSL dispatcher, not a shell (resolved to \
+                     {which_bash:?}); make Git Bash's bin directory win on PATH or \
+                     grant the skip allowance OPENFIRMA_ALLOW_NONKEYSTORE_SKIP.\n{combined}"
                 );
             }
-            eprintln!("skipped, bash on PATH is the WSL dispatcher, not a shell");
+            eprintln!("skipped, bash on PATH is the WSL dispatcher, not a shell ({which_bash})");
             return;
         }
     }
