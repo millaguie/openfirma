@@ -87,13 +87,25 @@ fn last_xref(pdf: &[u8]) -> usize {
 /// what the review's attack script did. The padding differs from the original
 /// writer's (different byte offsets), which is itself part of what the gate
 /// must look through: identical *content* is not an attack.
+/// A byte-identical copy of an object. The dictionary alone is NOT the object
+/// when the object is a stream: a writer relocating a page's content stream
+/// copies the data after `stream` too, and omitting it does not relocate the
+/// content, it deletes it — which is a change, and one the gate refuses (as it
+/// should: the page renders nothing).
 fn append_copy(pdf: &[u8], num: u32, source_at: usize) -> Vec<u8> {
+    let mut contents = Vec::new();
     let body = pdf::object_body(pdf, source_at).expect("the source offset holds an object");
+    contents.extend_from_slice(&pdf[body]);
+    if let Ok(payload) = pdf::stream_raw(pdf, source_at) {
+        contents.extend_from_slice(b"\nstream\n");
+        contents.extend_from_slice(&payload);
+        contents.extend_from_slice(b"\nendstream");
+    }
     let mut out = pdf.to_vec();
     out.push(b'\n');
     let object_at = out.len();
     out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
-    out.extend_from_slice(&pdf[body]);
+    out.extend_from_slice(&contents);
     out.extend_from_slice(b"\nendobj\n");
     let xref_at = out.len();
     let size = declared_size(pdf) + 1;
@@ -206,6 +218,35 @@ fn an_identical_copy_of_a_signed_object_does_not_trip_the_gate() {
     let source = object_at(&signed, 5);
     let copied = append_copy(&signed, 5, source);
     pades_verify(&copied, &anchors()).expect("a copy that changes nothing still verifies");
+}
+
+/// A rewritten page-content PAYLOAD is a rewrite even when its dictionary does
+/// not move an inch: `/Length 61` stays `61` while the 61 bytes a reader draws
+/// are replaced. Measured before the fix — resolving an object answers with its
+/// dictionary, so both sides looked like `<< /Length 61 >>`, the gate reported
+/// ZERO redefinitions and `verify` called the document fine while a reader
+/// showed the attacker's text under a signature that attests the original.
+#[test]
+fn a_rewritten_stream_payload_is_refused_even_when_its_dictionary_is_identical() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    // same dictionary bytes, same /Length, different 61 bytes of content
+    let mut payload = b"BT /F1 12 Tf 72 770 Td (PAID IN FULL to attacker) Tj ET".to_vec();
+    payload.resize(61, b' ');
+    let mut body = b"<< /Length 61 >>\nstream\n".to_vec();
+    body.extend_from_slice(&payload);
+    body.extend_from_slice(b"\nendstream");
+    let rewritten = append_written(&signed, 5, &body);
+    let error = pades_verify(&rewritten, &anchors()).expect_err("the payload was rewritten");
+    let text = format!("{error}");
+    assert!(text.contains("object 5 0 R"), "names the object: {text}");
+    assert!(
+        text.contains("a stream object was rewritten"),
+        "names the stream, not a dictionary: {text}"
+    );
 }
 
 /// The same attack with one more hop: a brand-new content stream plus a page

@@ -320,12 +320,46 @@ impl std::fmt::Display for Change {
     }
 }
 
-/// One object whose bytes changed between two revisions, with the body each
-/// state resolves for it (`before` = covering revision, `after` = final state).
+/// One object whose bytes changed between two revisions, with what each state
+/// holds for it (`before` = covering revision, `after` = final state). For a
+/// stream object that is its dictionary AND the data the dictionary says
+/// belongs to it — see [`rendered_body`].
 pub struct Redefinition {
     pub object: ObjRef,
     pub before: Vec<u8>,
     pub after: Vec<u8>,
+}
+
+/// The bytes a reader takes from an object: its dictionary, plus — for a stream
+/// — the data its `/Length` (or an `endstream` that `endobj` follows) says is
+/// its own.
+///
+/// Resolving the object alone answers with the dictionary, and a dictionary is
+/// not what a reader renders. Measured, not reasoned: a revision that rewrote
+/// the page's content stream kept `/Length 61` and replaced the 61 bytes after
+/// `stream`, and the gate saw the same `<< /Length 61 >>` on both sides —
+/// zero redefinitions, `verify` clean, and the text under the signature
+/// replaced by whatever the attacker wrote.
+fn rendered_body(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    cache: &mut pdf::ObjectStreamCache,
+    object: ObjRef,
+) -> Option<Vec<u8>> {
+    let body = pdf::resolve(pdf, locations, Some(cache), object).ok()?;
+    let mut out = body.into_owned();
+    // An object inside an object stream is a dictionary by construction —
+    // streams cannot be packed — so only a direct object can carry data here.
+    if let Some(Location::Direct(at)) = locations.get(&object)
+        && let Ok(payload) = pdf::stream_raw(pdf, *at)
+    {
+        // The `stream` keyword is part of what makes this object a stream, and
+        // carrying it here is what lets `describe_change` name the rewrite for
+        // what it is instead of calling a page's content a dictionary.
+        out.extend_from_slice(b"\nstream\n");
+        out.extend_from_slice(&payload);
+    }
+    Some(out)
 }
 
 /// The redefinitions that happened strictly after the revision ending at
@@ -355,8 +389,8 @@ pub fn redefinitions_after(
     {
         let mut cache = pdf::ObjectStreamCache::new();
         for object in covering_locs.keys() {
-            if let Ok(body) = pdf::resolve(pdf, &covering_locs, Some(&mut cache), *object) {
-                covering_bodies.insert(*object, body.to_vec());
+            if let Some(body) = rendered_body(pdf, &covering_locs, &mut cache, *object) {
+                covering_bodies.insert(*object, body);
             }
         }
     }
@@ -371,24 +405,24 @@ pub fn redefinitions_after(
         // only objects a newer revision touched can differ from the covering
         // state; but an object that lives inside an OLDER section keeps resolving
         // to old bytes and matches. This is exactly the wanted test.
-        let Ok(current) = pdf::resolve(pdf, &merged, Some(&mut cache), *object) else {
+        let Some(current) = rendered_body(pdf, &merged, &mut cache, *object) else {
             continue;
         };
         match covering_bodies.get(object) {
             // changed after the covering revision: an object the new state has
             // that did not exist below is `None` — a pure addition, classified as
             // such by the whitelist below (new signature objects land here).
-            Some(previous) if previous != current.as_ref() => {
+            Some(previous) if previous != &current => {
                 out.push(Redefinition {
                     object: *object,
-                    after: current.to_vec(),
+                    after: current,
                     before: previous.clone(),
                 });
             }
             None => {
                 out.push(Redefinition {
                     object: *object,
-                    after: current.to_vec(),
+                    after: current,
                     before: Vec::new(),
                 });
             }
