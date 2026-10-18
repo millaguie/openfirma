@@ -406,22 +406,31 @@ fn certification_gate(pdf: &[u8]) -> Result<()> {
         // falls through to the document-level sentence below).
         let v_ref = pdf::get(d, "/V").and_then(pdf::parse_ref);
         if let Some(v_ref) = v_ref {
-            // Which revision wrote the certifying dictionary: its definition sits at
-            // or below chain[i]'s own cross-reference (`startxref` is the last offset
-            // that revision wrote), and above the newest revision's cross-reference —
-            // `chain` is newest-first, so position() over those answers "how many
-            // revisions were appended after this one". A certification the newest
-            // revision itself wrote has nothing after it; a forged one naming an OLDER
-            // signature object (certification-after-the-fact) resolves through THIS
-            // xref to where that signature really stands, which is what flags it. The
-            // merged cross-reference resolves every object to its newest definition —
-            // an older revision re-INDEXING an object it did not write leaves the bytes
-            // at their original offset — so this placement never invents a revision for
-            // bytes that one never touched.
+            // Which revision wrote the certifying dictionary: an object of
+            // revision *i* lies above that revision's own cross-reference and
+            // below the one before it (`startxref` is the last offset the
+            // revision wrote). `chain` is newest first, so the last entry an
+            // object lies below is the index of its own revision — which is how
+            // many revisions were appended after it. A certification the newest
+            // revision itself wrote has nothing after it; a forged one naming an
+            // OLDER signature object (certification-after-the-fact) resolves
+            // through THIS xref to where that signature really stands, which is
+            // what flags it. The merged cross-reference resolves every object to
+            // its newest definition — an older revision re-INDEXING an object it
+            // did not write leaves the bytes at their original offset — so this
+            // placement never invents a revision for bytes that one never
+            // touched.
+            //
+            // The comparison is the one that answers that question
+            // (`offset < x` over a descending chain, so the last match is the
+            // revision the object belongs to). Read as `offset <= x` it matched
+            // at index 0 for every object in the file, which made this arm
+            // unreachable: a resolvable `/V` was always reported as a
+            // certification nothing followed, whatever the file held after it.
             let Some(pdf::Location::Direct(offset)) = locations.get(&v_ref).copied() else {
                 continue;
             };
-            match chain.iter().position(|x| offset <= *x) {
+            match chain.iter().rposition(|x| offset < *x) {
                 // The certifying signature lives in the newest revision: the
                 // certification closes its own state and nothing followed it.
                 Some(0) => return Ok(()),

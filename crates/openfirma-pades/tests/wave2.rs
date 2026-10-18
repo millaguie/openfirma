@@ -591,6 +591,83 @@ fn verify_flags_revisions_after_a_p1_certification() {
     );
 }
 
+/// A gate that stops biting is worse than a gate that says no. The
+/// certification gate's placement rule — which revision wrote the certifying
+/// dictionary — is counted over the `/Prev` chain, which is newest first, so
+/// the number of revisions that followed a certification is the index of the
+/// revision the certifying signature lives in. The comparison here was
+/// inverted, so it matched at index 0 for every object in the file: the arm
+/// that counts the revisions after a certification was unreachable, and a P=1
+/// certification whose `/V` resolved came back as "nothing followed it"
+/// whatever the file said.
+///
+/// Measured: a certified document (the PDF 2.0 shape, where the certification
+/// and the signature it names share a revision) signed once verifies; signed a
+/// second time, the certification is broken by definition — a certification
+/// with `/P 1` permits no revision after it — and this test says the verdict
+/// must say so too.
+#[test]
+fn a_revision_after_a_certification_is_counted_from_the_reader_numbering() {
+    let Some(signer) = test_signer() else {
+        eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    // The certification names object 7, and object 7 is what the signing
+    // revision below writes as its own signature dictionary.
+    let base = mini_pdf(
+        "<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP << \
+         /TransformParams << /Type /TransformParams /P 1 >> /V 7 0 R >> >> >>",
+    );
+    let allowed = PadesOptions {
+        allow_signing_certified: true,
+        ..PadesOptions::default()
+    };
+    let once = openfirma_pades::pades_sign(&base, &signer, &allowed)
+        .expect("the explicit opt-in signs the certified document");
+    let sigs = openfirma_pades::inspect::signatures(&once).expect("readable");
+    assert_eq!(sigs.len(), 1);
+    assert_eq!(
+        sigs[0].object.num, 7,
+        "the certification must name the object the signing revision writes, or \
+         this test measures something else"
+    );
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs");
+    let Ok(chain) = std::fs::read_to_string(dir.join("intermediate.crt")) else {
+        eprintln!("skipped, test PKI missing");
+        return;
+    };
+    let ca = std::fs::read_to_string(dir.join("ca.crt")).unwrap();
+    let anchors = openfirma_cades::verify::VerifyOptions::new(vec![
+        openfirma_core::CertificateHandle::from_pem(&chain).unwrap(),
+        openfirma_core::CertificateHandle::from_pem(&ca).unwrap(),
+    ]);
+
+    // the certification and the signature it names share the newest revision:
+    // nothing followed it, and that is not a refusal
+    openfirma_pades::pades_verify(&once, &anchors)
+        .expect("a certification whose signature closes the newest revision is intact");
+
+    // one more signature after it, and the certification is broken
+    let twice = openfirma_pades::pades_sign(&once, &signer, &allowed)
+        .expect("a second signature after the certification");
+    let err = openfirma_pades::pades_verify(&twice, &anchors)
+        .expect_err("an appended revision breaks a /P 1 certification, and every reader says so");
+    let text = err.to_string();
+    assert!(
+        text.contains("were appended after that certification"),
+        "the verdict names the certification as the reason: {text:?}"
+    );
+    assert!(
+        text.contains("and 1 revision(s)"),
+        "and counts exactly the revision that followed it: {text:?}"
+    );
+    assert!(
+        !text.contains("  "),
+        "with no run of spaces from a swallowed line break: {text:?}"
+    );
+}
+
 /// M-4: AutoFirma strips usage rights (`removeUsageRights`) before signing;
 /// a signed document that still carries /Perms /UR3 shows Adobe's extended-
 /// features warning over a state of the file that no longer exists. openfirma
