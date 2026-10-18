@@ -332,6 +332,15 @@ jobs:
         # GITHUB_ENV overrides it with the path the setup step created.
         env:
           SOFTHSM2_CONF: /tmp/opencode/keystores/softhsm/softhsm2.conf
+          # Pin the guard self-test's shell from outside the binary: when set,
+          # cli.rs execs exactly this file and fails loudly if it is absent or
+          # still prints the WSL dispatcher's line. Runs 39108474835 through
+          # 39110646666 proved PATH order, Get-Command, and where.exe all fail
+          # to predict what a Rust-spawned `bash` becomes on the windows
+          # runners (last one: ExecFormat failed with Access is denied even
+          # though PS resolved bash to C:\Program Files\Git\bin\bash.exe), so
+          # the CI environment states it outright. $Env vars reach cargo test.
+          OPENFIRMA_TEST_BASH: "${{ runner.os == 'Windows' && 'C:/Program Files/Git/bin/bash.exe' || '' }}"
         run: cargo test --target ${{ matrix.target }}
 
       # H-22: the version-guard test is `#[ignore]`d because it sets a

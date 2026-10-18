@@ -426,34 +426,85 @@ fn cert_guard_blocks_every_nested_signature_shape() {
     // is exactly this compilation unit's binary, so probe content can never
     // drift behind the code under test.
     //
-    // Which bash: NOT via PATH on Windows. Run 39109858613's witness settled
-    // it — Get-Command swore `bash` resolved to C:\Program Files\Git\bin\bash.exe
-    // while the spawned child still printed the WSL dispatcher's message, so
-    // PATH ordering and PS's resolver do not predict CreateProcess here, and
-    // three GITHUB_PATH prepends (runs 39108474835/39109200143/39109858613)
-    // bought nothing. On Windows the child is therefore pinned to Git's own
-    // bash.exe, found by walking up from git.exe itself; if the only bash a
-    // Windows machine has IS WSL's, this test refuses with the same honest
-    // skip/require rules as any missing prerequisite (and WSL-bash would lack
-    // the openssl/python3/openfirma-mingw the probes need anyway). Linux and
-    // macOS resolution is untouched: plain "bash".
-    let bash_program: std::path::PathBuf = if cfg!(windows) {
-        git_root().unwrap_or_else(|| "bash".into())
-    } else {
-        "bash".into()
-    };
-    let out = match Command::new(&bash_program)
+    // Which bash, in order of honesty: (1) OPENFIRMA_TEST_BASH, when set — an
+    // environment that KNOWS where its shell lives states it outright; CI's
+    // windows jobs point it at Git's bash.exe because every PATH-level guess
+    // failed there (runs 39108474835..39110646666: GITHUB_PATH prepends,
+    // Get-Command, and where.exe all disagreed with what CreateProcess really
+    // spawned — the last one even answered "Access is denied" while PS swore
+    // bash resolved to C:\Program Files\Git\bin\bash.exe). (2) On Windows,
+    // Git's own bin\bash.exe next to where.exe's git.exe. (3) Plain "bash".
+    // Linux and macOS never enter (1)/(2) unless their CI says so: untouched.
+    let bash_program: std::path::PathBuf = std::env::var_os("OPENFIRMA_TEST_BASH")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| if cfg!(windows) { git_root() } else { None })
+        .unwrap_or_else(|| "bash".into());
+    // An explicitly named shell that does not exist is a broken environment,
+    // never a silent fallback to the very thing the name was meant to dodge.
+    if std::env::var_os("OPENFIRMA_TEST_BASH").is_some_and(|v| !v.is_empty())
+        && !bash_program.exists()
+    {
+        panic!(
+            "OPENFIRMA_TEST_BASH names {} and it does not exist",
+            bash_program.display()
+        );
+    }
+    // Launch facts on failure, because five windows runs taught that here no
+    // resolver's answer predicts what CreateProcess does — so when something
+    // goes wrong the report says WHO was spawned (path + metadata), WHAT PS
+    // thinks `bash` is, and WHAT came back. A named shell that refuses to
+    // launch (run 39110646666: "Access is denied" on Git's own bash.exe) no
+    // longer dies as a bare OS message with no witness at all.
+    let spawn = Command::new(&bash_program)
         .arg(&script_abs)
         .current_dir(repo_root)
         .env("OPENFIRMA_GUARD_PROBE_BIN", env!("CARGO_BIN_EXE_openfirma"))
-        .output()
-    {
-        Ok(out) => out,
-        Err(_) if !require || allowed => {
-            eprintln!("skipped, no bash to run the guard self-test");
-            return;
+        .output();
+    fn resolve_bash() -> String {
+        #[cfg(windows)]
+        {
+            match Command::new("powershell")
+                .args(["-NoProfile", "-Command", "(Get-Command bash).Source"])
+                .output()
+            {
+                Ok(w) => String::from_utf8_lossy(&w.stdout).trim().to_string(),
+                Err(_) => "<powershell unavailable>".to_string(),
+            }
         }
-        Err(e) => panic!("cannot run the guard self-test: {e}"),
+        #[cfg(not(windows))]
+        {
+            // `command` is a shell builtin, never an executable to spawn.
+            match Command::new("sh").args(["-c", "command -v bash"]).output() {
+                Ok(w) => String::from_utf8_lossy(&w.stdout).trim().to_string(),
+                Err(_) => String::new(),
+            }
+        }
+    }
+    let out = match spawn {
+        Ok(out) => out,
+        Err(e) => {
+            #[allow(unused_mut)]
+            let mut facts = format!(
+                "spawned {:?} (exists={}, len={:?}); `bash` resolves to {:?}",
+                bash_program,
+                bash_program.exists(),
+                std::fs::metadata(&bash_program).map(|m| m.len()).ok(),
+                resolve_bash(),
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(m) = std::fs::metadata(&bash_program) {
+                    facts += &format!(", mode={:o}", m.permissions().mode());
+                }
+            }
+            if !require || allowed {
+                eprintln!("skipped, the guard self-test could not launch its shell: {e} — {facts}");
+                return;
+            }
+            panic!("cannot run the guard self-test: {e} — {facts}")
+        }
     };
     // If the child was NOT a shell, its complaint arrives without any probe
     // output to judge: on Windows that is usually the WSL dispatcher — "has
