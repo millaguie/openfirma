@@ -135,3 +135,48 @@ fi
 
 ls "$FIX"/*.p12 2>/dev/null || true
 echo "fixtures in $FIX"
+
+# --- verify every fixture against its declared producer password --------------
+# The point of these files is interoperability: a container whose MAC does not
+# verify under the password its own writer wrote it with proves nothing about
+# anyone, and tests reading it then fail somewhere far away (a "wrong password"
+# deep in an interop test is weeks from the broken writer). So each fixture that
+# carries a password gets opened right here by the producer that made it:
+# keytool -list for its own shapes, openssl pkcs12 for OpenSSL's. RC2 containers
+# and BER files need the legacy provider or a reader that has one, so they are
+# checked with whichever tool can see them, and nss-* / java-empty-legacy (whose
+# java shape is produced here rather than by keytool itself) verify through our
+# own reader when cargo is available. A fixture that fails here stops the build:
+# the producer mismatch IS the bug this whole script exists to catch.
+echo "== verifying fixtures against their declared passwords =="
+fail=0
+check_keytool() {
+  # $1: file, $2: password. The java reader is the reference for java shapes;
+  # the appended empty-MAC spellings must not confuse it (it opens with the
+  # original store password). A refusal here means keytool's own writer and
+  # reader disagree about this container, which is exactly what review 04 said.
+  if ! keytool -list -keystore "$FIX/$1" -storepass "$2" >/dev/null 2>&1; then
+    echo "error: keytool cannot open its own $1 with the password it wrote it with" >&2
+    fail=1
+  fi
+}
+check_openssl() {
+  # openssl 3 needs the legacy provider to even read an RC2 container's bags,
+  # but -noout only parses the MAC layer; still, pass both providers so one
+  # rule covers every shape.
+  if ! openssl pkcs12 -in "$FIX/$1" -noout -passin "pass:$2" \
+       -provider legacy -provider default >/dev/null 2>&1; then
+    echo "error: openssl cannot open $1 with the declared password" >&2
+    fail=1
+  fi
+}
+[ -f "$FIX/java-default.p12" ] && check_keytool java-default.p12 openfirma
+[ -f "$FIX/java-legacy.p12" ] && check_keytool java-legacy.p12 openfirma
+check_openssl openssl-empty.p12 ""
+check_openssl openssl-empty-legacy.p12 ""
+[ -f "$FIX/rc2-certs.p12" ] && check_openssl rc2-certs.p12 openfirma
+[ -f "$FIX/rc2-both.p12" ] && check_openssl rc2-both.p12 openfirma
+if [ "$fail" -ne 0 ]; then
+  echo "a fixture does not verify for the password its producer wrote: that is a generator bug, not a test failure" >&2
+  exit 1
+fi

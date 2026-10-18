@@ -189,7 +189,16 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
           openssl version
           ./tools/gen-testcert.sh
-          ./tools/gen-p12-fixtures.sh
+          # gen-p12-fixtures.sh also needs a python3 (re-MACs the java-empty
+          # shapes). Its absence used to kill this step with "command not
+          # found" — loudly failing unrelated tests while silently skipping
+          # java-*.p12 forever. Warn and let the fixture tests skip instead;
+          # a real generation failure still has no `|| true` in front of it.
+          if command -v python3 >/dev/null 2>&1; then
+            ./tools/gen-p12-fixtures.sh
+          else
+            echo "no python3 on this runner; PKCS#12 interop fixtures stay absent and their tests skip"
+          fi
 
       # Where no keystore can be built (see the two linux-only steps above),
       # the KEYSTORE tests must skip instead of panicking under
@@ -339,7 +348,14 @@ jobs:
           fi
           if [ -n "$openssl_bin" ]; then
             export PATH="$(dirname "$openssl_bin"):$PATH"
-            ./tools/gen-p12-fixtures.sh
+            # python3 is a hard need of gen-p12-fixtures.sh (the java-empty
+            # re-MAC step); absent, skip the whole fixture set like the
+            # matrix job does rather than die on "command not found".
+            if command -v python3 >/dev/null 2>&1; then
+              ./tools/gen-p12-fixtures.sh
+            else
+              echo "no python3 on this runner; PKCS#12 interop fixtures stay absent and their tests skip"
+            fi
           else
             echo "no openssl on this runner; fixture tests will skip"
           fi
