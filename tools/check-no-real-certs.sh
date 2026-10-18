@@ -25,6 +25,15 @@
 #   tools/check-no-real-certs.sh FILE...    scan the given files
 set -euo pipefail
 
+# Byte currency for every ${#var}, glob, and length below: the host locale may
+# count CHARACTERS (measured: `LC_ALL=C cat` inside `$(…)` does NOT change how
+# THIS shell later counts its own variable — a C.UTF-8 parent counted the
+# Spanish docs 47 characters short and once called them lossy), so the whole
+# guard runs in C where every byte is one character. Child greps below keep
+# their own explicit LC_ALL=C for when this script is run under shells that
+# reset it.
+export LC_ALL=C
+
 cd "$(dirname "$0")/.."
 
 # Marker of the synthetic PKI that tools/gen-testcert.sh creates. A
@@ -47,8 +56,15 @@ BANNED_NAMES='cert9\.db|key4\.db|cert8\.db|secmod\.db|cacerts|user\.keystore|aut
 violations=0
 
 block() {
-  echo "BLOCKED: $1" >&2
+  # CHECK_SUBSH marks the inner scan of check_file, whose stderr check_file
+  # itself captures and re-blocks line by line: there, `return 1` is the load-
+  # bearing half of the verdict — a BLOCKED text that never reaches $violations
+  # (captured away in run 39091143744's macOS) used to let probes through with
+  # exit 0. Every other caller counts normally and stays on stderr, where a
+  # clean scan can never print it.
+  printf 'BLOCKED: %s\n' "$1" >&2
   violations=$((violations + 1))
+  if [ "${CHECK_SUBSH:-0}" = 1 ]; then return 1; fi
 }
 
 list_files() {
@@ -89,7 +105,7 @@ extract_base64_certs() {
   # decode as nothing — cost: openssl attempts, never a missed candidate: a
   # line is only skipped if its exact 96-char head never appeared flagged,
   # and the scanner walks EVERY line, so no ≥300 run escapes.
-  local f="$1" big td line rest tail w run prefix printed
+  local f="$1" big td line rest tail w run prefix
   read_whole_file "$f" || { block "$f cannot be read whole; refusing to certify it clean"; return 1; }
   [ -n "$REPLY_DATA" ] || return 0
   if [ "$REPLY_TRUNC" = 1 ]; then
@@ -98,8 +114,18 @@ extract_base64_certs() {
     # verdict (check_embedded_certs blocks truncation before calling this).
     return 0
   fi
-  big="$(printf '%s\n' "$REPLY_DATA" | _scan_line_stream)" || big=""
+  big="$(_scan_line_stream "$REPLY_DATA")"      # no pipe: the payload never leaves bash
   [ -n "$big" ] || return 0
+  # The scanner FLAGS BY LINE PREFIX (`|<first 96 chars>` per candidate line).
+  # A base64 run can begin anywhere inside a line (that is exactly what
+  # openfirma's single-line XAdES does — probe-xml has always flagged as
+  # `|<ds:Signature …`), so the flag for it is that line's head, which no MII
+  # test on the LINE text can ever see. Matching flags here must therefore
+  # MIRROR _scan_line_stream exactly — "|$prefix", `${line:0:96}`, same source
+  # data — because a single byte of format drift drops the flag's only owner
+  # and every ≥300 run on that line walks into nothing: an un-`|`-led pattern
+  # once cost probe-xml.bin the extractor with zero candidates, the exact
+  # fail-open the prefix protocol was built to close.
   td="$(mktemp -d)" || return 0
   : > "$td/runs"
   while IFS= read -r line || [ -n "$line" ]; do
@@ -117,6 +143,10 @@ extract_base64_certs() {
     # matching line only when it qualifies; otherwise the exact 96-char head
     # belongs to a non-candidate and skipping is provably safe (the walk
     # below sees ≥300 runs on this line exactly when _line_has_run300 says so).
+    # EVERY ≥300 run is a candidate — no MII-shape gate here: openfirma's own
+    # XAdES puts its certificate after two 342-char digest runs, so gating on
+    # the FIRST run's opening (measured: _line_open8 says `xBw1iVPf` for that
+    # probe) blinds the extractor to exactly the file this guard exists for.
     if ! _line_has_run300 "$line"; then continue; fi
     tail="${line%%*[A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/]*}"
     tail="${line:${#tail}}"
@@ -173,7 +203,7 @@ cms_hides_foreign_certs() {
     runs="run binary"
   else
     data="$REPLY_DATA"
-    runs="$(printf '%s\n' "$data" | _scan_line_stream)" || runs=""
+    runs="$(_scan_line_stream "$data")"          # no pipe: the payload never leaves bash
   fi
   [ -n "$runs" ] || return 1
   ! extract_base64_certs "$f" | grep -q '### cert'
@@ -187,66 +217,77 @@ cms_hides_foreign_certs() {
 # REPLY_HAS_NUL=1, which every shape/decoder judgement below respects. Files
 # over the 4 MiB cap set REPLY_TRUNC — no scan past the cut may certify clean.
 read_whole_file() {
-  # $1 = path; result in REPLY_DATA (+REPLY_TRUNC / REPLY_HAS_NUL). Binary
-  # files are PROBED (first bytes for a NUL) and then not walked at all: bash
-  # strings stop at the first NUL no matter who fills them, so there is no
-  # honest whole-variable read to be had — HAS_NUL says "lossy channel" and
-  # every text-level decision declines for such files. The line loop only
-  # ever sees byte sequences that contained no NUL in the probe window; a
-  # NUL hidden deeper than the probe costs exactly one flagged-and-refused
-  # line (loop below), never an O(length) chew like the lossy `read -d ''`
-  # append loop paid over a 438 KiB ELF (rust_out, 11s/file).
-  local cap=4194304 size nul line stripped
+  # $1 = path; result in REPLY_DATA (+REPLY_TRUNC / REPLY_HAS_NUL). One substi-
+  # tution reads the file — no per-line loop ever chews an ELF again. `$(…)`'s
+  # complete failure model, measured on this machine: it DROPS NUL bytes (each
+  # invisible to ${#} too) and eats the EOF run of newlines; bash strings hold
+  # no NUL anywhere else. Read under LC_ALL=C so ${#var} counts BYTES (this
+  # system's own locale is C.UTF-8 and folds multibyte into characters — the
+  # trap that once called every Spanish doc lossy); the C read also keeps every
+  # downstream glob byte-safe. A builtin fd pass then separates eaten framing
+  # from hidden bytes (arithmetic only, O(1) per line; `IFS= read -r` consumes
+  # exactly one LF per framed record). No child measures anything for a VERDICT
+  # here: every external reader has had its turn answering EMPTY for a probe
+  # bash read whole (witness runs 39088314047→39090607884), and `wc -c` — the
+  # one child still consulted, purely to obtain `size`, never to bless — sits
+  # in that same witness log; a wc that lied LOW here would only mark a text
+  # file lossy, which downstream byte-wires (grep -a keywords, whole-file PEM/
+  # DER parses, the shaped-run grep) catch as "declined", never as clean. A
+  # wrongly-lossy verdict therefore costs extra greps; it cannot leak material
+  # and cannot certify a lie. HAS_NUL files decline the scan for exactly that
+  # reason.
+  local cap=4194304 size bytes line lfs
   REPLY_DATA=""; REPLY_TRUNC=0; REPLY_HAS_NUL=0
   [ -f "$1" ] || return 1
-  size=$(wc -c < "$1" 2>/dev/null) || return 1
+  # Byte-currency read: the script exports LC_ALL=C, so `${#var}` counts BYTES
+  # here (every byte is a character in C — the trap that once called every
+  # Spanish doc lossy was counting under the host locale). `$(…)` still eats
+  # NULs and the EOF run of newlines; those are this channel's ONLY losses.
+  # Bash ≥5.3 announces its silent NUL-diet at the ASSIGNMENT, in the PARENT
+  # process itself — measured: no redirect on either the command or the
+  # assignment can hush it (the `2>/dev/null` here sits inside the read
+  # subshell and silences only `cat`'s own failures; a real read failure still
+  # crosses as a nonzero status, which is load-bearing below). check_file
+  # re-attaches stderr to a temp file OUTSIDE this function, so the parent's
+  # notice lands there instead of on the user's terminal: nothing may certify
+  # on it — every hidden byte lands in the deficit check below.
+  REPLY_DATA="$(cat -- "$1" 2>/dev/null)" || {
+    REPLY_HAS_NUL=1                             # child died: never bless blind
+    return 0
+  }
+  bytes=${#REPLY_DATA}                          # bytes held: NULs gone, EOF newlines gone
+  size=$(wc -c < "$1" 2>/dev/null) || { REPLY_HAS_NUL=1; return 0; }   # never bless blind
   size="${size//[^0-9]/}"
-  [ -n "$size" ] || return 1
-  if [ "$size" -gt "$cap" ]; then REPLY_TRUNC=1; return 0; fi
-  # NUL count over the whole file, byte arithmetic: `tr -d '\0'` deletes only
-  # bytes that ARE NUL and writes every other byte through (no dialect, no
-  # line semantics), so deleted-bytes = size − survivors proves binary. The
-  # equation is exact even when a pipe truncates both measurements the same
-  # way; `wc` pads with spaces per BSD, hence the digit-strip. A file whose
-  # NULs hide deeper than any head window still lands here (full-file tr),
-  # and nothing may key on grep's "binary file matches" answer instead — it
-  # fires for ANY pattern once a NUL is present.
-  nul=$(tr -dc '\0' < "$1" 2>/dev/null | LC_ALL=C wc -c) || nul=""
-  nul="${nul//[^0-9]/}"
-  if [ -z "$nul" ] && [ "$size" -gt 0 ]; then
-    REPLY_HAS_NUL=1                            # unreadable is never clean
+  [ -n "$size" ] || { REPLY_HAS_NUL=1; return 0; }
+  if [ "$bytes" -gt "$cap" ]; then REPLY_TRUNC=1; REPLY_DATA=""; return 0; fi
+  if [ "$bytes" = "$size" ] || [ "$bytes" = "$(( size - 1 ))" ]; then
+    REPLY_HAS_NUL=0                             # pure whole read (framing slack)
     return 0
   fi
-  if [ "${nul:-0}" != 0 ]; then
-    REPLY_HAS_NUL=1                            # binary: the scan declines, honestly
+  # Short of stat: the deficit is `size - bytes` bytes that bash's C strings
+  # cannot show, and there are exactly two honest sources — eaten newlines at
+  # the EOF (at most one byte per record; `$(…)` eats the WHOLE final run) and
+  # NULs (each invisible to ${#}, and everything after one inside a line is
+  # gone too). One builtin fd pass counts the file's LFs (`IFS= read -r`
+  # consumes exactly one per framed record, `|| [ -n … ]` still accepts an
+  # unterminated final one, and only arithmetic runs here, so it measures the
+  # FILE — what the substitution dropped has no effect on it). Text satisfies
+  # bytes + lfs == size: every byte is either a survivor in REPLY_DATA or an
+  # LF (the eaten EOF run lives inside lfs). A NUL costs its own byte AND
+  # fuses two records, so one fewer iteration — the sum lands strictly BELOW
+  # size; hidden tails remove thousands more. rust_out (438 KiB, first NUL
+  # ~268 KiB deep) lands short in milliseconds and is never walked again.
+  # The loop's `${#line}` never enters the equation, so locales cannot
+  # distort it: the read counted bytes by fiat.
+  lfs=0
+  while IFS= read -r line || [ -n "$line" ]; do lfs=$((lfs + 1)); done < "$1"
+  if [ $(( bytes + lfs )) = "$size" ]; then
+    REPLY_HAS_NUL=0                             # framing fully accounted: text
     return 0
   fi
-  # Byte accounting: bash ${#var} counts CHARACTERS, not bytes (a UTF-8 é is
-  # one char, two bytes), so the size equation must count the same currency.
-  # LC_ALL=C makes every byte one character — base64, DER and PEM payloads are
-  # ASCII anyway, and any other locale would only disguise a NUL's worth of
-  # loss as accented prose. Bytes-after-first-NUL remain invisible to `read`
-  # (C strings); that is what the equation catches, marking the channel
-  # lossy rather than certifying it clean.
-  while IFS= read -r line || [ -n "$line" ]; do
-    REPLY_DATA+="$line"$'\n'
-    if [ "${#REPLY_DATA}" -gt "$cap" ]; then REPLY_TRUNC=1; break; fi
-  done < "$1"
-  stripped="$REPLY_DATA"
-  # ${#var} counts CHARACTERS: measure the payload in BYTES with C-locale
-  # wc (one byte = one character there), the same currency as `size`. A
-  # payload shorter than stat by more than read()'s known final-newline loss
-  # had bytes no bash string can hold (post-NUL, deeper than the probe), so
-  # it reports lossy rather than certifying an unseen tail as clean.
-  stripped=$(printf '%s' "$stripped" | LC_ALL=C wc -c)
-  stripped="${stripped//[^0-9]/}"
-  case "$stripped" in
-    "$size"|"$(( size - 1 ))") return 0 ;;
-  esac
-  REPLY_HAS_NUL=1
+  REPLY_HAS_NUL=1                               # bytes no bash string can hold
   return 0
 }
-
 _line_has_run300() {
   # $1 = one line. True iff it holds a ≥300-char [A-Za-z0-9+/] run, with NO
   # per-run work at all: `${line%%*<32-window>*}` is one backward glob scan
@@ -273,6 +314,29 @@ _line_has_run300() {
   return 1
 }
 
+_line_open8() {
+  # $1 = one line. Echoes the first eight characters of the FIRST run ≥300
+  # base64 chars it holds, "" for none — the geometry is _line_has_run300's
+  # verbatim (same window prefilter, same first-window tail), so a line can
+  # never be a candidate to one rule and invisible to the other.
+  local tail cut
+  case "$1" in
+    *[A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/]*)
+      : ;;
+    *) return 0 ;;
+  esac
+  tail="${1%%*[A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/]*}"
+  tail="${1:${#tail}}"
+  while [ -n "$tail" ]; do
+    cut="${tail%%[!A-Za-z0-9+/]*}"
+    if [ "${#cut}" -ge 300 ]; then printf '%s' "${cut:0:8}"; return 0; fi
+    tail="${tail#"$cut"}"
+    [ -n "$tail" ] || return 0
+    tail="${tail#?}"
+  done
+  return 0
+}
+
 # Reader-agnostic candidate scan over bash's own variable read (see below):
 # lines split runs exactly how PEM/XAdES wrap material in practice, and any
 # line holding a ≥300-char run reports its first 96 chars as `|<prefix>`.
@@ -281,18 +345,24 @@ _line_has_run300() {
 # certificate), so no child gets this decision.
 _scan_line_stream() {
   # Emits `|<first 96 chars>` for every line that holds a ≥300-char base64
-  # run, one line at a time from bash's own printf (the guard's variable-read
-  # protocol: no child touches the probe path — witness runs). All judging
-  # work lives in _line_has_run300 so scan, wire and extractor cannot
-  # disagree on what a candidate is. Prefixes ≤96 chars cross pipes whole
-  # (BSD `read` splits records at 512), so flagged lines stay identifiable by
-  # head; candidates are re-walked from bash's own bytes — relayed prefixes
-  # are filters, never the judged data.
-  local line
+  # run, one line at a time from bash's OWN builtin loop over the payload —
+  # no child touches it and no pipe carries it (the guard's variable-read
+  # protocol: tr/grep/awk/printf-pipes have each taken a turn being blind or
+  # lossy here on CI, witness runs 39088314047/39088995737: BSD grep said "no
+  # run" for a 1130-char certificate). `printf '%s\n' "$data" | _scan…` was
+  # measured away in BOTH directions: a pipe hands the payload to a child and
+  # chops long records on BSD (512B), while piping the FLAGS back through
+  # `$( )` buries bash ≥5.3's NUL warning — the parent emits it at its own
+  # assignment, so callers capture stderr too (see check_file). All judging
+  # work lives in _line_has_run300 so scan, wire and extractor cannot disagree
+  # on what a candidate is; prefixes ≤96 chars stay identifiable by head.
+  local line flag=""
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in '') continue ;; esac
-    _line_has_run300 "$line" && printf '|%s\n' "${line:0:96}"
-  done
+    _line_has_run300 "$line" && flag+="|${line:0:96}"$'\n'
+  done <<EOF2
+$1
+EOF2
+  printf '%s' "$flag"
 }
 
 
@@ -318,30 +388,15 @@ x509_shaped_but_undecodable() {
     return 0
   fi
   data="$REPLY_DATA"
-  # Same scanner geometry as the candidate rule (they must not disagree): for
-  # each line holding a ≥300-char run, test the first eight characters of any
-  # such run. X.509 DER opens MII/MIE…, PEM banners open "-----" = LS0t in
-  # base64; prose never carries those openings. The walk mirrors
-  # _scan_line_stream exactly (one window prefilter, then prefix-glob runs
-  # confined to the tail after the first window) so no line ever qualifies
-  # for one rule and not the other.
+  # Same scanner as the candidate rule (they must never disagree): for each
+  # line holding a ≥300-char run, test the first eight characters of its
+  # FIRST such run — _line_open8 mirrors _line_has_run300 exactly. X.509 DER
+  # opens MII/MIE…, PEM banners open "-----" = LS0t in base64; prose never
+  # carries those openings, so docs stay untouched. Lines come from the here-
+  # doc (bash feeding bash: no child sees the payload).
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in '') continue ;; esac
-    case "$line" in
-      *[A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/]*)
-        : ;;
-      *) continue ;;                                # provably no run ≥32
-    esac
-    tail="${line%%*[A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/]*}"
-    tail="${line:${#tail}}"                         # from the first window on
-    out=""
-    while [ -n "$tail" ]; do
-      cut="${tail%%[!A-Za-z0-9+/]*}"
-      if [ "${#cut}" -ge 300 ]; then out="${cut:0:8}"; break; fi
-      tail="${tail#"$cut"}"
-      [ -n "$tail" ] || break
-      tail="${tail#?}"
-    done
+    out="$(_line_open8 "$line")"
     case "$out" in MII*|MIE*|LS0t*) return 0 ;; esac
   done <<EOF2
 $data
@@ -414,9 +469,10 @@ check_embedded_certs() {
       *SignatureValue*|*X509Certificate*|*'BEGIN CERTIFICATE'*) names_cert=1 ;;
     esac
     if [ "$REPLY_HAS_NUL" = 1 ]; then
-      # Binary file, so the keyword case above never ran (data is empty). The
-      # file answers for itself through grep -a instead: same three keywords,
-      # byte semantics, no line-shape assumptions.
+      # The variable channel is lossy here (binary — or a NUL mangled inside
+      # some line of text). Keywords come from grep -a over the FILE: byte
+      # semantics, no line-shape assumptions, and true even where bash's own
+      # read went blind.
       if LC_ALL=C grep -qa -e SignatureValue -e X509Certificate -e 'BEGIN CERTIFICATE' "$f" 2>/dev/null; then
         names_cert=1
       fi
@@ -425,7 +481,7 @@ check_embedded_certs() {
       # make a no-decode outcome fatal below.
       runs="run binary"
     else
-      runs="$(printf '%s\n' "$data" | _scan_line_stream)" || runs=""
+      runs="$(_scan_line_stream "$data")"          # no pipe: the payload never leaves bash
     fi
     if [ "$names_cert" = 0 ] && [ -z "$runs" ]; then
       return 0
@@ -527,6 +583,53 @@ sys.stdout.write(raw[: off + int.from_bytes(raw[2:off], "big")].hex())
 }
 
 check_file() {
+  local f="$1" errfile restore="" status=0 msgs=0
+  # Whole-file scans run with stderr re-attached to a temp file for exactly
+  # one scan: bash ≥5.3's "ignored null byte in input" notice comes from the
+  # process doing `$(…)` and no redirect attached to the substitution can
+  # hush it (measured), so only moving fd 2 itself keeps the terminal clean.
+  # The file holds every `BLOCKED:` line, re-blocked below on the real stderr;
+  # stdout is untouched (the self-test captures it for its bookkeeping) and
+  # fd 2 comes back right after (and back onto the SCRIPT's saved fd, not a
+  # bare `2>&1` that would re-point stderr at stdout whenever a caller such as
+  # check_history captures our output); an EXIT trap restores it even if the
+  # scan dies mid-judgement. The scan's exit status crosses
+  # through `||`, so a verdict stands even where its text does not (run
+  # 39091143744: message-only verdicts died with a discarded channel and
+  # macOS certified probes clean).
+  errfile="$(mktemp)" || { block "$f: cannot open a scan channel"; return 1; }
+  exec 3>&2                                      # remember OUR caller's stderr
+  local prev restore
+  prev="$(trap -p EXIT)"                         # e.g. trap -- 'rm -f \"$PDFCMS_TMP\"' EXIT
+  # Re-arm the outer trap VERBATIM after restoring stderr: `trap -p` prints
+  # shell syntax (one layer of quoting stripped), so it goes back through
+  # `trap` itself, never re-eval'd as a command. The same text doubles as the
+  # crash path — `$0` inside an EXIT trap IS that text — so if bash's ERR/INT
+  # machinery takes over mid-scan, stderr still comes back and the outer trap
+  # (PDFCMS_TMP cleanup) survives us instead of being cleared or muted.
+  restore="exec 2>&3; exec 3<&-"
+  [ -n "$prev" ] && restore+="; trap ${prev#trap } EXIT"
+  trap "eval \"\$0\"; exit $?" EXIT
+  exec 2>"$errfile"
+  CHECK_SUBSH=1 _check_file_inner "$f" || status=$?
+  eval "$restore"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in 'BLOCKED: '*) block "${line#BLOCKED: }"; msgs=$((msgs + 1)) ;; esac
+  done < "$errfile"
+  rm -f "$errfile"
+  if [ "$status" -gt 1 ]; then         # crash mid-judgement: fail closed
+    block "$f made the guard exit $status; refusing to certify what it could not judge"
+    return 1
+  fi
+  if [ "$status" = 1 ] && [ "$msgs" = 0 ]; then
+    # inner said BLOCKED but no message crossed — keep the verdict anyway:
+    block "$f was blocked by an inner check whose message did not survive the scan channel"
+    return 1
+  fi
+  return 0
+}
+
+_check_file_inner() {
   local f="$1"
   [ -e "$f" ] || return 0
   # `test -e` passing and every reader below then answering "no such file" is
@@ -556,7 +659,10 @@ check_file() {
     # tools/gen-hostile-corpus.py. They wear .der/.p12 extensions only so the
     # tests can include_bytes! them like a real module hands them over. The
     # content checks below still run on them: what is allowlisted is the
-    # extension rule, nothing else.
+    # extension rule, nothing else. (testdata/fuzz-panic-corpus/ is the same
+    # crash-bait family with NO banned extensions, so it needs no entry here;
+    # if a future corpus member ever wears one, extend this pattern and prove
+    # the bytes harmless like these.)
     testdata/hostile/*.der|testdata/hostile/*.p12) allowlisted=1 ;;
   esac
 
@@ -607,18 +713,21 @@ check_history() {
   # test-PKI marker here too. The scan is slower than the tree walk (one blob
   # at a time out of the object store); history is finite and this runs in CI
   # on every push, which is the point.
-  local seen=0 tmp
+  local seen=0 tmp blocked
   tmp="$(mktemp -d)"
   while read -r sha; do
     seen=$((seen + 1))
     git cat-file -p "$sha" > "$tmp/blob" 2>/dev/null || continue
     # the blob file lives outside the tree, so it bypasses no rule: the same
-    # check_file judges it, and a violation names $tmp/blob — carry the sha
-    # into the message by re-blocking through block().
-    local before=$violations
-    check_file "$tmp/blob" >/dev/null 2>&1 || true
-    if [ "$violations" -gt "$before" ]; then
-      echo "        (blob $sha in history)" >> /dev/stderr
+    # check_file judges it (same re-attached stderr channel — bash's NUL
+    # notice stays off the terminal), every violation names $tmp/blob, and
+    # one extra line carries the sha. The verdict is check_file's exit
+    # status; its messages were already counted once inside, so they are NOT
+    # re-blocked here (run 39091143744 double-counted exactly this way).
+    blocked=0
+    check_file "$tmp/blob" || blocked=1
+    if [ "$blocked" = 1 ]; then
+      echo "        (blob $sha in history)" >&2
     fi
     rm -f "$tmp/blob"
   done < <(git rev-list --objects --all | awk '{print $1}' | sort -u | while read -r o; do
@@ -646,6 +755,8 @@ esac
 
 # One scratch file for the PDF CMS path, reused per file (the scan is serial).
 PDFCMS_TMP="$(mktemp)"
+# `trap - EXIT` would clear this too; check_file therefore re-arms whatever
+# trap was live when it buried stderr (rm runs first, stderr restore second).
 trap 'rm -f "$PDFCMS_TMP"' EXIT
 
 for f in "${files[@]:-}"; do

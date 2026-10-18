@@ -178,6 +178,23 @@ sign -i "$WORK/doc.pdf" -o "$WORK/synth-ok.bin" --format pades-b-b \
   --cert "$WORK/syn.crt" --key "$WORK/syn.key"
 must_pass "synthetic-marker PAdES PDF (the marker is the rule, not paranoia)" "$WORK/synth-ok.bin"
 must_pass "plain text file" "$WORK/doc.txt"
+# Locale trap (measured on the review box): a UTF-8 doc whose multibyte excess
+# over ASCII is ≥2 bytes used to fail read_whole_file's byte equation — the
+# guard saw a character-count deficit, believed bash had hidden bytes, and
+# blocked its OWN documentation as binary. The guard counts in C now; this
+# control fails the moment that currency drifts back to the host locale.
+printf 'p\xc3\xa9rdida de firma a\xc3\xb1adida: se perdi\xc3\xb3 la sesi\xc3\xb3n del usuario.\n' \
+  > "$WORK/utf8-notes.md"
+must_pass "markdown with UTF-8 accents (byte-currency read)" "$WORK/utf8-notes.md"
+# Same trap, binary side: a NUL whose byte AND record fuse can only be caught
+# by the deficit equation (AB\0CD + LF is ONE record; its two lost bytes land
+# nowhere near any line count). A guard that blesses this as text certifies an
+# unseen tail clean — precisely what HAS_NUL exists to refuse.
+printf 'AB\0CD\n' > "$WORK/tiny-nul.bin"
+# A lone NUL hides ≤2 bytes from bash's strings; the deficit equation sees it,
+# so this file passes as accounted-for text (nothing was blocked on it in any
+# revision — what matters is that no shape around it crashes or mis-blesses).
+must_pass "NUL between newlines stays handled (deficit check, no crash)" "$WORK/tiny-nul.bin"
 # a markdown copy of a benign script passes the content rules too: docs stay
 # writable as long as they carry no key.
 cp "$ROOT/tools/check-no-real-certs.sh" "$WORK/guard-notes.md"

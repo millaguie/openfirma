@@ -406,26 +406,44 @@ fn cert_guard_blocks_every_nested_signature_shape() {
         }
         Err(e) => panic!("cannot run the guard self-test: {e}"),
     };
-    if !out.status.success() {
-        // Both channels, run through `lossy`: the script's diagnostics go to
-        // stderr, but a Windows tooling error (a WSL dispatcher message, a
-        // loader complaint) lands on stdout in UTF-16LE — and String::from_
-        // utf8_lossy rendered that as NUL-separated characters, burying the
-        // one sentence that named the actual problem in the CI log. Decode by
+    // A `bash` that exists but is NOT a shell: on Windows runners PATH's bash
+    // may be the WSL dispatcher, which prints "Windows Subsystem for Linux
+    // must be updated…" and exits nonzero without ever running a probe (CI run
+    // 39091143744's windows jobs). That is a missing prerequisite like any
+    // other, not a guard verdict — the same skip/require rules apply, judged
+    // from its own message because it produces no probe output to judge.
+    fn decode(bytes: &[u8]) -> String {
+        // Both channels, decoded: a Windows tooling error (a WSL dispatcher
+        // message, a loader complaint) lands on stdout in UTF-16LE — and
+        // String::from_utf8_lossy rendered that as NUL-separated characters,
+        // burying the one sentence that named the actual problem. Decode by
         // BOM/shape: UTF-16LE when it smells like it (no valid ASCII header,
         // alternating NULs), lossy UTF-8 otherwise.
-        fn decode(bytes: &[u8]) -> String {
-            if bytes.len() >= 4 && bytes[1] == 0 && bytes[3] == 0 {
-                String::from_utf16_lossy(
-                    &bytes
-                        .chunks_exact(2)
-                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                String::from_utf8_lossy(bytes).into_owned()
-            }
+        if bytes.len() >= 4 && bytes[1] == 0 && bytes[3] == 0 {
+            String::from_utf16_lossy(
+                &bytes
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            String::from_utf8_lossy(bytes).into_owned()
         }
+    }
+    if !out.status.success() && !out.stdout.is_empty() {
+        let combined = format!("{}{}", decode(&out.stdout), decode(&out.stderr));
+        if combined.contains("Subsystem for Linux") {
+            if require && !allowed {
+                panic!(
+                    "bash is the Windows WSL dispatcher, not a shell; install Git Bash \
+                     or grant the skip allowance OPENFIRMA_ALLOW_NONKEYSTORE_SKIP.\n{combined}"
+                );
+            }
+            eprintln!("skipped, bash on PATH is the WSL dispatcher, not a shell");
+            return;
+        }
+    }
+    if !out.status.success() {
         panic!(
             "the cert guard failed its own probes:\n--- stderr ---\n{}\n--- stdout ---\n{}",
             decode(&out.stderr),
