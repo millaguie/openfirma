@@ -572,22 +572,22 @@ impl<'a> Cursor<'a> {
 
     /// The next value, which must be a SEQUENCE, as a cursor over its
     /// content.
-    pub fn sequence(&mut self, what: &str) -> Result<Cursor<'static>> {
-        // `allow_indefinite` propagates with the option it belongs to, and so
-        // does the nesting depth: a sequence inside an indefinite value is
-        // one level deeper for the guard in `indefinite_value`.
-        //
-        // The content is OWNED by the child rather than borrowed from this
-        // cursor's buffer. With BER indefinite lengths — the mode PKCS#12
-        // reads in — one element's bytes can be a prefix of a later sibling's
-        // (a constructed OCTET STRING wrapping a SEQUENCE is exactly what NSS
-        // writes), so two levels must not address one buffer while the parent
-        // keeps advancing. Containers are kilobytes: one bounded copy per
-        // descent buys the entire lifetime story, everywhere, for every caller.
-        // cursor's buffer, and every descent copies once: see above.
+    ///
+    /// The child BORROWS the parent's buffer: `v.content` is a `&'a [u8]` slice
+    /// of it in both modes — DER and BER indefinite both hand back a slice of
+    /// the cursor's own `'a` buffer (see [`Cursor::value`] and
+    /// [`Cursor::indefinite_value`]) — and an immutable slice stays valid while
+    /// the parent advances `self.i` past it. Two sibling cursors may therefore
+    /// overlap one buffer freely (exactly the BER shape where an element's bytes
+    /// are a prefix of a later sibling's) with no copy and no lifetime lie. An
+    /// earlier build returned `Cursor<'static>` and `Box::leak`ed a fresh copy
+    /// per descent to satisfy that bogus `'static`; that leaked every
+    /// container's bytes for the life of the process (review A-3: ~25 descents
+    /// per verification, unbounded across a long-running GUI).
+    pub fn sequence(&mut self, what: &str) -> Result<Cursor<'a>> {
         let v = self.expect(TAG_SEQUENCE, what)?;
         Ok(Cursor {
-            b: Box::leak(v.content.to_vec().into_boxed_slice()),
+            b: v.content,
             i: 0,
             reject_high_tag: self.reject_high_tag,
             allow_indefinite: self.allow_indefinite,
@@ -644,6 +644,29 @@ mod tests {
         assert_eq!(v.content, &[0x05, 0x00]);
         assert_eq!(v.whole, &bytes[..]);
         assert!(c.done());
+    }
+
+    /// Review A-3: `sequence()` must BORROW the parent's buffer, not leak a
+    /// copy. With the old `Box::leak` the child cursor pointed at a fresh
+    /// allocation, so its bytes lived at a different address than the parent's
+    /// input and stayed on the heap forever. Pointing at the same allocation is
+    /// what proves there is no per-descent leak now; the old code fails this on
+    /// the address check alone (and leaks in the bargain).
+    #[test]
+    fn a_child_cursor_borrows_its_parents_buffer_instead_of_leaking_a_copy() {
+        let bytes = tlv(TAG_SEQUENCE, &[TAG_SEQUENCE, 0x00]);
+        let base = bytes.as_ptr() as usize;
+        let mut c = Cursor::new(&bytes);
+        let child = c.sequence("an inner sequence").unwrap();
+        // the child's view of its content must live inside the SAME allocation
+        // the parent reads: borrowed, not a leaked copy
+        let inner_ptr = child.buffer().as_ptr() as usize;
+        assert!(
+            inner_ptr >= base && inner_ptr <= base + bytes.len(),
+            "the child cursor at {inner_ptr:#x} is outside the parent buffer \
+             [{base:#x}, {:#x}] — it copied (and, before the fix, leaked) the bytes",
+            base + bytes.len()
+        );
     }
 
     #[test]
