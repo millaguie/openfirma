@@ -125,18 +125,12 @@ check_embedded_certs() {
         fi
       done)" || blocks=""
     # A candidate loop that produced NOTHING while the file's own text names a
-    # certificate is a broken decoder, not a clean file — this function has been
-    # fooled twice (grep dialects, read dialects) exactly by answering zero
-    # candidates on files full of them. Two things have to hold before calling
-    # it a machinery failure: the candidate extractor must report at least one
-    # run at all (`grep -c`, not the pipeline — an empty set genuinely means
-    # prose mentioning X509Certificate, e.g. docs), and the first long run must
-    # be decodable material (a base64 alphabet plus `=` padding) whose decoded
-    # bytes begin with a plausible certificate: DER SEQUENCE/CONTEXT tag 0x30,
-    # or ASCII PEM armor that `openssl x509 -inform PEM` refuses only because
-    # it was truncated mid-run. Anything else — a minified asset's long run of
-    # JS identifiers, docs prose — is what it claims to be and passes quietly;
-    # anything matching decodes through openssl below, whose verdict stands.
+    # certificate is suspicious — this function has been fooled twice (grep
+    # dialects, read dialects) exactly by answering zero candidates on files
+    # full of them. Retry the decode through the most boring grammar there is:
+    # `grep -o` text mode + head + plain read. PEM armor without its header
+    # lines (a raw base64 run between <ds:X509Certificate> tags) also gets its
+    # own reader attempt here, `-inform PEM`, which the DER-only main loop skips.
     blocks="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null | head -50 |
       while read -r run || [ -n "$run" ]; do
         if printf '%s' "$run" | base64 -d 2>/dev/null |
@@ -146,16 +140,15 @@ check_embedded_certs() {
           echo "### cert"
         fi
       done)" || blocks=""
-    # Machinery-failure tripwire. Two independent witnesses, both computed with
-    # plain text tools and compared — no decoded artifact has to survive a
-    # platform's reader for the file to stay under judgment: (1) the extractor
-    # found at least one run; (2) some run carries the universal first 8 base64
-    # characters of X.509 material — PKCS#15 DER (`MII…`) and PEM armor (`LS0t`)
-    # both begin that way — yet not one run decoded as a certificate on this
-    # machine. That combination has meant only two things so far: a broken
-    # candidate pipeline (twice, macOS), or material deliberately fragmented to
-    # dodge exactly these greps. Either way the file is NOT clean: block it and
-    # say why, instead of letting a dialect difference masquerade as an ok.
+    # Tripwire for a broken candidate pipeline. If the boring-grammar extractor
+    # above still finds a run whose first eight characters are the universal
+    # base64 opening of X.509 material — `MII…` is the PKCS#15 DER SEQUENCE+
+    # length prefix every certificate encodes alike, `LS0t` the PEM armor — and
+    # still nothing decoded on this machine, the scan itself is broken (that is
+    # exactly what grep/read dialects did twice on macOS) or the material was
+    # fragmented to dodge these very greps. Either way the file cannot be
+    # certified clean: block it with the diagnosis instead of a quiet pass.
+    # Prose that merely mentions X509Certificate has no such run and stays ok.
     if [ -z "$blocks" ]; then
       candidates="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null | head -50)" || candidates=""
       if [ -n "$candidates" ] && printf '%s\n' "$candidates" |

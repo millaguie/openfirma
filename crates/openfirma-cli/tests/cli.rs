@@ -407,14 +407,29 @@ fn cert_guard_blocks_every_nested_signature_shape() {
         Err(e) => panic!("cannot run the guard self-test: {e}"),
     };
     if !out.status.success() {
-        // Both channels: the script's diagnostics go to stderr, but a missing
-        // tool or loader error in whatever bash exec'd can land on stdout, and
-        // run 39084111486's Windows failure printed an empty stderr — with only
-        // that half captured, the CI log contained literally nothing about why.
+        // Both channels, run through `lossy`: the script's diagnostics go to
+        // stderr, but a Windows tooling error (a WSL dispatcher message, a
+        // loader complaint) lands on stdout in UTF-16LE — and String::from_
+        // utf8_lossy rendered that as NUL-separated characters, burying the
+        // one sentence that named the actual problem in the CI log. Decode by
+        // BOM/shape: UTF-16LE when it smells like it (no valid ASCII header,
+        // alternating NULs), lossy UTF-8 otherwise.
+        fn decode(bytes: &[u8]) -> String {
+            if bytes.len() >= 4 && bytes[1] == 0 && bytes[3] == 0 {
+                String::from_utf16_lossy(
+                    &bytes
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                String::from_utf8_lossy(bytes).into_owned()
+            }
+        }
         panic!(
             "the cert guard failed its own probes:\n--- stderr ---\n{}\n--- stdout ---\n{}",
-            String::from_utf8_lossy(&out.stderr),
-            String::from_utf8_lossy(&out.stdout)
+            decode(&out.stderr),
+            decode(&out.stdout)
         );
     }
 }
