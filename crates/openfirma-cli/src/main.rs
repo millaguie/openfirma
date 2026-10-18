@@ -1218,6 +1218,19 @@ fn main() -> Result<()> {
                         t.object.generation,
                         t.digest.name()
                     );
+                    match (&t.problem, t.gen_time) {
+                        (None, Some(at)) => println!(
+                            "  the TSA's signature over this seal verified; it stamps {}",
+                            fmt_system_time(at)
+                        ),
+                        (Some(why), _) => {
+                            println!("  the TSA's signature over this seal is NOT verified: {why}");
+                            println!("  no B-LTA level is claimed from this document time-stamp");
+                        }
+                        (None, None) => {
+                            println!("  the seal's TSA signature was not verified")
+                        }
+                    }
                 }
                 if let Some(dss) = &document.dss {
                     println!(

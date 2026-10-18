@@ -659,6 +659,16 @@ fn b_lta_appends_the_document_timestamp_after_the_dss() {
     let report = pades_verify(&signed, &anchors()).expect("a B-LTA document must verify");
     assert_eq!(report.document_timestamps.len(), 1);
     assert!(
+        report.document_timestamps[0].verified(),
+        "a genuine document time-stamp must come back VERIFIED (its TSA signature \
+         checked against the anchors), not merely present: {:?}",
+        report.document_timestamps[0].problem
+    );
+    assert!(
+        report.document_timestamps[0].gen_time.is_some(),
+        "a verified document time-stamp must expose the genTime B-LTA asserts"
+    );
+    assert!(
         report.signatures[0].reports[0]
             .attributes
             .signature_time_stamp_token,
@@ -766,6 +776,118 @@ fn a_document_timestamp_with_a_wrong_imprint_is_refused() {
     assert!(
         text.contains("imprints a different digest"),
         "the refusal must name the imprint: {text}"
+    );
+}
+
+/// The A-2 false green, pinned: a document time-stamp whose TSA has nothing to
+/// do with the trust anchors is reported as PRESENT but NOT VERIFIED, and the
+/// report's `verified()` stays false. Before the fix, `verify` never ran the
+/// TSA's signature check over a `/Type /DocTimeStamp`, so a self-signed
+/// attacker seal looked exactly like a genuine one and the GUI printed "nivel
+/// B-LTA" over zero cryptographic evidence. The seal here is cryptographically
+/// sound in ITSELF (openssl produced a real token) but its TSA is a throwaway
+/// self-signed authority, so only the binding to the anchors can refuse it.
+#[test]
+fn a_document_timestamp_from_an_unknown_tsa_is_not_reported_as_verified() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    let (Some(signer), Some(revocation)) = (rsa_signer(), crls()) else {
+        require_or_skip("test PKI or CRLs missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // a throwaway TSA that no anchor vouches for: self-signed, its own chain
+    let dir = std::env::temp_dir().join(format!("openfirma-rogue-tsa-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("rogue.key");
+    let crt = dir.join("rogue.crt");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            key.to_str().unwrap(),
+            "-out",
+            crt.to_str().unwrap(),
+            "-days",
+            "3650",
+            "-subj",
+            "/CN=Rogue TSA/O=Evil",
+            "-addext",
+            "extendedKeyUsage=critical,timeStamping",
+        ],
+    );
+    assert!(ok, "generating the rogue TSA failed:\n{text}");
+
+    let (kc, cc) = (key.clone(), crt.clone());
+    // openssl's ts -reply needs a TSA section with a writable serial file, the
+    // same recipe the other TSA tests use; without it openssl falls back to its
+    // system config and dies looking for a certificate it does not have.
+    let cnf = dir.join("rogue-tsa.cnf");
+    std::fs::write(dir.join("tsaserial"), "4242\n").unwrap();
+    std::fs::write(
+        &cnf,
+        format!(
+            "[tsa]\ndefault_tsa = tsa_config1\n[tsa_config1]\nserial = {}\ncrypto_device = builtin\ndefault_policy = 1.2.3.4.1\ndigests = sha256\naccuracy = secs:1\nordering = no\ntsa_name = no\ness_cert_id_chain = no\ness_cert_id_alg = sha256\nsigner_digest = sha256\n",
+            dir.join("tsaserial").display()
+        ),
+    )
+    .unwrap();
+    let provider: openfirma_cades::TimestampFn = Arc::new(move |message: &[u8], digest| {
+        let query = tsp::request(digest, message, 0x0777)?;
+        let q = write_tmp("rogue.tsq", &query);
+        let r = write_tmp("rogue.tsr", b"");
+        let (ok, text) = run(
+            "openssl",
+            &[
+                "ts",
+                "-reply",
+                "-config",
+                cnf.to_str().unwrap(),
+                "-queryfile",
+                q.to_str().unwrap(),
+                "-out",
+                r.to_str().unwrap(),
+                "-signer",
+                cc.to_str().unwrap(),
+                "-inkey",
+                kc.to_str().unwrap(),
+            ],
+        );
+        assert!(ok, "openssl ts -reply with the rogue TSA failed:\n{text}");
+        let response = std::fs::read(&r).expect("the TSA wrote no response");
+        let token = tsp::token_from_response(&response, digest, message, Some(&query))?;
+        Ok(vec![tsp::unsigned_attribute(&token)?])
+    });
+    let opts = PadesOptions {
+        revocation,
+        document_timestamp: Some(provider),
+        ..PadesOptions::default()
+    };
+    let signed = pades_sign(INPUT, &signer, &opts)
+        .expect("signing with a document time-stamp must succeed even for a rogue TSA");
+    std::fs::remove_dir_all(&dir).ok();
+
+    let report = pades_verify(&signed, &anchors())
+        .expect("the document is still sound: the seal's failure is not the signature's");
+    assert_eq!(report.document_timestamps.len(), 1);
+    let dts = &report.document_timestamps[0];
+    assert!(
+        !dts.verified(),
+        "a document time-stamp from an unknown TSA must NOT be reported verified"
+    );
+    assert!(
+        dts.gen_time.is_none(),
+        "an unverified seal must not expose a genTime a B-LTA level could assert"
+    );
+    assert!(
+        dts.problem.as_deref().is_some_and(|p| !p.is_empty()),
+        "an unverified seal must say why, never fail silently"
     );
 }
 

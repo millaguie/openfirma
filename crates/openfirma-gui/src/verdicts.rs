@@ -378,11 +378,39 @@ fn pdf_list_from_report(report: &openfirma_pades::DocumentReport, tr: &Tr) -> Ve
     }
     let mut notes = Vec::new();
     if !report.document_timestamps.is_empty() {
-        notes.push(format!(
-            "El documento lleva {} sello(s) de tiempo de documento (nivel B-LTA): cada uno \
-             certifica todos los bytes anteriores al momento del sellado.",
-            report.document_timestamps.len()
-        ));
+        let total = report.document_timestamps.len();
+        let verified = report
+            .document_timestamps
+            .iter()
+            .filter(|t| t.verified())
+            .count();
+        if verified == total {
+            notes.push(format!(
+                "El documento lleva {total} sello(s) de tiempo de documento (nivel B-LTA): la \
+                 firma de la autoridad de sellado de cada uno se ha verificado, y cada sello \
+                 certifica todos los bytes anteriores al momento del sellado."
+            ));
+        } else if verified == 0 {
+            // A seal whose TSA signature did not verify is not a B-LTA level:
+            // saying it were would be the exact false green this project bans
+            // (review A2). Say what was seen, not what a level would claim.
+            let why = report
+                .document_timestamps
+                .iter()
+                .find_map(|t| t.problem.clone())
+                .unwrap_or_else(|| "no se pudo comprobar".into());
+            notes.push(format!(
+                "El documento lleva {total} sello(s) de tiempo de documento, pero la firma de \
+                 su autoridad de sellado NO se ha podido verificar ({why}). NO se afirma el \
+                 nivel B-LTA: un sello sin verificar no certifica nada."
+            ));
+        } else {
+            notes.push(format!(
+                "El documento lleva {total} sello(s) de tiempo de documento, de los que \
+                 {verified} tienen la firma de su autoridad verificada. NO se afirma el nivel \
+                 B-LTA mientras alguno quede sin verificar."
+            ));
+        }
     }
     if let Some(dss) = &report.dss {
         notes.push(format!(

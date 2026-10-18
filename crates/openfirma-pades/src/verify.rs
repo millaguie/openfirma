@@ -62,6 +62,22 @@ pub struct DocTimeStampReport {
     pub digest: DigestAlg,
     /// The RFC 3161 token in `/Contents`, without the zero padding.
     pub token: Vec<u8>,
+    /// The token's `genTime`, only when the TSA's signature over it verified
+    /// against the supplied anchors. `None` means the seal was NOT
+    /// cryptographically confirmed, and no B-LTA level may be claimed from it.
+    pub gen_time: Option<std::time::SystemTime>,
+    /// What makes this document time-stamp unverified, when it is. Never empty
+    /// when `gen_time` is `None`.
+    pub problem: Option<String>,
+}
+
+impl DocTimeStampReport {
+    /// Whether the document time-stamp's TSA signature was verified against a
+    /// trust anchor. This — not the mere presence of a token — is what B-LTA
+    /// may assert.
+    pub fn verified(&self) -> bool {
+        self.gen_time.is_some()
+    }
 }
 
 /// One signature whose chain could be rebuilt from the `/DSS` alone.
@@ -192,12 +208,46 @@ pub fn verify(pdf: &[u8], opts: &VerifyOptions) -> Result<DocumentReport> {
                 ));
             }
             if problems.is_empty() {
-                dts_reports.push(DocTimeStampReport {
-                    object: t.object,
-                    byte_range: t.byte_range,
-                    digest,
-                    token: t.token.clone(),
-                });
+                // The token is a real RFC 3161 TST: verify the TSA's own
+                // signature over it against the same anchors, exactly as the
+                // B-T signature path does. Presence of a token proves nothing —
+                // a self-signed attacker TSA's seal looked identical until now,
+                // and the GUI printed "nivel B-LTA" over zero cryptographic
+                // evidence (review A2: a level is claimed only when its evidence
+                // was verified). A /Type /DocTimeStamp verifies against the
+                // caller's trust anchors a fortiori: its own validity window
+                // must contain the stamp, and the stamp cannot be checked
+                // against nothing.
+                match openfirma_cades::tsp::verify_token_signature(
+                    &t.token,
+                    &opts.trust_anchors,
+                    opts.validation_time,
+                ) {
+                    Ok(status) => dts_reports.push(DocTimeStampReport {
+                        object: t.object,
+                        byte_range: t.byte_range,
+                        digest,
+                        token: t.token.clone(),
+                        gen_time: Some(status.gen_time),
+                        problem: None,
+                    }),
+                    Err(e) => {
+                        // not a hard failure: like a B-T token that does not
+                        // verify, the document is still sound — it just cannot
+                        // claim B-LTA from this stamp, and the report says why
+                        dts_reports.push(DocTimeStampReport {
+                            object: t.object,
+                            byte_range: t.byte_range,
+                            digest,
+                            token: t.token.clone(),
+                            gen_time: None,
+                            problem: Some(format!(
+                                "the document time-stamp's TSA signature did not verify \
+                                 ({e}), so this seal certifies nothing"
+                            )),
+                        });
+                    }
+                }
             }
         } else {
             for p in &t.problems {
