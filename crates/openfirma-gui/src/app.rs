@@ -245,8 +245,7 @@ impl App {
         match outcome {
             Ok(Loaded::Verify(bytes)) => self.verify_file(path, bytes),
             Ok(Loaded::Detached(bytes)) => {
-                let found = companion_of(&path);
-                if found.is_file() {
+                if let Some(found) = companion_of(&path) {
                     self.verify_file_with_content(path, bytes, Some(found));
                 } else {
                     // Ask rather than fail: the document exists almost surely
@@ -321,7 +320,19 @@ impl App {
     /// inventing one would be exactly the unfounded success this project
     /// bans — so the screen says what it needs and opens one file picker.
     fn verify_file(&mut self, path: PathBuf, bytes: Vec<u8>) {
-        let content = companion_of(&path).is_file().then(|| companion_of(&path));
+        let content = companion_of(&path);
+        // A `.csig` IS a detached signature (the library's own name for one),
+        // so with no original beside it there is nothing to verify against:
+        // ask which document was signed — the ask screen — instead of handing
+        // the verifier the signature as its own content, which is what made
+        // the window call its own output manipulated (round 2, 06-N-2).
+        if content.is_none() && detached_by_name(&path) {
+            self.screen = Screen::NeedsContent {
+                signature_path: path,
+                signature_bytes: bytes,
+            };
+            return;
+        }
         self.verify_file_with_content(path, bytes, content);
     }
 
@@ -406,7 +417,7 @@ impl App {
                         self.start_verify(LoadJob {
                             path,
                             bytes,
-                            content: companion_of_ok(&content),
+                            content: content.as_deref().and_then(companion_of_ok),
                             anchors: certs,
                         });
                     }
@@ -1920,22 +1931,40 @@ fn opens_as_verify(path: &Path) -> bool {
 }
 
 /// The original document a detached signature's name promises: the library's
-/// own naming rule reversed (`nota.txt.csig` → `nota.txt`). Existence decides;
-/// no fuzzy matching, because guessing which of two files signed is how wrong
-/// verdicts get made.
-fn companion_of(signature: &Path) -> PathBuf {
-    let name = signature
+/// own naming rule reversed (`nota.txt.csig` → `nota.txt`,
+/// `informe.v1.pdf.signed.pdf` → `informe.v1.pdf`). Existence decides, and
+/// `None` when there is nothing to name; no fuzzy matching, because guessing
+/// which of two files signed is how wrong verdicts get made.
+///
+/// The signature is NEVER its own companion (round 2, 06-N-2). The
+/// `strip_suffix('.')` step this used to chain onto the suffix match ate the
+/// dot the name had already lost, so for `.csig` it never matched and the
+/// function fell through to "the signature is the document": the window
+/// verified the `.csig` against its own bytes and declared the GUI's own
+/// output manipulated ("El documento cambió después de firmarse"). A file
+/// whose name reverses to itself, and a `.p7s`-style foreign detached
+/// signature with no rule here, answer `None` — the ask-screen's cue to ask
+/// for the original document instead of inventing one.
+/// Whether a signature's NAME says it is detached: the library writes `.csig`
+/// for exactly that (`workflow::default_output`), and an encapsulated CMS
+/// under another name is judged on its bytes by `LoadJob` like any other
+/// unknown shape.
+fn detached_by_name(signature: &Path) -> bool {
+    signature
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    for suffix in [".csig", ".signed.pdf", ".signed.xml"] {
-        if let Some(stripped) = name.strip_suffix(suffix).and_then(|s| s.strip_suffix('.')) {
-            return signature.with_file_name(stripped);
-        }
+        .is_some_and(|n| n.to_string_lossy().ends_with(".csig"))
+}
+
+fn companion_of(signature: &Path) -> Option<PathBuf> {
+    let name = signature.file_name()?.to_string_lossy().into_owned();
+    let stem = [".csig", ".signed.pdf", ".signed.xml"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))?;
+    if stem.is_empty() {
+        return None;
     }
-    // A `.p7s`-style foreign detached signature has no rule here, and guessing
-    // one would ask the wrong file for its verdict. The ask-screen covers it.
-    signature.to_path_buf()
+    let candidate = signature.with_file_name(stem);
+    (candidate != signature && candidate.is_file()).then_some(candidate)
 }
 
 /// `Some(path)` only when it is a real readable file (the None form is what

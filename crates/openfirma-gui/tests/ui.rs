@@ -439,6 +439,63 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
 }
 
 #[test]
+fn the_windows_own_csig_verifies_against_its_original_and_asks_when_it_is_gone() {
+    // 06-N-2 through the window, worker and all. `companion_of` reversed the
+    // library's naming rule with an extra `strip_suffix('.')` that could never
+    // match, so the companion of `nota.txt.csig` came back as the `.csig`
+    // itself: the window verified the signature against its own bytes and told
+    // the citizen the document had changed after signing — the GUI's own
+    // output, refused by the GUI's own screen. Nothing here uses a verdict
+    // delivered by the test: the deferred anchor question is answered by the
+    // fixture and the REAL worker runs (`drain_worker`), so what is read off
+    // the screen is what the window decides about the bytes it picked.
+    let p12 = testdata().join("certs/signer-rsa.p12");
+    let dir = temp_doc("csig-drop");
+    let doc = dir.join("nota.txt");
+    if require(p12.is_file(), "the test PKI").is_none() {
+        return;
+    }
+    std::fs::write(&doc, b"contenido de la nota\n").unwrap();
+    let signed = sign_through_gui_code_for("cades-b-b", &doc, &p12);
+    let csig = dir.join("nota.txt.csig");
+    std::fs::write(&csig, &signed).unwrap();
+
+    // (1) the original sits beside the signature, as the GUI itself wrote it
+    let mut app = fixture_app(Some(testdata().join("certs/chain.crt")));
+    app.load_path_for_test(csig.clone());
+    assert!(
+        app.pending_note_for_test().is_some(),
+        "verification waits for the configured anchor before it reads anything"
+    );
+    let mut harness = harness_for(app);
+    harness.run(); // the deferred ask fires and the fixture answers with chain.crt
+    drain_worker(&mut harness);
+    harness.run();
+    harness.get_by_label_contains("Firma válida");
+    assert!(
+        harness.query_by_label_contains("NO es válida").is_none(),
+        "the window's own .csig is not a manipulated document"
+    );
+    assert!(
+        harness.query_by_label_contains("cambió").is_none(),
+        "and it does not say the document changed"
+    );
+
+    // (2) the original is gone: a detached signature with nothing to check
+    // against asks for the document (the one dialog AutoFirma's validation
+    // tab never shows) instead of verifying the signature over itself
+    std::fs::remove_file(&doc).unwrap();
+    let mut app = fixture_app(None);
+    app.load_path_for_test(csig.clone());
+    assert!(
+        matches!(app.screen_ref_for_test(), Screen::NeedsContent { .. }),
+        "a signature with no original asks which document was signed"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn verdict_details_stay_open_across_frames_and_say_hiding() {
     // M-3, pinned: the old details checkbox reset itself every frame, so no
     // technical block was ever readable. The toggle is screen state now — one
@@ -841,6 +898,12 @@ fn temp_doc(tag: &str) -> PathBuf {
 /// a `KeySource`, exactly what the Picked screen runs) — the other tests use
 /// it to produce signed material without driving every widget again.
 fn sign_through_gui_code(doc: &Path, p12: &Path) -> Vec<u8> {
+    sign_through_gui_code_for("pades-b-b", doc, p12)
+}
+
+/// The same, with the profile named: a `.txt` document goes out as CAdES
+/// (`.csig`), which is the file the companion-rule test needs.
+fn sign_through_gui_code_for(format: &str, doc: &Path, p12: &Path) -> Vec<u8> {
     let key = KeySource::P12 {
         path: p12.to_path_buf(),
         password: zeroize::Zeroizing::new("openfirma".into()),
@@ -850,14 +913,14 @@ fn sign_through_gui_code(doc: &Path, p12: &Path) -> Vec<u8> {
     let signer = key.signer().expect("the test .p12 opens");
     let content = std::fs::read(doc).unwrap();
     openfirma_gui::signing::execute(
-        "pades-b-b",
+        format,
         &content,
         signer.as_ref(),
         openfirma_core::DigestAlg::Sha256,
         None,
         None,
     )
-    .expect("signing the test pdf through the GUI's dispatcher works")
+    .expect("signing the test document through the GUI's dispatcher works")
 }
 
 /// The verify worker's answer over real signed bytes, through the window's
