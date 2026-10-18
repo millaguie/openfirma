@@ -507,6 +507,21 @@ pub fn last_startxref(data: &[u8]) -> Result<usize> {
 
 /// Reads the trailer dictionary of the revision whose cross-reference section
 /// starts at `xref_at`.
+/// Whether the cross-reference section starting at `xref_at` is a
+/// cross-reference *stream* (an `N G obj << /Type /XRef …` at that offset)
+/// rather than a classic table (the keyword `xref`).
+///
+/// The incremental writer needs it: a revision whose `/Prev` points at a
+/// stream has to be a stream itself. iText — the reader inside AutoFirma —
+/// follows `/Prev` from a stream as a stream and from a table with
+/// `readXrefSection`, which requires the word `xref`, so a classic table over a
+/// stream is a chain it refuses to walk: it rebuilds the file and will not
+/// sign it in append mode (round 2, N-3).
+pub fn section_is_stream(data: &[u8], xref_at: usize) -> bool {
+    let i = skip_ws(data, xref_at);
+    data.get(i..).is_some_and(|rest| !rest.starts_with(b"xref"))
+}
+
 pub fn trailer(data: &[u8], xref_at: usize) -> Result<Trailer> {
     // finding M-6: the offset comes from the file (a `startxref` number or a
     // `/Prev`), so it may point past the end. Checked where it is read, before
@@ -1626,6 +1641,7 @@ pub(crate) mod tests {
             None,
             1,
             b"<< /Size 1 >>",
+            false,
         )
         .unwrap();
         update.push(crate::update::Object::new(

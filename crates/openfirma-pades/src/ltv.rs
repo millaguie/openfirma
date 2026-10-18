@@ -279,6 +279,7 @@ pub fn add_validation_data(
         trailer.info,
         size,
         &pdf::trailer_dict(pdf, xref_at)?,
+        pdf::section_is_stream(pdf, xref_at),
     )?;
     let mut next_num = update.next_object_number();
     let mut new_cert_refs: Vec<ObjRef> = Vec::new();
@@ -510,6 +511,7 @@ pub fn add_document_timestamp(
         trailer.info,
         size,
         &pdf::trailer_dict(pdf, xref_at)?,
+        pdf::section_is_stream(pdf, xref_at),
     )?;
     let first_new = update.next_object_number();
     let appearance = ObjRef::new(first_new, 0);

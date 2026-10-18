@@ -348,8 +348,14 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     // be written), so first_new + 6 is the number this revision really writes
     // — never one another object already took.
     let info_ref = trailer.info_for_revision(ObjRef::new(first_new + 6, 0));
-    let mut update =
-        Update::new_with_trailer(xref_at, root, Some(info_ref), size, &previous_trailer)?;
+    let mut update = Update::new_with_trailer(
+        xref_at,
+        root,
+        Some(info_ref),
+        size,
+        &previous_trailer,
+        pdf::section_is_stream(pdf, xref_at),
+    )?;
     let appearance = ObjRef::new(first_new, 0);
     let helv = ObjRef::new(first_new + 1, 0);
     let zadb = ObjRef::new(first_new + 2, 0);
