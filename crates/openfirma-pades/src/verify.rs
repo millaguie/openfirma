@@ -11,10 +11,11 @@
 //! Since B-LT it also checks what the document archives for later: when the
 //! catalog carries a `/DSS`, every certificate in it has to parse, every CRL
 //! has to verify under the key of the CA it names, every OCSP response has to
-//! be a successful answer, and for every signature the `/VRI` covers, the
-//! chain has to rebuild **from the archived data alone** — with at least one
-//! revocation datum per CA certificate of that chain, and no certificate of
-//! the chain revoked by the data archived for it. And since B-LTA, every
+//! be a successful answer from that CA (or a delegate it issued itself), and
+//! for every signature the `/VRI` covers, the chain has to rebuild **from the
+//! archived data alone** — with a revocation datum per link of that chain,
+//! bound to the certificates of the link, and no certificate of the chain
+//! revoked by the data archived for it. And since B-LTA, every
 //! document time-stamp token has to imprint the bytes its own `/ByteRange`
 //! covers.
 //!
@@ -804,13 +805,16 @@ fn verify_dss(
         }
     }
 
-    // every CRL: parse, signature under the naming CA's key, dates
+    // every CRL: parse, signature under the naming CA's key, dates. The pool is
+    // what makes the archive readable at all; WHICH chain certificate each CRL
+    // may speak for is decided per link below, where the candidate is the one
+    // certificate of the chain.
     let mut issuers = cert_handles.clone();
     issuers.extend_from_slice(&opts.trust_anchors);
-    let mut crls: Vec<CrlReport> = Vec::with_capacity(dss.crls.len());
+    let mut crls: Vec<(Vec<u8>, CrlReport)> = Vec::with_capacity(dss.crls.len());
     for (i, (_, der)) in dss.crls.iter().enumerate() {
         match revocation::verify_crl(der, &issuers, opts.validation_time) {
-            Ok(report) => crls.push(report),
+            Ok(report) => crls.push((der.clone(), report)),
             Err(e) => {
                 return Err(fail_dss(&format!(
                     "CRL {} archived under /CRLs is not a revocation datum: {}",
@@ -891,33 +895,42 @@ fn verify_dss(
                 ))
             })?;
 
-            // every CA of the chain has to have contributed at least one
-            // revocation datum, and no certificate below the anchor may be
-            // revoked by the data archived for it
-            for ca in &chain[1..] {
-                let ca_subject = ca.subject_der().map_err(|e| fail_dss(&e.to_string()))?;
-                let by_crl = crls.iter().any(|r| r.issuer_der == ca_subject);
-                let by_ocsp = ocsp_ids
-                    .iter()
-                    .any(|id| ltv::ocsp_id_names_ca(id, ca).unwrap_or(false));
-                if !by_crl && !by_ocsp {
+            // Every link of the chain needs revocation data about the child
+            // from its parent, and the data has to be THAT parent's: the CRL
+            // must verify under the chain certificate's own key, and an OCSP
+            // response must name the child's serial number and the parent.
+            //
+            // Both halves were round 2 findings. N3: the CRL only had to verify
+            // under *some* certificate of /Certs (or an anchor) carrying the
+            // issuing CA's name, so a self-signed impostor with that name and a
+            // key of its own signed an empty CRL and the archive looked
+            // complete while every conforming validator saw the signer revoked.
+            // N5: an authentic OCSP response about a different certificate of
+            // the same CA counted for this one, which is an answer anyone can
+            // ask that CA's public responder for.
+            for pair in chain.windows(2) {
+                let (child, parent) = (&pair[0], &pair[1]);
+                let serial = child.serial_number().as_bytes().to_vec();
+                let crl = crls.iter().find(|(der, _)| {
+                    revocation::verify_crl(der, std::slice::from_ref(parent), opts.validation_time)
+                        .is_ok()
+                });
+                let by_ocsp = ocsp_ids.iter().any(|id| {
+                    id.serial == serial && ltv::ocsp_id_names_ca(id, parent).unwrap_or(false)
+                });
+                if crl.is_none() && !by_ocsp {
                     return Err(fail_dss(&format!(
-                        "the archive carries no revocation datum issued by \"{}\", a CA of \
-                         the chain of signature {}: a B-LT /DSS needs at least one CRL or \
-                         OCSP response per CA certificate",
-                        ca.subject(),
+                        "the archive carries no revocation datum issued by \"{}\" about \
+                         \"{}\" (serial {}), a link of the chain of signature {}: a B-LT /DSS \
+                         needs a CRL or an OCSP response from each CA about the certificate it \
+                         issued, verifiable under that CA's own key",
+                        parent.subject(),
+                        child.subject(),
+                        hex::encode(&serial),
                         i + 1
                     )));
                 }
-            }
-            for pair in chain.windows(2) {
-                let (child, parent) = (&pair[0], &pair[1]);
-                let parent_subject = parent.subject_der().map_err(|e| fail_dss(&e.to_string()))?;
-                let serial = child.serial_number().as_bytes().to_vec();
-                if crls
-                    .iter()
-                    .any(|r| r.issuer_der == parent_subject && r.revoked_serials.contains(&serial))
-                {
+                if crl.is_some_and(|(_, r)| r.revoked_serials.contains(&serial)) {
                     return Err(fail_dss(&format!(
                         "the archived CRL issued by \"{}\" revokes \"{}\" (serial {}), a \
                          certificate of the chain of signature {}",
@@ -954,7 +967,7 @@ fn verify_dss(
 
     Ok(Some(DssReport {
         certificates: cert_handles.len(),
-        crls,
+        crls: crls.into_iter().map(|(_, report)| report).collect(),
         ocsps: dss.ocsps.len(),
         vri_keys,
         chains,

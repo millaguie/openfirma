@@ -958,6 +958,152 @@ fn tmp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("openfirma-{}-{test}-{name}", std::process::id()))
 }
 
+/// Round 2, N3, the CRL half. A CRL was accepted as soon as *some* certificate
+/// in the archive (or an anchor) carried the name it claims as issuer and its
+/// key verified the signature. So a self-signed impostor — the CA's subject
+/// copied byte for byte, a key of its own, `cRLSign` inherited from the copied
+/// extensions — signed an empty CRL, and the archive looked complete while the
+/// real CRL, the one every conforming validator reads, revoked the signer.
+///
+/// The datum has to be bound to the certificate it speaks for: the CRL that
+/// counts for a link of the chain must verify under that link's parent, the
+/// chain certificate itself.
+#[test]
+fn a_crl_signed_by_an_impostor_copying_the_ca_name_is_not_a_datum() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    let Some(signer) = rsa_signer() else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let Ok(ca_crl) = std::fs::read(certs_dir().join("ca.crl.der")) else {
+        require_or_skip("the test PKI has no CRLs, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let intermediate = cert_handles(&["intermediate.crt"]).remove(0);
+
+    // the impostor: openssl copies the intermediate's subject into a new
+    // certificate and re-signs it with a key of its own
+    let key = tmp_path("impostor.key");
+    let pubkey = tmp_path("impostor.pub");
+    let cert = tmp_path("impostor.crt");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            key.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "openssl genpkey failed:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "pkey",
+            "-in",
+            key.to_str().unwrap(),
+            "-pubout",
+            "-out",
+            pubkey.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "openssl pkey failed:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "x509",
+            "-in",
+            certs_dir().join("intermediate.crt").to_str().unwrap(),
+            "-force_pubkey",
+            pubkey.to_str().unwrap(),
+            "-signkey",
+            key.to_str().unwrap(),
+            "-set_serial",
+            "7",
+            "-out",
+            cert.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "openssl could not mint the impostor:\n{text}");
+    let impostor_cert_pem =
+        std::fs::read_to_string(&cert).expect("openssl wrote the impostor certificate");
+    let impostor_key_pem = std::fs::read_to_string(&key).expect("openssl wrote the impostor key");
+    let impostor = SoftwareSigner::from_pkcs8_pem(&impostor_cert_pem, &impostor_key_pem)
+        .expect("the impostor key must load");
+    let impostor_handle =
+        CertificateHandle::from_pem(&impostor_cert_pem).expect("the impostor certificate parses");
+    // the impostor wears the CA's name: that is the whole attack
+    assert_eq!(
+        impostor_handle.subject_der().unwrap(),
+        intermediate.subject_der().unwrap(),
+        "the impostor's subject must be the intermediate's byte for byte"
+    );
+
+    // an empty CRL naming the intermediate as its issuer, signed by the impostor
+    let now = std::time::SystemTime::now();
+    let day = std::time::Duration::from_secs(86_400);
+    let alg = tlv::sequence(&[tlv::oid(&oid::ID_SHA256_WITH_RSA).unwrap(), tlv::null()]);
+    let tbs = tlv::sequence(&[
+        alg.clone(),
+        intermediate.subject_der().unwrap(),
+        tlv::utc_time(now - day).unwrap(),
+        tlv::utc_time(now + 30 * day).unwrap(),
+    ]);
+    let prehash = DigestAlg::Sha256.digest(&tbs);
+    let signature = impostor
+        .sign_prehash(DigestAlg::Sha256, &prehash)
+        .expect("the impostor signs with its own key");
+    let forged = tlv::sequence(&[
+        tbs,
+        alg,
+        tlv::tlv(tlv::TAG_BIT_STRING, &[&[0u8][..], &signature].concat()),
+    ]);
+
+    // it is a real statement of the impostor's, and nothing the CA said
+    assert!(
+        openfirma_cades::revocation::verify_crl(
+            &forged,
+            std::slice::from_ref(&impostor_handle),
+            now
+        )
+        .is_ok(),
+        "the impostor really signed this CRL: the archive has a readable datum"
+    );
+    assert!(
+        openfirma_cades::revocation::verify_crl(&forged, std::slice::from_ref(&intermediate), now)
+            .is_err(),
+        "the CA whose name the CRL carries never signed it"
+    );
+
+    let opts = PadesOptions {
+        validation_certs: vec![impostor_handle],
+        revocation: vec![RevocationBytes::Crl(forged), RevocationBytes::Crl(ca_crl)],
+        ..PadesOptions::default()
+    };
+    let signed =
+        pades_sign(INPUT, &signer, &opts).expect("signing with the impostor material failed");
+    let dss = read_dss(&signed)
+        .expect("readable")
+        .expect("the /DSS is there");
+    assert_eq!(dss.crls.len(), 2, "both CRLs are archived");
+
+    let err = pades_verify(&signed, &anchors()).expect_err(
+        "a CRL signed by a certificate wearing the CA's name is not the CA's revocation state",
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("carries no revocation datum issued by")
+            && text.contains("Test Intermediate CA"),
+        "the refusal must name the link that has no datum, not the pool: {text}"
+    );
+}
+
 /// Round 2, N4. A leaf certificate issued by the CA with **no** extendedKeyUsage
 /// extension served as an OCSP responder for it: the reader treated the absence
 /// as "any purpose" (the RFC 5280 reading for a leaf), so anyone holding a
@@ -1348,6 +1494,133 @@ fn an_ocsp_responder_that_hangs_from_a_sub_ca_is_not_a_delegate() {
         text.contains("OCSP response 1") && text.contains("not a revocation datum"),
         "the refusal must name the archived response: {text}"
     );
+}
+
+/// Round 2, N5. An OCSP response only had to name the CA; the serial number it
+/// answers about was read (for the "revoked" verdict) but never required to be
+/// the child's. So the CA's ordinary public responder — which anyone can ask
+/// about their own certificate — produced a genuine "good" answer about a
+/// *different* certificate, and the archive counted it as though it covered
+/// the signer.
+#[test]
+fn an_ocsp_response_about_another_certificate_is_not_a_datum() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    let Some(signer) = rsa_signer() else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let (Ok(ca_crl), Ok(good_ocsp), Ok(int_pem), Ok(ca_pem)) = (
+        std::fs::read(certs_dir().join("ca.crl.der")),
+        std::fs::read(certs_dir().join("signer-rsa.ocsp.der")),
+        std::fs::read_to_string(certs_dir().join("intermediate.crt")),
+        std::fs::read_to_string(certs_dir().join("ca.crt")),
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let intermediate = CertificateHandle::from_pem(&int_pem).expect("intermediate.crt");
+    let ca = CertificateHandle::from_pem(&ca_pem).expect("ca.crt");
+
+    // an authentic answer from the CA's own responder, about signer-ec
+    let other_serial = cert_handles(&["signer-ec.crt"]).remove(0);
+    let resp = tmp_path("other-serial.ocsp.der");
+    let index = write_tmp(
+        "other-serial.index",
+        format!(
+            "V\t491231235959Z\t\t{}\tunknown\t{}\n",
+            hex::encode_upper(other_serial.serial_number().as_bytes()),
+            "C=ES, O=DIRECCION GENERAL DE LA POLICIA, OU=DNIE, CN=LOPEZ MARTIN, JUAN"
+        )
+        .as_bytes(),
+    );
+    let request = tmp_path("other-serial.req");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-reqout",
+            request.to_str().unwrap(),
+            "-issuer",
+            certs_dir().join("intermediate.crt").to_str().unwrap(),
+            "-cert",
+            certs_dir().join("signer-ec.crt").to_str().unwrap(),
+            "-no_nonce",
+        ],
+    );
+    assert!(ok, "openssl could not build the OCSP request:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-index",
+            index.to_str().unwrap(),
+            "-CA",
+            certs_dir().join("intermediate.crt").to_str().unwrap(),
+            "-rsigner",
+            certs_dir().join("ocsp.crt").to_str().unwrap(),
+            "-rkey",
+            certs_dir().join("ocsp.key").to_str().unwrap(),
+            "-reqin",
+            request.to_str().unwrap(),
+            "-respout",
+            resp.to_str().unwrap(),
+            "-ndays",
+            "3650",
+        ],
+    );
+    assert!(ok, "openssl could not sign the OCSP response:\n{text}");
+    let resp = std::fs::read(&resp).expect("openssl wrote the OCSP response");
+
+    // it IS a genuine datum of that CA: verified, and about another certificate
+    let status = openfirma_cades::read_ocsp_response(
+        &resp,
+        &[ca.clone(), intermediate.clone()],
+        std::time::SystemTime::now(),
+    );
+    assert!(
+        status.verified(),
+        "the CA's own responder signed it, and it must be read as such: {status:?}"
+    );
+    let ids = openfirma_cades::revocation::parse_ocsp_response(&resp).expect("it parses");
+    assert_eq!(ids.len(), 1);
+    assert_ne!(
+        ids[0].serial,
+        signer.certificate().serial_number().as_bytes(),
+        "the answer is about a different certificate of the same CA"
+    );
+
+    let opts = PadesOptions {
+        revocation: vec![
+            RevocationBytes::Ocsp(resp),
+            RevocationBytes::Crl(ca_crl.clone()),
+        ],
+        ..PadesOptions::default()
+    };
+    let signed = pades_sign(INPUT, &signer, &opts).expect("signing failed");
+    let err = pades_verify(&signed, &anchors())
+        .expect_err("an answer about another certificate of the same CA does not cover the signer");
+    let text = err.to_string();
+    assert!(
+        text.contains("carries no revocation datum issued by")
+            && text.contains("Test Intermediate CA"),
+        "the refusal must name the link that has no datum: {text}"
+    );
+
+    // and the same construction with the answer that does name the signer is a
+    // datum for it: the rule binds an answer to a certificate, it does not
+    // refuse OCSP
+    let opts = PadesOptions {
+        revocation: vec![
+            RevocationBytes::Ocsp(good_ocsp),
+            RevocationBytes::Crl(ca_crl),
+        ],
+        ..PadesOptions::default()
+    };
+    let signed = pades_sign(INPUT, &signer, &opts).expect("signing failed");
+    pades_verify(&signed, &anchors()).expect("the answer about the signer itself covers it");
 }
 
 #[test]
