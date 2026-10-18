@@ -19,6 +19,10 @@ Statuses mean:
   (real Windows card reader, real sede server, signed macOS/Windows runs).
   These stay declared as untested wherever they are user-visible.
 
+Two adversarial rounds on the fixes themselves followed (`R1`, `R2` below):
+models that had not written the code were asked to break it, with an executable
+proof of concept or nothing.
+
 ## CAdES / core (`01`)
 
 | ID | Finding | Status |
@@ -141,6 +145,38 @@ per request instead of per process (M-8).
   sane; no copied AutoFirma code; no personal data; pure-Rust where it
   matters; edition 2024 consistent).
 
+## Adversarial rounds on the fixes itself (`R1`, `R2`)
+
+The seven reviews above judge the code; these two rounds judge the *fixes*. A
+frozen tree was handed to a model that had not written them, with the findings
+and the exact commits to falsify, and one rule: nothing closes by reading. Each
+round had to break a fix with an executable proof of concept, and for every fix
+had to show that the test guarding it actually fails when the fix is reverted —
+a test that stops biting is worse than a test that fails. The reports are not
+in this repository, for the same reason as the seven above.
+
+| ID | Finding | Status |
+|---|---|---|
+| R1-C1 | Shadow attack through a hanging `/DSS`: the incremental-saving gate seeded "this object is validation data, so it may change" from EVERY object whose `/Type` is `/DSS`, referenced or not, so one appended revision that rewrote the page content stream and added an unreferenced `<< /Type /DSS /Certs [<payload> 0 R] >>` verified green over text a reader shows as substituted | fixed (`ab7e0ef`: the walk starts at the archive the catalog names, and a rewritten object claiming `/Type /DSS` is no longer excused) |
+| R1-A1 | `verify` never recognised a genuine B-T signature — two bugs stacked. The unsigned attribute value was unwrapped from the inner OID instead of the whole `ContentInfo`, so every token was refused with "expected the ContentInfo (tag 0x30), found tag 0x06"; and the imprint was compared against un-hashed `cert || signature` rather than the digest of the signature value (`CMSTimestamper.java:227`) | fixed (`4995746`: the token is unwrapped whole, and the imprint is the digest of the signature value, the same input the signing side hashes) |
+| R1-A2 | A `/Type /DocTimeStamp` seal signed by an attacker's self-signed TSA passed `verify` with every light green, and the window printed "nivel B-LTA: cada uno certifica todos los bytes anteriores" over zero cryptographic evidence — `tsp::verify_token_signature` was never called on the token | fixed (`2cf68c5`: the same TSA verification the B-T path uses runs against the caller's anchors, and the report and the window say which tokens were checked) |
+| R1-A3 | `Cursor::sequence` returned `Cursor<'static>` and satisfied the bogus lifetime with `Box::leak(v.content.to_vec())`, leaking a copy per descent — ~25 per verification, chosen by hostile input, in the long-running window | fixed (`23a339a`: the borrow was always available; measured at 0 kB per iteration versus +6 kB/iteration with the leak restored) |
+| R1-M1 | Windows PKCS#11 ABI: `slot_info_ptr` read function-table slot 6 as byte offset `6·sizeof(pointer)` while the rest of the crate goes through the packed-table rule. On LP64 Unix the two agree, so every Linux dev box and CI run was blind to it; on Windows the value read was a mix of `C_GetSlotInfo` and `C_GetTokenInfo`, transmuted to `extern "C" fn` and called | fixed (`5960edb`: the same `function_slot_offset` every other slot uses, plus `read_unaligned`) |
+| R1-B1 | `openfirma verify -i signed.xml` answered "these bytes are not a CMS signature: expected the ContentInfo (tag 0x30), found tag 0x3c" — 0x3c being `<`, which reads to a citizen like a corrupted file instead of "this build does not verify XAdES yet" | fixed (`13efbf5`: XML is named, with the way out) |
+| R1-X | Not a finding of the round: a PKCS#12 export with a random salt failed to load about once in 117 ("a DER length that is overlong or runs past the input") while openssl opened the same file. Pre-existing (reproduced on `fb41351`), surfaced by a flaky macOS CI job. `decrypt_pbe_all` returned the first password candidate whose PKCS#7 padding validated, and with an 8-byte block cipher a wrong candidate satisfies that padding by chance once in 256 | fixed (`b10b81a`: a decrypted bag is accepted only when its whole plaintext is one DER structure; 1000 random-salt exports, 0 failures) |
+| R2-C1 | **The round-1 fix for C-1 did not close the class.** The walk followed EVERY reference from the catalog's archive, not the keys a validation-data reader consumes, so a revision that rewrote the page content stream and named it from a key no reader reads (`/Foo [<content> 0 R]`), or reached it one hop through a free object, or named it only inside a `/VRI` entry, still verified green over substituted text. Reproduced here against the reviewer's own artifacts before touching a line | fixed (`77ae89f`: the walk follows `/Certs`, `/CRLs` and `/OCSPs` only, follows nothing inside a named object, and licenses anything only as an addition — an archive pass appends, it never replaces a byte a reader rendered). Three tests, each shown to bite by reverting the fix |
+
+Two observations from round 2 that are not defeats of a fix, kept here so they do
+not get lost:
+
+- The window's B-LTA wording for the mixed case (a verified signature plus a
+  document time-stamp that is not) has no test of its own; the library verdict
+  it renders does. Noted, not a defect.
+- A PKCS#12 whose MAC is HMAC-MD5 is refused as "wrong password" — openssl opens
+  it. Pre-existing, low, and a compatibility gap rather than a vulnerability;
+  the honest fix is to check the MD5 MAC rather than to keep the misleading
+  sentence.
+
 ## What remains unverifiable from this repository
 
 1. **Windows runtime paths**: PKCS#11 against a real card DLL, and the CAPI
@@ -156,5 +192,10 @@ per request instead of per process (M-8).
    it gates every release locally, and validation-log records the date of
    its last run (12/12 MATCH on 2026-10-17).
 5. **Release artifact contents** (per-platform packaging, THIRD-PARTY-LICENSES
-   generation): the release workflow has never run for lack of a tag; its
-   steps mirror what CI already proves per platform.
+   generation): the release workflow's first execution (2026-10-18) showed its
+   licence step could not run at all — see H-12. It now runs end to end on
+   dispatch (8/8 legs, run 39129111129) and the artifacts were downloaded,
+   checksum-verified and executed here (`docs/validation-log.md`, "Release
+   artifacts"). Still unproven from here: the Windows and macOS binaries on
+   their own platforms (cross-built, no such host), the window on a physical
+   desktop, and the `publish` job, which only a tag starts.
