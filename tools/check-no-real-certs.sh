@@ -88,12 +88,16 @@ check_embedded_certs() {
     # XAdES or any text carrying a base64 certificate: XML wraps the DER as
     # raw base64 inside <ds:X509Certificate>, PEM wraps it with armor, and a
     # CMS print_certs dump interleaves subject/issuer lines with the base64.
-    # All three shapes collapse to "long base64 runs": cut every run between
-    # 400 and 10000 chars (a certificate DER is ~800–3200 bytes, i.e. ~1100–
-    # 4300 chars), decode each independently — base64 -d ignores whitespace
-    # and stops at the first non-alphabet character, so a run that bleeds into
-    # XML markup simply fails to parse as a certificate and is skipped.
-    blocks="$(grep -oE '[A-Za-z0-9+/]{400,10000}={0,2}' "$f" 2>/dev/null |
+    # All three shapes collapse to "long base64 runs" of at least 400 chars (a
+    # certificate DER is ~800–3200 bytes, i.e. ~1100–4300 chars), each decoded
+    # independently — openssl's DER reader consumes only what a certificate
+    # needs and ignores the trailing bytes of a run that bleeds into XML markup,
+    # so an overlong candidate simply fails to parse and is skipped. No upper
+    # bound: BSD grep caps {m,n} intervals at 255 repetitions and answers "invalid
+    # repetition" (measured on macOS runners, where the guard then blocked
+    # nothing), while GNU grep silently truncates the match at n. Trivially slow
+    # is fine here: candidates are rare, and a fail-open guard must never be one.
+    blocks="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null |
       while read -r run; do
         if printf '%s' "$run" | base64 -d 2>/dev/null |
            openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
