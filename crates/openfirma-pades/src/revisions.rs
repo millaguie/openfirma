@@ -387,26 +387,24 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
     }
     let trailer = pdf::trailer(pdf, xref_at)?;
     let catalog = final_state.get(&trailer.root).cloned().unwrap_or_default();
-    // Validation data: reachable from SOME /DSS dictionary of the final state —
-    // the current one and any older archive's /DSS a newer pass replaced. Reach-
-    // ability scans stop at each object's own `stream` marker (see `refs_in`), so
-    // no encoded payload can drag unrelated objects into the set, and payload
-    // hides inside validation data only by being *referenced* from an archive
-    // dictionary — which is exactly what a /DSS/Certs/CRLs/OCSPs/VRI tree is.
+    // Validation data: reachable from the /DSS the CATALOG references. An
+    // earlier fix seeded reachability from every object whose /Type is /DSS,
+    // referenced or not, which handed an attacker the whole whitelist: append a
+    // revision that rewrites the page's content stream and add an unreferenced
+    // `<< /Type /DSS /Certs [<payload> 0 R] >>`, and the rewritten payload
+    // became "validation data" that verify accepted (shadow attack; the /DSS
+    // validator never looks at a hanging dictionary). Only the archive the
+    // reader actually reads — the one the catalog points at — may whitelist an
+    // object, so the seed is that one reference. A catalog with no /DSS seeds
+    // nothing, exactly right for a B-B document. The /DSS dictionary itself and
+    // everything reachable from it (its /Certs, /CRLs, /OCSPs, /VRI tree) stay
+    // licensed; a hanging /DSS whitelists nothing, and classify_one grants only
+    // an ADDED /Type /DSS dictionary (an inert co-signature archive) a pass of
+    // its own — never a rewritten one, which is how a content stream that
+    // rewrote itself with `/Type /DSS` used to slip through.
     let mut dss_reachable: BTreeSet<ObjRef> = BTreeSet::new();
-    let mut archive_dicts: Vec<ObjRef> = final_state
-        .iter()
-        .filter(|(_, body)| is_type(body, "/DSS"))
-        .map(|(o, _)| *o)
-        .collect();
-    // The current catalog's /DSS counts even if a hand-made file spells the
-    // dictionary without /Type: what the final document points at IS its archive.
-    if let Some(dss_ref) = pdf::get(&catalog, "/DSS").and_then(pdf::parse_ref) {
-        if !archive_dicts.contains(&dss_ref) {
-            archive_dicts.push(dss_ref);
-        }
-    }
-    for dss in archive_dicts {
+    let catalog_dss = pdf::get(&catalog, "/DSS").and_then(pdf::parse_ref);
+    if let Some(dss) = catalog_dss {
         collect_reachable(pdf, &locations, &mut cache, dss, &mut dss_reachable);
         dss_reachable.insert(dss);
     }
@@ -452,15 +450,23 @@ fn classify_one(
     if is_type(newer, "/DocTimeStamp") || is_type(older, "/DocTimeStamp") {
         return Change::DocTimeStamp(*object);
     }
-    if dss_reachable.contains(object) || is_type(newer, "/DSS") || is_type(older, "/DSS") {
-        // Validation data: reached from some /DSS of the final state (see
-        // reachability above), or a /DSS dictionary itself — an older archive's
-        // /DSS that a newer pass replaced is no longer reachable and still may
-        // not be refused for it. A stream object can claim neither shape: page
-        // content, XObjects and other payload never become /Type /DSS or get
-        // referenced from the certificate tree on their own, so rewriting them
-        // cannot hide on this rule — an attacker would have to name the new
-        // payload from inside the archive's certificate chain.
+    // Validation data: reached from the CATALOG's /DSS (see the seed above), or
+    // an ADDED /DSS dictionary of its own. Two shapes are licensed and they are
+    // safe for different reasons:
+    //   - reachable from the catalog's archive: these are the bytes the reader's
+    //     own /DSS names, so changing them is archiving, not content;
+    //   - a brand-new /Type /DSS: an older archive a co-signature pass replaced
+    //     (it could not overwrite the previous one — that one is inside the new
+    //     signature's /ByteRange — so it wrote a fresh dictionary and re-pointed
+    //     the catalog). It is inert: nothing seeds reachability from it, so it
+    //     can whitelist no rewritten object; only its own dictionary is spared.
+    // What is NOT licensed: a rewritten object that merely CLAIMS /Type /DSS in
+    // its body. A page-content stream rewritten with `/Type /DSS` in its
+    // dictionary used to walk through the old `is_type(newer, "/DSS")` branch,
+    // and a hanging `/Type /DSS` referencing the payload used to seed
+    // reachability over it (both shadow attacks). Neither is brand-new-as-a-
+    // dictionary, and neither is reachable from the catalog's archive.
+    if dss_reachable.contains(object) || (brand_new && is_type(newer, "/DSS")) {
         return Change::ValidationData(*object);
     }
     // The catalog: /DSS gaining (fresh or merged), AcroForm appearing through a

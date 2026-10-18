@@ -276,3 +276,93 @@ fn a_second_definition_of_a_signed_object_is_refused_even_unreferenced() {
         "the refusal says what was violated: {error}"
     );
 }
+
+/// The shadow attack through a hanging `/DSS` (Kimi round 1, C-1). The
+/// revisions gate seeds "this object is validation data" from the archive the
+/// CATALOG's /DSS names. An earlier build seeded it from every object whose
+/// /Type is /DSS, referenced or not, so an attacker appended one revision that
+/// rewrote the page content stream AND added an unreferenced
+/// `<< /Type /DSS /Certs [<content> 0 R] >>`: the rewritten content then
+/// counted as validation data and `verify` said OK over a document whose text
+/// a reader renders as something no signature covered. The hanging /DSS must
+/// whitelist nothing.
+#[test]
+fn a_hanging_dss_dictionary_cannot_whitelist_a_rewritten_payload() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    let content =
+        b"<< /Length 46 >>\nstream\nBT /F1 24 Tf 72 700 Td (PAGUESE 1.000.000 EUR) Tj ET\nendstream";
+    // one revision: rewrite object 5 (the page content) and add object 99, a
+    // /Type /DSS nothing references but which points at the rewritten stream
+    let dss = b"<< /Type /DSS /Certs [5 0 R] /CRLs [5 0 R] /OCSPs [5 0 R] >>";
+    let attacked = append_two(&signed, &[(5, content), (99, dss.as_slice())]);
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a hanging /DSS must not turn a content rewrite into validation data");
+    let text = error.to_string();
+    assert!(
+        text.contains("no archive may append"),
+        "the refusal says what was violated: {text}"
+    );
+    assert!(
+        text.contains("5 0 R"),
+        "the refusal names the rewritten content object: {text}"
+    );
+}
+
+/// The same shadow attack with the payload rewriting ITSELF as a /Type /DSS
+/// object instead of adding a separate hanging dictionary: classify_one used to
+/// grant any object whose body says `/Type /DSS` a pass, so a content stream
+/// that overwrote its own dictionary with that key walked through. Only an
+/// ADDED /Type /DSS dictionary (a co-signature's inert archive) is licensed; a
+/// REWRITE that claims it is not.
+#[test]
+fn a_rewritten_object_claiming_type_dss_is_still_refused() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    let body = b"<< /Type /DSS /Length 46 >>\nstream\nBT /F1 24 Tf 72 700 Td (PAGUESE 1.000.000 EUR) Tj ET\nendstream";
+    let attacked = append_written(&signed, 5, body);
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a rewritten object that merely claims /Type /DSS is not validation data");
+    assert!(
+        error.to_string().contains("no archive may append"),
+        "the refusal says what was violated: {error}"
+    );
+}
+
+/// Append one revision that (re)defines SEVERAL objects at once. The shadow
+/// attack needs the rewrite and the hanging dictionary in a single update so
+/// the covering signature sees both as its successors.
+fn append_two(pdf: &[u8], objects: &[(u32, &[u8])]) -> Vec<u8> {
+    let mut out = pdf.to_vec();
+    out.push(b'\n');
+    let mut entries = Vec::new();
+    for (num, body) in objects {
+        let at = out.len();
+        out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+        entries.push((*num, at));
+    }
+    let xref_at = out.len();
+    let max_num = objects.iter().map(|(n, _)| *n).max().unwrap_or(0);
+    let size = declared_size(pdf).max(max_num + 1);
+    out.extend_from_slice(b"xref\n");
+    // one subsection per object number: xref subsections need not be contiguous
+    for (num, at) in &entries {
+        out.extend_from_slice(format!("{num} 1\n{at:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Prev {} >>\nstartxref\n{xref_at}\n%%EOF\n",
+            last_xref(pdf)
+        )
+        .as_bytes(),
+    );
+    out
+}
