@@ -77,9 +77,14 @@ check_embedded_certs() {
   # file is neither %PDF- nor parsable CMS: return 0, guard silently blind.
   # Stripping the invocation's own path prefix and taking the first token works
   # on both spellings (`--mime-type` also never wraps long names, unlike -b).
-  mime="$(file --mime-type "$f" 2>/dev/null | head -n 1 | sed "s|^$f: ||; s|[[:space:]].*||")"
+  # `${f##*/}` strips the directory because some file(1) builds (and any alias
+  # or wrapper script in PATH — CI proved one existed on the macOS runners)
+  # print "path: type" even for --mime-type WITHOUT -b; anchoring on the bare
+  # basename covers relative and absolute invocations alike. And `command`
+  # pins the search to executables, past any function of the same name.
+  mime="$(command file --mime-type "$f" 2>/dev/null | head -n 1 | sed "s|.*[/\\]${f##*/}: *||; s|[[:space:]].*||")"
   case "${mime:-unknown}" in
-    text/*|application/xml|text/xml) ;;
+    text/*|application/xml|text/xml|text) ;;
     *)
       # binary: PDF and raw CMS paths only make sense there, and asking about
       # them costs one openssl call per real binary file, none per source file.
@@ -104,14 +109,16 @@ check_embedded_certs() {
     # repetition" (measured on macOS runners, where the guard then blocked
     # nothing), while GNU grep silently truncates the match at n. Trivially slow
     # is fine here: candidates are rare, and a fail-open guard must never be one.
-    # Read the runs so the LAST one is not lost: BSD read hands over a final
-    # line without its newline only via `read || [ -n "$var" ]`, and openfirma's
-    # XAdES wraps nothing — its certificate run is one giant newline-less token.
-    # The bare `| while read` (macOS runs, CI 39082771932) saw zero candidates
-    # on a file GNU decoded two certificates from: the same fail-open shape
-    # {400,10000} had, one layer further in.
-    blocks="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null |
-      while read -r run || [ -n "$run" ]; do
+    # Read the runs through NUL delimiters (`grep -z` output, `read -d ''`):
+    # a text-mode pipeline is exactly where platform line semantics bite — BSD
+    # read drops a newline-less final line (openfirma's XAdES carries its whole
+    # certificate run as one), and BSD tr(1) refuses NUL bytes in the input.
+    # With -z, grep emits `run\0` records for every match regardless of what
+    # newlines the file happens to contain, and read stops only at \0: no line
+    # story left for either dialect to get wrong. (Both bare-`read` and
+    # `tr '\n' '\0'` variants failed exactly this way on the CI's macOS.)
+    blocks="$(grep -zoaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null |
+      while IFS= read -r -d '' run; do
         if printf '%s' "$run" | base64 -d 2>/dev/null |
            openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
           echo "### cert"

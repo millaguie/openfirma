@@ -401,9 +401,14 @@ fn cert_guard_blocks_every_nested_signature_shape() {
         Err(e) => panic!("cannot run the guard self-test: {e}"),
     };
     if !out.status.success() {
+        // Both channels: the script's diagnostics go to stderr, but a missing
+        // tool or loader error in whatever bash exec'd can land on stdout, and
+        // run 39084111486's Windows failure printed an empty stderr — with only
+        // that half captured, the CI log contained literally nothing about why.
         panic!(
-            "the cert guard failed its own probes:\n{}",
-            String::from_utf8_lossy(&out.stderr)
+            "the cert guard failed its own probes:\n--- stderr ---\n{}\n--- stdout ---\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
         );
     }
 }
