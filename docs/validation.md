@@ -560,9 +560,15 @@ signed with it, never enter the repository:
   `/tmp/opencode/keystores` by `tools/setup-test-keystores.sh`, so a real DNIe
   card is never mounted in test infrastructure either.
 
-`tools/check-no-real-certs.sh` blocks the whole class of mistake, including a
-signature that embeds someone's certificate without anyone meaning to. See the
-certificate material policy in the README.
+`tools/check-no-real-certs.sh` blocks the shapes that class of mistake takes:
+every PEM block in a file (a bundle, not just its first block), a certificate
+whose subject or issuer line is not the synthetic one, every `/Contents`
+signature of a PDF, a signature's embedded `X509Certificate`, a keystore under
+any name it recognises — in the working tree, in the index, and in every path
+history ever recorded. Its limits are measured and named in the README (base64
+re-wrapped across lines, a PKCS#12 under a free extension, a compressed
+container); a document that leans on this guard for those shapes is leaning on
+something that does not hold yet.
 
 ## Definition of done for a profile
 

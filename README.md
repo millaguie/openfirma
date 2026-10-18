@@ -253,17 +253,32 @@ git config core.hooksPath tools/hooks # install the pre-commit guard
 ```
 
 `tools/check-no-real-certs.sh` enforces it, by content first and extension
-second. It rejects banned extensions and keystore filenames; any PEM private
-key block in ANY file, markdown included; any file that parses as an X.509
-certificate not issued by the synthetic `openfirma Test` PKI; and every way a
-signature hides one inside an innocent-looking name — a `%PDF-` file whose
-`/Contents` CMS carries foreign certificates, XML carrying
+second. It rejects banned extensions and keystore filenames wherever they
+appear in a *path* — the working tree, the index, and every path a blob ever
+had in history; any PEM private key block in ANY file, markdown included; and
+every certificate it can read, which is EVERY PEM block in a file (`openssl`
+alone reads only the first) judged on both of its name lines: a certificate is
+test material only when its subject and its issuer both carry the synthetic
+`openfirma Test` marker. It judges every way a signature hides one inside an
+innocent-looking name too: each `/Contents` CMS of a `%PDF-` file, one per
+signature and not just the first, XML carrying
 `ds:SignatureValue`/`X509Certificate`, and raw CMS `SignedData` under any
 extension. Allowlisted paths (`docs/`, generated fixtures) skip the extension
-rule only, never the content rules. The guard tests itself against all of
-these shapes (`tools/test-check-no-real-certs.sh`, run as a cargo test). It
-runs on pre-commit, over every tracked file with `--tracked`, and over every
-blob in history with `--history`. CI runs the last two on each push.
+rule only, never the content rules. The guard tests itself against all of these
+shapes, controls included (`tools/test-check-no-real-certs.sh`, run as a cargo
+test). It runs on pre-commit, over every tracked file with `--tracked`, and
+over every blob in history with `--history`. CI runs the last two on each push.
+
+Its measured limits, named so that nobody reads the guard as more than it is: a
+certificate whose base64 is re-wrapped across lines — the shape `xmlsec1`
+writes, or a certificate body with its PEM markers stripped — is not decoded
+and passes; a PKCS#12 container renamed to a free extension (`secret.dat`) is
+not parsed and passes; a certificate inside a *compressed* container is not
+recursed into and passes (an uncompressed one is read as text and blocked). The
+guard reads one file at a time and stops where its decoders stop. What it
+exists for it does: a certificate in a PEM file, a signature made here or by
+AutoFirma, a `.p12` or keystore under a name it recognises, and a certificate
+pasted into markdown are all blocked.
 
 Acceptance runs against VALIDe that need a trusted certificate are done by hand
 by whoever holds one, outside the repository, and only the verdict is written

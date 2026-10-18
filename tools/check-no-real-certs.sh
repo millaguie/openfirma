@@ -545,9 +545,22 @@ check_embedded_certs() {
     fi
   fi
   # One certificate per chunk: openssl -noout prints its "subject=…\nissuer=…"
-  # lines, terminated by the "### cert" marker each decoder emits. Every
-  # chunk must mention the synthetic PKI on both of its lines — a real leaf
-  # issued BY a test CA is still somebody's identity and fails the rule.
+  # lines, terminated by the "### cert" marker each decoder emits. BOTH lines
+  # must carry the synthetic marker, and each closes a different hole: the
+  # issuer alone would bless a certificate whose subject is somebody's real
+  # identity as long as a marked CA signed it (round 2's N-1 probe — the only
+  # way to obtain one is to hold the test CA's key, but the guard is not
+  # entitled to assume that), and the subject alone would bless anything that
+  # describes itself as synthetic whatever issued it. A real certificate — FNMT,
+  # DNIe, a sello, a representative's — carries its real issuer and fails here.
+  #
+  # The named consequence: a *synthetic* leaf whose subject is identity-shaped
+  # is refused too. The test PKI mints one on purpose — signer-ec.crt is
+  # `O=DIRECCION GENERAL DE LA POLICIA, OU=DNIE, serialNumber=IDNIE-12345678Y,
+  # CN=LOPEZ MARTIN, JUAN` — and committing material signed with it needs the
+  # explicit allowlist entry this script's refusal message asks for. Over-
+  # refusing synthetic material is this guard's accepted failure direction;
+  # letting a real one through is not.
   # PipedReader input, never <<<: a here-string word before awk can be eaten
   # as an assignment in some shells, and awk must not expand a redirect path
   # out of DATA at all (a crafted "### cert" chunk would rewrite files).
@@ -559,20 +572,30 @@ check_embedded_certs() {
   '
   for part in "$tmpblocks"/*.part; do
     [ -e "$part" ] || continue
-    if ! grep -q "$TEST_CA_MARKER" "$part"; then
+    if ! grep -qi "^subject=.*$TEST_CA_MARKER" "$part" || ! grep -qi "^issuer=.*$TEST_CA_MARKER" "$part"; then
       block "$f embeds an X.509 certificate that is not from the '$TEST_CA_MARKER' test PKI (signatures embed the signer's whole chain — this is exactly how a real FNMT or DNIe identity would leak)"
     fi
   done
   rm -rf "$tmpblocks"
 }
 
-# The CMS inside a PDF's /Contents, as the certificate list openssl prints.
-# Prints nothing when the PDF carries no parsable CMS.
+# Every CMS inside a PDF's /Contents, one per signature, as the certificate
+# list openssl prints. Prints nothing when the PDF carries no parsable CMS.
+#
+# EVERY /Contents, not just the first: a co-signed document has one hex string
+# per signature, and the `head -1` this used to carry judged only the one
+# written first. Round 2's N-1 built exactly that case — a PDF signed with the
+# test PKI and then co-signed with a foreign certificate — and the second
+# signer's certificate was never looked at. Whitespace is allowed inside the
+# hex string and stripped: a producer may fold it, and a folded string is the
+# same certificate.
 pdf_certs_pem() {
-  local f="$1" hex cms_der
-  hex="$(grep -ao '/Contents[[:space:]]*<[0-9A-Fa-f]*>' "$f" | head -1 | sed 's/.*<//; s/>$//')" || true
-  [ -n "$hex" ] || return 0
-  cms_der="$(printf '%s' "$hex" | python3 -c '
+  local f="$1" match hex cms_der
+  grep -ao '/Contents[[:space:]]*<[0-9A-Fa-f[:space:]]*>' "$f" 2>/dev/null |
+    while IFS= read -r match; do
+      hex="$(printf '%s' "$match" | tr -d '[:space:]' | sed 's/.*<//; s/>$//')" || continue
+      [ -n "$hex" ] || continue
+      cms_der="$(printf '%s' "$hex" | python3 -c '
 import sys
 raw = bytes.fromhex(sys.stdin.read().rstrip() or "00")
 if raw[:1] != b"\x30":
@@ -584,23 +607,67 @@ if ln & 0x80:
     n = ln & 0x7F
     off = 2 + n
 sys.stdout.write(raw[: off + int.from_bytes(raw[2:off], "big")].hex())
-' 2>/dev/null)" || return 0
-  [ -n "$cms_der" ] || return 0
-  if [ -n "$PDFCMS_TMP" ]; then
-    # hex -> DER via python3, not xxd: the guard already depends on python3
-    # (the length walk immediately above), and xxd ships in vim-common, which
-    # a CI runner does not install. A guard that silently returns clean when
-    # its helper is missing is a fail-open, so the helpers it leans on must be
-    # the ones guaranteed present. python3 -c reads the hex on stdin and
-    # writes raw bytes, no temporary of its own.
-    printf '%s' "$cms_der" | python3 -c 'import sys,binascii; sys.stdout.buffer.write(binascii.unhexlify(sys.stdin.read().strip()))' > "$PDFCMS_TMP" 2>/dev/null || return 0
-    # `openssl pkcs7 -print_certs` without -noout emits, per certificate, its
-    # subject/issuer pair followed by the PEM body; dropping the PEM leaves
-    # exactly one chunk per certificate for the chunker. The marker line is
-    # printed BEFORE each BEGIN (the trailing issuer= would otherwise wait a
-    # new block), so awk rotates the chunk there.
-    openssl pkcs7 -print_certs -inform DER -in "$PDFCMS_TMP" 2>/dev/null |
-      awk '/^-+BEGIN/{print "### cert"; skip=1; next} /^-+END/{skip=0; next} skip{next} {print}'
+' 2>/dev/null)" || continue
+      [ -n "$cms_der" ] || continue
+      [ -n "$PDFCMS_TMP" ] || continue
+      # hex -> DER via python3, not xxd: the guard already depends on python3
+      # (the length walk immediately above), and xxd ships in vim-common, which
+      # a CI runner does not install. A guard that silently returns clean when
+      # its helper is missing is a fail-open, so the helpers it leans on must be
+      # the ones guaranteed present. python3 -c reads the hex on stdin and
+      # writes raw bytes, no temporary of its own.
+      printf '%s' "$cms_der" | python3 -c 'import sys,binascii; sys.stdout.buffer.write(binascii.unhexlify(sys.stdin.read().strip()))' > "$PDFCMS_TMP" 2>/dev/null || continue
+      # `openssl pkcs7 -print_certs` without -noout emits, per certificate, its
+      # subject/issuer pair followed by the PEM body; dropping the PEM leaves
+      # exactly one chunk per certificate for the chunker. The marker line is
+      # printed BEFORE each BEGIN (the trailing issuer= would otherwise wait a
+      # new block), so awk rotates the chunk there.
+      openssl pkcs7 -print_certs -inform DER -in "$PDFCMS_TMP" 2>/dev/null |
+        awk '/^-+BEGIN/{print "### cert"; skip=1; next} /^-+END/{skip=0; next} skip{next} {print}'
+    done
+  return 0
+}
+
+# The rule that lives in a file's PATH: banned extensions, banned store
+# names, and the allowlist of regenerable fixtures. Split out of check_file so
+# `--history` can apply it to the path a blob had in the tree: the history walk
+# scans a temp copy, which has no extension of its own, so a `.p12` committed
+# and later deleted used to walk past it clean (round 2's N-1).
+path_rule_blocks() {
+  local f="$1" base ext allowlisted=0
+  # Files whose NAME is allowlisted (regenerated fixtures, documentation):
+  # the extension rule may be skipped, but NEVER the content rules — review
+  # 07, H-3 measured that `*.md` and `docs/*` were returned-safe sight
+  # unseen, so a PEM private key saved as README.md passed. An allowlisted
+  # path is allowed to not be a banned extension; it is never allowed to
+  # contain a real certificate or a private key.
+  case "$f" in
+    testdata/*/README.md|docs/*|*.md) allowlisted=1 ;;
+    # Wave-3 hostile corpus (H-11): DER/PKCS#12-shaped crash bait under
+    # testdata/hostile/. These files are NOT certificate material — they are
+    # a handful of bytes each (max 36), carry no certificate, no key and no
+    # signature over anything, and every one is regenerated byte-for-byte by
+    # tools/gen-hostile-corpus.py. They wear .der/.p12 extensions only so the
+    # tests can include_bytes! them like a real module hands them over. The
+    # content checks below still run on them: what is allowlisted is the
+    # extension rule, nothing else. (testdata/fuzz-panic-corpus/ is the same
+    # crash-bait family with NO banned extensions, so it needs no entry here;
+    # if a future corpus member ever wears one, extend this pattern and prove
+    # the bytes harmless like these.)
+    testdata/hostile/*.der|testdata/hostile/*.p12) allowlisted=1 ;;
+  esac
+
+  base="$(basename "$f")"
+  ext="${base##*.}"
+  if [ "$ext" = "$base" ]; then ext=""; fi
+
+  if [ "$allowlisted" -eq 0 ] && printf '%s' "$ext" | grep -qiE "^($BANNED_EXT)$"; then
+    block "$f has a banned extension .$ext, certificate or key material does not belong in this repo"
+    return 1
+  fi
+  if printf '%s' "$base" | grep -qiE "^($BANNED_NAMES)$"; then
+    block "$f is a certificate or key store"
+    return 1
   fi
   return 0
 }
@@ -666,42 +733,7 @@ _check_file_inner() {
     return 1
   fi
 
-  # Files whose NAME is allowlisted (regenerated fixtures, documentation):
-  # the extension rule may be skipped, but NEVER the content rules — review
-  # 07, H-3 measured that `*.md` and `docs/*` were returned-safe sight
-  # unseen, so a PEM private key saved as README.md passed. An allowlisted
-  # path is allowed to not be a banned extension; it is never allowed to
-  # contain a real certificate or a private key.
-  local allowlisted=0
-  case "$f" in
-    testdata/*/README.md|docs/*|*.md) allowlisted=1 ;;
-    # Wave-3 hostile corpus (H-11): DER/PKCS#12-shaped crash bait under
-    # testdata/hostile/. These files are NOT certificate material — they are
-    # a handful of bytes each (max 36), carry no certificate, no key and no
-    # signature over anything, and every one is regenerated byte-for-byte by
-    # tools/gen-hostile-corpus.py. They wear .der/.p12 extensions only so the
-    # tests can include_bytes! them like a real module hands them over. The
-    # content checks below still run on them: what is allowlisted is the
-    # extension rule, nothing else. (testdata/fuzz-panic-corpus/ is the same
-    # crash-bait family with NO banned extensions, so it needs no entry here;
-    # if a future corpus member ever wears one, extend this pattern and prove
-    # the bytes harmless like these.)
-    testdata/hostile/*.der|testdata/hostile/*.p12) allowlisted=1 ;;
-  esac
-
-  local base ext
-  base="$(basename "$f")"
-  ext="${base##*.}"
-  if [ "$ext" = "$base" ]; then ext=""; fi
-
-  if [ "$allowlisted" -eq 0 ] && printf '%s' "$ext" | grep -qiE "^($BANNED_EXT)$"; then
-    block "$f has a banned extension .$ext, certificate or key material does not belong in this repo"
-    return 1
-  fi
-  if printf '%s' "$base" | grep -qiE "^($BANNED_NAMES)$"; then
-    block "$f is a certificate or key store"
-    return 1
-  fi
+  path_rule_blocks "$f" || return 1
 
   # Text level checks, cheap and they catch material pasted into a source
   # file, a fixture or a commit template — in EVERY extension now, including
@@ -714,15 +746,54 @@ _check_file_inner() {
   # Anything that parses as a certificate must come from the synthetic test
   # PKI. Covers DER blobs with an unexpected extension and certificates
   # embedded in text.
-  local subj
-  for fmt in PEM DER; do
-    if subj="$(openssl x509 -inform "$fmt" -in "$f" -noout -subject -issuer 2>/dev/null)" && [ -n "$subj" ]; then
-      if ! printf '%s' "$subj" | grep -q "$TEST_CA_MARKER"; then
-        block "$f parses as an X.509 certificate that is not from the '$TEST_CA_MARKER' test PKI"
-      fi
-      return 0
+  #
+  # EVERY PEM block, not just the first: `openssl x509` reads one block and
+  # stops, so a test-PKI certificate followed by a real one inside the same
+  # file (round 2's N-1 probe: a `.md` with both) walked past the old loop,
+  # which returned as soon as the first block parsed. A block is the whole PEM
+  # SHAPE — both markers alone on their own lines, a base64 body between them —
+  # and not merely the two strings: this repository's own source spells the
+  # markers as Rust string literals (a fixture builder in openfirma-cli, the
+  # parser in openfirma-core, and this script's own regex, which must not read
+  # itself as material). A block whose shape is there but which no reader on
+  # this machine can parse is the contradiction, and is refused.
+  local subj pdir
+  pdir="$(mktemp -d)" || { block "$f: cannot open a scan directory"; return 1; }
+  python3 -c '
+import re, sys
+data = open(sys.argv[1], "rb").read()
+pat = re.compile(rb"(?m)^-----BEGIN CERTIFICATE-----[ \t]*\r?\n(?:[A-Za-z0-9+/=]{1,76}[ \t]*\r?\n)+-----END CERTIFICATE-----[ \t]*\r?$")
+n = 0
+for m in pat.finditer(data):
+    n += 1
+    open("%s/%d.pem" % (sys.argv[2], n), "wb").write(m.group() + b"\n")
+' "$f" "$pdir" 2>/dev/null || true
+  for pem in "$pdir"/*.pem; do
+    [ -e "$pem" ] || continue
+    subj="$(openssl x509 -inform PEM -in "$pem" -noout -subject -issuer 2>/dev/null)" || subj=""
+    if [ -z "$subj" ]; then
+      block "$f carries a PEM certificate block no reader on this machine could parse — refusing to certify what it could not judge"
+      continue
+    fi
+    if ! printf '%s' "$subj" | grep -qi "^subject=.*$TEST_CA_MARKER" ||
+       ! printf '%s' "$subj" | grep -qi "^issuer=.*$TEST_CA_MARKER"; then
+      block "$f parses as an X.509 certificate that is not from the '$TEST_CA_MARKER' test PKI"
     fi
   done
+  if [ -n "$(ls -A "$pdir" 2>/dev/null)" ]; then
+    rm -rf "$pdir"
+    return 0
+  fi
+  rm -rf "$pdir"
+  # A DER blob has exactly one certificate in it, so one attempt is the whole
+  # search. (The PEM case is the one that can carry a bundle.)
+  if subj="$(openssl x509 -inform DER -in "$f" -noout -subject -issuer 2>/dev/null)" && [ -n "$subj" ]; then
+    if ! printf '%s' "$subj" | grep -qi "^subject=.*$TEST_CA_MARKER" ||
+       ! printf '%s' "$subj" | grep -qi "^issuer=.*$TEST_CA_MARKER"; then
+      block "$f parses as an X.509 certificate that is not from the '$TEST_CA_MARKER' test PKI"
+    fi
+    return 0
+  fi
 
   # Nested material: PAdES /Contents, ds:X509Certificate, CMS SignedData.
   check_embedded_certs "$f"
@@ -736,10 +807,22 @@ check_history() {
   # test-PKI marker here too. The scan is slower than the tree walk (one blob
   # at a time out of the object store); history is finite and this runs in CI
   # on every push, which is the point.
-  local seen=0 tmp blocked
+  local seen=0 tmp blocked sha path
   tmp="$(mktemp -d)"
-  while read -r sha; do
+  # `git rev-list --objects` prints the path a blob had, and the path is what
+  # the extension rule needs: the temp copy the content check reads has no
+  # extension of its own, so a `.p12` or `.key` committed and later deleted
+  # used to walk past `--history` clean (round 2's N-1). Paths with spaces are
+  # fine — the last variable takes the whole rest of the line.
+  while read -r sha path; do
     seen=$((seen + 1))
+    # The extension rule belongs to the PATH, and is applied to it: the
+    # allowlist for regenerated fixtures (testdata/hostile/*.der and friends)
+    # still works, which it would not if the temp copy inherited only the
+    # extension under a path no pattern matches.
+    if [ -n "$path" ]; then
+      path_rule_blocks "$path" || echo "        (blob $sha in history)" >&2
+    fi
     git cat-file -p "$sha" > "$tmp/blob" 2>/dev/null || continue
     # the blob file lives outside the tree, so it bypasses no rule: the same
     # check_file judges it (same re-attached stderr channel — bash's NUL
@@ -753,8 +836,9 @@ check_history() {
       echo "        (blob $sha in history)" >&2
     fi
     rm -f "$tmp/blob"
-  done < <(git rev-list --objects --all | awk '{print $1}' | sort -u | while read -r o; do
-             git cat-file -t "$o" 2>/dev/null | grep -q '^blob$' && echo "$o"
+  done < <(git rev-list --objects --all | sort -u | while IFS= read -r line; do
+             o="${line%% *}"
+             git cat-file -t "$o" 2>/dev/null | grep -q '^blob$' && printf '%s\n' "$line"
            done)
   rmdir "$tmp" 2>/dev/null || true
   echo "scanned $seen blobs from history" >&2

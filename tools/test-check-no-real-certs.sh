@@ -200,6 +200,94 @@ must_pass "NUL between newlines stays handled (deficit check, no crash)" "$WORK/
 cp "$ROOT/tools/check-no-real-certs.sh" "$WORK/guard-notes.md"
 must_pass "markdown with prose (docs are not exempt, just clean)" "$WORK/guard-notes.md"
 
+# Round 2's N-1, probe 1: a document signed TWICE — first with the synthetic
+# marker, then with a foreign certificate. `pdf_certs_pem` read only the first
+# /Contents, so the second signer, the one a real leak would ride on, was never
+# looked at; every /Contents is judged now. The control below (two synthetic
+# signatures on the same file) is what keeps this from being "co-signature
+# phobia": a document signed twice is judged by what its signatures contain.
+sign -i "$WORK/doc.pdf" -o "$WORK/cosign-base.pdf" --format pades-b-b \
+  --cert "$WORK/syn.crt" --key "$WORK/syn.key"
+rebuild_cosigned() {
+  rm -f "$WORK/probe-cosigned.pdf"
+  sign -i "$WORK/cosign-base.pdf" -o "$WORK/probe-cosigned.pdf" --format pades-b-b \
+    --cert "$WORK/rogue.crt" --key "$WORK/rogue.key"
+}
+must_block "PAdES PDF co-signed with a foreign certificate (the second /Contents)" \
+  "$WORK/probe-cosigned.pdf" rebuild_cosigned
+sign -i "$WORK/cosign-base.pdf" -o "$WORK/cosign-ok.pdf" --format pades-b-b \
+  --cert "$WORK/syn.crt" --key "$WORK/syn.key"
+must_pass "PAdES PDF co-signed twice with the synthetic marker" "$WORK/cosign-ok.pdf"
+
+# Round 2's N-1, probe 2: a PEM bundle whose first block is synthetic and whose
+# second is foreign. `openssl x509 -in file` reads ONE block and stops, and the
+# old loop returned as soon as that block parsed — the foreign one was never
+# opened. Every block in a file is split out and asked now. The all-synthetic
+# bundle is the control that proves the rule is the marker, not bundling.
+cat "$WORK/syn.crt" "$WORK/rogue.crt" > "$WORK/bundle-mixed.md"
+must_block "PEM bundle: a synthetic certificate followed by a foreign one" "$WORK/bundle-mixed.md"
+cat "$WORK/syn.crt" "$WORK/syn.crt" > "$WORK/bundle-synth.md"
+must_pass "PEM bundle of two synthetic certificates" "$WORK/bundle-synth.md"
+
+# Round 2's N-1, probe 3: both halves of the marker rule, one certificate each.
+# Free extensions on purpose (.bin): a .crt name is itself a banned extension,
+# and a probe that blocks on the name never reaches the rule it is testing.
+# A marked subject over an unmarked issuer, and an unmarked (real-looking)
+# subject over a marked issuer — the second is the shape the review built and
+# read as a pass. Both are refused; a synthetic leaf of the test PKI's own
+# making still passes, which is the point of requiring the pair.
+openssl req -new -newkey rsa:2048 -nodes -keyout "$WORK/marked.key" \
+  -out "$WORK/marked.csr" -subj "/CN=openfirma Test Probe/serialNumber=IDCES-12345678Z" 2>/dev/null
+openssl x509 -req -in "$WORK/marked.csr" -CA "$WORK/rogue.crt" -CAkey "$WORK/rogue.key" \
+  -CAcreateserial -out "$WORK/marked-subject.bin" -days 1 2>/dev/null
+must_block "a certificate naming the test PKI in its subject, issued by a CA that does not" \
+  "$WORK/marked-subject.bin"
+openssl req -new -newkey rsa:2048 -nodes -keyout "$WORK/leaf.key" \
+  -out "$WORK/leaf.csr" -subj "/CN=DE TAL FULANO/serialNumber=99999999R" 2>/dev/null
+openssl x509 -req -in "$WORK/leaf.csr" -CA "$WORK/syn.crt" -CAkey "$WORK/syn.key" \
+  -CAcreateserial -out "$WORK/leaf-real-name.bin" -days 1 2>/dev/null
+must_block "a leaf with a real-looking identity issued by a marked test CA (round 2's N-1 probe)" \
+  "$WORK/leaf-real-name.bin"
+openssl req -new -newkey rsa:2048 -nodes -keyout "$WORK/good.key" \
+  -out "$WORK/good.csr" -subj "/O=openfirma test/CN=PEREZ GARCIA, ANA" 2>/dev/null
+openssl x509 -req -in "$WORK/good.csr" -CA "$WORK/syn.crt" -CAkey "$WORK/syn.key" \
+  -CAcreateserial -out "$WORK/good-leaf.bin" -days 1 2>/dev/null
+must_pass "a leaf whose subject and issuer both carry the marker" "$WORK/good-leaf.bin"
+# and the same leaf shape as a PAdES signature, so the marker rule in the
+# CHUNK path (one chunk per certificate out of a CMS) is pinned too, subject
+# half and issuer half alike
+sign -i "$WORK/doc.pdf" -o "$WORK/leaf-real-name.pdf" --format pades-b-b \
+  --cert "$WORK/leaf-real-name.bin" --key "$WORK/leaf.key"
+must_block "PAdES signed with a real-looking identity over a marked issuer" \
+  "$WORK/leaf-real-name.pdf"
+
+# Round 2's N-1, probe 4: the extension rule is a rule about PATHS, and
+# `--history` reads blobs out of the object store where the path is gone. A
+# `.p12` committed and then deleted had no extension for the rule to see, so it
+# walked past clean. The guard now applies the path rule to the path `git
+# rev-list --objects` prints beside each blob. The temp repo carries this
+# script, so the probe runs the guard that is in this tree.
+hist="$WORK/history-repo"
+mkdir -p "$hist/tools"
+cp "$ROOT/tools/check-no-real-certs.sh" "$hist/tools/"
+printf 'only ever a path with a banned extension\n' > "$hist/secret.p12"
+(
+  cd "$hist"
+  git init -q
+  git -c user.email=guard@example.invalid -c user.name=guard add -A
+  git -c user.email=guard@example.invalid -c user.name=guard commit -qm add
+  git rm -q secret.p12
+  git -c user.email=guard@example.invalid -c user.name=guard commit -qm remove
+) >/dev/null 2>&1
+hist_status=0
+( cd "$hist" && ./tools/check-no-real-certs.sh --history >/dev/null 2>&1 ) || hist_status=1
+if [ "$hist_status" = 0 ]; then
+  echo "FAIL: guard let a .p12 that exists only in history through: a blob has no extension, and the rule is about the path it had" >&2
+  fails=$((fails + 1))
+else
+  echo "ok, blocked: a .p12 deleted from the tree, found in --history by its path"
+fi
+
 if [ "$fails" -gt 0 ]; then
   echo "$fails guard self-test failure(s)" >&2
   exit 1
