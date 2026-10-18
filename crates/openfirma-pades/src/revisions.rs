@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use openfirma_core::{Error, Result};
 
-use crate::pdf::{self, ObjRef};
+use crate::pdf::{self, Location, ObjRef};
 
 /// One revision of the document, newest first (the order the `/Prev` chain
 /// names them).
@@ -469,14 +469,33 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
         }
     }
 
+    // The widgets and fields whose signature value attests their own bytes: the
+    // appearance streams they name are the plumbing of the signature that owns
+    // them and of no other, so a pass cannot lend itself an earlier signature's
+    // name to license an appearance of its own (round 3).
+    let attested: BTreeSet<ObjRef> = final_state
+        .keys()
+        .copied()
+        .filter(|object| {
+            carries_attested_signature_value(pdf, &locations, &final_state, object)
+                || is_signature_field(pdf, &locations, &final_state, object)
+        })
+        .collect();
+    let appearances = widget_appearances(&final_state, &attested);
+
     let mut out = Vec::new();
     for change in redefined {
         out.push((
             change.object,
             classify_one(
-                &final_state,
-                trailer.root,
-                &validation_data,
+                &Gate {
+                    pdf,
+                    locations: &locations,
+                    final_state: &final_state,
+                    root: trailer.root,
+                    validation_data: &validation_data,
+                    appearances: &appearances,
+                },
                 &change.object,
                 &change.after,
                 &change.before,
@@ -486,14 +505,27 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
     Ok(out)
 }
 
-fn classify_one(
-    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+/// What classifying one redefinition needs from the document it lives in: the
+/// bytes and their addresses (a signature's `/ByteRange` is checked against
+/// them), the final state, and the sets `classify` computed once for the whole
+/// pass — the fixpoint of allowed validation data and the appearance streams the
+/// attested widgets name.
+struct Gate<'a> {
+    pdf: &'a [u8],
+    locations: &'a BTreeMap<ObjRef, Location>,
+    final_state: &'a BTreeMap<ObjRef, Vec<u8>>,
     root: ObjRef,
-    validation_data: &BTreeSet<ObjRef>,
-    object: &ObjRef,
-    newer: &[u8],
-    older: &[u8],
-) -> Change {
+    validation_data: &'a BTreeSet<ObjRef>,
+    appearances: &'a BTreeSet<ObjRef>,
+}
+
+fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Change {
+    let pdf = gate.pdf;
+    let locations = gate.locations;
+    let final_state = gate.final_state;
+    let root = gate.root;
+    let validation_data = gate.validation_data;
+    let appearances = gate.appearances;
     let brand_new = older.is_empty();
     // A pass that rewrites a body it did not change (an xref-only touch, or the
     // trailer's /Info pointing at a fresh timestamp dictionary of its own): no
@@ -554,7 +586,7 @@ fn classify_one(
                 final_state.get(&a).is_some_and(|body| {
                     references_in(Some(body))
                         .into_iter()
-                        .all(|f| is_signature_field(final_state, &f))
+                        .all(|f| is_signature_field(pdf, locations, final_state, &f))
                         || pdf::get(body, "/Fields")
                             .map(|v| references_in(Some(v)).is_empty())
                             .unwrap_or(false)
@@ -575,7 +607,9 @@ fn classify_one(
         let grew = added_references(older, newer, b"/Fields");
         let lost = removed_references(older, newer, b"/Fields");
         if !brand_new
-            && grew.iter().all(|f| is_signature_field(final_state, f))
+            && grew
+                .iter()
+                .all(|f| is_signature_field(pdf, locations, final_state, f))
             && lost.is_empty()
             && other_keys_equal(older, newer, b"/Fields")
         {
@@ -613,7 +647,7 @@ fn classify_one(
             && !grew.is_empty()
             && grew
                 .iter()
-                .all(|a| carries_real_signature_value(final_state, a))
+                .all(|a| carries_attested_signature_value(pdf, locations, final_state, a))
             && other_keys_equal(older, newer, b"/Annots")
         {
             return Change::SignaturePlumbing(*object);
@@ -621,11 +655,24 @@ fn classify_one(
     }
     // A signature field itself, or any dictionary (widget or plain AcroForm
     // field — the B-LTA timestamp field carries no /Subtype) whose own or par-
-    // ent's /V names a real signature: the plumbing licenses only objects that
-    // verifiably carry a signature value.
-    if is_signature_field(final_state, object) || carries_real_signature_value(final_state, object)
+    // ent's /V names a real signature the /ByteRange of which contains this
+    // object's own bytes: the plumbing licenses only objects that verifiably
+    // carry a signature value, and only the bytes that value attests. A widget
+    // a later revision adds at an earlier signature's expense — reusing its
+    // /V, giving itself a rectangle and an appearance of its own — is refused
+    // here, and its appearance with it (round 3).
+    if is_signature_field(pdf, locations, final_state, object)
+        || carries_attested_signature_value(pdf, locations, final_state, object)
     {
-        return Change::SignaturePlumbing(*object);
+        // A REWRITE of such a field or widget may only restate its value: every
+        // key but /V must be the bytes the earlier signature covered, because a
+        // new /Rect and a new /AP on the signature's own widget is text on the
+        // page that no signature put there (round 3, measured: the signature's
+        // own widget rewritten with a visible rectangle and its /AP re-pointed
+        // at a form XObject of the attacker's own).
+        if brand_new || other_keys_equal(older, newer, b"/V") {
+            return Change::SignaturePlumbing(*object);
+        }
     }
     // The pieces a signature pass builds around its widget: the appearance
     // stream (an empty or drawn Form XObject) and the two standard form fonts
@@ -645,7 +692,7 @@ fn classify_one(
         }
         if is_type(newer, "/XObject")
             && pdf::get(newer, "/Subtype").is_some_and(|t| pdf::trim_ws(t) == b"/Form")
-            && widget_appearances(final_state).contains(object)
+            && appearances.contains(object)
         {
             return Change::SignaturePlumbing(*object);
         }
@@ -658,9 +705,18 @@ fn classify_one(
 
 /// The /AP/N targets of every widget in the final state: what appearance streams
 /// look like from the finished document.
-fn widget_appearances(final_state: &BTreeMap<ObjRef, Vec<u8>>) -> BTreeSet<ObjRef> {
+fn widget_appearances(
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    attested: &BTreeSet<ObjRef>,
+) -> BTreeSet<ObjRef> {
     let mut out = BTreeSet::new();
-    for body in final_state.values() {
+    for (object, body) in final_state {
+        // Only a widget whose own bytes its signature value attests lends its
+        // name: a widget a later revision builds to point at an earlier
+        // signature licenses nothing with its /AP (round 3).
+        if !attested.contains(object) {
+            continue;
+        }
         if pdf::get(body, "/Subtype").is_none_or(|t| pdf::trim_ws(t) != b"/Widget") {
             continue;
         }
@@ -766,27 +822,110 @@ pub(crate) fn is_type(body: &[u8], name: &str) -> bool {
 
 /// Whether a field (final state) is a signature field: /FT /Sig whose own or
 /// inherited /V names a real signature dictionary.
-fn is_signature_field(final_state: &BTreeMap<ObjRef, Vec<u8>>, field: &ObjRef) -> bool {
+fn is_signature_field(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    field: &ObjRef,
+) -> bool {
     let Some(body) = final_state.get(field) else {
         return false;
     };
     if pdf::get(body, "/FT").is_none_or(|t| pdf::trim_ws(t) != b"/Sig") {
         return false;
     }
-    v_names_signature(final_state, body)
+    value_attests(pdf, locations, final_state, body, *field)
 }
 
-fn v_names_signature(final_state: &BTreeMap<ObjRef, Vec<u8>>, body: &[u8]) -> bool {
-    pdf::get(body, "/V")
-        .and_then(pdf::parse_ref)
-        .and_then(|v| final_state.get(&v))
-        // A /Sig dictionary or a document time-stamp — the widget's /V may hold
-        // either (the B-LTA timestamp field points at its /DocTimeStamp), and
-        // both are signature values a reader shows.
-        .is_some_and(|b| is_type(b, "/Sig") || is_type(b, "/DocTimeStamp"))
+/// The bytes of an object written at a top-level offset: from its xref offset to
+/// the byte after the `endobj` that closes it. `None` for an object that lives
+/// inside an object stream, whose own bytes are not addressed anywhere.
+fn object_span(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    object: ObjRef,
+) -> Option<(usize, usize)> {
+    let Location::Direct(start) = locations.get(&object)? else {
+        return None;
+    };
+    let start = *start;
+    let rest = pdf.get(start..)?;
+    let end = start + rest.windows(6).position(|window| window == b"endobj")? + 6;
+    Some((start, end))
 }
 
-fn carries_real_signature_value(final_state: &BTreeMap<ObjRef, Vec<u8>>, annot: &ObjRef) -> bool {
+/// The four numbers of a `/ByteRange`, when the value is one and parses.
+fn byte_range_numbers(body: &[u8]) -> Option<[usize; 4]> {
+    let value = pdf::get(body, "/ByteRange")?;
+    let trimmed = pdf::trim_ws(value);
+    let inner = trimmed
+        .strip_prefix(b"[")
+        .and_then(|rest| rest.strip_suffix(b"]"))
+        .unwrap_or(trimmed);
+    let mut numbers = [0usize; 4];
+    let mut seen = 0usize;
+    for token in std::str::from_utf8(inner).ok()?.split_whitespace() {
+        if seen == 4 {
+            return None;
+        }
+        numbers[seen] = token.parse().ok()?;
+        seen += 1;
+    }
+    (seen == 4).then_some(numbers)
+}
+
+/// Whether the `/ByteRange` of the signature dictionary at `signature` contains
+/// every byte of the object at `object`. This is the link a pass cannot forge:
+/// a signature can only attest bytes that existed when it was made, so plumbing
+/// written later is plumbing its own signature covers.
+fn signature_covers(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    signature: ObjRef,
+    object: ObjRef,
+) -> bool {
+    let Some(body) = final_state.get(&signature) else {
+        return false;
+    };
+    let Some([head_len, _hole, tail_start, tail_len]) = byte_range_numbers(body) else {
+        return false;
+    };
+    let Some((start, end)) = object_span(pdf, locations, object) else {
+        return false;
+    };
+    end <= head_len || (start >= tail_start && end <= tail_start.saturating_add(tail_len))
+}
+
+/// `/V` names a `/Sig` dictionary or a document time-stamp — the widget's /V may
+/// hold either (the B-LTA timestamp field points at its `/DocTimeStamp`), and
+/// both are signature values a reader shows — AND that value's `/ByteRange`
+/// contains the bytes of `annot` itself.
+fn value_attests(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    body: &[u8],
+    annot: ObjRef,
+) -> bool {
+    let Some(value) = pdf::get(body, "/V").and_then(pdf::parse_ref) else {
+        return false;
+    };
+    let Some(target) = final_state.get(&value) else {
+        return false;
+    };
+    if !(is_type(target, "/Sig") || is_type(target, "/DocTimeStamp")) {
+        return false;
+    }
+    signature_covers(pdf, locations, final_state, value, annot)
+}
+
+fn carries_attested_signature_value(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    annot: &ObjRef,
+) -> bool {
     let Some(body) = final_state.get(annot) else {
         return false;
     };
@@ -800,14 +939,14 @@ fn carries_real_signature_value(final_state: &BTreeMap<ObjRef, Vec<u8>>, annot: 
     if !shape_ok {
         return false;
     }
-    if v_names_signature(final_state, body) {
+    if value_attests(pdf, locations, final_state, body, *annot) {
         return true;
     }
     // the widget's /Parent field may carry the value instead
     pdf::get(body, "/Parent")
         .and_then(pdf::parse_ref)
         .and_then(|p| final_state.get(&p))
-        .is_some_and(|parent| v_names_signature(final_state, parent))
+        .is_some_and(|parent| value_attests(pdf, locations, final_state, parent, *annot))
 }
 
 /// References `newer`'s array under `key` has beyond `older`'s. A key absent

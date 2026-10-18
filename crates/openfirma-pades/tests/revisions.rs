@@ -755,6 +755,123 @@ fn a_string_that_mentions_stream_does_not_hide_a_reference() {
     );
 }
 
+/// The number of the first object whose resolved body, as the LAST revision
+/// defines it, contains `needle`.
+fn object_with(signed: &[u8], needle: &[u8]) -> u32 {
+    let xref_at = pdf::last_startxref(signed).expect("the file has an xref");
+    let locations = pdf::object_locations(signed, xref_at).expect("the xref reads");
+    let mut cache = pdf::ObjectStreamCache::new();
+    let mut found: Vec<u32> = Vec::new();
+    for object in locations.keys() {
+        if let Ok(body) = pdf::resolve(signed, &locations, Some(&mut cache), *object) {
+            if body.windows(needle.len()).any(|window| window == needle) {
+                found.push(object.num);
+            }
+        }
+    }
+    *found.first().expect("the needle is in the document")
+}
+
+/// A form XObject body drawing one line of text, the shape a widget's `/AP`
+/// names.
+fn appearance_body(text: &[u8]) -> Vec<u8> {
+    format!(
+        "<< /Type /XObject /Subtype /Form /FormType 1 /BBox [ 0 0 300 200 ] \
+         /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+        text.len(),
+        std::str::from_utf8(text).expect("ascii")
+    )
+    .into_bytes()
+}
+
+/// What a reader draws has to be the bytes a signature covered, and the
+/// signature's own widget was the exception that proved it: the plumbing rule
+/// licensed any object carrying a real `/V`, so a later revision could give the
+/// widget of signature 1 a visible rectangle and an `/AP` of its own. Measured
+/// before the fix: `pdftotext` read the attacker's sentence and verify answered
+/// OK, because the widget's value was still the real signature. Now the widget
+/// is refused (only a rewrite touching nothing but `/V` is plumbing) and so is
+/// the appearance nothing attested names.
+#[test]
+fn a_rewritten_signature_widget_may_not_draw() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let plain = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    let signature = object_with(&plain, b"/Type /Sig");
+    let widget = object_with(&plain, b"/Subtype /Widget");
+    let body = format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /P 3 0 R \
+         /Rect [ 50 50 350 250 ] /F 132 /V {signature} 0 R /AP << /N 100 0 R >> >>"
+    );
+    let attacked = append_two(
+        &plain,
+        &[
+            (widget, body.as_bytes()),
+            (
+                100,
+                appearance_body(b"BT /F1 18 Tf 10 100 Td (PAGUESE 9999 EUR) Tj ET").as_slice(),
+            ),
+        ],
+    );
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a widget the covered bytes already carried may not be redrawn");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("{widget} 0 R")),
+        "the refusal names the redrawn widget: {message}"
+    );
+    assert!(
+        message.contains("100 0 R"),
+        "and the appearance nothing attests names: {message}"
+    );
+}
+
+/// The same door without rewriting anything: the covered page already names a
+/// `/Kids`-style annotation the file does not have, and the appended revision
+/// fills it with a widget that reuses the signature already in the document —
+/// real `/V`, its own rectangle and its own appearance. The value was attested
+/// only by the bytes it was made over, and the widget is none of them (round 3:
+/// this verified OK while `pdftotext` read the appended text).
+#[test]
+fn a_new_widget_cannot_reuse_an_earlier_signatures_value() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R \
+                 /Annots [ 100 0 R ] >>";
+    let crafted = append_two(INPUT, &[(3, page.as_slice())]);
+    let plain = pades_sign(&crafted, &signer, &PadesOptions::default()).expect("signing failed");
+    pades_verify(&plain, &anchors()).expect("a dangling annotation is harmless on its own");
+
+    let signature = object_with(&plain, b"/Type /Sig");
+    let body = format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Sig /T (SignatureLegal) /P 3 0 R \
+         /Rect [ 50 50 350 250 ] /F 132 /V {signature} 0 R /AP << /N 101 0 R >> >>"
+    );
+    let attacked = append_two(
+        &plain,
+        &[
+            (100, body.as_bytes()),
+            (
+                101,
+                appearance_body(b"BT /F1 18 Tf 10 100 Td (PAGUESE 9999 EUR) Tj ET").as_slice(),
+            ),
+        ],
+    );
+    let error = pades_verify(&attacked, &anchors()).expect_err(
+        "a widget of its own may not borrow the value of a signature that never covered it",
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("100 0 R"),
+        "the refusal names the borrowed-value widget: {message}"
+    );
+}
+
 /// Append one revision that (re)defines SEVERAL objects at once. The shadow
 /// attack needs the rewrite and the hanging dictionary in a single update so
 /// the covering signature sees both as its successors.
