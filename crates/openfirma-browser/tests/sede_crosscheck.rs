@@ -6,7 +6,7 @@
 /// shares no code with this repository, so its yes means something ours does
 /// not already assume.
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -14,6 +14,8 @@ use base64::Engine;
 use openfirma_browser::serve::{LoopbackServer, OwnedKeySource};
 
 use zeroize::Zeroizing;
+
+mod common;
 
 fn certs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
@@ -55,7 +57,7 @@ fn post(
     headers: &[String],
     body: &[u8],
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    let mut stream = TcpStream::connect(addr).expect("the endpoint must accept");
+    let mut stream = common::connect(addr);
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();

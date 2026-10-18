@@ -19,6 +19,8 @@ use base64::Engine;
 use openfirma_browser::serve::{LoopbackServer, MAX_BODY_BYTES, OwnedKeySource};
 use zeroize::Zeroizing;
 
+mod common;
+
 fn certs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
 }
@@ -87,7 +89,7 @@ fn request(
         3
     };
     for attempt in 0..tries {
-        let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
+        let stream = common::connect(addr);
         let answer = request_on(stream, addr, method, path, host, origin, body);
         if answer.0 != u16::MAX {
             return answer;
@@ -279,7 +281,7 @@ fn ask(
     for attempt in 0..12 {
         let token = server.issue_token();
         let path = format!("/sign/{token}");
-        let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
+        let stream = common::connect(addr);
         let (status, headers, payload) =
             request_on(stream, addr, method, &path, host, origin, body);
         if status != u16::MAX {
@@ -728,7 +730,7 @@ fn request_with_declared_length(
     declared: u64,
     _no_body: bool,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    let mut stream = TcpStream::connect(addr).unwrap();
+    let mut stream = common::connect(addr);
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
@@ -771,7 +773,7 @@ fn request_chunked(
     origin: Option<&str>,
     body: &[u8],
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    let mut stream = TcpStream::connect(addr).unwrap();
+    let mut stream = common::connect(addr);
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
@@ -808,7 +810,7 @@ fn request_no_length(
     origin: Option<&str>,
     body: &[u8],
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    let mut stream = TcpStream::connect(addr).unwrap();
+    let mut stream = common::connect(addr);
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
@@ -947,7 +949,7 @@ fn a_truncated_request_refuses_without_burning_the_token() {
     let host = format!("127.0.0.1:{}", addr.port());
     let token = server.issue_token();
 
-    let mut stream = TcpStream::connect(addr).unwrap();
+    let mut stream = common::connect(addr);
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
@@ -1039,7 +1041,7 @@ fn a_silent_half_header_is_cut_at_the_deadline() {
     let addr = server.addr();
     let host = format!("127.0.0.1:{}", addr.port());
 
-    let mut stream = TcpStream::connect(addr).unwrap();
+    let mut stream = common::connect(addr);
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(90)))
         .unwrap();
@@ -1099,7 +1101,7 @@ fn a_dribbling_peer_dies_at_the_absolute_budget_not_at_its_own_trickle() {
     let addr = server.addr();
     let host = format!("127.0.0.1:{}", addr.port());
 
-    let mut stream = TcpStream::connect(addr).unwrap();
+    let mut stream = common::connect(addr);
     // Poll with a short socket timeout so every event is visible; the trickle
     // cadence and the budget are what this test is about, not the poll window.
     stream
@@ -1273,7 +1275,7 @@ fn dribbling_peers_never_starve_a_tokened_caller() {
                 // nothing until its cut, a refused one has already spoken.
                 let (mut stream, started) = loop {
                     let started = std::time::Instant::now();
-                    let mut stream = TcpStream::connect(addr).unwrap();
+                    let mut stream = common::connect(addr);
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_millis(500)))
                         .unwrap();
@@ -1375,7 +1377,7 @@ fn dribbling_peers_never_starve_a_tokened_caller() {
     loop {
         let token = server.issue_token();
         let path = format!("/sign/{token}");
-        let stream = TcpStream::connect(addr).expect("the endpoint must accept connections");
+        let stream = common::connect(addr);
         let body = uri_body(b"la firma legitima entre dribblers");
         let (status, _, payload) =
             request_on(stream, addr, "POST", &path, &host, None, body.as_bytes());
@@ -1456,7 +1458,7 @@ fn stalled_connections_age_out_and_the_endpoint_never_shuts_down() {
     for wave in 0..2 {
         let mut crowd = Vec::new();
         for _ in 0..openfirma_browser::serve::MAX_CONCURRENT_CONNECTIONS {
-            let mut stream = TcpStream::connect(addr).unwrap();
+            let mut stream = common::connect(addr);
             // one byte of a head: accepted, handler busy, deadline ticking.
             stream.write_all(b"P").unwrap();
             stream.flush().unwrap();
@@ -1559,7 +1561,7 @@ fn a_flood_of_live_connections_gets_503_not_a_dead_endpoint() {
     let mut stalled = Vec::new();
     let mut got_503 = false;
     for _ in 0..(openfirma_browser::serve::MAX_CONCURRENT_CONNECTIONS + 8) {
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = common::connect(addr);
         // one byte of a head: accepted, handler blocked waiting for the rest.
         stream.write_all(b"P").unwrap();
         stream.flush().unwrap();
