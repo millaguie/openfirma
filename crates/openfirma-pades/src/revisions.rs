@@ -142,8 +142,20 @@ pub fn revisions(pdf: &[u8]) -> Result<Vec<Revision>> {
         // A middle section whose own offset no %%EOF line names has no honest
         // boundary: guessing one from a candidate floated above it would let a
         // certification-after-the-fact hide, so this stays an error.
+        // A revision ends at its OWN closing record, and the next revision's
+        // appended bytes begin just past it: that offset is the boundary a
+        // signature's /ByteRange names when it covers this revision and nothing
+        // after it. The OLDEST revision needs that boundary as much as any
+        // other, and it is the one this rule was not applied to: a writer that
+        // rewrites the document to sign it (iText, behind AutoFirma's first
+        // signature) puts a signature inside revision 1, so for every later
+        // pass over such a document the coverage end is revision 1's own
+        // record — which the file end is not. Measured against
+        // `testdata/golden/simple.autofirma.pdf`, AutoFirma's own single
+        // revision output: appending an archive to it was refused with "the
+        // /ByteRange ends at 55424, which is not the end of any revision".
         let end = match (closing[i], i + 1 < sections.len()) {
-            (Some(boundary), true) => boundary,
+            (Some(boundary), _) => boundary,
             (None, true) => {
                 return Err(Error::Pdf(format!(
                     "the revision whose cross-reference starts at {startxref} has no closing \
@@ -152,7 +164,11 @@ pub fn revisions(pdf: &[u8]) -> Result<Vec<Revision>> {
                      way"
                 )));
             }
-            (_, false) => pdf.len(),
+            // The oldest revision of a chain whose own record is missing or
+            // names a cross-reference this walk never reached: the end of the
+            // file is the only boundary left, and a coverage claiming it claims
+            // the whole document (`covering_revision`).
+            (None, false) => pdf.len(),
         };
         out.push(Revision { startxref, end });
     }

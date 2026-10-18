@@ -252,6 +252,63 @@ fn an_archive_appended_after_a_signature_passes_the_gate() {
         .expect("a /DSS appended after a signature is what archives are for");
 }
 
+/// The shape a writer that REWRITES the document to sign produces — iText,
+/// behind AutoFirma's first signature: the signature lives in revision 1, and
+/// the boundary its `/ByteRange` names is that revision's own `%%EOF` record.
+/// Every later pass over such a document (another signature, an archive) is
+/// classified against that boundary, and until the oldest revision got its own
+/// record back instead of the file end, the pass was refused with "the
+/// /ByteRange ends at 55424, which is not the end of any revision" — measured
+/// on AutoFirma's own `testdata/golden/simple.autofirma.pdf`, 55424 bytes.
+///
+/// That fixture is AutoFirma's output: `tools/golden-diff.sh` makes it from a
+/// JVM and the AutoFirma jar, neither of which this repository ships or CI has.
+/// Rather than commit a signed PDF whose chain the next `gen-testcert.sh`
+/// invalidates, the test says so and does nothing when it is not there.
+#[test]
+fn an_archive_over_a_document_autofirma_wrote_is_accepted() {
+    let Some(revocation) = crls() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/golden/simple.autofirma.pdf");
+    let Ok(auto) = std::fs::read(&fixture) else {
+        eprintln!(
+            "skipped, {} is not here: tools/golden-diff.sh writes it (needs autofirma.jar)",
+            fixture.display()
+        );
+        return;
+    };
+    // The reference tool's own document verifies on its own, and it is ONE
+    // revision: iText rewrote the file to sign it, which is the shape this test
+    // exists for.
+    pades_verify(&auto, &anchors()).expect("AutoFirma's own output verifies");
+    let revs = openfirma_pades::revisions::revisions(&auto).expect("the fixture is readable");
+    assert_eq!(revs.len(), 1, "AutoFirma rewrites the document to sign it");
+
+    // A later pass over it is appended right where that first revision ends.
+    let archived = openfirma_pades::add_validation_data(
+        &auto,
+        &[handle("signer-rsa.crt"), handle("intermediate.crt")],
+        &revocation,
+    )
+    .expect("the B-LT pass runs over the reference tool's document");
+    // The verdict first, because it is the thing a user sees: with the file end
+    // standing where this revision's own record belongs, this is where the
+    // archive was refused — "the /ByteRange ends at 55424, which is not the end
+    // of any revision".
+    pades_verify(&archived, &anchors())
+        .expect("an archive appended to the reference tool's own signature is an archive");
+    let revs = openfirma_pades::revisions::revisions(&archived).expect("readable");
+    assert_eq!(revs.len(), 2);
+    assert_eq!(
+        revs[1].end,
+        auto.len(),
+        "the revision AutoFirma wrote ends at its own record, which is where the archive begins"
+    );
+}
+
 /// The gate decides on what the merged state shows, not on who wrote a byte:
 /// an appended revision that redefines a signed object with different bytes is
 /// refused even when no reader would ever reach the new definition (nothing
