@@ -70,17 +70,24 @@ list_files() {
 # carry the synthetic marker. A file no reader can parse is simply not one of
 # these shapes; the probes' exit status says so.
 check_embedded_certs() {
-  local f="$1" blocks part tmpblocks
-  case "$(file -b --mime-type "$f" 2>/dev/null || echo unknown)" in
+  local f="$1" blocks part tmpblocks mime
+  # NOT `file -b`: some file(1) builds — macOS among them, measured on the CI
+  # runners — print "PATH: type" even with -b, so a whole-line `case` matched
+  # nothing and every XAdES/XML probe fell into the binary branch, where a text
+  # file is neither %PDF- nor parsable CMS: return 0, guard silently blind.
+  # Stripping the invocation's own path prefix and taking the first token works
+  # on both spellings (`--mime-type` also never wraps long names, unlike -b).
+  mime="$(file --mime-type "$f" 2>/dev/null | head -n 1 | sed "s|^$f: ||; s|[[:space:]].*||")"
+  case "${mime:-unknown}" in
     text/*|application/xml|text/xml) ;;
     *)
       # binary: PDF and raw CMS paths only make sense there, and asking about
       # them costs one openssl call per real binary file, none per source file.
-      head -c 5 "$f" | grep -q '%PDF-' || openssl pkcs7 -inform DER -in "$f" -noout 2>/dev/null || return 0
+      head -c 5 "$f" | grep -qa %PDF- || openssl pkcs7 -inform DER -in "$f" -noout 2>/dev/null || return 0
       ;;
   esac
   blocks=""
-  if head -c 5 "$f" | grep -q '%PDF-'; then
+  if head -c 5 "$f" | grep -qa '%PDF-'; then
     # PAdES: the /Contents hex string IS a CMS SignedData (possibly zero
     # padded); its DER prefix ends where the outer SEQUENCE says it does.
     blocks="$(pdf_certs_pem "$f")" || blocks=""
@@ -97,8 +104,14 @@ check_embedded_certs() {
     # repetition" (measured on macOS runners, where the guard then blocked
     # nothing), while GNU grep silently truncates the match at n. Trivially slow
     # is fine here: candidates are rare, and a fail-open guard must never be one.
+    # Read the runs so the LAST one is not lost: BSD read hands over a final
+    # line without its newline only via `read || [ -n "$var" ]`, and openfirma's
+    # XAdES wraps nothing — its certificate run is one giant newline-less token.
+    # The bare `| while read` (macOS runs, CI 39082771932) saw zero candidates
+    # on a file GNU decoded two certificates from: the same fail-open shape
+    # {400,10000} had, one layer further in.
     blocks="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null |
-      while read -r run; do
+      while read -r run || [ -n "$run" ]; do
         if printf '%s' "$run" | base64 -d 2>/dev/null |
            openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
           echo "### cert"
