@@ -496,6 +496,8 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
         }
     }
 
+    let fonts = plumbing_fonts(pdf, &locations, &final_state, &referrers);
+
     let mut out = Vec::new();
     for change in redefined {
         out.push((
@@ -508,6 +510,7 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
                     root: trailer.root,
                     validation_data: &validation_data,
                     appearances: &appearances,
+                    fonts: &fonts,
                 },
                 &change.object,
                 &change.after,
@@ -530,6 +533,7 @@ struct Gate<'a> {
     root: ObjRef,
     validation_data: &'a BTreeSet<ObjRef>,
     appearances: &'a BTreeSet<ObjRef>,
+    fonts: &'a BTreeSet<ObjRef>,
 }
 
 fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Change {
@@ -539,6 +543,7 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     let root = gate.root;
     let validation_data = gate.validation_data;
     let appearances = gate.appearances;
+    let fonts = gate.fonts;
     let brand_new = older.is_empty();
     // A pass that rewrites a body it did not change (an xref-only touch, or the
     // trailer's /Info pointing at a fresh timestamp dictionary of its own): no
@@ -688,19 +693,20 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
         }
     }
     // The pieces a signature pass builds around its widget: the appearance
-    // stream (an empty or drawn Form XObject) and the two standard form fonts
-    // every writer of visible signatures carries. Whitelisted as plumbing when
-    // they ARE those: a /Form XObject that some final-state widget names under
-    // /AP, and Helvetica/ZapfDingbats Type1 font dictionaries — content streams
-    // are never Font or Form/XObject dictionaries (a page's /Contents is a bare
-    // stream), so the shape test separates plumbing from payload. Anything else
-    // new — embedded files, XObjects reached from rewritten /Resources — stays
-    // off this rule and lands below as NotAllowed.
+    // stream (an empty or drawn Form XObject) and the font dictionaries its
+    // appearance and the AcroForm's /DR carry. Both are plumbing only when the
+    // signature that covers their own bytes also covers the object that NAMES
+    // them — a pass writes its font and the thing that uses it in the same
+    // revision — not for carrying a shape a reader might draw with. A /Font slot
+    // the covered bytes already named is not such a place: only a later revision
+    // can fill it, and filling it re-maps the glyphs of text the signature
+    // signed (round 3b, measured: an appended /Helvetica whose /Encoding carries
+    // a /Differences array turned the covered "PAGO UN CERO UNO" into
+    // "QBHP VO DFSP DFSP" while verify answered OK). Anything else new — embedded
+    // files, XObjects reached from rewritten /Resources — stays off this rule and
+    // lands below as NotAllowed.
     if brand_new {
-        if is_type(newer, "/Font")
-            && pdf::get(newer, "/BaseFont")
-                .is_some_and(|name| matches!(pdf::trim_ws(name), b"/Helvetica" | b"/ZapfDingbats"))
-        {
+        if is_type(newer, "/Font") && fonts.contains(object) {
             return Change::SignaturePlumbing(*object);
         }
         if is_type(newer, "/XObject")
@@ -869,6 +875,59 @@ fn signature_covers(
     };
     (start >= head_start && end <= head_start.saturating_add(head_len))
         || (start >= tail_start && end <= tail_start.saturating_add(tail_len))
+}
+
+/// The font dictionaries that are plumbing: a pass writes its font and the
+/// object that uses it — its appearance's `/Resources`, the AcroForm's `/DR` — in
+/// the same revision, so one signature's `/ByteRange` covers both. A `/Font` slot
+/// the covered bytes already named is not such a place: nothing but a later
+/// revision can fill it, and filling it re-maps the glyphs of text a signature
+/// signed. That is the round-3b shape: an appended `/Helvetica` whose `/Encoding`
+/// carries a `/Differences` array turned the covered "PAGO UN CERO UNO" into
+/// "QBHP VO DFSP DFSP" while `verify` answered OK.
+fn plumbing_fonts(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    referrers: &BTreeMap<ObjRef, BTreeSet<ObjRef>>,
+) -> BTreeSet<ObjRef> {
+    let signatures: Vec<ObjRef> = final_state
+        .iter()
+        .filter(|(_, body)| is_type(body, "/Sig") || is_type(body, "/DocTimeStamp"))
+        .map(|(object, _)| *object)
+        .collect();
+    let covered_by = |object: ObjRef| -> BTreeSet<ObjRef> {
+        signatures
+            .iter()
+            .copied()
+            .filter(|signature| signature_covers(pdf, locations, final_state, *signature, object))
+            .collect()
+    };
+    // A signature covers this font, and nothing outside that signature's bytes
+    // names it: a pass writes its font and everything that uses it — its
+    // appearance's /Resources, the AcroForm's /DR — inside its own /ByteRange. A
+    // font nobody names renders nothing, so it is inert; a font a namer OUTSIDE
+    // the covering signature points at is text that signature never set.
+    let mut out = BTreeSet::new();
+    for (object, body) in final_state {
+        if !is_type(body, "/Font") {
+            continue;
+        }
+        let covering = covered_by(*object);
+        if covering.is_empty() {
+            continue;
+        }
+        let names_it = referrers.get(object);
+        if covering.iter().any(|signature| {
+            names_it.is_none_or(|from| {
+                from.iter()
+                    .all(|referrer| covered_by(*referrer).contains(signature))
+            })
+        }) {
+            out.insert(*object);
+        }
+    }
+    out
 }
 
 /// `/V`, when it names a `/Sig` dictionary or a document time-stamp: the two

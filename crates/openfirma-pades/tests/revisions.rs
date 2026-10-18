@@ -908,7 +908,8 @@ fn an_appearance_the_covered_widget_was_still_waiting_for_is_refused() {
     };
     let probe = pades_sign(&crafted(9999), &signer, &PadesOptions::default()).expect("signing");
     let signature = object_with(&probe, b"/Type /Sig");
-    let plain = pades_sign(&crafted(signature), &signer, &PadesOptions::default()).expect("signing");
+    let plain =
+        pades_sign(&crafted(signature), &signer, &PadesOptions::default()).expect("signing");
     pades_verify(&plain, &anchors()).expect("the widget borrows the signature the signer writes");
 
     let attacked = append_two(
@@ -923,6 +924,55 @@ fn an_appearance_the_covered_widget_was_still_waiting_for_is_refused() {
     assert!(
         error.to_string().contains("900 0 R"),
         "the refusal names the appearance the covered widget was waiting for: {error}"
+    );
+}
+
+/// The third way into the room the fixpoint closed, and the one a shape test
+/// left open: a font dictionary. The page a signature covers already names
+/// `/F2 97 0 R` in its `/Resources` and its content stream sets that font for a
+/// headline; 97 does not exist, so a reader draws nothing there. A later revision
+/// defines 97 as a Helvetica whose `/Encoding` carries a `/Differences` array
+/// remapping every capital one letter up, and "PAGO UN CERO CERO" renders as
+/// "QBHP VO DFSP DFSP". Not one covered byte changed — the glyphs did — and round
+/// 3b measured `verify` answering OK over exactly this document, because the
+/// plumbing branch licensed any brand-new `/Type /Font` whose `/BaseFont` was
+/// Helvetica or ZapfDingbats without asking who pointed at it. A pass writes its
+/// font and the object that names it in the same revision, so the signature that
+/// covers the font's bytes covers its namer too; a slot the covered bytes left
+/// dangling is not a place a pass put a font.
+#[test]
+fn a_font_slot_the_page_left_dangling_cannot_be_filled_with_a_remapping_font() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R /F2 97 0 R >> >> /Contents 4 0 R >>";
+    let headline = b"BT /F2 24 Tf 72 640 Td (PAGO UN CERO CERO) Tj ET";
+    let plain = pades_sign(
+        &append_two(INPUT, &[(3, page.as_slice()), (4, &stream_body(headline))]),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing a page whose /F2 slot is still empty");
+    pades_verify(&plain, &anchors()).expect("an empty /F2 slot is not an attack");
+
+    // every capital one letter up: A -> B, P -> Q, ...
+    let differences = (65..90)
+        .map(|code| format!("{code} /{}", char::from(code as u8 + 1)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let font = format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+         /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding \
+         /Differences [ {differences} ] >> >>"
+    );
+    let attacked = append_two(&plain, &[(97, font.as_bytes())]);
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("the font re-maps the glyphs of text the signature signed");
+    assert!(
+        error.to_string().contains("97 0 R"),
+        "the refusal names the font that filled the slot: {error}"
     );
 }
 
