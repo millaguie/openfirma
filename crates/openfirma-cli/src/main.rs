@@ -1270,6 +1270,24 @@ fn main() -> Result<()> {
                     document.signatures.len()
                 );
             } else {
+                // B-1: an XML file (XAdES) is not a CMS, and handing it to the
+                // CMS verifier produced "these bytes are not a CMS signature:
+                // expected the ContentInfo (tag 0x30), found tag 0x3c" — a raw
+                // codec complaint that reads like corruption to a citizen.
+                // Name the actual situation: XAdES verification is not
+                // implemented yet (README says so), so say THAT.
+                if matches!(
+                    openfirma_core::workflow::Format::detect(&bytes),
+                    openfirma_core::workflow::Format::Xml
+                ) {
+                    bail!(
+                        "{} looks like an XML signature (XAdES), and this build does not \
+                         verify XAdES yet — only CAdES (.csig, CMS) and PAdES (PDF). The \
+                         signature can still be checked with an XML tool (xmlsec1) or a \
+                         validator such as VALIDe",
+                        input.display()
+                    );
+                }
                 let external = match &content {
                     Some(path) => Some(
                         std::fs::read(path)

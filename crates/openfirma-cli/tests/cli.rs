@@ -83,6 +83,49 @@ fn verify_refuses_an_impossible_validation_date() {
     std::fs::remove_file(&trust).ok();
 }
 
+/// B-1: verifying an XML file (XAdES) must say what is going on, not leak the
+/// CMS codec's complaint. Before this, `verify` on a signed XML answered
+/// "these bytes are not a CMS signature: expected the ContentInfo (tag 0x30),
+/// found tag 0x3c" — 0x3c is `<`, so the message read like corruption rather
+/// than "XAdES is not verified here yet".
+#[test]
+fn verify_names_xades_instead_of_leaking_a_cms_codec_error() {
+    let xml = write_tmp(
+        "signed.xml",
+        b"<?xml version=\"1.0\"?>\n<doc><Signature/></doc>",
+    );
+    // a REAL certificate as the anchor: the XAdES refusal must be about the
+    // input, not about the anchor (the CLI loads anchors before the input)
+    let trust = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs/ca.crt");
+    if !trust.exists() {
+        if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+            panic!("OPENFIRMA_REQUIRE_TESTS is set and testdata/certs/ca.crt is missing");
+        }
+        eprintln!("skipped: the test PKI is absent, run tools/gen-testcert.sh");
+        return;
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "verify",
+            "-i",
+            xml.to_str().unwrap(),
+            "--trust",
+            trust.to_str().unwrap(),
+        ])
+        .output()
+        .expect("the binary must run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("XAdES"),
+        "the refusal must name XAdES, not a raw codec error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tag 0x3c") && !stderr.contains("not a CMS signature"),
+        "the CMS codec's complaint must not reach the user for an XML file: {stderr}"
+    );
+    std::fs::remove_file(&xml).ok();
+}
+
 /// `OPENFIRMA_PASSWORD` is offered by the refusal text of every command that
 /// opens a PKCS#12, so every one of them must actually read it: an earlier
 /// revision wired it only into `sign`, and `afirma-uri`/`afirma-serve` failed
