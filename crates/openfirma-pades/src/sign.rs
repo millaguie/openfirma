@@ -58,8 +58,12 @@ pub struct PadesOptions {
     /// question.
     pub sign_time: SystemTime,
 
-    /// Name of the AcroForm field. When the document already has signature
-    /// fields, the next free `SignatureN` is used instead.
+    /// Name of the AcroForm field. When the document already has a signature
+    /// field with that name the signature is written INTO it, into the box the
+    /// form drew; the field must be empty (a field that carries a value already
+    /// is refused rather than overwritten), and a visible signature is drawn in
+    /// the field's own rectangle. When the document has signature fields and no
+    /// name is given, the next free `SignatureN` is used instead.
     pub field_name: Option<String>,
 
     /// Bytes reserved for `/Contents`.
@@ -390,12 +394,58 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
         .unwrap_or_else(|| next_field_name(&existing.names));
     let acroform = acroform_of(pdf, &offsets, Some(&mut cache), &catalog)?;
 
+    // A caller who NAMES a field the form already offers signs IN it. That is
+    // what an empty signature field is for, and it is the flow the reference
+    // tool has (its GUI asks which field to use, and its API takes
+    // `signatureField`). The field is written back under its own number,
+    // gaining the value — and, for a visible signature, the appearance — it was
+    // waiting for, while its rectangle, its name and its page stay the bytes the
+    // form had. Measured against AutoFirma 1.9.1: signing a two-field form twice
+    // leaves the first field alone and fills the second by adding `/V` and `/AP`
+    // to it. The revisions gate that guards our own output licenses exactly that
+    // shape: a field whose covered bytes carried no `/V` may gain `/V` and `/AP`.
+    //
+    // Two shapes this refuses rather than guessing: a field that already
+    // carries a value (filling it would replace the signature a reader shows
+    // there) and a parent field with `/Kids` (the value goes on the parent and
+    // the appearance on a widget child; openfirma signs a field whose own
+    // dictionary is its widget, which is what a form that renders one carries).
+    let target = opts.field_name.as_ref().and_then(|want| {
+        existing
+            .named
+            .iter()
+            .find(|(name, _)| name == want)
+            .cloned()
+    });
+    let filling = match &target {
+        None => None,
+        Some((name, r)) => {
+            let body = pdf::resolve(pdf, &offsets, Some(&mut cache), *r)?.into_owned();
+            if pdf::get(&body, "/V").is_some() {
+                return Err(Error::Pdf(format!(
+                    "field {name:?} already carries a signature value: filling it would \
+                     replace the signature a reader shows there"
+                )));
+            }
+            if pdf::get(&body, "/Kids").is_some() {
+                return Err(Error::Pdf(format!(
+                    "field {name:?} is the parent of widget annotations (/Kids): openfirma \
+                     signs a field whose own dictionary is its widget"
+                )));
+            }
+            let rect = pdf::get(&body, "/Rect").and_then(rect_numbers);
+            Some((*r, body, rect))
+        }
+    };
+
     let sig_dict = build_sig_dict(signer, opts)?;
 
     // Even an invisible signature needs an appearance entry, viewers look for
-    // it, and a blank form XObject is how you say "draw nothing".
-    let (rect, appearance_body) = match &opts.visible {
-        Some(a) => {
+    // it, and a blank form XObject is how you say "draw nothing". A fill is the
+    // exception: the field already has whatever appearance the form gave it,
+    // and an invisible fill leaves that alone.
+    let (rect, appearance_body) = match (&opts.visible, &filling) {
+        (Some(a), None) => {
             appearance::check_rect(a.rect)?;
             let [llx, lly, urx, ury] = a.rect;
             let lines = appearance_lines(signer, opts);
@@ -411,25 +461,52 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
                 appearance::form_xobject(urx - llx, ury - lly, &lines, helv)?,
             )
         }
-        None => ("[0 0 0 0]".to_string(), appearance::blank()),
+        // A visible fill draws in the FIELD's rectangle: that is the box the
+        // form fixed and the one a reader maps the appearance onto, so the
+        // caller's own rectangle plays no part.
+        (Some(_), Some((_, _, Some([llx, lly, urx, ury])))) if urx > llx && ury > lly => {
+            let lines = appearance_lines(signer, opts);
+            (
+                String::new(),
+                appearance::form_xobject(urx - llx, ury - lly, &lines, helv)?,
+            )
+        }
+        (_, Some(_)) => (String::new(), appearance::blank()),
+        (None, None) => ("[0 0 0 0]".to_string(), appearance::blank()),
     };
-    update.push(Object::new(appearance, appearance_body));
-    update.push(Object::new(
-        helv,
-        // two of the standard 14 fonts, referenced and not embedded, which is
-        // what iText puts in /DR for the field's default appearance
-        "<< /BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /Helv \
-         /Subtype /Type1 /Type /Font >>",
-    ));
-    update.push(Object::new(
-        zadb,
-        "<< /BaseFont /ZapfDingbats /Name /ZaDb /Subtype /Type1 /Type /Font >>",
-    ));
+    // An invisible fill draws nothing and needs no font of ours: the field
+    // keeps the appearance the form gave it, and the objects that would only
+    // say "blank" stay out of the revision.
+    if filling.is_none() || opts.visible.is_some() {
+        update.push(Object::new(appearance, appearance_body));
+        update.push(Object::new(
+            helv,
+            // two of the standard 14 fonts, referenced and not embedded, which is
+            // what iText puts in /DR for the field's default appearance
+            "<< /BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /Helv \
+             /Subtype /Type1 /Type /Font >>",
+        ));
+        update.push(Object::new(
+            zadb,
+            "<< /BaseFont /ZapfDingbats /Name /ZaDb /Subtype /Type1 /Type /Font >>",
+        ));
+    }
     update.push(Object::new(sig, sig_dict));
-    update.push(Object::new(
-        field,
-        build_field(field_name, appearance, page_ref, sig, &rect),
-    ));
+    match &filling {
+        // The field the form had, back under its own number with the value it
+        // was waiting for — and the appearance, when there is one to draw.
+        Some((field_ref, body, _)) => {
+            let mut filled = pdf::set(body, "/V", sig.to_string().as_bytes())?;
+            if opts.visible.is_some() {
+                filled = pdf::set(&filled, "/AP", format!("<< /N {appearance} >>").as_bytes())?;
+            }
+            update.push(Object::new(*field_ref, filled));
+        }
+        None => update.push(Object::new(
+            field,
+            build_field(field_name, appearance, page_ref, sig, &rect),
+        )),
+    }
 
     // The catalog and the page keep their numbers, so every reference to them
     // from the older revisions now resolves to these new definitions and the
@@ -445,19 +522,32 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
     // and the catalog is left alone entirely.
     match acroform {
         Some((acro_ref, acro_bytes)) => {
-            let mut new_acro = match pdf::get(&acro_bytes, "/Fields") {
-                Some(v) => pdf::set(&acro_bytes, "/Fields", &merged_fields(v, field)?)?,
-                None => pdf::set(&acro_bytes, "/Fields", format!("[{field}]").as_bytes())?,
+            // A fill does not grow /Fields: the field that is being signed is
+            // in the form already. The dictionary is rewritten only if
+            // /SigFlags was missing, and otherwise nothing about the form moves.
+            let new_acro = if filling.is_some() {
+                match pdf::get(&acro_bytes, "/SigFlags") {
+                    Some(_) => None,
+                    None => Some(pdf::set(&acro_bytes, "/SigFlags", b"3")?),
+                }
+            } else {
+                let mut written = match pdf::get(&acro_bytes, "/Fields") {
+                    Some(v) => pdf::set(&acro_bytes, "/Fields", &merged_fields(v, field)?)?,
+                    None => pdf::set(&acro_bytes, "/Fields", format!("[{field}]").as_bytes())?,
+                };
+                if pdf::get(&written, "/SigFlags").is_none() {
+                    written = pdf::set(&written, "/SigFlags", b"3")?;
+                }
+                Some(written)
             };
-            if pdf::get(&new_acro, "/SigFlags").is_none() {
-                new_acro = pdf::set(&new_acro, "/SigFlags", b"3")?;
-            }
-            match acro_ref {
-                Some(r) => update.push(Object::new(r, new_acro)),
-                None => update.push(Object::new(
-                    trailer.root,
-                    pdf::set(&catalog, "/AcroForm", &new_acro)?,
-                )),
+            if let Some(new_acro) = new_acro {
+                match acro_ref {
+                    Some(r) => update.push(Object::new(r, new_acro)),
+                    None => update.push(Object::new(
+                        trailer.root,
+                        pdf::set(&catalog, "/AcroForm", &new_acro)?,
+                    )),
+                }
             }
         }
         None => {
@@ -474,14 +564,18 @@ pub fn sign(pdf: &[u8], signer: &dyn Signer, opts: &PadesOptions) -> Result<Vec<
             ));
         }
     }
-    match merged_annots(pdf, &offsets, Some(&mut cache), &page, field)? {
-        MergedAnnots::Inline(array) => {
-            update.push(Object::new(page_ref, pdf::set(&page, "/Annots", &array)?))
+    // A field the form already renders is in the page's /Annots already: it is
+    // the widget annotation there, and a fill adds no second entry.
+    if filling.is_none() {
+        match merged_annots(pdf, &offsets, Some(&mut cache), &page, field)? {
+            MergedAnnots::Inline(array) => {
+                update.push(Object::new(page_ref, pdf::set(&page, "/Annots", &array)?))
+            }
+            // the page keeps pointing at "N G R"; only the array object it names
+            // is rewritten, in the new revision, where the old one stays exactly
+            // where the earlier /ByteRanges say it is
+            MergedAnnots::Indirect(r, array) => update.push(Object::new(r, array)),
         }
-        // the page keeps pointing at "N G R"; only the array object it names
-        // is rewritten, in the new revision, where the old one stays exactly
-        // where the earlier /ByteRanges say it is
-        MergedAnnots::Indirect(r, array) => update.push(Object::new(r, array)),
     }
 
     // Recording that the document changed is what /ModDate is for — except
@@ -587,6 +681,27 @@ fn build_acroform(fields: &[ObjRef], helv: ObjRef, zadb: ObjRef) -> String {
          /Fields [{}] /SigFlags 3 >>",
         list.join(" ")
     )
+}
+
+/// The four numbers of a `/Rect`, which a fill needs to size its appearance to
+/// the box the form fixed. Anything else about the value — a wrong count, a
+/// token that is not a number — reads as "no usable rectangle", and the fill
+/// then draws nothing rather than guessing.
+fn rect_numbers(value: &[u8]) -> Option<[f64; 4]> {
+    let inner = pdf::trim_ws(value).strip_prefix(b"[")?.strip_suffix(b"]")?;
+    let mut out = [0f64; 4];
+    let mut seen = 0;
+    for token in inner.split(|b: &u8| b.is_ascii_whitespace()) {
+        if token.is_empty() {
+            continue;
+        }
+        if seen == 4 {
+            return None;
+        }
+        out[seen] = std::str::from_utf8(token).ok()?.parse().ok()?;
+        seen += 1;
+    }
+    (seen == 4).then_some(out)
 }
 
 /// `/F 132` is `Print | Locked`, `/Rect [0 0 0 0]` with a blank appearance is
@@ -957,10 +1072,14 @@ fn readable_date(t: SystemTime) -> Result<String> {
 }
 
 /// The signature fields already in the document, so that a second signature is
-/// added to `/Fields` instead of replacing the first one.
+/// added to `/Fields` instead of replacing the first one — and so that a caller
+/// who NAMES a field the form already offers signs in it (`named`), which is
+/// what the field is there for.
 pub(crate) struct ExistingFields {
     pub refs: Vec<ObjRef>,
     pub names: Vec<String>,
+    /// Name to object, in `/Fields` order, for the fields that carry a `/T`.
+    pub named: Vec<(String, ObjRef)>,
 }
 
 /// The document's `/AcroForm` dictionary: its bytes, and the object it lives
@@ -1014,6 +1133,7 @@ pub(crate) fn existing_signature_fields(
     let empty = ExistingFields {
         refs: Vec::new(),
         names: Vec::new(),
+        named: Vec::new(),
     };
     // A dangling indirect /AcroForm is refused by `acroform_of` itself (B-5);
     // here only the "no form at all" reading may fall through to an empty
@@ -1028,14 +1148,17 @@ pub(crate) fn existing_signature_fields(
         return empty;
     };
     let mut names = Vec::new();
+    let mut named = Vec::new();
     for r in &refs {
         if let Ok(f) = pdf::resolve(pdf, offsets, cache.as_deref_mut(), *r) {
             if let Some(t) = pdf::get(&f, "/T") {
-                names.push(unquote(t));
+                let name = unquote(t);
+                named.push((name.clone(), *r));
+                names.push(name);
             }
         }
     }
-    ExistingFields { refs, names }
+    ExistingFields { refs, names, named }
 }
 
 fn next_field_name(taken: &[String]) -> String {
@@ -1158,7 +1281,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    pub use crate::testkit::{mini_pdf, test_signer};
+    pub use crate::testkit::{build_pdf, mini_pdf, test_signer};
 
     #[test]
     fn dates_are_utc_and_zero_padded() {
@@ -1523,5 +1646,134 @@ pub(crate) mod tests {
             &openfirma_cades::verify::VerifyOptions::new(vec![ca]),
         )
         .expect("the signed document must verify");
+    }
+
+    /// Signing a field the form already offers FILLS it: the rectangle, the name
+    /// and the page stay the form's own bytes and the field gains the value and
+    /// the appearance it was waiting for. This is the flow the reference tool
+    /// has — `signatureField`, which its GUI drives — measured against AutoFirma
+    /// 1.9.1 on a two-field form: the second signature lands in the second field
+    /// and leaves the first exactly where it was.
+    #[test]
+    fn a_named_field_the_form_already_has_is_filled_not_duplicated() {
+        let Some(signer) = test_signer() else {
+            eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let doc = build_pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /AcroForm << /Fields [ 4 0 R ] /SigFlags 3 >> >>",
+                "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] /Annots [ 4 0 R ] >>",
+                "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma1) \
+                 /Rect [ 72 600 400 660 ] /F 132 /P 3 0 R >>",
+            ],
+            "/Size 5 /Root 1 0 R",
+        );
+        let opts = PadesOptions {
+            field_name: Some("Firma1".into()),
+            visible: Some(Appearance {
+                page: 1,
+                rect: [72.0, 600.0, 400.0, 660.0],
+                label: None,
+            }),
+            ..PadesOptions::default()
+        };
+        let signed = sign(&doc, &signer, &opts).expect("signing into the form's own field");
+
+        let at = pdf::last_startxref(&signed).unwrap();
+        let tr = pdf::trailer(&signed, at).unwrap();
+        let locs = pdf::object_locations(&signed, at).unwrap();
+        let field = pdf::resolve(&signed, &locs, None, ObjRef::new(4, 0)).unwrap();
+        let text = String::from_utf8_lossy(&field);
+        assert!(
+            text.contains("/T (Firma1)") && text.contains("/Rect [ 72 600 400 660 ]"),
+            "the name and the rectangle stay the form's bytes: {text}"
+        );
+        assert!(
+            pdf::get(&field, "/V").is_some(),
+            "the field gained the value: {text}"
+        );
+        let ap = pdf::get(&field, "/AP").expect("and a named appearance");
+        let look = pdf::get(ap, "/N")
+            .and_then(pdf::parse_ref)
+            .expect("/N names the appearance");
+        let appearance = pdf::resolve(&signed, &locs, None, look).unwrap();
+        let drawn = String::from_utf8_lossy(&appearance);
+        assert!(
+            drawn.contains("/BBox [0 0 328 60]") && drawn.contains("/Font"),
+            "the appearance is sized to the form's box and draws the signature, \
+             where the blank one is [0 0 0 0] with no font: {drawn}"
+        );
+        let catalog = pdf::resolve(&signed, &locs, None, tr.root).unwrap();
+        let acro = pdf::get(&catalog, "/AcroForm").expect("the catalog keeps its /AcroForm");
+        assert_eq!(
+            pdf::array_refs(pdf::get(acro, "/Fields").unwrap()).unwrap(),
+            vec![ObjRef::new(4, 0)],
+            "/Fields is still the author's: a fill adds no field"
+        );
+        let page = pdf::resolve(&signed, &locs, None, ObjRef::new(3, 0)).unwrap();
+        assert_eq!(
+            pdf::array_refs(pdf::get(&page, "/Annots").unwrap()).unwrap(),
+            vec![ObjRef::new(4, 0)],
+            "and the page keeps its one widget"
+        );
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs");
+        let ca = openfirma_core::cert::CertificateHandle::from_pem(
+            &std::fs::read_to_string(dir.join("ca.crt")).expect("the test PKI has a ca.crt"),
+        )
+        .expect("ca.crt is a certificate");
+        crate::verify::verify(
+            &signed,
+            &openfirma_cades::verify::VerifyOptions::new(vec![ca]),
+        )
+        .expect("the filled document must verify");
+    }
+
+    /// Two fields a fill may NOT take over, and the refusal says which: one the
+    /// form already signed (filling it would replace the signature a reader
+    /// shows there) and a parent field whose value lives on the dictionary while
+    /// its widgets are the children (openfirma signs a field whose own
+    /// dictionary IS its widget, which is what a form that renders one has).
+    #[test]
+    fn naming_a_signed_field_or_a_parent_field_is_refused() {
+        let Some(signer) = test_signer() else {
+            eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+            return;
+        };
+        let base = |field: &str| {
+            build_pdf(
+                &[
+                    "<< /Type /Catalog /Pages 2 0 R \
+                     /AcroForm << /Fields [ 4 0 R ] /SigFlags 3 >> >>",
+                    "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>",
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] /Annots [ 4 0 R ] >>",
+                    field,
+                ],
+                "/Size 5 /Root 1 0 R",
+            )
+        };
+        let signed_field = base(
+            "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma1) \
+             /Rect [ 72 600 400 660 ] /F 132 /P 3 0 R /V 9 0 R >>",
+        );
+        let parent = base("<< /FT /Sig /T (Firma1) /Kids [ 9 0 R ] /Rect [ 72 600 400 660 ] >>");
+        let opts = PadesOptions {
+            field_name: Some("Firma1".into()),
+            ..PadesOptions::default()
+        };
+
+        let taken = sign(&signed_field, &signer, &opts).expect_err("a signed field is not a place");
+        assert!(
+            taken.to_string().contains("already carries a signature"),
+            "the refusal says why: {taken}"
+        );
+        let kids = sign(&parent, &signer, &opts).expect_err("/Kids is not a widget");
+        assert!(
+            kids.to_string().contains("/Kids"),
+            "the refusal pushes the field: {kids}"
+        );
     }
 }

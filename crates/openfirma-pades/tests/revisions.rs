@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use openfirma_cades::verify::VerifyOptions;
 use openfirma_core::{CertificateHandle, SoftwareSigner};
 use openfirma_pades::ltv::RevocationBytes;
-use openfirma_pades::{PadesOptions, pades_sign, pades_verify, pdf};
+use openfirma_pades::{Appearance, PadesOptions, pades_sign, pades_verify, pdf};
 
 const INPUT: &[u8] = include_bytes!("../../../testdata/inputs/simple.pdf");
 
@@ -1660,5 +1660,93 @@ fn a_name_the_signed_bytes_already_carried_is_not_a_place_for_a_font() {
     assert!(
         text.contains(&format!("{claimed} 0 R")),
         "the refusal names the font that filled the covered name: {text}"
+    );
+}
+
+/// A pass that FILLS a signature field the signed bytes left empty is an
+/// ordinary signature: it gives the field the value and the appearance the field
+/// was waiting for, and nothing that says where that field is or whose it is
+/// moves. A form's own box is what a form is for.
+///
+/// Measured against AutoFirma 1.9.1 first: on a two-field form signed twice with
+/// the reference tool, the second pass adds `/V` and `/AP` to the second field
+/// and leaves the first exactly where it was — and this gate refused the
+/// document, naming that second field (`a form field value was rewritten`).
+/// The writer of this crate produces the same shape when a caller names a field
+/// the form already offers (`PadesOptions::field_name`), which is what makes
+/// this fixture exact rather than a stand-in.
+///
+/// What stays refused is round 3's shape: a widget whose covered bytes DID carry
+/// a value may not gain a rectangle and an appearance of its own.
+#[test]
+fn a_pass_that_fills_a_field_the_signed_bytes_left_empty_is_an_ordinary_signature() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // The form before anyone signs it: two boxes of its own, both in the
+    // /AcroForm and both drawn on the page.
+    let catalog = b"<< /Type /Catalog /Pages 2 0 R \
+                    /AcroForm << /Fields [ 13 0 R 14 0 R ] /SigFlags 3 >> >>";
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Annots [ 13 0 R 14 0 R ] >>";
+    let field1 = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma1) \
+                   /Rect [ 72 600 400 660 ] /F 132 /P 3 0 R >>";
+    let field2 = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma2) \
+                   /Rect [ 72 400 400 460 ] /F 132 /P 3 0 R >>";
+    let form = append_two(
+        INPUT,
+        &[
+            (1, catalog.as_slice()),
+            (3, page.as_slice()),
+            (13, field1.as_slice()),
+            (14, field2.as_slice()),
+        ],
+    );
+
+    let first = PadesOptions {
+        field_name: Some("Firma1".into()),
+        visible: Some(Appearance {
+            page: 1,
+            rect: [72.0, 600.0, 400.0, 660.0],
+            label: None,
+        }),
+        ..PadesOptions::default()
+    };
+    let once = pades_sign(&form, &signer, &first).expect("the first signer fills Firma1");
+    pades_verify(&once, &anchors()).expect("one signature in the form's own box verifies");
+
+    let second = PadesOptions {
+        field_name: Some("Firma2".into()),
+        visible: Some(Appearance {
+            page: 1,
+            rect: [72.0, 400.0, 400.0, 460.0],
+            label: None,
+        }),
+        ..PadesOptions::default()
+    };
+    let twice = pades_sign(&once, &signer, &second).expect("the second signer fills Firma2");
+
+    let report = pades_verify(&twice, &anchors())
+        .expect("a fill of a field the signed bytes left empty is an ordinary signature");
+    assert_eq!(
+        report.signatures.len(),
+        2,
+        "both boxes signed, both verified"
+    );
+
+    // The filled field is still the form's, with the value and the appearance
+    // added to it; and it is the object the form named, not a new one.
+    let at = pdf::last_startxref(&twice).unwrap();
+    let locations = pdf::object_locations(&twice, at).unwrap();
+    let filled = pdf::resolve(&twice, &locations, None, pdf::ObjRef::new(14, 0)).unwrap();
+    let text = String::from_utf8_lossy(&filled);
+    assert!(
+        text.contains("/T (Firma2)") && text.contains("/Rect [ 72 400 400 460 ]"),
+        "the field keeps the form's name and rectangle: {text}"
+    );
+    assert!(
+        pdf::get(&filled, "/V").is_some() && pdf::get(&filled, "/AP").is_some(),
+        "and gained the value and the appearance: {text}"
     );
 }

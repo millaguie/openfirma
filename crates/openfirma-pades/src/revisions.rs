@@ -707,13 +707,28 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     if is_signature_field(pdf, locations, final_state, object)
         || carries_attested_signature_value(pdf, locations, final_state, object)
     {
-        // A REWRITE of such a field or widget may only restate its value: every
-        // key but /V must be the bytes the earlier signature covered, because a
-        // new /Rect and a new /AP on the signature's own widget is text on the
-        // page that no signature put there (round 3, measured: the signature's
-        // own widget rewritten with a visible rectangle and its /AP re-pointed
-        // at a form XObject of the attacker's own).
-        if brand_new || other_keys_equal(older, newer, b"/V") {
+        // A REWRITE of such a field or widget may restate its value: every key
+        // but /V must be the bytes the earlier signature covered, because a new
+        // /Rect and a new /AP on the signature's own widget is text on the page
+        // that no signature put there (round 3, measured: the signature's own
+        // widget rewritten with a visible rectangle and its /AP re-pointed at a
+        // form XObject of the attacker's own).
+        //
+        // Or it may be the signature that a field the covered bytes left EMPTY
+        // was waiting for: the pass gives it /V and, when it draws, /AP, while
+        // the rectangle, the name and the page that say where the field is and
+        // whose it is stay the bytes the earlier signature covered. This is the
+        // flow the reference tool has — measured with AutoFirma 1.9.1, signing a
+        // two-field form twice adds /V and /AP to the second field and leaves
+        // the first alone — and this crate's own writer produces it when a
+        // caller names a field the form already offers. Round 3's widget is a
+        // different shape: THAT field's covered bytes carried a value, so only
+        // the restatement branch is open to it.
+        if brand_new
+            || other_keys_equal(older, newer, b"/V")
+            || (pdf::get(older, "/V").is_none()
+                && keys_equal_except(older, newer, &[b"/V", b"/AP"]))
+        {
             return Change::SignaturePlumbing(*object);
         }
     }

@@ -400,8 +400,12 @@ struct SignArgs {
     #[arg(long)]
     contact_info: Option<String>,
 
-    /// Name of the AcroForm signature field. Defaults to the next free
-    /// SignatureN in the document.
+    /// Name of the AcroForm signature field. When the document already has a
+    /// signature field with this name, the signature is written INTO it — the
+    /// box the form drew — and that field must not carry a signature yet;
+    /// otherwise a field with this name is added. A visible signature
+    /// (--rect) is drawn in the field's own rectangle. Defaults to the next
+    /// free SignatureN in the document.
     #[arg(long)]
     field_name: Option<String>,
 
