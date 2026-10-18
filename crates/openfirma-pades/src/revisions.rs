@@ -369,9 +369,13 @@ fn rendered_body(
     let mut out = body.into_owned();
     // An object inside an object stream is a dictionary by construction —
     // streams cannot be packed — so only a direct object can carry data here.
-    if let Some(Location::Direct(at)) = locations.get(&object)
-        && let Ok(payload) = pdf::stream_raw(pdf, *at)
-    {
+    // (No let-chain: the workspace floor is 1.85, where they are still an
+    // unstable feature; the GUI, which is allowed them, runs at 1.95.)
+    let payload = match locations.get(&object) {
+        Some(Location::Direct(at)) => pdf::stream_raw(pdf, *at).ok(),
+        _ => None,
+    };
+    if let Some(payload) = payload {
         // The `stream` keyword is part of what makes this object a stream, and
         // carrying it here is what lets `describe_change` name the rewrite for
         // what it is instead of calling a page's content a dictionary.
