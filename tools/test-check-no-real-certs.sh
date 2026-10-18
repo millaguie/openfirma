@@ -145,6 +145,18 @@ must_block "PAdES PDF with /Contents carrying a foreign CMS" "$WORK/probe-pdf.bi
 must_block "XAdES XML with ds:SignatureValue + X509Certificate" "$WORK/probe-xml.bin" resign testdata/inputs/simple.xml xades-b-b
 must_block "PEM private key saved as markdown" "$WORK/notes.md"
 must_block "bare certificate renamed .bin" "$WORK/rogue-cert.bin"
+# The BSD-Grep witness shape (run 39088314047, first-run-len=0): a whole DER
+# certificate as ONE unbroken base64 run, with no PEM header and no XML tag
+# to name it. On the CI's macOS the old grep-interval extractor extracted
+# nothing from exactly this file and certified it clean. Line-wrapped PEM
+# passes because the BEGIN header trips the keyword branch; here there is no
+# header at all — only length and content can catch it, so they must.
+python3 -c 'import base64,sys; sys.stdout.write(base64.b64encode(open("'"$WORK"'/rogue.crt","rb").read()).decode())' \
+  > "$WORK/rogue-singleline.dat" 2>/dev/null || \
+  { base64 -w0 "$WORK/rogue.crt" > "$WORK/rogue-singleline.dat" 2>/dev/null || \
+    base64 "$WORK/rogue.crt" | tr -d '\n' > "$WORK/rogue-singleline.dat"; }
+must_block "certificate as one raw base64 run, no header, no keyword (the BSD grep witness shape)" \
+  "$WORK/rogue-singleline.dat" cp "$WORK/rogue.crt" "$WORK/rogue-singleline.dat"
 
 must_pass "synthetic-marker PAdES PDF (the marker is the rule, not paranoia)" "$WORK/synth-ok.bin"
 must_pass "plain text file" "$WORK/doc.txt"

@@ -69,115 +69,88 @@ list_files() {
 # several, so the split is explicit), and each block's subject+issuer must
 # carry the synthetic marker. A file no reader can parse is simply not one of
 # these shapes; the probes' exit status says so.
+# The base64 certificate candidates of a text file, as "subject=/issuer=…
+# ### cert" blocks. tr splits every non-base64 byte into a line break — no
+# grep interval semantics (BSD caps {m,n}, GNU truncates matches at n, BSD
+# read drops newline-less tails) survives between the file and this loop, and
+# each run is small enough to feed openssl one printf at a time. Runs shorter
+# than 300 chars cannot hold a real certificate's DER headers anyway; the DER
+# reader, not the length guess, decides what is a certificate.
+extract_base64_certs() {
+  tr -c 'A-Za-z0-9+/' '\n' < "$1" 2>/dev/null | awk 'length >= 300' |
+    while IFS= read -r run || [ -n "$run" ]; do
+      run="${run%$'\r'}"
+      if printf '%s' "$run" | base64 -d 2>/dev/null |
+         openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
+        echo "### cert"
+      elif printf '%s' "$run" | openssl x509 -inform PEM -noout -subject -issuer 2>/dev/null; then
+        echo "### cert"
+      fi
+    done
+}
+
 check_embedded_certs() {
-  local f="$1" blocks part tmpblocks mime
-  # file(1) is only consulted to decide what NOT to bother reading; the probe
-  # itself decides what IS readable, and a text file always answers to it. Two
-  # dialects of `file --mime-type` were measured failing on CI's macOS (a PATH
-  # wrapper that prints "path: type" even without -b, sed then misanchoring on
-  # it; plus per-platform mime guesses), and each one silently routed a probe
-  # into the binary-only branch where nothing matched — fail-open. So file(1)
-  # may only ever SAY NO here (an explicit "text/xml" answer lets the binary
-  # fast-paths stay cheap), never be trusted to skip content: anything unknown
-  # runs the full inspection below, whose branch conditions are magic bytes and
-  # openssl — not a guesser. One extra `openssl pkcs7` per binary source file in
-  # the tree scan is the price of no platform tool getting a veto.
-  mime="$(command file --mime-type "$f" 2>/dev/null | head -n 1)"
-  case "$mime" in
-    */*xml*|text/*) ;;
-    *)
-      # every other answer — including "no file(1) here", which leaves $mime
-      # empty — inspects the content anyway.
-      ;;
-  esac
-  blocks=""
+  local f="$1" blocks="" part tmpblocks tail
+  # Branch decisions come from file CONTENT and openssl only — magic bytes,
+  # greps that match anywhere in the file, one DER parse. Nothing else gets a
+  # veto: `file`'s guesses, grep's line handling, `-z`, brace-interval caps,
+  # locale-dependent classes and awk dialects have each produced a fail-open
+  # here on the CI's macOS within one review (H-3's fix was "content first" for
+  # exactly this reason). The text candidate extractor is deliberately dumb:
+  # `tr -c alphabet \n` turns every non-base64 byte into a line break, so runs
+  # come out whole in any dialect, and each run gets one openssl attempt.
   if head -c 5 "$f" | grep -qa '%PDF-'; then
     # PAdES: the /Contents hex string IS a CMS SignedData (possibly zero
     # padded); its DER prefix ends where the outer SEQUENCE says it does.
     blocks="$(pdf_certs_pem "$f")" || blocks=""
-  elif grep -aq 'SignatureValue\|X509Certificate\|BEGIN CERTIFICATE' "$f"; then
-    # XAdES or any text carrying a base64 certificate: XML wraps the DER as
-    # raw base64 inside <ds:X509Certificate>, PEM wraps it with armor, and a
-    # CMS print_certs dump interleaves subject/issuer lines with the base64.
-    # All three shapes collapse to "long base64 runs" of at least 400 chars (a
-    # certificate DER is ~800–3200 bytes, i.e. ~1100–4300 chars), each decoded
-    # independently — openssl's DER reader consumes only what a certificate
-    # needs and ignores the trailing bytes of a run that bleeds into XML markup,
-    # so an overlong candidate simply fails to parse and is skipped. No upper
-    # bound: BSD grep caps {m,n} intervals at 255 repetitions and answers "invalid
-    # repetition" (measured on macOS runners, where the guard then blocked
-    # nothing), while GNU grep silently truncates the match at n. Trivially slow
-    # is fine here: candidates are rare, and a fail-open guard must never be one.
-    # Read the runs straight out of grep -z: every match arrives as one
-    # NUL-terminated record, so the loop has NO line story left for a platform
-    # dialect to get wrong — the two previous shapes (bare `| while read`, and
-    # re-feeding candidates through a second text pipeline) each lost content to
-    # BSD line semantics on the CI's macOS while every Linux measurement stayed
-    # green. Trailing `=` padding never matches `[^[:space:]]`, so a record ends
-    # exactly at it, wherever grep drew its line boundaries; printf's `%s` drops
-    # any stray CR a CRLF file left inside (base64 treats it as whitespace).
-    blocks="$(grep -zoaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null |
-      while IFS= read -r -d '' run; do
-        run="${run%$'\r'}"
-        if printf '%s' "$run" | base64 -d 2>/dev/null |
-           openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
-          echo "### cert"
-        fi
-      done)" || blocks=""
-    # A candidate loop that produced NOTHING while the file's own text names a
-    # certificate is suspicious — this function has been fooled twice (grep
-    # dialects, read dialects) exactly by answering zero candidates on files
-    # full of them. Retry the decode through the most boring grammar there is:
-    # `grep -o` text mode + head + plain read. PEM armor without its header
-    # lines (a raw base64 run between <ds:X509Certificate> tags) also gets its
-    # own reader attempt here, `-inform PEM`, which the DER-only main loop skips.
-    blocks="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null | head -50 |
-      while read -r run || [ -n "$run" ]; do
-        if printf '%s' "$run" | base64 -d 2>/dev/null |
-           openssl x509 -inform DER -noout -subject -issuer 2>/dev/null; then
-          echo "### cert"
-        elif printf '%s' "$run" | openssl x509 -inform PEM -noout -subject -issuer 2>/dev/null; then
-          echo "### cert"
-        fi
-      done)" || blocks=""
-    # Tripwire for a broken candidate pipeline. If the boring-grammar extractor
-    # above still finds a run whose first eight characters are the universal
-    # base64 opening of X.509 material — `MII…` is the PKCS#15 DER SEQUENCE+
-    # length prefix every certificate encodes alike, `LS0t` the PEM armor — and
-    # still nothing decoded on this machine, the scan itself is broken (that is
-    # exactly what grep/read dialects did twice on macOS) or the material was
-    # fragmented to dodge these very greps. Either way the file cannot be
-    # certified clean: block it with the diagnosis instead of a quiet pass.
-    # Prose that merely mentions X509Certificate has no such run and stays ok.
-    if [ -z "$blocks" ]; then
-      candidates="$(grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$f" 2>/dev/null | head -50)" || candidates=""
-      if [ -n "$candidates" ] && printf '%s\n' "$candidates" |
-         grep -qE '^(MII|LS0t)[A-Za-z0-9+/]{6}'; then
-        block "$f carries runs that open exactly like base64 certificate material yet no decoder on this machine read one (file(1): '${mime:-nothing}') — refusing to call material I cannot fully inspect clean"
-        return 1
-      fi
-    fi
-    [ -n "$blocks" ] || return 0
   elif openssl pkcs7 -inform DER -in "$f" -noout 2>/dev/null; then
+    # A raw CMS SignedData blob (CAdES detached/encapsulated): every one of
+    # them embeds its certificates, so a parsable PKCS#7 always produces
+    # blocks below — an empty parse result is the decoder failing on us, not
+    # an absence of material.
     # same chunking as the PDF path, so a chain of several certificates is
     # judged one certificate at a time and not as one blob whose marker in
     # any line would hide a foreign leaf.
     blocks="$(openssl pkcs7 -print_certs -inform DER -in "$f" 2>/dev/null |
       awk '/^-+BEGIN/{print "### cert"; skip=1; next} /^-+END/{skip=0; next} skip{next} {print}')" || blocks=""
-    [ -n "$blocks" ] || return 0
   else
-    return 0
+    # Candidate scan: does this file hold ANY long base64 run (300+ chars, so
+    # big enough to be a certificate) or name a certificate at all? Written
+    # with `tr`-splitting and awk length tests instead of grep intervals — on
+    # the CI's macOS, BSD grep answered this very question with silence for a
+    # 1130-char single-line certificate (H-3's witness: first-run-len=0), and
+    # a false here is a fail-open. If nothing even looks like material, there
+    # is nothing to decode; if something does, extract_base64_certs judges it.
+    if ! grep -qa 'SignatureValue\|X509Certificate\|BEGIN CERTIFICATE' "$f" &&
+       ! tr -c 'A-Za-z0-9+/=' '\n' < "$f" 2>/dev/null | awk 'length >= 300 { found=1; exit } END { exit !found }'; then
+      return 0
+    fi
+    blocks="$(extract_base64_certs "$f")" || blocks=""
+    if [ -z "$blocks" ]; then
+      # Long base64 is present (or a certificate is NAMED) and nothing in it
+      # decoded. A docs page mentioning "X509Certificate" has no long runs, so
+      # nothing was there — clean. But a 300+ character run that opens like
+      # X.509 material (MII…/LS0t…) and still does not decode means the scan
+      # is broken on this machine or the material was fragmented to dodge it:
+      # refuse to certify either as clean.
+      tail="$(tr -c 'A-Za-z0-9+/=' '\n' < "$f" 2>/dev/null | awk 'length >= 300 { print substr($0, 1, 8); exit }')" || tail=""
+      if [ -n "$tail" ]; then
+        case "$tail" in
+          MII*|LS0t*)
+            block "$f names a certificate and carries ${#tail}-byte+ base64 opening exactly like X.509 material, yet no decoder read it — refusing to call material I cannot fully inspect clean"
+            return 1 ;;
+        esac
+      fi
+      return 0
+    fi
   fi
   # One certificate per chunk: openssl -noout prints its "subject=…\nissuer=…"
   # lines, terminated by the "### cert" marker each decoder emits. Every
   # chunk must mention the synthetic PKI on both of its lines — a real leaf
   # issued BY a test CA is still somebody's identity and fails the rule.
-  # Read $blocks through printf, never `<<<`: a here-string's word before awk
-  # is subject to assignment-style interpretation in some shells (and awk's
-  # redirect target under any shell must not pass through a variable expanded
-  # from the DATA — a crafted "### cert" chunk could rewrite arbitrary files).
-  # Piped input kills both birds. The marker test below also runs per-LINE, so
-  # no single-line format assumption survives here either.
+  # PipedReader input, never <<<: a here-string word before awk can be eaten
+  # as an assignment in some shells, and awk must not expand a redirect path
+  # out of DATA at all (a crafted "### cert" chunk would rewrite files).
   tmpblocks="$(mktemp -d)"
   printf '%s\n' "$blocks" | awk -v dir="$tmpblocks" '
     function out(i) { return dir "/" i ".part" }
