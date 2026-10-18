@@ -8,13 +8,13 @@
 //! [`verify_crl`] establishes; a CRL from any other key is not a revocation
 //! datum, it is a claim nobody made.
 //!
-//! OCSP responses are parsed only as far as their `CertID`s, which is what
+//! OCSP responses are parsed down to their `CertID`s, which is what
 //! associating a response with a certificate needs, and their `certStatus` is
-//! read. Their own signature is *not* verified: that needs the responder's
-//! certificate and the ESS signing-certificate matching of RFC 6960 4.2.2.2,
-//! a chain of trust of its own. The CRL is the cryptographically checked
-//! revocation path here; an archive that has to stand on its own should carry
-//! CRLs. Deliberate limitation, recorded in docs/validation.md.
+//! read. Their own signature IS verified, and the responder is held to RFC 6960
+//! 4.2.2.2: the CA each `CertID` names, or a delegate that CA issued directly
+//! and that carries `id-kp-OCSPSigning`. The CRL is the other
+//! cryptographically checked path here, and it is bound to the certificate of
+//! the chain it belongs to (see [`verify_crl`]).
 
 use std::time::SystemTime;
 
@@ -378,13 +378,15 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
                 // the CA itself answered
                 true
             } else {
-                // a delegate: id-kp-OCSPSigning (or no EKU extension at all,
-                // which RFC 5280 reads as any purpose) and chains to that CA
-                let delegated = match eku_of(candidate) {
-                    None => true,
-                    Some(eku) => eku.contains(&OID_EKU_OCSP_SIGNING),
-                };
-                delegated && chain_certificates_ok(candidate, &embedded, &[(*ca).clone()], at)
+                // a delegate, and RFC 6960 4.2.2.2 is strict about what that
+                // means: it MUST carry id-kp-OCSPSigning (no extendedKeyUsage at
+                // all is "any purpose" for a leaf, which is exactly the reading
+                // that turned any certificate of the CA — another citizen's,
+                // reviewed as round 2's N4 — into a responder for it), and the CA
+                // must have issued it directly, which is what the empty
+                // `embedded` slice enforces: nothing between the two can stand in.
+                eku_of(candidate).is_some_and(|eku| eku.contains(&OID_EKU_OCSP_SIGNING))
+                    && chain_certificates_ok(candidate, &[], std::slice::from_ref(*ca), at)
             };
             if authority {
                 chains_to_issuer = true;
@@ -565,6 +567,15 @@ fn crl_extensions(tbs_content: &[u8]) -> Vec<(ObjectIdentifier, bool)> {
     out
 }
 
+/// # The pool is a binding, not a search space
+///
+/// Every certificate handed in here is treated as equally entitled to have
+/// issued the list, so a caller that knows which certificate the CRL must come
+/// from — the parent of a chain link — has to pass that one certificate and
+/// nothing else. Round 2's N3 was the other reading: a self-signed certificate
+/// carrying the CA's name and a key of its own, archived in the same `/Certs`
+/// pool as everything else, satisfied this function, and its empty CRL looked
+/// like the CA's own statement while the signer's real CRL revoked it.
 pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> Result<CrlReport> {
     let mut outer = der_cursor(der);
     let list = outer.expect(tlv::TAG_SEQUENCE, "the CertificateList")?;

@@ -948,6 +948,408 @@ fn verify_rejects_a_crl_signed_by_the_wrong_ca() {
     );
 }
 
+/// Same as [`write_tmp`] but for a file a tool will create: the name has to be
+/// unique per test, not per test *and* content.
+fn tmp_path(name: &str) -> PathBuf {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace("::", "_");
+    std::env::temp_dir().join(format!("openfirma-{}-{test}-{name}", std::process::id()))
+}
+
+/// Round 2, N4. A leaf certificate issued by the CA with **no** extendedKeyUsage
+/// extension served as an OCSP responder for it: the reader treated the absence
+/// as "any purpose" (the RFC 5280 reading for a leaf), so anyone holding a
+/// certificate from the CA — a citizen's, an employee's — could answer for every
+/// other certificate that CA ever issued. RFC 6960 4.2.2.2 requires
+/// `id-kp-OCSPSigning` of a delegated responder, and requires the CA to have
+/// issued that responder directly.
+#[test]
+fn an_ocsp_response_from_a_responder_without_the_signing_eku_is_not_a_datum() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    let Some(signer) = rsa_signer() else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let (Ok(ca_crl), Ok(int_pem)) = (
+        std::fs::read(certs_dir().join("ca.crl.der")),
+        std::fs::read_to_string(certs_dir().join("intermediate.crt")),
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let intermediate = CertificateHandle::from_pem(&int_pem).expect("intermediate.crt");
+    let Ok(ca_pem) = std::fs::read_to_string(certs_dir().join("ca.crt")) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let ca = CertificateHandle::from_pem(&ca_pem).expect("ca.crt");
+
+    // a certificate issued directly by the intermediate, with no EKU at all:
+    // digitalSignature and nothing else, which is what millions of ordinary
+    // certificates look like
+    let key = tmp_path("no-eku.key");
+    let csr = tmp_path("no-eku.csr");
+    let crt = tmp_path("no-eku.crt");
+    let ext = write_tmp(
+        "no-eku.ext",
+        b"basicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSignature\n",
+    );
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            key.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "openssl genpkey failed:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "req",
+            "-new",
+            "-key",
+            key.to_str().unwrap(),
+            "-subj",
+            "/C=ES/O=openfirma test/OU=Test PKI/CN=openfirma No EKU Responder",
+            "-out",
+            csr.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "openssl req failed:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "x509",
+            "-req",
+            "-in",
+            csr.to_str().unwrap(),
+            "-CA",
+            certs_dir().join("intermediate.crt").to_str().unwrap(),
+            "-CAkey",
+            certs_dir().join("intermediate.key").to_str().unwrap(),
+            "-set_serial",
+            "4242",
+            "-days",
+            "3650",
+            "-sha256",
+            "-extfile",
+            ext.to_str().unwrap(),
+            "-out",
+            crt.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        ok,
+        "openssl could not issue the no-EKU certificate:\n{text}"
+    );
+
+    let resp = tmp_path("no-eku.ocsp.der");
+    let index = write_tmp(
+        "no-eku.index",
+        format!(
+            "V\t491231235959Z\t\t{}\tunknown\t{}\n",
+            hex::encode_upper(signer.certificate().serial_number().as_bytes()),
+            "C=ES, O=openfirma test, OU=AC openfirma Usuarios, CN=PEREZ GARCIA, ANA"
+        )
+        .as_bytes(),
+    );
+    let request = tmp_path("no-eku.req");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-reqout",
+            request.to_str().unwrap(),
+            "-issuer",
+            certs_dir().join("intermediate.crt").to_str().unwrap(),
+            "-cert",
+            certs_dir().join("signer-rsa.crt").to_str().unwrap(),
+            "-no_nonce",
+        ],
+    );
+    assert!(ok, "openssl could not build the OCSP request:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-index",
+            index.to_str().unwrap(),
+            "-CA",
+            certs_dir().join("intermediate.crt").to_str().unwrap(),
+            "-rsigner",
+            crt.to_str().unwrap(),
+            "-rkey",
+            key.to_str().unwrap(),
+            "-reqin",
+            request.to_str().unwrap(),
+            "-respout",
+            resp.to_str().unwrap(),
+            "-ndays",
+            "3650",
+        ],
+    );
+    assert!(ok, "openssl could not sign the OCSP response:\n{text}");
+    let resp = std::fs::read(&resp).expect("openssl wrote the OCSP response");
+
+    // a well formed "good" answer about the signer, from that leaf
+    let ids = openfirma_cades::revocation::parse_ocsp_response(&resp)
+        .expect("the response openssl produced must parse");
+    assert_eq!(ids.len(), 1);
+    assert!(!ids[0].revoked);
+    assert_eq!(
+        ids[0].serial,
+        signer.certificate().serial_number().as_bytes(),
+        "the answer is about the signer"
+    );
+    let status = openfirma_cades::read_ocsp_response(
+        &resp,
+        &[ca.clone(), intermediate.clone()],
+        std::time::SystemTime::now(),
+    );
+    assert!(
+        !status.verified(),
+        "a responder without id-kp-OCSPSigning is not a responder: {status:?}"
+    );
+
+    let opts = PadesOptions {
+        revocation: vec![RevocationBytes::Ocsp(resp), RevocationBytes::Crl(ca_crl)],
+        ..PadesOptions::default()
+    };
+    let signed =
+        pades_sign(INPUT, &signer, &opts).expect("signing with the forged response failed");
+    let err = pades_verify(&signed, &anchors()).expect_err(
+        "an OCSP answer signed by a certificate of the CA without the OCSP signing EKU is not a datum",
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("OCSP response 1") && text.contains("not a revocation datum"),
+        "the refusal must name the archived response: {text}"
+    );
+}
+
+/// Round 2, N4, the second half of the delegation rule: the delegate had to
+/// *chain* to the CA, not be issued by it. RFC 6960 4.2.2.2 authorizes a
+/// responder the CA issues, and a certificate hanging from a sub-CA of that CA
+/// is not one — the CA never authorized it, the sub-CA did.
+#[test]
+fn an_ocsp_responder_that_hangs_from_a_sub_ca_is_not_a_delegate() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    let Some(signer) = rsa_signer() else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let (Ok(ca_crl), Ok(int_pem), Ok(ca_pem)) = (
+        std::fs::read(certs_dir().join("ca.crl.der")),
+        std::fs::read_to_string(certs_dir().join("intermediate.crt")),
+        std::fs::read_to_string(certs_dir().join("ca.crt")),
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let intermediate = CertificateHandle::from_pem(&int_pem).expect("intermediate.crt");
+    let ca = CertificateHandle::from_pem(&ca_pem).expect("ca.crt");
+    let int_crt = certs_dir().join("intermediate.crt");
+    let int_key = certs_dir().join("intermediate.key");
+
+    // a sub-CA under the intermediate, and a responder the sub-CA issues with
+    // the OCSP signing EKU: a proper delegation, from the wrong CA
+    let sub_key = tmp_path("sub-ca.key");
+    let sub_csr = tmp_path("sub-ca.csr");
+    let sub_crt = tmp_path("sub-ca.crt");
+    let sub_ext = write_tmp(
+        "sub-ca.ext",
+        b"basicConstraints = critical, CA:TRUE, pathlen:0\nkeyUsage = critical, keyCertSign, cRLSign\n",
+    );
+    let r_key = tmp_path("sub-responder.key");
+    let r_csr = tmp_path("sub-responder.csr");
+    let r_crt = tmp_path("sub-responder.crt");
+    let r_ext = write_tmp(
+        "sub-responder.ext",
+        b"basicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSignature\nextendedKeyUsage = critical, OCSPSigning\n",
+    );
+    for (key, csr, subj) in [
+        (
+            &sub_key,
+            &sub_csr,
+            "/C=ES/O=openfirma test/OU=Test PKI/CN=openfirma Sub CA",
+        ),
+        (
+            &r_key,
+            &r_csr,
+            "/C=ES/O=openfirma test/OU=Test PKI/CN=openfirma Sub CA Responder",
+        ),
+    ] {
+        let (ok, text) = run(
+            "openssl",
+            &[
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-out",
+                key.to_str().unwrap(),
+            ],
+        );
+        assert!(ok, "openssl genpkey failed:\n{text}");
+        let (ok, text) = run(
+            "openssl",
+            &[
+                "req",
+                "-new",
+                "-key",
+                key.to_str().unwrap(),
+                "-subj",
+                subj,
+                "-out",
+                csr.to_str().unwrap(),
+            ],
+        );
+        assert!(ok, "openssl req failed:\n{text}");
+    }
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "x509",
+            "-req",
+            "-in",
+            sub_csr.to_str().unwrap(),
+            "-CA",
+            int_crt.to_str().unwrap(),
+            "-CAkey",
+            int_key.to_str().unwrap(),
+            "-set_serial",
+            "9001",
+            "-days",
+            "3650",
+            "-sha256",
+            "-extfile",
+            sub_ext.to_str().unwrap(),
+            "-out",
+            sub_crt.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "openssl could not issue the sub-CA:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "x509",
+            "-req",
+            "-in",
+            r_csr.to_str().unwrap(),
+            "-CA",
+            sub_crt.to_str().unwrap(),
+            "-CAkey",
+            sub_key.to_str().unwrap(),
+            "-set_serial",
+            "9002",
+            "-days",
+            "3650",
+            "-sha256",
+            "-extfile",
+            r_ext.to_str().unwrap(),
+            "-out",
+            r_crt.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "openssl could not issue the responder:\n{text}");
+
+    // an answer about the signer, signed by that responder, with its own chain
+    // embedded in the response (`-rother`) so that nothing is missing to build
+    // it: the delegation itself is what has to be refused
+    let resp = tmp_path("sub-responder.ocsp.der");
+    let index = write_tmp(
+        "sub-responder.index",
+        format!(
+            "V\t491231235959Z\t\t{}\tunknown\t{}\n",
+            hex::encode_upper(signer.certificate().serial_number().as_bytes()),
+            "C=ES, O=openfirma test, OU=AC openfirma Usuarios, CN=PEREZ GARCIA, ANA"
+        )
+        .as_bytes(),
+    );
+    let request = tmp_path("sub-responder.req");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-reqout",
+            request.to_str().unwrap(),
+            "-issuer",
+            int_crt.to_str().unwrap(),
+            "-cert",
+            certs_dir().join("signer-rsa.crt").to_str().unwrap(),
+            "-no_nonce",
+        ],
+    );
+    assert!(ok, "openssl could not build the OCSP request:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-index",
+            index.to_str().unwrap(),
+            "-CA",
+            int_crt.to_str().unwrap(),
+            "-rsigner",
+            r_crt.to_str().unwrap(),
+            "-rkey",
+            r_key.to_str().unwrap(),
+            "-rother",
+            sub_crt.to_str().unwrap(),
+            "-reqin",
+            request.to_str().unwrap(),
+            "-respout",
+            resp.to_str().unwrap(),
+            "-ndays",
+            "3650",
+        ],
+    );
+    assert!(ok, "openssl could not sign the OCSP response:\n{text}");
+    let resp = std::fs::read(&resp).expect("openssl wrote the OCSP response");
+
+    // the signature is the responder's, the delegation is the sub-CA's
+    let status = openfirma_cades::read_ocsp_response(
+        &resp,
+        &[ca.clone(), intermediate.clone()],
+        std::time::SystemTime::now(),
+    );
+    assert!(
+        status.signature_verified,
+        "the responder really signed this answer: {status:?}"
+    );
+    assert!(
+        !status.chains_to_issuer,
+        "a responder the intermediate's sub-CA issued is not a delegate the \
+         intermediate authorized: {status:?}"
+    );
+
+    let opts = PadesOptions {
+        revocation: vec![RevocationBytes::Ocsp(resp), RevocationBytes::Crl(ca_crl)],
+        ..PadesOptions::default()
+    };
+    let signed = pades_sign(INPUT, &signer, &opts).expect("signing failed");
+    let err = pades_verify(&signed, &anchors())
+        .expect_err("a delegation from a sub-CA is not a delegation from the CA");
+    let text = err.to_string();
+    assert!(
+        text.contains("OCSP response 1") && text.contains("not a revocation datum"),
+        "the refusal must name the archived response: {text}"
+    );
+}
+
 #[test]
 fn openssl_verifies_the_crls_we_embed() {
     if !openssl_available() {
