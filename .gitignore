@@ -52,3 +52,7 @@ autofirma.pfx
 # about generate` produce it in the release job from this lockfile); a copy
 # committed here would drift from the lockfile it is supposed to describe.
 /THIRD-PARTY-LICENSES.html
+
+# Stray compiler output (never belongs in git): a 400 KiB ELF that no
+guard or test needs and that every whole-file scan has to chew through.
+rust_out
