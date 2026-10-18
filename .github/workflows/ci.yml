@@ -194,16 +194,21 @@ jobs:
           # PATH, and the cert-guard self-test spawns the dispatcher instead
           # of a shell. This step only reaches here inside Git Bash (its shell
           # is bash and openssl came out of that install), so prepend Git's
-          # bin directory — where bash.exe lives next to git.exe — to the
-          # persisted PATH and `bash` resolves to a real shell in every later
-          # step. cygpath'd like openssl above; a no-op on Linux/macOS, where
-          # /bin/bash already wins (no bash.exe sits next to their git). The
-          # self-test's contract stays honest: without a real bash it refuses
-          # loudly under REQUIRE_TESTS rather than riding the dispatcher.
-          if command -v git >/dev/null 2>&1; then
-            gitbin="$(dirname "$(command -v git)")"
-            if [ -x "$gitbin/bash.exe" ]; then
-              bdir="$gitbin"
+          # *root* bin directory to the persisted PATH. Not `dirname
+          # $(command -v git)`: on these runners git resolves through a shim
+          # dir ahead of Git on PATH, and prepending THAT put the WSL stubs in
+          # front as well — run 39108474835 proved it. bash.exe lives at the
+          # install root's bin (next to git-bash.exe), which is also where
+          # ssh.exe sits, so PATH already carries it once we put it first. The
+          # line is a no-op on Linux/macOS: <derived>/bin/bash.exe does not
+          # exist there and /bin/bash already wins. The self-test's contract stays honest:
+          # without a real bash it refuses loudly under REQUIRE_TESTS rather
+          # than riding the dispatcher.
+          git_exe="$(command -v git.exe || command -v git || true)"
+          if [ -n "$git_exe" ]; then
+            git_home="$(dirname "$(dirname "$git_exe")")"
+            if [ -x "$git_home/bin/bash.exe" ]; then
+              bdir="$git_home/bin"
               if command -v cygpath >/dev/null 2>&1; then bdir="$(cygpath -w "$bdir")"; fi
               echo "$bdir" >> "$GITHUB_PATH"
             fi
@@ -356,6 +361,22 @@ jobs:
             echo "no openssl on this runner, tests needing the PKI will skip"
             echo "OPENFIRMA_ALLOW_NONKEYSTORE_SKIP=1" >> "$GITHUB_ENV"
             exit 0
+          fi
+          # The same PATH trick as the matrix job's PKI step, with the same
+          # care: derive Git's ROOT by walking up from `git.exe` and prepend
+          # <root>/bin (bash.exe lives there), never dirname(git) — on these
+          # runners git may resolve through a shim dir whose WSL stubs would
+          # ride along. No-op where /bin/bash already wins ("<derived>/bin/
+          # bash.exe" does not exist on Linux/macOS). A self-test without a
+          # real bash still refuses loudly under REQUIRE_TESTS.
+          git_exe="$(command -v git.exe || command -v git || true)"
+          if [ -n "$git_exe" ]; then
+            git_home="$(dirname "$(dirname "$git_exe")")"
+            if [ -x "$git_home/bin/bash.exe" ]; then
+              bdir="$git_home/bin"
+              if command -v cygpath >/dev/null 2>&1; then bdir="$(cygpath -w "$bdir")"; fi
+              echo "$bdir" >> "$GITHUB_PATH"
+            fi
           fi
           dir="$(dirname "$openssl_bin")"
           export PATH="$dir:$PATH"
