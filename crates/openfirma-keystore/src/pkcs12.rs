@@ -941,21 +941,54 @@ fn decrypt_pbe_all(
     // PBES2 gets every spelling (OpenSSL 3.x's raw-UTF-8 PBKDF2 is not the BMP
     // one Java writes), while the legacy SHA-1 PBEs have always been keyed over
     // the BMPString, so trying more there would only slow a wrong password
-    // down. The padding check is the verdict either way; nothing accepts a
-    // wrong key with an 8-byte block cipher often enough to matter.
+    // down.
     let candidates = if alg == OID_PBES2 {
         pbes2_password_candidates(password)
     } else {
         mac_password_candidates(password)
     };
+    // The padding check alone is NOT a safe verdict: with an 8-byte block
+    // cipher (3DES) a wrong candidate's garbage passes PKCS#7 padding by
+    // chance roughly once in 256 — measured here as a ~1/117 flake over
+    // random-salts, where the empty spelling was tried first, its garbage
+    // passed padding, and the correct `00 00` candidate was never reached
+    // (the caller then died reading that garbage as DER). What every PKCS#12
+    // decryption produces IS DER — a SafeContents SEQUENCE for the content
+    // info, a PKCS#8 PrivateKeyInfo for a key bag — so a candidate is only
+    // accepted when its plaintext is a complete, well-formed DER SEQUENCE.
+    // The first candidate that is BOTH padding-valid and a whole SEQUENCE
+    // wins; a padding-valid result that is not DER is remembered only as a
+    // fallback, so the old behaviour survives for any input that could
+    // legitimately decrypt to something this check reads as non-DER (none is
+    // known, but the fallback keeps the change strictly additive).
+    let mut padding_only: Option<Zeroizing<Vec<u8>>> = None;
     for pw in &candidates {
-        let r = decrypt_pbe(alg, params, encrypted, pw);
-        match r {
-            Ok(v) => return Ok(v),
+        match decrypt_pbe(alg, params, encrypted, pw) {
+            Ok(v) if is_whole_der_sequence(&v) => return Ok(v),
+            Ok(v) => {
+                if padding_only.is_none() {
+                    padding_only = Some(v);
+                }
+            }
             Err(e) => last = Some(e),
         }
     }
+    if let Some(v) = padding_only {
+        return Ok(v);
+    }
     Err(last.expect("password candidates are never empty"))
+}
+
+/// Whether `bytes` is exactly one DER SEQUENCE and nothing else — the shape
+/// every decrypted PKCS#12 payload has. Strict: an indefinite length or any
+/// trailing byte fails it, which is what tells a genuine plaintext from a
+/// wrong key whose garbage happened to satisfy the block padding.
+fn is_whole_der_sequence(bytes: &[u8]) -> bool {
+    let mut c = openfirma_core::tlv::Cursor::new(bytes);
+    match c.value() {
+        Ok(v) => v.tag == 0x30 && v.whole.len() == bytes.len() && c.done(),
+        Err(_) => false,
+    }
 }
 
 fn decrypt_content_info(content: &mut Level, password: &str) -> Result<Zeroizing<Vec<u8>>> {
@@ -1814,6 +1847,66 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("padding"), "{err}");
+    }
+
+    /// The bug that made PKCS#12 loading flaky (measured ~1 in 117 over
+    /// random-salt exports): with an 8-byte block cipher the WRONG password
+    /// candidate's garbage satisfies PKCS#7 padding roughly once in 256, and
+    /// `decrypt_pbe_all` returned the first padding-valid result — so the real
+    /// plaintext was never reached and the caller read the garbage as DER
+    /// ("a DER length that is overlong or runs past the input"). The fix makes
+    /// a candidate acceptable only when its plaintext is a whole DER SEQUENCE.
+    /// Deterministic: it searches a fixed salt space for a collision and then
+    /// asserts the empty-password path returns the DER, not the garbage.
+    #[test]
+    fn a_wrong_candidate_whose_garbage_passes_padding_is_not_accepted_over_the_real_one() {
+        use cbc::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
+        // a tiny but complete DER SEQUENCE: SEQUENCE { INTEGER 1 }
+        let plaintext: &[u8] = &[0x30, 0x03, 0x02, 0x01, 0x01];
+        // the spelling OpenSSL/NSS key this PBE with for the empty password
+        let good: &[u8] = &[0x00, 0x00];
+        let iterations = 1usize;
+
+        let mut found = None;
+        for seed in 0u32..2_000_000 {
+            let salt = seed.to_le_bytes();
+            let key = pkcs12_kdf::<sha1::Sha1>(1, good, &salt, iterations, 24, 64);
+            let iv = pkcs12_kdf::<sha1::Sha1>(2, good, &salt, iterations, 8, 64);
+            let enc = <cbc::Encryptor<des::TdesEde3> as KeyIvInit>::new_from_slices(&key, &iv)
+                .unwrap();
+            let ct = enc.encrypt_padded_vec::<Pkcs7>(plaintext);
+            let params = pbe_sha1_params(&salt, iterations);
+            // does the WRONG (empty) candidate satisfy padding on this ct?
+            if decrypt_pbe(OID_PBE_SHA1_3DES, &params, &ct, &[]).is_ok() {
+                found = Some((salt, params, ct));
+                break;
+            }
+        }
+        let (salt, params, ct) =
+            found.expect("a padding collision must exist within the fixed salt search");
+
+        // the good candidate really is the DER plaintext
+        let good_out = decrypt_pbe(OID_PBE_SHA1_3DES, &params, &ct, good).unwrap();
+        assert_eq!(
+            &good_out[..],
+            plaintext,
+            "sanity: the real key yields the DER"
+        );
+        // and the empty-password path must return THAT, never the garbage
+        let out = decrypt_pbe_all(OID_PBE_SHA1_3DES, &params, &ct, "").unwrap();
+        assert_eq!(
+            &out[..],
+            plaintext,
+            "the wrong candidate's garbage (salt {salt:?}) was accepted over the real plaintext"
+        );
+    }
+
+    /// `pkcs-12PbeParams` content: an OCTET STRING salt and an INTEGER count,
+    /// the two fields every legacy SHA-1 PBE reads (see `decrypt_pbe`).
+    fn pbe_sha1_params(salt: &[u8], iterations: usize) -> Vec<u8> {
+        let mut out = tlv::octet_string(salt).unwrap();
+        out.extend_from_slice(&der_integer(iterations));
+        out
     }
 
     /// `PBES2-params` for one cipher with a declared keyLength: PBKDF2 with a
