@@ -44,6 +44,21 @@ fn xmlsec_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// A crosscheck TOOL unprovisioned on this platform — not a missing test PKI,
+/// which require_or_skip keeps mandatory (review 07, H-2). The runner names
+/// exactly WHICH tools it cannot have in OPENFIRMA_ALLOW_MISSING_TOOL (a
+/// comma/space list); an unlisted tool's absence still fails the job. xmlsec1 is
+/// the Windows case: no Windows package exists, so only it is excused there.
+fn tool_or_skip(tool: &str, reason: &str) {
+    let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
+    let excused = std::env::var("OPENFIRMA_ALLOW_MISSING_TOOL")
+        .is_ok_and(|list| list.split([',', ' ', ';']).any(|t| t.trim() == tool));
+    if required && !excused {
+        panic!("cannot run the crosscheck: {reason}");
+    }
+    eprintln!("skipped, {reason}");
+}
+
 /// Name of the document's root element — `ns:name` when prefixed, the bare local
 /// name otherwise — which is exactly what `--id-attr:Id <root>` expects on 1.2.x
 /// (a prefixed root measured working with its prefix). None if not parseable.
@@ -167,7 +182,7 @@ fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
 #[test]
 fn xmlsec_verifies_the_rsa_signature() {
     if !xmlsec_available() {
-        require_or_skip("xmlsec1 not found, install xmlsec1");
+        tool_or_skip("xmlsec1", "xmlsec1 not found, install xmlsec1");
         return;
     }
     let Some(signer) = load_signer(
@@ -203,7 +218,7 @@ fn xmlsec_verifies_the_rsa_signature() {
 #[test]
 fn xmlsec_verifies_signatures_over_documents_with_namespaced_roots() {
     if !xmlsec_available() {
-        require_or_skip("xmlsec1 not found, install xmlsec1");
+        tool_or_skip("xmlsec1", "xmlsec1 not found, install xmlsec1");
         return;
     }
     let Some(signer) = load_signer(
@@ -242,7 +257,7 @@ fn xmlsec_verifies_signatures_over_documents_with_namespaced_roots() {
 #[test]
 fn xmlsec_verifies_the_ecdsa_signature() {
     if !xmlsec_available() {
-        require_or_skip("xmlsec1 not found, install xmlsec1");
+        tool_or_skip("xmlsec1", "xmlsec1 not found, install xmlsec1");
         return;
     }
     let Some(signer) = load_signer(
@@ -269,7 +284,7 @@ fn xmlsec_verifies_the_ecdsa_signature() {
 #[test]
 fn xmlsec_notices_a_tampered_document() {
     if !xmlsec_available() {
-        require_or_skip("xmlsec1 not found, install xmlsec1");
+        tool_or_skip("xmlsec1", "xmlsec1 not found, install xmlsec1");
         return;
     }
     let Some(signer) = load_signer(

@@ -33,6 +33,12 @@ env:
   #       not run because the runner has no openssl at all; nothing sets it
   #       today (every runner ships an openssl), and it is spelled out here
   #       so an accidental export in a future job is auditable.
+  #   OPENFIRMA_ALLOW_MISSING_TOOL    — a comma list of crosscheck TOOLS a
+  #       platform genuinely cannot provision (Windows: pdfsig, whose
+  #       Chocolatey poppler omits it, and xmlsec1, which has no Windows
+  #       package). Read ONLY by the crosscheck tool sites (tool_or_skip),
+  #       NEVER by the PKI sites: a broken PKI step still turns the job red.
+  #       It names tools, so an unlisted tool's absence still fails the job.
   # A job may never blanket-disable REQUIRE_TESTS: if the PKI step fails for
   # any other reason, the job must go red, loudly.
   OPENFIRMA_REQUIRE_TESTS: "1"
@@ -285,12 +291,59 @@ jobs:
       # before its xades binaries ran, so whether brew's xmlsec1 verifies our
       # documents under REQUIRE_TESTS was never observed; install it too and
       # let the next run say so with its result lines instead of a comment.
-      # Windows keeps xmlsec absent — no packaged xmlsec exists there, and
-      # those tests skip like every other non-keystore crosscheck does under
-      # the platform allowance (a platform fact, recorded honestly).
+      # Windows keeps xmlsec absent — no packaged xmlsec exists there. What
+      # skips there and why is spelled out at its own step below; the old line
+      # here claimed a "platform allowance" that was never wired.
       - name: install crosscheck tools (macos)
         if: runner.os == 'macOS'
         run: brew install qpdf poppler xmlsec1
+
+      # The crosscheck tools on Windows, and what is HONESTLY reachable there:
+      #   - qpdf: Chocolatey's package ships qpdf.exe, so its crosschecks run.
+      #   - pdfsig: Chocolatey's `poppler` package does NOT ship pdfsig.exe
+      #     (its zip carries pdftotext/pdfinfo/... but no pdfsig — pdfsig links
+      #     NSS, which that Windows build omits), so it cannot run here.
+      #   - xmlsec1: no Windows package at all (the Chocolatey feed offers
+      #     neither `xmlsec` nor `xmlsec1`), so it cannot run here.
+      # Rather than hardcode those two absences, this step installs what exists
+      # and then PROBES what actually resolves, excusing exactly the tools that
+      # do not. An unlisted tool's absence still fails the job, and the
+      # allowance is read only by the crosscheck tool sites — never by the PKI
+      # ones, so a broken PKI step still turns this red (review 07, H-2). This
+      # replaces the earlier comment claiming Windows skipped "under the
+      # platform allowance": no such allowance was ever wired, which is why the
+      # pades crosschecks failed the job (run 39112495002) instead of skipping.
+      - name: install crosscheck tools and name the tool gap (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install qpdf --yes --no-progress
+          # choco's shims live in C:\ProgramData\chocolatey\bin. The installer
+          # adds that to the MACHINE PATH, but a running process does not see a
+          # PATH change, so later steps (and the probe below) would miss qpdf and
+          # we would excuse it wrongly. Publish the dir for later steps through
+          # GITHUB_PATH and prepend it for this one — prepend, never rebuild, so
+          # nothing the runner already injected is lost.
+          $chocoBin = 'C:\ProgramData\chocolatey\bin'
+          Add-Content -Path $env:GITHUB_PATH -Value $chocoBin
+          $env:Path = "$chocoBin;$env:Path"
+          # Probe the SAME way the tests gate themselves (qpdf --version, pdfsig
+          # -v, xmlsec1 --version): a tool that resolves but does not run — e.g.
+          # an x64 qpdf on the arm64 runner under a emulation gap — is as absent
+          # to the suite as one that is not installed, and must be excused.
+          $probes = @{ qpdf = @('--version'); pdfsig = @('-v'); xmlsec1 = @('--version') }
+          $missing = @()
+          foreach ($tool in 'qpdf','pdfsig','xmlsec1') {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { $missing += $tool; continue }
+            & $tool @($probes[$tool]) *> $null
+            if ($LASTEXITCODE -ne 0) { $missing += $tool }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "not provisionable on this runner, excused: $($missing -join ',')"
+            Add-Content -Path $env:GITHUB_ENV -Value "OPENFIRMA_ALLOW_MISSING_TOOL=$($missing -join ',')"
+          } else {
+            Write-Host "all crosscheck tools resolved; nothing excused"
+          }
 
       # eframe's sys crates need the windowing client libraries to LINK on
       # Linux even for a headless build (the kittest tests never open a

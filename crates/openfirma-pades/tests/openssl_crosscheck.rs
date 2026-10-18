@@ -107,6 +107,22 @@ fn require_or_skip(reason: &str) {
     eprintln!("skipped, {reason}");
 }
 
+/// A crosscheck TOOL unprovisioned on this platform — a different fact from a
+/// missing test PKI, which require_or_skip keeps mandatory (review 07, H-2: one
+/// flag must not relax both). The runner names exactly WHICH tools it cannot
+/// have in OPENFIRMA_ALLOW_MISSING_TOOL (a comma/space list); an unlisted tool's
+/// absence still fails the job, so on Windows only xmlsec1 (which has no Windows
+/// package) is excused while installed qpdf/poppler keep their crosschecks.
+fn tool_or_skip(tool: &str, reason: &str) {
+    let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
+    let excused = std::env::var("OPENFIRMA_ALLOW_MISSING_TOOL")
+        .is_ok_and(|list| list.split([',', ' ', ';']).any(|t| t.trim() == tool));
+    if required && !excused {
+        panic!("cannot run the crosscheck: {reason}");
+    }
+    eprintln!("skipped, {reason}");
+}
+
 fn run(program: &str, args: &[&str]) -> (bool, String) {
     let out = Command::new(program)
         .args(args)
@@ -334,7 +350,7 @@ fn openssl_verifies_the_signature() {
 #[test]
 fn qpdf_reads_the_signed_document() {
     if !qpdf_available() {
-        require_or_skip("qpdf not found, install qpdf");
+        tool_or_skip("qpdf", "qpdf not found, install qpdf");
         return;
     }
     let Some(signer) = load_signer(
@@ -365,7 +381,7 @@ fn qpdf_reads_the_signed_document() {
 #[test]
 fn poppler_pdfsig_verifies_the_signature() {
     if !pdfsig_available() {
-        require_or_skip("pdfsig not found, install poppler-utils");
+        tool_or_skip("pdfsig", "pdfsig not found, install poppler-utils");
         return;
     }
     let Some(signer) = load_signer(

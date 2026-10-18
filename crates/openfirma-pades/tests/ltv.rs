@@ -57,6 +57,24 @@ fn require_or_skip(reason: &str) {
     eprintln!("skipped, {reason}");
 }
 
+/// A crosscheck TOOL unprovisioned on this platform, which is a different fact
+/// from a missing test PKI (the one require_or_skip guards). The runner names
+/// exactly WHICH tools it cannot have in OPENFIRMA_ALLOW_MISSING_TOOL (a
+/// comma/space list), so an unlisted tool's absence still fails the job: on
+/// Windows qpdf and poppler install from Chocolatey and their crosschecks run,
+/// while xmlsec1 has no Windows package at all and only it is excused. Missing
+/// material must still fail under REQUIRE_TESTS — review 07, H-2 forbids one
+/// flag relaxing both.
+fn tool_or_skip(tool: &str, reason: &str) {
+    let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
+    let excused = std::env::var("OPENFIRMA_ALLOW_MISSING_TOOL")
+        .is_ok_and(|list| list.split([',', ' ', ';']).any(|t| t.trim() == tool));
+    if required && !excused {
+        panic!("cannot run the test: {reason}");
+    }
+    eprintln!("skipped, {reason}");
+}
+
 fn openssl_available() -> bool {
     Command::new("openssl")
         .arg("version")
@@ -896,7 +914,7 @@ fn openssl_verifies_the_crls_we_embed() {
 #[test]
 fn pdfsig_still_validates_earlier_signatures_after_ltv() {
     if !pdfsig_available() {
-        require_or_skip("pdfsig not found, install poppler-utils");
+        tool_or_skip("pdfsig", "pdfsig not found, install poppler-utils");
         return;
     }
     if !openssl_available() {
@@ -966,7 +984,7 @@ fn pdfsig_still_validates_earlier_signatures_after_ltv() {
 #[test]
 fn qpdf_reads_the_b_lt_document() {
     if !qpdf_available() {
-        require_or_skip("qpdf not found, install qpdf");
+        tool_or_skip("qpdf", "qpdf not found, install qpdf");
         return;
     }
     let (Some(signer), Some(revocation)) = (rsa_signer(), crls()) else {
