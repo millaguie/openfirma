@@ -201,9 +201,15 @@ jobs:
           # install root's bin (next to git-bash.exe), which is also where
           # ssh.exe sits, so PATH already carries it once we put it first. The
           # line is a no-op on Linux/macOS: <derived>/bin/bash.exe does not
-          # exist there and /bin/bash already wins. The self-test's contract stays honest:
-          # without a real bash it refuses loudly under REQUIRE_TESTS rather
-          # than riding the dispatcher.
+          # exist there and /bin/bash already wins. Run 39109858613's witness
+          # then proved the point: Get-Command resolved Git's bash.exe at
+          # C:\Program Files\Git\bin — and the spawned child STILL printed the
+          # dispatcher message, so PATH ordering does not decide this spawn.
+          # cli.rs now resolves bash explicitly via `git --exec-path` on
+          # Windows; this prepend stays as a harmless convenience for other
+          # steps. The self-test's contract stays honest: without a real bash
+          # it refuses loudly under REQUIRE_TESTS rather than riding the
+          # dispatcher.
           git_exe="$(command -v git.exe || command -v git || true)"
           if [ -n "$git_exe" ]; then
             git_home="$(dirname "$(dirname "$git_exe")")"

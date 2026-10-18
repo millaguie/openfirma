@@ -362,6 +362,38 @@ fn test_certs() -> Option<std::path::PathBuf> {
     dir.join("signer-rsa.crt").is_file().then_some(dir)
 }
 
+#[cfg(windows)]
+/// Git for Windows' bin directory — the one holding bash.exe — resolved
+/// without asking PATH anything that lies on these runners: `where.exe`
+/// searches in CreateProcess' own order, and the first hit's install root is
+/// where git.exe was found. The returned path is that root's `bin`, verified
+/// to contain bash.exe (Git ships its bash next to git-bash.exe, one level
+/// under the root; a GitHub shim dir or System32 never qualifies). None on
+/// unix (`where.exe` does not exist there) or when no hit has a Git layout.
+fn git_root() -> Option<std::path::PathBuf> {
+    let out = Command::new("where.exe").arg("git.exe").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .find_map(|line| {
+            Path::new(line).ancestors().find_map(|anc| {
+                let cand = anc.join("bin").join("bash.exe");
+                cand.is_file()
+                    .then_some(cand.parent().unwrap().to_path_buf())
+            })
+        })
+}
+
+#[cfg(not(windows))]
+/// The stub keeps the call sites above platform-blind; unix never asks.
+fn git_root() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// The certificate guard proves itself (review 07, H-3): the script signs
 /// throwaway rogue certificates into PAdES/XAdES/CMS shapes and must block
 /// every one of them. Needs bash + openssl + the debug binary; where any is
@@ -393,7 +425,24 @@ fn cert_guard_blocks_every_nested_signature_shape() {
     // and probes signed by a stale signer measure yesterday's code. CARGO_BIN_EXE
     // is exactly this compilation unit's binary, so probe content can never
     // drift behind the code under test.
-    let out = match Command::new("bash")
+    //
+    // Which bash: NOT via PATH on Windows. Run 39109858613's witness settled
+    // it — Get-Command swore `bash` resolved to C:\Program Files\Git\bin\bash.exe
+    // while the spawned child still printed the WSL dispatcher's message, so
+    // PATH ordering and PS's resolver do not predict CreateProcess here, and
+    // three GITHUB_PATH prepends (runs 39108474835/39109200143/39109858613)
+    // bought nothing. On Windows the child is therefore pinned to Git's own
+    // bash.exe, found by walking up from git.exe itself; if the only bash a
+    // Windows machine has IS WSL's, this test refuses with the same honest
+    // skip/require rules as any missing prerequisite (and WSL-bash would lack
+    // the openssl/python3/openfirma-mingw the probes need anyway). Linux and
+    // macOS resolution is untouched: plain "bash".
+    let bash_program: std::path::PathBuf = if cfg!(windows) {
+        git_root().unwrap_or_else(|| "bash".into())
+    } else {
+        "bash".into()
+    };
+    let out = match Command::new(&bash_program)
         .arg(&script_abs)
         .current_dir(repo_root)
         .env("OPENFIRMA_GUARD_PROBE_BIN", env!("CARGO_BIN_EXE_openfirma"))
@@ -406,15 +455,15 @@ fn cert_guard_blocks_every_nested_signature_shape() {
         }
         Err(e) => panic!("cannot run the guard self-test: {e}"),
     };
-    // A `bash` that exists but is NOT a shell: on Windows runners PATH's
-    // bash may be the WSL dispatcher — "has no installed distributions" or
-    // "must be updated to the latest version" — which exits nonzero without
-    // ever running a probe (runs 39091143744 and 39106701806; the message
-    // lands on stderr, so both channels are joined below). That is a missing
-    // prerequisite like any other, not a guard verdict: it follows the same
-    // skip/require rules as a bash that is absent entirely. The ci.yml PKI
-    // step puts Git's real bash.exe first on PATH to keep this from firing
-    // on healthy runners; the panic message names the way out either way.
+    // If the child was NOT a shell, its complaint arrives without any probe
+    // output to judge: on Windows that is usually the WSL dispatcher — "has
+    // no installed distributions" or "must be updated to the latest version"
+    // (runs 39091143744 and 39106701806; its message lands on stderr, so both
+    // channels are joined below). That is a missing prerequisite like any
+    // other, not a guard verdict: same skip/require rules as no bash at all.
+    // Since run 39109858613 the spawn never goes through PATH on Windows (see
+    // above), so this fires only on machines whose ONLY bash is WSL's stub —
+    // for which git_root() found no Git bin\bash.exe next to any git.exe.
     fn decode(bytes: &[u8]) -> String {
         // Both channels, decoded: a Windows tooling error (a WSL dispatcher
         // message, a loader complaint) lands on stdout in UTF-16LE — and
@@ -435,38 +484,41 @@ fn cert_guard_blocks_every_nested_signature_shape() {
     }
     if !out.status.success() && !(out.stdout.is_empty() && out.stderr.is_empty()) {
         let combined = format!("{}{}", decode(&out.stdout), decode(&out.stderr));
-        // Which bash the child actually spawned, straight from Get-Command:
-        // run 39109200143 proved PATH ordering alone is not observable enough
-        // — the persisted GITHUB_PATH prepend never beat System32's WSL stub
-        // for a Rust-spawned `bash`, and guessing that cost two more runs.
-        // One line of witness turns "why did it die" into an answer instead
-        // of a hypothesis. (cmd /c where bash cannot answer: the stub writes
-        // its complaint to stderr with exit 0, so only PS's resolver sees it.)
-        let which_bash = if std::env::consts::OS == "windows" {
-            match Command::new("powershell")
-                .args(["-NoProfile", "-Command", "(Get-Command bash).Source"])
-                .output()
-            {
-                Ok(w) => decode(&w.stdout).trim().to_string(),
-                Err(_) => "<powershell unavailable>".to_string(),
+        // The witness stays, but now it names the FACT: the exact program
+        // this test spawned. Runs 39109200143/39109858613 proved that a
+        // resolver's opinion (Get-Command) and PATH order do not predict the
+        // child on these runners, so only "what did we actually exec" is
+        // evidence — plus Get-Command beside it, because if those two ever
+        // disagree again about anything, THAT is the interesting fact.
+        let which_bash = format!(
+            "spawned {}; resolver says {}",
+            bash_program.display(),
+            if cfg!(windows) {
+                match Command::new("powershell")
+                    .args(["-NoProfile", "-Command", "(Get-Command bash).Source"])
+                    .output()
+                {
+                    Ok(w) => decode(&w.stdout).trim().to_string(),
+                    Err(_) => "<powershell unavailable>".to_string(),
+                }
+            } else {
+                // POSIX shells only: `command` is a builtin, never an
+                // executable to spawn. Ask the shell itself.
+                match Command::new("sh").args(["-c", "command -v bash"]).output() {
+                    Ok(w) => decode(&w.stdout).trim().to_string(),
+                    Err(_) => String::new(),
+                }
             }
-        } else {
-            // POSIX shells only: `command` is a shell builtin, never an
-            // executable to spawn. Ask the shell itself.
-            match Command::new("sh").args(["-c", "command -v bash"]).output() {
-                Ok(w) => decode(&w.stdout).trim().to_string(),
-                Err(_) => String::new(),
-            }
-        };
+        );
         if combined.contains("Subsystem for Linux") {
             if require && !allowed {
                 panic!(
-                    "bash is the Windows WSL dispatcher, not a shell (resolved to \
-                     {which_bash:?}); make Git Bash's bin directory win on PATH or \
-                     grant the skip allowance OPENFIRMA_ALLOW_NONKEYSTORE_SKIP.\n{combined}"
+                    "bash is the Windows WSL dispatcher, not a shell ({which_bash}); install \
+                     Git Bash so a bash.exe sits next to git.exe, or grant the skip \
+                     allowance OPENFIRMA_ALLOW_NONKEYSTORE_SKIP.\n{combined}"
                 );
             }
-            eprintln!("skipped, bash on PATH is the WSL dispatcher, not a shell ({which_bash})");
+            eprintln!("skipped, spawned bash is the WSL dispatcher, not a shell ({which_bash})");
             return;
         }
     }
