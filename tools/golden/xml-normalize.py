@@ -390,29 +390,52 @@ def integrity(path, trusted):
                      "be verified independently")
         return lines
     cmd = [xmlsec, "--verify", "--enabled-key-data", "x509"]
-    # --add-id-attr only exists from xmlsec1 1.3 on (Ubuntu ships 1.2.x). An
-    # unknown flag makes 1.2.x say "parameter ... is not supported" on stderr
-    # (measured against the real apt package: it ALSO dumps its usage banner
-    # on stdout, so keying off one stream reads that backwards); and 1.2.39
-    # knows no --verbose either, while the counters only print verbosely —
-    # which is why the "ok" line tolerates refs (?,?) on the older shape.
-    probe = subprocess.run([xmlsec, "--verify", "--add-id-attr", "Id", "/nonexistent.xml"],
-                           capture_output=True, text=True)
-    if "is not supported" not in (probe.stderr or ""):
+    # Typing the Id attribute so the URI="#..." references resolve through
+    # id(), per xmlsec version — both forms measured against real binaries
+    # (Arch 1.3.12, Ubuntu 24.04's 1.2.39): 1.3+ takes `--add-id-attr Id
+    # --verbose`; 1.2.x knows only `--id-attr:Id <root>` — it has no built-in
+    # knowledge of Id and gets zero references verified without it — and
+    # refuses both --add-id-attr and --verbose. An unknown flag answers
+    # "is not supported" on stderr; the usage banner it also dumps goes to
+    # stdout, so keying off one stream reads that backwards. Counters only
+    # print in verbose mode, hence refs (?,?) tolerated on 1.2.x.
+    def _accepts(option: str) -> bool:
+        probe = subprocess.run([xmlsec, "--verify", option, "/nonexistent.xml"],
+                               capture_output=True, text=True)
+        return "is not supported" not in (probe.stderr or "")
+
+    if _accepts("--add-id-attr"):
         cmd += ["--add-id-attr", "Id", "--verbose"]
+    else:
+        with open(path, "rb") as fh:
+            head = fh.read(4096).decode("utf-8", "replace")
+        root = re.search(r"<([A-Za-z_][\w:.-]*)[ >/]", head)
+        # two arguments, never one glued `--id-attr:Id<root>`: 1.2.x then reads the
+        # root name as a second input file and fails parsing it (measured). The
+        # probe checks `--id-attr` without the suffix — 1.2.x names unknown flags by
+        # their prefix, and `--id-attr:Id` itself is accepted on both lines.
+        if root and _accepts("--id-attr"):
+            cmd += ["--id-attr:Id", root.group(1)]
     for t in trusted:
         cmd += ["--trusted-pem", str(t)]
     cmd.append(str(path))
     proc = subprocess.run(cmd, capture_output=True, text=True)
     out = proc.stdout + proc.stderr
-    status = re.search(r"Verification status: (\w+)", out)
+    # 1.2.39 answers a bare "OK" on stderr, 1.3.x "Verification status: OK";
+    # the exit code is the version-independent truth, counters say how much
+    # was verified (measured on both lines)
     refs_ok = re.search(r"SignedInfo References \(ok/all\): (\d+)/(\d+)", out)
-    if status and status.group(1) == "OK":
-        lines.append("ok: xmlsec1 verified the SignatureValue with the signer "
-                     "certificate and %s/%s references"
-                     % (refs_ok.groups() if refs_ok else ("?", "?")))
+    if proc.returncode == 0:
+        # both xmlsec lines print the counters on verify (measured 1.2.39 and
+        # 1.3.12); "OK" without every reference verified is a FAIL, not an ok
+        if not refs_ok or refs_ok.group(1) != refs_ok.group(2):
+            lines.append("FAIL xmlsec1 reported OK but not every reference "
+                         "verified: %s" % (refs_ok.group(0) if refs_ok else out[:200]))
+        else:
+            lines.append("ok: xmlsec1 verified the SignatureValue with the signer "
+                         "certificate and %s/%s references" % refs_ok.groups())
     else:
-        reason = status.group(0) if status else ""
+        reason = "exit %d" % proc.returncode
         for line in out.splitlines():
             if "error" in line.lower() and not line.startswith("===="):
                 reason += " | " + line.strip()[:160]
