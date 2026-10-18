@@ -77,7 +77,19 @@ list_files() {
 # than 300 chars cannot hold a real certificate's DER headers anyway; the DER
 # reader, not the length guess, decides what is a certificate.
 extract_base64_certs() {
-  tr -c 'A-Za-z0-9+/' '\n' < "$1" 2>/dev/null | awk 'length >= 300' |
+  # Read through a variable and a here-string. Every direct channel took its
+  # turn being blind on this repo's CI witnesses — BSD grep intervals, `file`
+  # output shapes, and in run 39088995737 even `tr < file` reported no long
+  # base64 run in a probe whose md5 matched byte-for-byte. A variable read by
+  # bash's own builtin, piped through printf, is the one path with no child
+  # process opening anything; if it still disagrees with the candidate scan,
+  # the contradiction tripwire in check_embedded_certs blocks instead of
+  # passing. The trailing-`x` dance keeps command substitution from eating a
+  # newline that might sit inside a run.
+  local data run
+  data="$(cat "$1" 2>/dev/null; printf x)" || return 0
+  data="${data%$'\x'}"
+  printf '%s' "$data" | tr -c 'A-Za-z0-9+/' '\n' | awk 'length >= 300' |
     while IFS= read -r run || [ -n "$run" ]; do
       run="${run%$'\r'}"
       if printf '%s' "$run" | base64 -d 2>/dev/null |
@@ -118,22 +130,28 @@ check_embedded_certs() {
     # big enough to be a certificate) or name a certificate at all? Written
     # with `tr`-splitting and awk length tests instead of grep intervals — on
     # the CI's macOS, BSD grep answered this very question with silence for a
-    # 1130-char single-line certificate (H-3's witness: first-run-len=0), and
-    # a false here is a fail-open. If nothing even looks like material, there
-    # is nothing to decode; if something does, extract_base64_certs judges it.
+    # 1130-char single-line certificate (witness runs 39088314047/39088995737:
+    # first-run-len=0), and a false here is a fail-open. Same variable read as
+    # extract_base64_certs, so both readers see one byte stream; if the scan
+    # sees material and no decoder reads it, the tripwire below blocks. If
+    # nothing even looks like material and nothing names one, return early —
+    # a prose "X509Certificate" mention still enters below through grep.
+    local data
+    data="$(cat "$f" 2>/dev/null; printf x)" || data=""
+    data="${data%$'\x'}"
     if ! grep -qa 'SignatureValue\|X509Certificate\|BEGIN CERTIFICATE' "$f" &&
-       ! tr -c 'A-Za-z0-9+/=' '\n' < "$f" 2>/dev/null | awk 'length >= 300 { found=1; exit } END { exit !found }'; then
+       ! printf '%s' "$data" | tr -c 'A-Za-z0-9+/=' '\n' | awk 'length >= 300 { found=1; exit } END { exit !found }'; then
       return 0
     fi
     blocks="$(extract_base64_certs "$f")" || blocks=""
     if [ -z "$blocks" ]; then
       # Long base64 is present (or a certificate is NAMED) and nothing in it
-      # decoded. A docs page mentioning "X509Certificate" has no long runs, so
-      # nothing was there — clean. But a 300+ character run that opens like
-      # X.509 material (MII…/LS0t…) and still does not decode means the scan
-      # is broken on this machine or the material was fragmented to dodge it:
-      # refuse to certify either as clean.
-      tail="$(tr -c 'A-Za-z0-9+/=' '\n' < "$f" 2>/dev/null | awk 'length >= 300 { print substr($0, 1, 8); exit }')" || tail=""
+      # decoded. A docs page with no material produces nothing — clean. But
+      # material that the length scan saw and no decoder can read, opening
+      # like X.509 (MII…/LS0t…) or shaped like PEM base64 (LS0t is exactly
+      # "-----"), means this machine's readers are lying: refuse to certify
+      # a contradiction as clean.
+      tail="$(printf '%s' "$data" | tr -c 'A-Za-z0-9+/=' '\n' | awk 'length >= 300 { print substr($0, 1, 8); exit }')" || tail=""
       if [ -n "$tail" ]; then
         case "$tail" in
           MII*|LS0t*)

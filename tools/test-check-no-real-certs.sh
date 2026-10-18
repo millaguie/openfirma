@@ -110,16 +110,13 @@ must_block() {
       if [ -r "$path" ]; then
         echo "        size=$(wc -c <"$path") md5=$( (md5 -q "$path" 2>/dev/null || md5sum "$path" 2>/dev/null) | awk '{print $1}')"
         echo "        trigger-lines=$( { grep -ac 'SignatureValue\|X509Certificate\|BEGIN CERTIFICATE' "$path"; true; } )"
-        R="$( { grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$path" 2>/dev/null | head -1; true; } )"
-        echo "        first-run-len=${#R}"
-        if [ -n "$R" ]; then
-          D="$WORK/dec.$$"; b64_status=0; printf '%s' "$R" | base64 -d >"$D" 2>"$D.err" || b64_status=$?
-          echo "        b64-exit=$b64_status dec=$(wc -c <"$D") b64-err=$(head -1 "$D.err")"
-          x509_status=0
-          openssl x509 -inform DER -in "$D" -noout -subject -issuer >"$D.out" 2>"$D.oerr" || x509_status=$?
-          echo "        x509-exit=$x509_status out=$(head -1 "$D.out") err=$(head -1 "$D.oerr")"
-          rm -f "$D" "$D.err" "$D.out" "$D.oerr"
-        fi
+        # Witness the extractor's OWN channel, not grep's: a 400+-run probe
+        # still showed first-run-len=0 after grep left the guard (witness run
+        # 39088995737), so what matters is whether tr sees the file at all.
+        N="$( { tr -c 'A-Za-z0-9+/' '\n' < "$path" 2>/dev/null | awk 'length >= 300 { print length; exit }'; true; } )"
+        echo "        tr-first-long-run=${N:-none}"
+        M="$( { cat "$path" 2>/dev/null | tr -c 'A-Za-z0-9+/' '\n' | awk 'length >= 300 { print length; exit }'; true; } )"
+        echo "        cat-piped-long-run=${M:-none}"
       else
         echo "        unreadable-at-witness-time"
       fi
