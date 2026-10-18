@@ -310,3 +310,89 @@ fn the_token_signature_verifies_against_an_anchor_and_only_against_it() {
         "{err}"
     );
 }
+
+/// The end-to-end B-T contract that the level actually promises: sign with a
+/// real TSA token, then run the FULL verifier over the produced signature and
+/// require it to report the token as verified with its genTime. The earlier
+/// tests exercise `verify_token_signature` (the token alone) and signing, but
+/// none walked `verify()` over our own B-T output — which is why a broken
+/// unwrap and a never-hashed imprint comparison survived five waves: every
+/// B-T signature came back "token present but not verified", so the level was
+/// never claimed.
+#[test]
+fn verify_reports_a_genuine_b_t_signature_as_timestamped() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    if !certs_dir().join("tsa.crt").exists() {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    }
+    let Some(signer) = load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+
+    let provider: openfirma_cades::TimestampFn = Arc::new(move |sig, digest| {
+        let query = tsp::request(digest, sig, 0x0bad_c0de)?;
+        let q = write_tmp("bt-e2e.tsq", &query);
+        let r = write_tmp("bt-e2e.tsr", b"");
+        let dir = certs_dir();
+        let (ok, text) = run(&[
+            "ts",
+            "-reply",
+            "-config",
+            tsa_cnf("bt-e2e").to_str().unwrap(),
+            "-queryfile",
+            q.to_str().unwrap(),
+            "-out",
+            r.to_str().unwrap(),
+            "-signer",
+            dir.join("tsa.crt").to_str().unwrap(),
+            "-inkey",
+            dir.join("tsa.key").to_str().unwrap(),
+            "-chain",
+            dir.join("chain.crt").to_str().unwrap(),
+        ]);
+        assert!(ok, "openssl ts -reply failed:\n{text}");
+        let response = std::fs::read(&r).expect("the TSA wrote no response");
+        let token = tsp::token_from_response(&response, digest, sig, Some(&query))?;
+        Ok(vec![tsp::unsigned_attribute(&token)?])
+    });
+
+    let opts = CadesOptions {
+        timestamp: Some(provider),
+        ..CadesOptions::default()
+    };
+    let signature = sign(CONTENT, &signer, &opts).expect("signing B-T failed");
+
+    let ca = {
+        let pem = std::fs::read_to_string(certs_dir().join("ca.crt")).unwrap();
+        CertificateHandle::from_pem(&pem).unwrap()
+    };
+    let reports = openfirma_cades::verify::verify(
+        &signature,
+        Some(CONTENT),
+        &openfirma_cades::verify::VerifyOptions {
+            trust_anchors: vec![ca],
+            ..Default::default()
+        },
+    )
+    .expect("the verifier must accept a signature it just produced");
+
+    let report = reports.first().expect("exactly one report for one signer");
+    assert!(
+        report.timestamp.verified(),
+        "the verifier did not recognise our own genuine B-T token: {:?}",
+        report.timestamp.problem()
+    );
+    assert!(
+        report.timestamp.gen_time().is_some(),
+        "a verified token must expose the genTime the B-T level asserts"
+    );
+}

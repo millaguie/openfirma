@@ -639,14 +639,12 @@ fn verify_signer_info(
     };
     let signature_value_digest = {
         // The bytes a B-T token imprints for this signature, EN 319 122-1
-        // 6.1: the DER of the signer certificate followed by the OCTET
-        // STRING content of `signatureValue`, hashed under the token's own
-        // algorithm. This is what `signed_data::sign` stamps with, so a
-        // genuine stamp matches and one for anything else cannot.
-        let mut input = Vec::with_capacity(cert.der().len() + si.signature.len());
-        input.extend_from_slice(cert.der());
-        input.extend_from_slice(si.signature);
-        input
+        // (CAdES) and AutoFirma's own CMSTimestamper.java:227: the digest of the
+        // `signature` field alone — the OCTET STRING content of `signatureValue`,
+        // NOT the certificate. The signing side hashes the same thing
+        // (`signed_data::sign` hands the provider `&signature_value`), so a
+        // genuine stamp matches and one over anything else cannot.
+        si.signature.to_vec()
     };
     let unsigned_attributes = match si.unsigned_attrs {
         Some(content) => attribute_oids(content)?,
@@ -665,8 +663,11 @@ fn verify_signer_info(
         for value in unsigned_values(content, oid::ID_SIGNATURE_TIME_STAMP_TOKEN)? {
             // The attribute value is the ContentInfo TLV itself; some
             // producers wrap it in an OCTET STRING instead (a BER habit), so
-            // unwrap that first when present.
-            let mut token = value.content;
+            // unwrap that first when present. `whole` is tag+length+content —
+            // the whole ContentInfo — which is what the TSP parser expects;
+            // `content` alone starts at the inner OID and it refused every
+            // token with "expected the ContentInfo (tag 0x30), found tag 0x06".
+            let mut token = value.whole;
             if token.first().copied() == Some(tlv::TAG_OCTET_STRING) {
                 let mut c = der_cursor(token);
                 token = c.value()?.content;
@@ -686,7 +687,12 @@ fn verify_signer_info(
                     // to this signature and not to another document's.
                     let bound = crate::tsp::token_imprint(token)
                         .and_then(|(alg, hash)| {
-                            if alg == si.digest_alg && hash == signature_value_digest {
+                            // The token imprints the DIGEST of this signature's
+                            // value under its own algorithm; hashing here is
+                            // what the signing side did (`signed_data::sign`
+                            // hands the provider `&signature_value`), and what
+                            // AutoFirma's CMSTimestamper.java:227 does too.
+                            if alg == si.digest_alg && hash == alg.digest(&signature_value_digest) {
                                 Ok(())
                             } else {
                                 Err(Error::Other(format!(
