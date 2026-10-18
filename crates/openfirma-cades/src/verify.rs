@@ -23,7 +23,9 @@
 //! countersignature tree. Chain construction itself follows RFC 5280: an
 //! issuer is only ever accepted when `basicConstraints` says `cA = TRUE`, its
 //! `keyUsage` (when present) allows `keyCertSign`, its `pathLenConstraint`
-//! still leaves room, and no critical extension escapes interpretation. The
+//! still leaves room, and no critical extension escapes interpretation — nor a
+//! non-critical one that limits what the CA may certify, which this verifier
+//! refuses to read past (see [`UNINTERPRETED_CONSTRAINTS`]). The
 //! signer certificate must be allowed to sign (`digitalSignature` or
 //! `nonRepudiation` when `keyUsage` is present). Without these rules any leaf
 //! could issue a fake certificate at anyone's name and the chain would climb
@@ -70,12 +72,30 @@ const KNOWN_EXTENSIONS: &[ObjectIdentifier] = &[
     ObjectIdentifier::new_unwrap(OID_EXTENDED_KEY_USAGE),
     ObjectIdentifier::new_unwrap("2.5.29.31"), // cRLDistributionPoints
     oid::ID_CERTIFICATE_POLICIES,              // certificatePolicies
-    ObjectIdentifier::new_unwrap("2.5.29.33"), // policyMappings
     ObjectIdentifier::new_unwrap("2.5.29.35"), // authorityKeyIdentifier
-    ObjectIdentifier::new_unwrap("2.5.29.36"), // policyConstraints
-    ObjectIdentifier::new_unwrap(OID_NAME_CONSTRAINTS),
     ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.1.1"), // authorityInfoAccess
     ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.5"), // ocspNoCheck
+];
+
+/// Extensions that narrow what a CA is allowed to certify, and that this
+/// verifier does not apply: `nameConstraints` (RFC 5280 4.2.1.10),
+/// `policyMappings` (4.2.1.5) and `policyConstraints` (4.2.1.11).
+///
+/// A certificate carrying one is refused, critical or not, and says why. The
+/// alternative — the one this list used to take, by naming them as understood —
+/// was measured as round 2's N2: a sub-CA restricted to `C=FR` issued for a
+/// `C=ES` signer and `verify` answered OK, with every digest and signature
+/// genuinely valid, while `openssl verify` refused the same chain with
+/// "permitted subtree violation". Reading a certificate as unconstrained when
+/// its issuer meant to constrain it is the failure direction that hands a
+/// verdict to the wrong person, so the honest answer is that the constraint
+/// cannot be honoured. Implementing the subtrees (directoryName, rfc822Name,
+/// dNSName) is the way out, and the day it lands these OIDs move back into
+/// [`KNOWN_EXTENSIONS`].
+const UNINTERPRETED_CONSTRAINTS: &[ObjectIdentifier] = &[
+    ObjectIdentifier::new_unwrap(OID_NAME_CONSTRAINTS),
+    ObjectIdentifier::new_unwrap("2.5.29.33"), // policyMappings
+    ObjectIdentifier::new_unwrap("2.5.29.36"), // policyConstraints
 ];
 
 /// Name of the check that the `sid` resolves to an embedded certificate.
@@ -1003,6 +1023,28 @@ pub fn check_certificate_rules(cert: &CertificateHandle, role: CertRole) -> Resu
     let mut saw_basic_constraints = false;
     for ext in tbs.extensions().into_iter().flatten() {
         let oid = ext.extn_id.to_string();
+        // Constraints on what this certificate may certify, which this verifier
+        // does not honour (round 2, N2): refused whatever their critical bit
+        // says, because reading past them would report a chain its issuer is
+        // not allowed to have built. See UNINTERPRETED_CONSTRAINTS.
+        if UNINTERPRETED_CONSTRAINTS.contains(&ext.extn_id) {
+            let (name, rfc) = match oid.as_str() {
+                OID_NAME_CONSTRAINTS => ("nameConstraints", "RFC 5280 4.2.1.10"),
+                "2.5.29.33" => ("policyMappings", "RFC 5280 4.2.1.5"),
+                _ => ("policyConstraints", "RFC 5280 4.2.1.11"),
+            };
+            return Err(fail(
+                CHECK_CERTIFICATE_CHAIN,
+                format!(
+                    "\"{}\" carries {name} ({rfc}) and this verifier does not apply it, so it \
+                     cannot know which names or policies the certificate may certify; RFC 5280 \
+                     4.2.1.10 makes such a CA authoritative over its subordinates and a \
+                     constraint nobody applies must not be read past. Remove the extension from \
+                     the issuing CA, or have the chain checked by a verifier that implements it",
+                    subject(cert)
+                ),
+            ));
+        }
         // RFC 5280 4.2: a critical extension the verifier does not understand
         // condemns the certificate, whatever role it plays.
         if ext.critical && !KNOWN_EXTENSIONS.contains(&ext.extn_id) {
