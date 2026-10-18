@@ -103,8 +103,14 @@ said (`/ID`, a custom key like a DSS tool's `/Enforce`, and yes an older
 `/Size`, `/Root`, `/Prev` and its own `/Info`; every other key is copied byte
 for byte. Dropping `/ID` used to happen, and qpdf reported "File does not
 start with a '%PDF-' header" on the result for documents whose only identity
-was that key; a document whose revisions stop sharing an `/ID` is no longer
-one document. And the trailer always names the `/Info` the signature pass
+was that key. Carrying it over is a WRITER's duty, and it stops there: the
+reader rules on `/Encrypt` alone (the check above), because strings a signature
+pass writes under a smuggled encryption dictionary would stay unencrypted. A
+trailer whose `/ID` an append regenerated is not refused any more — iText 2.1.7,
+behind AutoFirma's first signature, rewrites both elements on the incremental
+update it appends for a second signature, and the reference tool's own document
+has to stay readable and signable (measured; `docs/review-findings.md` R4-C3).
+And the trailer always names the `/Info` the signature pass
 actually wrote — the dictionary it stamped with `/ModDate` is the one readers
 find, never an orphan two objects over.
 
