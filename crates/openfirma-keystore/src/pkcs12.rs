@@ -1872,8 +1872,8 @@ mod tests {
             let salt = seed.to_le_bytes();
             let key = pkcs12_kdf::<sha1::Sha1>(1, good, &salt, iterations, 24, 64);
             let iv = pkcs12_kdf::<sha1::Sha1>(2, good, &salt, iterations, 8, 64);
-            let enc = <cbc::Encryptor<des::TdesEde3> as KeyIvInit>::new_from_slices(&key, &iv)
-                .unwrap();
+            let enc =
+                <cbc::Encryptor<des::TdesEde3> as KeyIvInit>::new_from_slices(&key, &iv).unwrap();
             let ct = enc.encrypt_padded_vec::<Pkcs7>(plaintext);
             let params = pbe_sha1_params(&salt, iterations);
             // does the WRONG (empty) candidate satisfy padding on this ct?
