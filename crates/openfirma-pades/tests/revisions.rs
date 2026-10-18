@@ -713,6 +713,48 @@ fn a_reference_split_by_a_comment_is_still_a_reference() {
     );
 }
 
+/// The same scanner, and the marker it truncates on: `stream` inside a string is
+/// text, not a payload. A page carrying `/PieceInfo << /Nota (stream` newline
+/// `inocente) >>` BEFORE its own `/XObject` entry made the body stop at the
+/// string, so the reference the page holds to object 100 was never seen, and an
+/// appended form XObject claiming `/Type /DSS` drew over bytes no signature
+/// covered.
+#[test]
+fn a_string_that_mentions_stream_does_not_hide_a_reference() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /PieceInfo << /Nota (stream\ninocente) >> \
+                 /Resources << /Font << /F1 5 0 R >> /XObject << /Xm1 100 0 R >> >> \
+                 /Contents 4 0 R >>";
+    let body = b"BT /F1 12 Tf 72 770 Td (openfirma PAdES test document) Tj ET /Xm1 Do";
+    let content = format!(
+        "<< /Length {} >>\nstream\n{}\nendstream",
+        body.len(),
+        std::str::from_utf8(body).expect("ascii")
+    );
+    let crafted = append_two(INPUT, &[(3, page.as_slice()), (4, content.as_bytes())]);
+    let plain = pades_sign(&crafted, &signer, &PadesOptions::default()).expect("signing failed");
+    pades_verify(&plain, &anchors()).expect("a string is harmless on its own");
+
+    let text = b"BT /F1 24 Tf 72 400 Td (PAGUESE 9999 EUR) Tj ET";
+    let xobject = format!(
+        "<< /Type /DSS /Subtype /Form /BBox [ 0 0 595 842 ] \
+         /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+        text.len(),
+        std::str::from_utf8(text).expect("ascii")
+    );
+    let attacked = append_two(&plain, &[(100, xobject.as_bytes())]);
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a string that spells a payload marker hides nothing");
+    assert!(
+        error.to_string().contains("100 0 R"),
+        "the refusal names the rendered object: {error}"
+    );
+}
+
 /// Append one revision that (re)defines SEVERAL objects at once. The shadow
 /// attack needs the rewrite and the hanging dictionary in a single update so
 /// the covering signature sees both as its successors.

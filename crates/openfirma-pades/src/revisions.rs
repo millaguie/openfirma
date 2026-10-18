@@ -1134,17 +1134,51 @@ fn skip_literal_string(body: &[u8], at: usize) -> usize {
 /// dictionary text (`/XstreamXYZ` etc.): ISO 32000 defines the keyword as termi-
 /// nated by an end-of-line marker. The first hit wins, which is the object's own
 /// marker (a dictionary value never spells `stream\r\n` or `stream\n`).
+///
+/// The walk is over the syntax, not over raw bytes: a `stream\n` sitting inside a
+/// string or a comment is text, not a payload. Scanning raw bytes made
+/// `/PieceInfo << /Nota (stream` newline `... ) >>` truncate the body there, and
+/// every reference after it — a page's own `/XObject << /Xm1 100 0 R >>`, say —
+/// stopped counting as a reference (round 3, `bd74a50`'s neighbour: the appended
+/// object rendered while verify answered OK).
 fn find_stream_marker(body: &[u8]) -> Option<usize> {
-    let mut from = 0;
-    while let Some(found) = body[from..].windows(6).position(|w| w == b"stream") {
-        let at = from + found;
-        let after = at + 6;
-        if body[after..].starts_with(b"\r\n")
-            || body.get(after).is_some_and(|b| matches!(b, b'\n' | b'\r'))
-        {
-            return Some(at);
+    let mut i = 0usize;
+    while i < body.len() {
+        match body[i] {
+            b'%' => {
+                // a comment is not payload
+                while i < body.len() && body[i] != b'\n' && body[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b'(' => i = skip_literal_string(body, i),
+            b'<' if body.get(i + 1) == Some(&b'<') => i += 2,
+            b'<' => {
+                // a hex string is not payload either
+                i += 1;
+                while i < body.len() && body[i] != b'>' {
+                    i += 1;
+                }
+                if i < body.len() {
+                    i += 1;
+                }
+            }
+            _ => {
+                // `stream` as its own token: not the tail of `endstream` and not
+                // a name like `/stream`, both of which a raw scan would take
+                let standalone =
+                    i == 0 || !(body[i - 1].is_ascii_alphanumeric() || body[i - 1] == b'/');
+                if standalone && body[i..].starts_with(b"stream") {
+                    let after = i + 6;
+                    if body[after..].starts_with(b"\r\n")
+                        || body.get(after).is_some_and(|b| matches!(b, b'\n' | b'\r'))
+                    {
+                        return Some(i);
+                    }
+                }
+                i += 1;
+            }
         }
-        from = after;
     }
     None
 }
