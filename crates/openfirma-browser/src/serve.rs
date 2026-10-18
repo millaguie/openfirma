@@ -911,8 +911,43 @@ fn write_bytes(
     // macOS does this readily when the peer has already stopped reading (it
     // never reads a refusal's body) — and the client sees "connection reset"
     // where we promised a named refusal.
+    //
+    // And the request the refusal left unread is emptied first. A socket closed
+    // with bytes still in its receive buffer is reset rather than closed, and a
+    // reset discards what the peer has not read yet: measured on the
+    // aarch64-windows runner, the 413 for a declared-but-unsent body was sent
+    // and then lost anyway — the client's read failed with `ConnectionReset`
+    // (`Os { code: 10054, kind: ConnectionReset }`) and the named refusal went
+    // with it. Only what has ALREADY arrived is read, never a byte of the body
+    // the refusal exists to avoid waiting for, and only up to a bounded count,
+    // so a peer that keeps talking cannot hold the thread.
+    drain_what_arrived(stream);
     stream.shutdown(std::net::Shutdown::Both).ok();
     result
+}
+
+/// Read and discard the bytes that have already arrived, without waiting for
+/// any that have not. See the close in [`write_bytes`] for why the receive
+/// buffer has to be empty before the socket goes away.
+fn drain_what_arrived(stream: &mut TcpStream) {
+    /// Enough for the request bytes a refusal leaves behind, and small enough
+    /// that a peer which keeps sending cannot make this a reading loop.
+    const DRAIN_LIMIT: usize = 64 * 1024;
+    if stream.set_nonblocking(true).is_err() {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    let mut drained = 0usize;
+    while drained < DRAIN_LIMIT {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => drained += n,
+            // WouldBlock is the state this exists to reach — nothing more has
+            // arrived — and any other error leaves nothing that can be read.
+            Err(_) => break,
+        }
+    }
+    let _ = stream.set_nonblocking(false);
 }
 
 fn write_and_flush(stream: &mut TcpStream, response: &[u8]) -> std::io::Result<()> {

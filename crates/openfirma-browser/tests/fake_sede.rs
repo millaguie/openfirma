@@ -740,11 +740,27 @@ fn request_with_declared_length(
         "Content-Length: {declared}\r\nConnection: close\r\n\r\n"
     ));
     // one body byte, nowhere near the lie: proves the cap is on the header.
-    stream.write_all(text.as_bytes()).unwrap();
-    stream.write_all(b"x").unwrap();
-    stream.flush().unwrap();
+    //
+    // Both writes may race the close a refusal comes with — the endpoint
+    // answers 413 from the header alone and hangs up on the body it never
+    // reads — so their errors are not the assertion, and neither is a read
+    // that ends when the peer's close arrives as a reset: on the
+    // aarch64-windows runner that reset (`Os { code: 10054, kind:
+    // ConnectionReset }`) used to arrive before the client had read the 413 at
+    // all. What is asserted is the answer, and an empty one still fails loudly
+    // in `parse_response`.
+    let _ = stream.write_all(text.as_bytes());
+    let _ = stream.write_all(b"x");
+    let _ = stream.flush();
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).unwrap();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
     parse_response(&raw)
 }
 
