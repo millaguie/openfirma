@@ -330,6 +330,11 @@ pub struct Redefinition {
     pub after: Vec<u8>,
 }
 
+/// The `after` of an object the final state declares and nothing can read: not
+/// a body, a statement. [`describe_change`] says so, and no licensing branch
+/// reads a shape out of it.
+const UNREADABLE: &[u8] = b"\x00openfirma: these bytes cannot be read";
+
 /// The bytes a reader takes from an object: its dictionary, plus — for a stream
 /// — the data its `/Length` (or an `endstream` that `endobj` follows) says is
 /// its own.
@@ -405,8 +410,29 @@ pub fn redefinitions_after(
         // only objects a newer revision touched can differ from the covering
         // state; but an object that lives inside an OLDER section keeps resolving
         // to old bytes and matches. This is exactly the wanted test.
-        let Some(current) = rendered_body(pdf, &merged, &mut cache, *object) else {
-            continue;
+        let current = match rendered_body(pdf, &merged, &mut cache, *object) {
+            Some(body) => body,
+            // The final state declares this object and nothing can read it. If
+            // the covering state could, that IS the change: the bytes a reader
+            // used to get are not there any more, and what a reader salvages
+            // from what replaced them is its own business. Skipping here is the
+            // gate declining to judge, in silence — measured: an unterminated
+            // literal string in the page's content stream left `verify` clean.
+            None => match covering_bodies.get(object) {
+                Some(previous) => {
+                    let before = previous.clone();
+                    let after = UNREADABLE.to_vec();
+                    out.push(Redefinition {
+                        object: *object,
+                        before,
+                        after,
+                    });
+                    continue;
+                }
+                // neither state can be read: there is nothing to compare, and
+                // nothing a signature was ever read for either
+                None => continue,
+            },
         };
         match covering_bodies.get(object) {
             // changed after the covering revision: an object the new state has
@@ -619,6 +645,15 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     let fonts = gate.fonts;
     let transport = gate.transport;
     let brand_new = older.is_empty();
+    // Nothing may read a shape out of bytes that could not be read — and in
+    // particular `/Sig` on the OLD side may not license losing a signature
+    // dictionary's bytes, which is why this comes before the branch below.
+    if newer == UNREADABLE {
+        return Change::NotAllowed {
+            object: *object,
+            detail: describe_change(newer),
+        };
+    }
     // A pass that rewrites a body it did not change (an xref-only touch, or the
     // trailer's /Info pointing at a fresh timestamp dictionary of its own): no
     // byte a reader sees moved, so nothing was added to what the signature cov-
@@ -1686,7 +1721,11 @@ fn find_stream_marker(body: &[u8]) -> Option<usize> {
 
 /// How to describe a redefinition the whitelist does not cover.
 fn describe_change(body: &[u8]) -> String {
-    if body.windows(6).any(|w| w == b"stream") {
+    if body == UNREADABLE {
+        "the new bytes of this object cannot be read: no signature attests what \
+         they render, and no writer's shape may be assumed for them"
+            .into()
+    } else if body.windows(6).any(|w| w == b"stream") {
         "a stream object was rewritten after the signature; readers render its \
          bytes (page content, XObjects, embedded files)"
             .into()

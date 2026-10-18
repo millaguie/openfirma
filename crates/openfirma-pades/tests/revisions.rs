@@ -249,6 +249,37 @@ fn a_rewritten_stream_payload_is_refused_even_when_its_dictionary_is_identical()
     );
 }
 
+/// A rewrite nothing can read is still a rewrite. When `redefinitions_after`
+/// cannot resolve an object's new bytes it used to `continue` — the gate
+/// declining to judge, in silence — and the covering state's bytes are gone
+/// from every reader's view while `verify` reports a clean document. The
+/// unreadable body here is an unterminated literal string in the page's
+/// content stream, which is the shape a real writer's bug or a hostile
+/// revision produces, and which the parser cannot read to the end of the file.
+///
+/// Flagged by the round-5 reviewer as a method note ("a resolve that fails in
+/// this gate is SILENT; validate any ObjStm PoC with qpdf before trusting an
+/// OK") after a malformed PoC of theirs looked like a hole. It is one.
+#[test]
+fn a_rewrite_whose_bytes_cannot_be_read_is_refused_not_skipped() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    // The unterminated string runs to the end of the file, so the dictionary
+    // never closes and nothing can resolve this object.
+    let body = b"<< /Length 61 /X (oops\nstream\nPAID IN FULL\nendstream";
+    let rewritten = append_written(&signed, 5, body);
+    let error = pades_verify(&rewritten, &anchors()).expect_err("the object was rewritten");
+    let text = format!("{error}");
+    assert!(text.contains("object 5 0 R"), "names the object: {text}");
+    assert!(
+        text.contains("cannot be read"),
+        "says the new bytes are unreadable rather than guessing a shape: {text}"
+    );
+}
+
 /// The same attack with one more hop: a brand-new content stream plus a page
 /// dictionary repointing `/Contents` at it. The page rewrite is off the white-
 /// list whatever the new stream is, so this must refuse too.
