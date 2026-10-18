@@ -170,8 +170,12 @@ Two observations from round 2 that are not defeats of a fix, kept here so they d
 not get lost:
 
 - The window's B-LTA wording for the mixed case (a verified signature plus a
-  document time-stamp that is not) has no test of its own; the library verdict
-  it renders does. Noted, not a defect.
+  document time-stamp that is not) had no test of its own; the library verdict
+  it renders did. Not a defect — a hole in the net around A-2, whose whole
+  point was not over-claiming. Closed: the test now builds the mixed report,
+  asserts the sentence names the counts, refuses the level out loud and never
+  prints the claim, and fails when the branch is put back to claiming it
+  (`crates/openfirma-gui/src/verdicts.rs`).
 - A PKCS#12 whose MAC is HMAC-MD5 was refused as "wrong password" — openssl
   opens it. Pre-existing, low, and a compatibility gap rather than a
   vulnerability: the sentence sent the holder of a good certificate looking for

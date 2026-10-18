@@ -1020,4 +1020,64 @@ mod tests {
         // Garbage is not a CMS: zero, i.e. "do not split".
         assert_eq!(signer_count(b"nada"), 0);
     }
+
+    /// Round 2 of the adversarial review: the window's wording for the MIXED
+    /// document time-stamp case — a document whose seals did NOT all verify —
+    /// had no test of its own while the library verdict it renders did. The
+    /// mixed branch is the one that must not round up: one unverified seal
+    /// means no B-LTA, and the sentence has to say how many and why instead of
+    /// claiming the level, which is exactly the over-claim A-2 was about.
+    #[test]
+    fn a_mixed_document_timestamp_set_never_claims_b_lta() {
+        let seal = |object: u32, verified: bool| openfirma_pades::verify::DocTimeStampReport {
+            object: openfirma_pades::pdf::ObjRef::new(object, 0),
+            byte_range: [0, 100, 200, 10],
+            digest: openfirma_core::alg::DigestAlg::Sha256,
+            token: Vec::new(),
+            gen_time: verified.then_some(std::time::UNIX_EPOCH),
+            problem: (!verified).then(|| "la cadena del sello no llega a un ancla".to_string()),
+        };
+        let report = openfirma_pades::DocumentReport {
+            signatures: Vec::new(),
+            document_timestamps: vec![seal(31, true), seal(41, false)],
+            dss: None,
+        };
+        let list = pdf_list_from_report(&report, &Tr::es());
+        let text = list.notes.join(" ");
+        assert!(
+            text.contains("de los que 1"),
+            "the counts are named, not rounded: {text}"
+        );
+        assert!(
+            text.contains("NO se afirma el nivel B-LTA"),
+            "the level is refused, out loud: {text}"
+        );
+        assert!(
+            !text.contains("(nivel B-LTA)"),
+            "the mixed case may not claim the level: {text}"
+        );
+        // The other two branches stay distinguishable in the same sentence
+        // space: every seal verified says so, and none verified says so too.
+        let all = openfirma_pades::DocumentReport {
+            signatures: Vec::new(),
+            document_timestamps: vec![seal(31, true), seal(41, true)],
+            dss: None,
+        };
+        let all_text = pdf_list_from_report(&all, &Tr::es()).notes.join(" ");
+        assert!(
+            all_text.contains("(nivel B-LTA)"),
+            "two verified seals are the level: {all_text}"
+        );
+        let none = openfirma_pades::DocumentReport {
+            signatures: Vec::new(),
+            document_timestamps: vec![seal(31, false)],
+            dss: None,
+        };
+        let none_text = pdf_list_from_report(&none, &Tr::es()).notes.join(" ");
+        assert!(
+            none_text.contains("NO se afirma el nivel B-LTA")
+                && none_text.contains("la cadena del sello no llega a un ancla"),
+            "an unverified seal says why: {none_text}"
+        );
+    }
 }
