@@ -335,6 +335,110 @@ fn a_rewritten_object_claiming_type_dss_is_still_refused() {
     );
 }
 
+/// Round 2, C-1 again: the archive is the one the CATALOG names, but it may
+/// only license the objects it names through the keys a validation-data reader
+/// consumes (`/Certs`, `/CRLs`, `/OCSPs`, see `collect_archive_data`). The
+/// seeded walk used to follow EVERY reference inside the archive dictionary, so
+/// one revision that rewrote the page content stream and re-pointed the catalog
+/// at a fresh `<< /Type /DSS /Foo [<content> 0 R] >>` turned the rewritten
+/// payload into "validation data" — `verify` answered OK over text the reader
+/// shows as something the signature never covered. A key no validator reads
+/// licenses nothing.
+#[test]
+fn an_inert_key_of_the_catalog_archive_cannot_whitelist_a_rewritten_payload() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    let content =
+        b"<< /Length 46 >>\nstream\nBT /F1 24 Tf 72 700 Td (PAGUESE 1.000.000 EUR) Tj ET\nendstream";
+    let catalog = b"<< /Type /Catalog /Pages 2 0 R /DSS 99 0 R >>";
+    let dss = b"<< /Type /DSS /Foo [5 0 R] /Bar [4 0 R] >>";
+    let attacked = append_two(
+        &signed,
+        &[(1, catalog.as_slice()), (5, content), (99, dss.as_slice())],
+    );
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a key no validation-data reader reads cannot license a content rewrite");
+    let text = error.to_string();
+    assert!(
+        text.contains("no archive may append"),
+        "the refusal says what was violated: {text}"
+    );
+    assert!(
+        text.contains("5 0 R"),
+        "the refusal names the rewritten content object: {text}"
+    );
+}
+
+/// The same attack one hop away: the archive names the payload through an
+/// object of its own (`/Foo [98 0 R]`, 98 being `<< /Jump [5 0 R] >>`, or a
+/// free array). Following references found INSIDE a named object is what let
+/// the payload in; the walk now stops at the taxed key, so the hop licenses
+/// nothing — a rewritten object is not validation data for the sole reason that
+/// something the archive points at points back at it.
+#[test]
+fn a_hop_through_a_free_object_cannot_whitelist_a_rewritten_payload() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    let content =
+        b"<< /Length 46 >>\nstream\nBT /F1 24 Tf 72 700 Td (PAGUESE 1.000.000 EUR) Tj ET\nendstream";
+    let catalog = b"<< /Type /Catalog /Pages 2 0 R /DSS 99 0 R >>";
+    let dss = b"<< /Type /DSS /Foo [98 0 R] >>";
+    let hop = b"<< /Jump [5 0 R] >>";
+    let attacked = append_two(
+        &signed,
+        &[
+            (1, catalog.as_slice()),
+            (5, content),
+            (98, hop.as_slice()),
+            (99, dss.as_slice()),
+        ],
+    );
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a reference inside a named object is not the archive naming the payload");
+    assert!(
+        error.to_string().contains("5 0 R"),
+        "the refusal names the rewritten content object: {error}"
+    );
+}
+
+/// An object only a `/VRI` entry names is not licensed, deliberately: this gate
+/// licenses what verification then checks, and openfirma's own `/DSS` validator
+/// parses and verifies the top-level `/Certs`, `/CRLs` and `/OCSPs` arrays — it
+/// reads the `/VRI` keys against those arrays and never parses per-entry data.
+/// Licensing per-entry references would hand an attacker a key to name an
+/// addition with that nothing verifies. The profile requires the top-level
+/// arrays, so an archive pass that writes only `/VRI` entries is refused here;
+/// if a real document turns up that does so, the fix is to make the validator
+/// verify per-entry data first and license it afterwards, in that order.
+#[test]
+fn an_object_named_only_inside_a_vri_entry_is_not_validation_data() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let signed = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    let payload =
+        b"<< /Length 46 >>\nstream\nBT /F1 24 Tf 72 700 Td (PAGUESE 1.000.000 EUR) Tj ET\nendstream";
+    let catalog = b"<< /Type /Catalog /Pages 2 0 R /DSS 99 0 R >>";
+    let dss = b"<< /Type /DSS /VRI << /ABCDEF0123456789ABCDEF0123456789ABCDEF01 << /Cert [98 0 R] >> >> >>";
+    let attacked = append_two(
+        &signed,
+        &[(1, catalog.as_slice()), (99, dss.as_slice()), (98, payload)],
+    );
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a /VRI entry is not a key the validator reads data with");
+    assert!(
+        error.to_string().contains("98 0 R"),
+        "the refusal names the unverified addition: {error}"
+    );
+}
+
 /// Append one revision that (re)defines SEVERAL objects at once. The shadow
 /// attack needs the rewrite and the hanging dictionary in a single update so
 /// the covering signature sees both as its successors.

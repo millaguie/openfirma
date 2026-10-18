@@ -387,26 +387,30 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
     }
     let trailer = pdf::trailer(pdf, xref_at)?;
     let catalog = final_state.get(&trailer.root).cloned().unwrap_or_default();
-    // Validation data: reachable from the /DSS the CATALOG references. An
-    // earlier fix seeded reachability from every object whose /Type is /DSS,
-    // referenced or not, which handed an attacker the whole whitelist: append a
-    // revision that rewrites the page's content stream and add an unreferenced
-    // `<< /Type /DSS /Certs [<payload> 0 R] >>`, and the rewritten payload
-    // became "validation data" that verify accepted (shadow attack; the /DSS
-    // validator never looks at a hanging dictionary). Only the archive the
-    // reader actually reads — the one the catalog points at — may whitelist an
-    // object, so the seed is that one reference. A catalog with no /DSS seeds
-    // nothing, exactly right for a B-B document. The /DSS dictionary itself and
-    // everything reachable from it (its /Certs, /CRLs, /OCSPs, /VRI tree) stay
-    // licensed; a hanging /DSS whitelists nothing, and classify_one grants only
-    // an ADDED /Type /DSS dictionary (an inert co-signature archive) a pass of
-    // its own — never a rewritten one, which is how a content stream that
-    // rewrote itself with `/Type /DSS` used to slip through.
-    let mut dss_reachable: BTreeSet<ObjRef> = BTreeSet::new();
-    let catalog_dss = pdf::get(&catalog, "/DSS").and_then(pdf::parse_ref);
-    if let Some(dss) = catalog_dss {
-        collect_reachable(pdf, &locations, &mut cache, dss, &mut dss_reachable);
-        dss_reachable.insert(dss);
+    // Validation data: only the archive the CATALOG names, and only the objects
+    // that archive names through the keys a validation-data reader consumes.
+    //
+    // Three review rounds narrowed this the hard way (round 1 C-1, round 2 C-1
+    // again):
+    //   - seeding from every object whose /Type is /DSS let a HANGING dictionary
+    //     whitelist a rewritten payload, referenced by nothing;
+    //   - seeding from *everything reachable* from the catalog's archive let a
+    //     `<< /Type /DSS /Foo [<payload> 0 R] >>` — or one hop through a free
+    //     object — do the same, because no reader ever looks at a key the archive
+    //     is not allowed to name validation data with. What the reader consumes
+    //     is `/Certs`, `/CRLs`, `/OCSPs` (arrays of stream references) and `/VRI`
+    //     (`ltv::Dss::read`); everything else a dictionary carries is inert.
+    // So the walk follows exactly those three keys, and classify_one licenses
+    // them only as ADDITIONS — an archive pass appends the bytes it archives
+    // (that is what the `before` state tells apart), it never replaces a byte a
+    // reader already rendered. The archive dictionary itself is licensed the
+    // same way, and so is a `/Type /DSS` dictionary the catalog does not point
+    // at yet (an earlier pass's archive, left in place by a later merge) — see
+    // classify_one for why that one is inert.
+    let archive = pdf::get(&catalog, "/DSS").and_then(pdf::parse_ref);
+    let mut archive_data: BTreeSet<ObjRef> = BTreeSet::new();
+    if let Some(dss) = archive {
+        collect_archive_data(&final_state, dss, &mut archive_data);
     }
 
     let mut out = Vec::new();
@@ -414,10 +418,10 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
         out.push((
             change.object,
             classify_one(
-                &locations,
                 &final_state,
                 trailer.root,
-                &dss_reachable,
+                archive,
+                &archive_data,
                 &change.object,
                 &change.after,
                 &change.before,
@@ -428,10 +432,10 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
 }
 
 fn classify_one(
-    locations: &BTreeMap<ObjRef, pdf::Location>,
     final_state: &BTreeMap<ObjRef, Vec<u8>>,
     root: ObjRef,
-    dss_reachable: &BTreeSet<ObjRef>,
+    archive: Option<ObjRef>,
+    archive_data: &BTreeSet<ObjRef>,
     object: &ObjRef,
     newer: &[u8],
     older: &[u8],
@@ -450,23 +454,29 @@ fn classify_one(
     if is_type(newer, "/DocTimeStamp") || is_type(older, "/DocTimeStamp") {
         return Change::DocTimeStamp(*object);
     }
-    // Validation data: reached from the CATALOG's /DSS (see the seed above), or
-    // an ADDED /DSS dictionary of its own. Two shapes are licensed and they are
-    // safe for different reasons:
-    //   - reachable from the catalog's archive: these are the bytes the reader's
-    //     own /DSS names, so changing them is archiving, not content;
-    //   - a brand-new /Type /DSS: an older archive a co-signature pass replaced
-    //     (it could not overwrite the previous one — that one is inside the new
-    //     signature's /ByteRange — so it wrote a fresh dictionary and re-pointed
-    //     the catalog). It is inert: nothing seeds reachability from it, so it
-    //     can whitelist no rewritten object; only its own dictionary is spared.
-    // What is NOT licensed: a rewritten object that merely CLAIMS /Type /DSS in
-    // its body. A page-content stream rewritten with `/Type /DSS` in its
-    // dictionary used to walk through the old `is_type(newer, "/DSS")` branch,
-    // and a hanging `/Type /DSS` referencing the payload used to seed
-    // reachability over it (both shadow attacks). Neither is brand-new-as-a-
-    // dictionary, and neither is reachable from the catalog's archive.
-    if dss_reachable.contains(object) || (brand_new && is_type(newer, "/DSS")) {
+    // Validation data: the objects the catalog's archive names as such (see the
+    // walk in `classify`), and only ever as ADDITIONS. A pass that archives
+    // bytes appends the objects it archives; it does not replace an object a
+    // reader already rendered — and that is the whole difference between an
+    // archive pass and the shadow attack, whose payload is by construction a
+    // REWRITE of a covered object.
+    //
+    // So a rewritten object is never validation data, however it got named:
+    // not by being pointed at from a taxed key (`/Certs [<payload> 0 R]`), not
+    // by carrying `/Type /DSS` in its own body, not by being the dictionary the
+    // catalog's own `/DSS` points at. Only brand-new objects pass.
+    //
+    // The `brand_new && /Type /DSS` clause covers an ADDED archive dictionary a
+    // reader's merge left behind: a later archive pass writes its own `/DSS` and
+    // re-points the catalog, so the dictionary of the earlier pass stays in the
+    // file — added, never rewritten, and seen by the signature that preceded it
+    // as a brand-new object. It is inert: reachability starts at the catalog's
+    // archive and follows only taxed keys, so it can whitelist nothing but its
+    // own dictionary. A *rewritten* object claiming `/Type /DSS` is still
+    // refused: the payload of every shadow attack is a rewrite.
+    if brand_new
+        && (Some(*object) == archive || archive_data.contains(object) || is_type(newer, "/DSS"))
+    {
         return Change::ValidationData(*object);
     }
     // The catalog: /DSS gaining (fresh or merged), AcroForm appearing through a
@@ -593,7 +603,6 @@ fn classify_one(
             return Change::SignaturePlumbing(*object);
         }
     }
-    let _ = locations;
     Change::NotAllowed {
         object: *object,
         detail: describe_change(newer),
@@ -847,29 +856,45 @@ fn only_new_key_differs(older: &[u8], newer: &[u8], only: &[u8]) -> bool {
     fresh == 1
 }
 
-/// Collect `from` and everything its body references into `out`, bounded by the
-/// document's own object count so a loop of fake references cannot explode.
-fn collect_reachable(
-    pdf: &[u8],
-    locations: &BTreeMap<ObjRef, pdf::Location>,
-    cache: &mut pdf::ObjectStreamCache,
-    from: ObjRef,
+/// Collect the objects the catalog's archive names as validation data, reading
+/// ONLY the keys a validation-data reader consumes: `/Certs`, `/CRLs`,
+/// `/OCSPs`, each an array of references (or one reference to such an array).
+///
+/// Nothing else is followed, and nothing found inside a named object is
+/// followed either: a reference is licensed because the archive names it
+/// *directly* as data, never because some object it points at named it. That is
+/// what stops both round-2 vectors — a key the archive validator never reads
+/// (`/Foo [<payload> 0 R]`), and one hop through a free object that does
+/// reference the payload. The `/VRI` tree is deliberately not followed: reader
+/// checks the `/VRI` keys against the top-level arrays, but it does not parse
+/// or verify per-entry data, and this gate licenses only what verification then
+/// actually checks.
+fn collect_archive_data(
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    dss: ObjRef,
     out: &mut BTreeSet<ObjRef>,
 ) {
-    let mut queue = vec![from];
-    while let Some(current) = queue.pop() {
-        if !out.insert(current) {
-            continue;
-        }
-        if out.len() > locations.len() + 1 {
-            return; // a cycle of fake references: stop rather than chase it
-        }
-        let Ok(body) = pdf::resolve(pdf, locations, Some(cache), current) else {
+    let Some(body) = final_state.get(&dss) else {
+        return;
+    };
+    for key in ["/Certs", "/CRLs", "/OCSPs"] {
+        let Some(value) = pdf::get(body, key) else {
             continue;
         };
-        for reference in refs_in(&body) {
-            if locations.contains_key(&reference) {
-                queue.push(reference);
+        match pdf::parse_ref(value) {
+            // `/Certs 20 0 R`: the array itself is archived bytes too.
+            Some(array) => {
+                out.insert(array);
+                if let Some(resolved) = final_state.get(&array) {
+                    if let Ok(refs) = pdf::array_refs(resolved) {
+                        out.extend(refs);
+                    }
+                }
+            }
+            None => {
+                if let Ok(refs) = pdf::array_refs(value) {
+                    out.extend(refs);
+                }
             }
         }
     }
