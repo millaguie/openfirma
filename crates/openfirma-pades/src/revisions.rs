@@ -497,6 +497,8 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
         }
     }
 
+    let revs = revisions(pdf)?;
+
     // The widgets and fields whose signature value attests their own bytes: the
     // appearance streams they name are the plumbing of the signature that owns
     // them and of no other, so a pass cannot lend itself an earlier signature's
@@ -510,21 +512,27 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
         }
         attested.insert(*object);
         // The appearance a widget names renders, so it is plumbing only when the
-        // very signature the widget carries covers its bytes too. Otherwise a
-        // covered widget whose /AP named an object that did not exist yet — a
-        // dangling reference written by whoever signed it — licenses whatever a
-        // later revision writes there (round 3, measured: the appended form
-        // XObject drew its text while verify answered OK).
+        // pass that wrote the widget — the one whose signature the widget carries
+        // — wrote the appearance too. Otherwise a covered widget whose /AP named
+        // an object that did not exist yet — a dangling reference written by
+        // whoever signed it — licenses whatever a later revision writes there
+        // (round 3, measured: the appended form XObject drew its text while
+        // verify answered OK).
+        //
+        // "Covers its bytes" was the round-3 way of saying this and is implied by
+        // it (see `same_pass`); asking who WROTE the object is what also reaches a
+        // writer that packs its appearance into its own object stream, whose bytes
+        // are addressed only through the container (round 4, A-7).
         if let Some(appearance) = widget_appearance(&final_state, body) {
-            if attesting.is_some_and(|signature| {
-                signature_covers(pdf, &locations, &final_state, signature, appearance)
-            }) {
+            if attesting
+                .is_some_and(|signature| same_pass(&locations, &revs, signature, appearance))
+            {
                 appearances.insert(appearance);
             }
         }
     }
 
-    let fonts = plumbing_fonts(pdf, &locations, &final_state, &referrers);
+    let fonts = plumbing_fonts(&locations, &final_state, &referrers, &revs);
     let transport = transport_containers(redefined, &locations, &referrers);
 
     let mut out = Vec::new();
@@ -931,6 +939,49 @@ fn transport_containers(
         .collect()
 }
 
+/// Which revision wrote the object: the last one whose bytes end after it, since
+/// revisions end where the next one's bytes begin. An object packed into an
+/// object stream is addressed through its container — the container is where its
+/// bytes and the entry that maps them live, and an object stream nested in
+/// another is not a thing ISO 32000-1 allows, so one hop is all there is.
+fn revision_of(
+    locations: &BTreeMap<ObjRef, Location>,
+    revs: &[Revision],
+    object: ObjRef,
+) -> Option<usize> {
+    let offset = match locations.get(&object)? {
+        Location::Direct(at) => *at,
+        Location::InObjectStream { stream, .. } => match locations.get(stream)? {
+            Location::Direct(at) => *at,
+            Location::InObjectStream { .. } => return None,
+        },
+    };
+    revs.iter().rposition(|rev| rev.end > offset)
+}
+
+/// Whether the signature's own pass wrote the object: the signature's revision
+/// is the revision the object's bytes (or its object stream's) were written in.
+///
+/// This is the link round 4 showed the font rule was missing. "Some signature
+/// covers these bytes" is true of every signature made after the object, and a
+/// `/ByteRange` that reaches a revision boundary covers every earlier revision
+/// whole — so a licence asked that way was granted to a font by a signature that
+/// did not exist when the font was written. A signature attests bytes that were
+/// there when it was made, and the plumbing a pass wrote is its own; anything
+/// else is a change the pass inherited. Reading the same span it always read,
+/// which is what makes a packed object (no span of its own) reachable too.
+fn same_pass(
+    locations: &BTreeMap<ObjRef, Location>,
+    revs: &[Revision],
+    signature: ObjRef,
+    object: ObjRef,
+) -> bool {
+    let Some(pass) = revision_of(locations, revs, signature) else {
+        return false;
+    };
+    revision_of(locations, revs, object) == Some(pass)
+}
+
 /// The font dictionaries that are plumbing: a pass writes its font and the
 /// object that uses it — its appearance's `/Resources`, the AcroForm's `/DR` — in
 /// the same revision, so one signature's `/ByteRange` covers both. A `/Font` slot
@@ -939,44 +990,38 @@ fn transport_containers(
 /// signed. That is the round-3b shape: an appended `/Helvetica` whose `/Encoding`
 /// carries a `/Differences` array turned the covered "PAGO UN CERO UNO" into
 /// "QBHP VO DFSP DFSP" while `verify` answered OK.
+///
+/// Round 4 measured that asking "does some signature COVER this font" reopened
+/// exactly that shape: the fill happened between two signatures, and the second
+/// one's `/ByteRange` covers every earlier revision, so the font came back
+/// licensed by a pass that ran after it. What licenses a font is that the pass
+/// which wrote the font is the pass the signature belongs to — and the same for
+/// every object that names it. A font nobody names renders nothing, so it is
+/// inert; a font a namer from another revision points at is text that pass never
+/// set.
 fn plumbing_fonts(
-    pdf: &[u8],
     locations: &BTreeMap<ObjRef, Location>,
     final_state: &BTreeMap<ObjRef, Vec<u8>>,
     referrers: &BTreeMap<ObjRef, BTreeSet<ObjRef>>,
+    revs: &[Revision],
 ) -> BTreeSet<ObjRef> {
     let signatures: Vec<ObjRef> = final_state
         .iter()
         .filter(|(_, body)| is_type(body, "/Sig") || is_type(body, "/DocTimeStamp"))
         .map(|(object, _)| *object)
         .collect();
-    let covered_by = |object: ObjRef| -> BTreeSet<ObjRef> {
-        signatures
-            .iter()
-            .copied()
-            .filter(|signature| signature_covers(pdf, locations, final_state, *signature, object))
-            .collect()
-    };
-    // A signature covers this font, and nothing outside that signature's bytes
-    // names it: a pass writes its font and everything that uses it — its
-    // appearance's /Resources, the AcroForm's /DR — inside its own /ByteRange. A
-    // font nobody names renders nothing, so it is inert; a font a namer OUTSIDE
-    // the covering signature points at is text that signature never set.
     let mut out = BTreeSet::new();
     for (object, body) in final_state {
         if !is_type(body, "/Font") {
             continue;
         }
-        let covering = covered_by(*object);
-        if covering.is_empty() {
-            continue;
-        }
         let names_it = referrers.get(object);
-        if covering.iter().any(|signature| {
-            names_it.is_none_or(|from| {
-                from.iter()
-                    .all(|referrer| covered_by(*referrer).contains(signature))
-            })
+        if signatures.iter().any(|signature| {
+            same_pass(locations, revs, *signature, *object)
+                && names_it.is_none_or(|from| {
+                    from.iter()
+                        .all(|referrer| same_pass(locations, revs, *signature, *referrer))
+                })
         }) {
             out.insert(*object);
         }

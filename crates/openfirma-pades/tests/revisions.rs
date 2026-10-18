@@ -1526,3 +1526,47 @@ fn append_two_with(pdf: &[u8], objects: &[(u32, &[u8])], extra: &str) -> Vec<u8>
     );
     out
 }
+
+/// Round 4 measured the fill-in of the previous test coming BACK when a second
+/// signer co-signs the document: a routine flow, `sign` over an already signed
+/// document. The licence was asked globally — "is there SOME signature in the
+/// document whose /ByteRange covers this font and every namer of it?" — and a
+/// signature made after the fill covers everything written before it, so the
+/// font the fill wrote came back licensed by a signature that did not exist
+/// when it was written. A signature attests what existed when it was made.
+#[test]
+fn a_later_signature_does_not_bless_a_font_an_earlier_pass_filled_in() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R /F2 97 0 R >> >> /Contents 4 0 R >>";
+    let headline = b"BT /F2 24 Tf 72 640 Td (PAGO UN CERO CERO) Tj ET";
+    let plain = pades_sign(
+        &append_two(INPUT, &[(3, page.as_slice()), (4, &stream_body(headline))]),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing a page whose /F2 slot is still empty");
+
+    let differences = (65..90)
+        .map(|code| format!("{code} /{}", char::from(code as u8 + 1)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let font = format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+         /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding \
+         /Differences [ {differences} ] >> >>"
+    );
+    let filled = append_two(&plain, &[(97, font.as_bytes())]);
+
+    // from here on it is a two-signer document: the fill happened between them
+    let cosigned = pades_sign(&filled, &signer, &PadesOptions::default()).expect("co-signing");
+    let error = pades_verify(&cosigned, &anchors())
+        .expect_err("a signature made after the fill cannot license it");
+    assert!(
+        error.to_string().contains("97 0 R"),
+        "the refusal names the font the earlier pass filled in: {error}"
+    );
+}
