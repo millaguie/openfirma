@@ -473,15 +473,28 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
     // appearance streams they name are the plumbing of the signature that owns
     // them and of no other, so a pass cannot lend itself an earlier signature's
     // name to license an appearance of its own (round 3).
-    let attested: BTreeSet<ObjRef> = final_state
-        .keys()
-        .copied()
-        .filter(|object| {
-            carries_attested_signature_value(pdf, &locations, &final_state, object)
-                || is_signature_field(pdf, &locations, &final_state, object)
-        })
-        .collect();
-    let appearances = widget_appearances(&final_state, &attested);
+    let mut attested: BTreeSet<ObjRef> = BTreeSet::new();
+    let mut appearances: BTreeSet<ObjRef> = BTreeSet::new();
+    for (object, body) in &final_state {
+        let attesting = attesting_signature(pdf, &locations, &final_state, object);
+        if attesting.is_none() && !is_signature_field(pdf, &locations, &final_state, object) {
+            continue;
+        }
+        attested.insert(*object);
+        // The appearance a widget names renders, so it is plumbing only when the
+        // very signature the widget carries covers its bytes too. Otherwise a
+        // covered widget whose /AP named an object that did not exist yet — a
+        // dangling reference written by whoever signed it — licenses whatever a
+        // later revision writes there (round 3, measured: the appended form
+        // XObject drew its text while verify answered OK).
+        if let Some(appearance) = widget_appearance(&final_state, body) {
+            if attesting.is_some_and(|signature| {
+                signature_covers(pdf, &locations, &final_state, signature, appearance)
+            }) {
+                appearances.insert(appearance);
+            }
+        }
+    }
 
     let mut out = Vec::new();
     for change in redefined {
@@ -703,48 +716,6 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     }
 }
 
-/// The /AP/N targets of every widget in the final state: what appearance streams
-/// look like from the finished document.
-fn widget_appearances(
-    final_state: &BTreeMap<ObjRef, Vec<u8>>,
-    attested: &BTreeSet<ObjRef>,
-) -> BTreeSet<ObjRef> {
-    let mut out = BTreeSet::new();
-    for (object, body) in final_state {
-        // Only a widget whose own bytes its signature value attests lends its
-        // name: a widget a later revision builds to point at an earlier
-        // signature licenses nothing with its /AP (round 3).
-        if !attested.contains(object) {
-            continue;
-        }
-        if pdf::get(body, "/Subtype").is_none_or(|t| pdf::trim_ws(t) != b"/Widget") {
-            continue;
-        }
-        // /AP is an inline dictionary or a reference to one: resolve it against
-        // the final state (or take the inline bytes) and follow its /N.
-        let Some(ap_value) = pdf::get(body, "/AP") else {
-            continue;
-        };
-        let ap_dict: Option<Vec<u8>> = match pdf::parse_ref(ap_value) {
-            // referenced /AP: a dictionary object in the final state
-            Some(reference) => final_state.get(&reference).cloned(),
-            // inline /AP << /N 17 0 R >>: the value bytes ARE the dictionary
-            None if pdf::trim_ws(ap_value).starts_with(b"<<") => {
-                Some(pdf::trim_ws(ap_value).to_vec())
-            }
-            _ => None,
-        };
-        let state = match ap_dict {
-            Some(state) => state,
-            None => continue,
-        };
-        if let Some(n) = pdf::get(&state, "/N").and_then(pdf::parse_ref) {
-            out.insert(n);
-        }
-    }
-    out
-}
-
 /// The names of the dictionary keys whose value bytes differ between the two
 /// states (a key only one side carries counts as differing, named by it).
 fn differing_keys(older: &[u8], newer: &[u8]) -> Vec<Vec<u8>> {
@@ -834,7 +805,8 @@ fn is_signature_field(
     if pdf::get(body, "/FT").is_none_or(|t| pdf::trim_ws(t) != b"/Sig") {
         return false;
     }
-    value_attests(pdf, locations, final_state, body, *field)
+    signature_value(final_state, body)
+        .is_some_and(|value| signature_covers(pdf, locations, final_state, value, *field))
 }
 
 /// The bytes of an object written at a top-level offset: from its xref offset to
@@ -888,47 +860,41 @@ fn signature_covers(
     let Some(body) = final_state.get(&signature) else {
         return false;
     };
-    let Some([head_len, _hole, tail_start, tail_len]) = byte_range_numbers(body) else {
+    // The four numbers are two (start, length) pairs, not lengths on their own.
+    let Some([head_start, head_len, tail_start, tail_len]) = byte_range_numbers(body) else {
         return false;
     };
     let Some((start, end)) = object_span(pdf, locations, object) else {
         return false;
     };
-    end <= head_len || (start >= tail_start && end <= tail_start.saturating_add(tail_len))
+    (start >= head_start && end <= head_start.saturating_add(head_len))
+        || (start >= tail_start && end <= tail_start.saturating_add(tail_len))
 }
 
-/// `/V` names a `/Sig` dictionary or a document time-stamp — the widget's /V may
-/// hold either (the B-LTA timestamp field points at its `/DocTimeStamp`), and
-/// both are signature values a reader shows — AND that value's `/ByteRange`
-/// contains the bytes of `annot` itself.
-fn value_attests(
-    pdf: &[u8],
-    locations: &BTreeMap<ObjRef, Location>,
-    final_state: &BTreeMap<ObjRef, Vec<u8>>,
-    body: &[u8],
-    annot: ObjRef,
-) -> bool {
-    let Some(value) = pdf::get(body, "/V").and_then(pdf::parse_ref) else {
-        return false;
-    };
-    let Some(target) = final_state.get(&value) else {
-        return false;
-    };
-    if !(is_type(target, "/Sig") || is_type(target, "/DocTimeStamp")) {
-        return false;
-    }
-    signature_covers(pdf, locations, final_state, value, annot)
+/// `/V`, when it names a `/Sig` dictionary or a document time-stamp: the two
+/// values a reader shows as a signature (the B-LTA timestamp field points at its
+/// `/DocTimeStamp`).
+fn signature_value(final_state: &BTreeMap<ObjRef, Vec<u8>>, body: &[u8]) -> Option<ObjRef> {
+    let value = pdf::get(body, "/V").and_then(pdf::parse_ref)?;
+    let target = final_state.get(&value)?;
+    (is_type(target, "/Sig") || is_type(target, "/DocTimeStamp")).then_some(value)
 }
 
-fn carries_attested_signature_value(
+/// The signature object that attests the bytes THIS dictionary is made of: the
+/// value it carries — its own `/V`, or the `/V` of the `/Parent` field — when
+/// that value is a signature (or a document time-stamp) whose `/ByteRange`
+/// contains the dictionary's own bytes. `None` for anything else, including a
+/// dictionary that merely points at somebody else's signature: a signature can
+/// only have been made over bytes that existed when it was made, so an object
+/// written later can never borrow an earlier one's name (round 3: a widget that
+/// reused the `/V` already in the document drew text nobody had signed).
+fn attesting_signature(
     pdf: &[u8],
     locations: &BTreeMap<ObjRef, Location>,
     final_state: &BTreeMap<ObjRef, Vec<u8>>,
     annot: &ObjRef,
-) -> bool {
-    let Some(body) = final_state.get(annot) else {
-        return false;
-    };
+) -> Option<ObjRef> {
+    let body = final_state.get(annot)?;
     // A widget always says so; a plain AcroForm field dictionary (the /FT /Sig
     // carrier whose value lives in /V) does not carry /Subtype at all, and the
     // B-LTA timestamp field is exactly that shape.
@@ -937,16 +903,46 @@ fn carries_attested_signature_value(
         None => true,
     };
     if !shape_ok {
-        return false;
+        return None;
     }
-    if value_attests(pdf, locations, final_state, body, *annot) {
-        return true;
+    if let Some(value) = signature_value(final_state, body) {
+        if signature_covers(pdf, locations, final_state, value, *annot) {
+            return Some(value);
+        }
     }
     // the widget's /Parent field may carry the value instead
-    pdf::get(body, "/Parent")
-        .and_then(pdf::parse_ref)
-        .and_then(|p| final_state.get(&p))
-        .is_some_and(|parent| value_attests(pdf, locations, final_state, parent, *annot))
+    let parent = pdf::get(body, "/Parent").and_then(pdf::parse_ref)?;
+    let parent_body = final_state.get(&parent)?;
+    let value = signature_value(final_state, parent_body)?;
+    signature_covers(pdf, locations, final_state, value, *annot).then_some(value)
+}
+
+fn carries_attested_signature_value(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    final_state: &BTreeMap<ObjRef, Vec<u8>>,
+    annot: &ObjRef,
+) -> bool {
+    attesting_signature(pdf, locations, final_state, annot).is_some()
+}
+
+/// The appearance stream a widget names under `/AP` → `/N`, the thing a reader
+/// draws in its rectangle. `None` unless the object is a widget naming one.
+fn widget_appearance(final_state: &BTreeMap<ObjRef, Vec<u8>>, body: &[u8]) -> Option<ObjRef> {
+    if pdf::get(body, "/Subtype").is_none_or(|t| pdf::trim_ws(t) != b"/Widget") {
+        return None;
+    }
+    // /AP is an inline dictionary or a reference to one: resolve it against the
+    // final state (or take the inline bytes) and follow its /N.
+    let ap_value = pdf::get(body, "/AP")?;
+    let ap_dict: Vec<u8> = match pdf::parse_ref(ap_value) {
+        // referenced /AP: a dictionary object in the final state
+        Some(reference) => final_state.get(&reference)?.clone(),
+        // inline /AP << /N 17 0 R >>: the value bytes ARE the dictionary
+        None if pdf::trim_ws(ap_value).starts_with(b"<<") => pdf::trim_ws(ap_value).to_vec(),
+        _ => return None,
+    };
+    pdf::get(&ap_dict, "/N").and_then(pdf::parse_ref)
 }
 
 /// References `newer`'s array under `key` has beyond `older`'s. A key absent

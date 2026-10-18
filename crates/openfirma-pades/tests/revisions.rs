@@ -872,6 +872,60 @@ fn a_new_widget_cannot_reuse_an_earlier_signatures_value() {
     );
 }
 
+/// The appearance a widget names renders, so it belongs to what the signature
+/// that owns the widget covered — and a covered widget whose `/AP` named an
+/// object that did not exist yet is how a later revision put text of its own on
+/// the page.
+///
+/// The document here is crafted so the widget the page already names points its
+/// `/V` at the signature the signer is about to write (the number the signer
+/// picks is a function of the input's objects, so a probe signing tells it) and
+/// its `/AP` at object 900, which nobody has written. Signing verifies; the one
+/// appended form XObject then draws "PAGUESE 9999 EUR" where the widget's
+/// rectangle is, and with only the byte-range coverage of `762c321` — whose
+/// first range was read as a length, so no object before the signature's
+/// `/Contents` ever counted as covered — the appended object was refused for
+/// that accident. Reading the ranges for what they are and licensing the
+/// appearance only when the attesting signature covers IT leaves the refusal in
+/// place for the right reason.
+#[test]
+fn an_appearance_the_covered_widget_was_still_waiting_for_is_refused() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // the same shape twice: only the /V number changes, so the signer numbers
+    // its own objects the same way both times
+    let crafted = |vref: u32| {
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                     /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R \
+                     /Annots [ 100 0 R ] >>";
+        let widget = format!(
+            "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /P 3 0 R \
+             /Rect [ 50 50 350 250 ] /F 132 /AP << /N 900 0 R >> /V {vref} 0 R >>"
+        );
+        append_two(INPUT, &[(3, page.as_slice()), (100, widget.as_bytes())])
+    };
+    let probe = pades_sign(&crafted(9999), &signer, &PadesOptions::default()).expect("signing");
+    let signature = object_with(&probe, b"/Type /Sig");
+    let plain = pades_sign(&crafted(signature), &signer, &PadesOptions::default()).expect("signing");
+    pades_verify(&plain, &anchors()).expect("the widget borrows the signature the signer writes");
+
+    let attacked = append_two(
+        &plain,
+        &[(
+            900,
+            appearance_body(b"BT /F1 18 Tf 10 100 Td (PAGUESE 9999 EUR) Tj ET").as_slice(),
+        )],
+    );
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("the appearance was written after the bytes the signature covered");
+    assert!(
+        error.to_string().contains("900 0 R"),
+        "the refusal names the appearance the covered widget was waiting for: {error}"
+    );
+}
+
 /// Append one revision that (re)defines SEVERAL objects at once. The shadow
 /// attack needs the rewrite and the hanging dictionary in a single update so
 /// the covering signature sees both as its successors.
