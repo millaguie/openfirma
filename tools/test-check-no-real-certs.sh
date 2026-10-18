@@ -88,10 +88,42 @@ must_block() {
     fails=$((fails + 1))
     return
   fi
-  local out
-  if out="$( cd "$ROOT" && ./tools/check-no-real-certs.sh "$path" 2>&1 )"; then
+  local out status=0
+  # capture without `if`: with pipefail set, the guard's normal BLOCK exit would
+  # abort this very function under `set -e` if it arrived as a pipeline status
+  # rather than through the if-condition (the shape CI's bash variant hit).
+  out="$( cd "$ROOT" && ./tools/check-no-real-certs.sh "$path" 2>&1 )" || status=$?
+  if [ "$status" -eq 0 ]; then
     echo "FAIL: guard let $why through ($path): the guard exited clean on a file it must block. Its output:" >&2
     printf '%s\n' "$out" | sed 's/^/        /' >&2
+    # Five runs have blamed the guard on macOS with zero context about WHAT the
+    # platform actually handed it (mime? grep -z? openssl DER?). Until the log
+    # says, every hypothesis is cheap to hold; dump the whole witness chain for
+    # the ONE probe that got through. Remove when this test is boring again.
+    {
+      echo "        --- witness ---"
+      echo "        uname=$(uname -srm)"
+      echo "        bash=${BASH_VERSION:-?} path=\$PATH"
+      for t in grep base64 openssl file awk sed tr; do
+        echo "        $t=$(command -v "$t") | $(command "$t" --version 2>&1 </dev/null | head -1)"
+      done
+      if [ -r "$path" ]; then
+        echo "        size=$(wc -c <"$path") md5=$( (md5 -q "$path" 2>/dev/null || md5sum "$path" 2>/dev/null) | awk '{print $1}')"
+        echo "        trigger-lines=$( { grep -ac 'SignatureValue\|X509Certificate\|BEGIN CERTIFICATE' "$path"; true; } )"
+        R="$( { grep -oaE '[A-Za-z0-9+/]{400,}={0,2}' "$path" 2>/dev/null | head -1; true; } )"
+        echo "        first-run-len=${#R}"
+        if [ -n "$R" ]; then
+          D="$WORK/dec.$$"; b64_status=0; printf '%s' "$R" | base64 -d >"$D" 2>"$D.err" || b64_status=$?
+          echo "        b64-exit=$b64_status dec=$(wc -c <"$D") b64-err=$(head -1 "$D.err")"
+          x509_status=0
+          openssl x509 -inform DER -in "$D" -noout -subject -issuer >"$D.out" 2>"$D.oerr" || x509_status=$?
+          echo "        x509-exit=$x509_status out=$(head -1 "$D.out") err=$(head -1 "$D.oerr")"
+          rm -f "$D" "$D.err" "$D.out" "$D.oerr"
+        fi
+      else
+        echo "        unreadable-at-witness-time"
+      fi
+    } >&2 || true
     fails=$((fails + 1))
   else
     echo "ok, blocked: $why"
