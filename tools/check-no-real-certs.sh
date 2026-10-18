@@ -109,20 +109,28 @@ extract_base64_certs() {
 # a full XAdES through this branch on macOS (runs 39088995737/39089691658);
 # it now answers from bytes and fails closed when the answer is no.
 cms_hides_foreign_certs() {
-  local f="$1" n
-  n="$(awk '
-    { line = $0; start = 0
-      for (i = 1; i <= length(line) + 1; i++) {
-        c = (i <= length(line)) ? substr(line, i, 1) : "\n"
-        if (c ~ /[A-Za-z0-9+\/]/) { if (!run) start = i; run++ }
-        else {
-          if (run >= 300) { print "candidate"; exit }
-          run = 0
-        }
-      }
-    }' "$f" 2>/dev/null)" || n=""
+  local f="$1" n data
+  data="$(cat "$1" 2>/dev/null; printf x)" || return 1
+  data="${data%$'\x'}"
+  n="$(printf '%s' "$data" | tr -c 'A-Za-z0-9+/=' '\n' | awk 'length >= 300 { print "candidate"; exit }')" || n=""
   [ "$n" = candidate ] || return 1
   ! extract_base64_certs "$f" | grep -q '### cert'
+}
+
+# A 300+-character base64 run that OPENS like X.509 material (MII…/LS0t…) but
+# decodes to no certificate anywhere, measured from the same variable channel
+# the extractors use: either this machine's readers are lying or the material
+# was fragmented to dodge them. Refuse to certify such a file clean — prose
+# never carries MII… runs, so docs stay untouched. The shape is checked in
+# awk's own record-splitting (`tr` took turns being blind; the candidate scan
+# and this wire must not disagree), and awk always exits 0 here, so no `||`
+# fallback can silently swap an empty answer in.
+x509_shaped_but_undecodable() {
+  local data head
+  data="$(cat "$1" 2>/dev/null; printf x)" || return 1
+  data="${data%$'\x'}"
+  head="$(printf '%s' "$data" | awk 'BEGIN{RS="[A-Za-z0-9+/=]+"} length >= 300 { print substr($0, 1, 8); exit }')" || head=""
+  case "$head" in MII*|LS0t*) return 0 ;; *) return 1 ;; esac
 }
 
 check_embedded_certs() {
@@ -139,6 +147,10 @@ check_embedded_certs() {
     # PAdES: the /Contents hex string IS a CMS SignedData (possibly zero
     # padded); its DER prefix ends where the outer SEQUENCE says it does.
     blocks="$(pdf_certs_pem "$f")" || blocks=""
+    if [ -z "$blocks" ] && x509_shaped_but_undecodable "$f"; then
+      block "$f is a PDF carrying base64 that opens exactly like X.509 material which no decoder on this machine can read — refusing to call it clean"
+      return 1
+    fi
   elif openssl pkcs7 -inform DER -in "$f" -noout 2>/dev/null; then
     # A raw CMS SignedData blob (CAdES detached/encapsulated): every one of
     # them embeds its certificates, so a parsable PKCS#7 always produces
@@ -192,6 +204,13 @@ check_embedded_certs() {
             block "$f names a certificate and carries ${#tail}-byte+ base64 opening exactly like X.509 material, yet no decoder read it — refusing to call material I cannot fully inspect clean"
             return 1 ;;
         esac
+      fi
+      # Second opinion through awk's own record splitter (tr may still be the
+      # liar here, and a false "no runs" on a file that NAMED a certificate is
+      # precisely how run 39089691658 passed).
+      if x509_shaped_but_undecodable "$f"; then
+        block "$f names a certificate and carries base64 opening exactly like X.509 material (awk's own splitter) which no decoder read — refusing to call it clean"
+        return 1
       fi
       return 0
     fi

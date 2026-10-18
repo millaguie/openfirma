@@ -113,24 +113,16 @@ must_block() {
         # Witness the extractor's OWN channel, not grep's: a 400+-run probe
         # still showed first-run-len=0 after grep left the guard (witness run
         # 39088995737), so what matters is whether tr sees the file at all.
-        N="$( { printf '%s' "$(cat "$path" 2>/dev/null; printf x)" | tr -c 'A-Za-z0-9+/' '\n' | awk 'length >= 300 { print length; exit }'; true; } )"
-        echo "        var-channel-first-run=${N:-none}"
-        # And decode that run through the SAME channel the guard uses, so a
-        # witness can never again say "run visible" while the guard's copy of
-        # the same pipeline answered differently (run 39089691658: var-channel
-        # said 342 and the guard still passed — that gap is what this section
-        # exists to close).
-        RUNS="$WORK/runs.$$"
-        printf '%s' "$(cat "$path" 2>/dev/null; printf x)" | tr -c 'A-Za-z0-9+/' '\n' | awk 'length >= 300' > "$RUNS" || true
-        echo "        runs-file=$(wc -c <"$RUNS") lines=$(wc -l <"$RUNS")"
-        while IFS= read -r R || [ -n "$R" ]; do
-          D="$WORK/dec.$$"
-          bst=0; { printf '%s' "$R" | base64 -d 2>/dev/null || printf '%s' "$R" | base64 -D 2>/dev/null; } > "$D" 2>/dev/null || bst=$?
-          xs=0; xo="$(openssl x509 -inform DER -in "$D" -noout -subject -issuer 2>&1)" || xs=$?
-          echo "        run=${#R} b64-status=$bst der-bytes=$(wc -c <"$D") x509-status=$xs out=$(printf '%s' "$xo" | head -1)"
-          rm -f "$D"
-        done < "$RUNS"
-        rm -f "$RUNS"
+        # Run detection through awk's OWN record splitter — no tr, no pipes:
+        # if the file holds base64 material in any form, this says so.
+        N="$( { awk 'BEGIN{RS="[A-Za-z0-9+/=]+"} length >= 300 { print length; exit }' "$path" 2>/dev/null; true; } )"
+        echo "        awk-rs-first-run=${N:-none}"
+        # Same variable channel the guard's extractor uses. Run 39088314047→
+        # 39089691658 each removed one layer of CI blindness; whatever this
+        # line prints next is the answer we have not seen yet.
+        data="$(cat "$path" 2>/dev/null; printf x)"; data="${data%$'\x'}"
+        V="$( { printf '%s' "$data" | awk 'BEGIN{RS="[A-Za-z0-9+/=]+"} length >= 300 { print substr($0, 1, 8); exit }'; true; } )"
+        echo "        var-first-run-head=${V:-none}"
       else
         echo "        unreadable-at-witness-time"
       fi
