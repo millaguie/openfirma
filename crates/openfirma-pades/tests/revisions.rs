@@ -188,6 +188,54 @@ fn a_revision_rewriting_page_content_after_a_signature_is_refused() {
     );
 }
 
+/// Round 2, N-5. A later revision could rewrite the covered signature
+/// dictionary itself, licensed by the *type of the old body*
+/// (`is_type(older, "/Sig")` in `classify_one`). On a document carrying two
+/// signatures, the rewrite below turns the first one into an ordinary
+/// dictionary: `inspect::signatures` stops enumerating it, the second signature
+/// still verifies by its own numbers, and the verdict — which speaks about the
+/// signatures it can see — reports one signature over a document that was
+/// signed twice. A *new* signature is a new object, so a rewrite of a real one
+/// has no shape to license.
+#[test]
+fn a_covered_signature_dictionary_cannot_be_rewritten() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let once = pades_sign(INPUT, &signer, &PadesOptions::default()).expect("signing failed");
+    let twice =
+        pades_sign(&once, &signer, &PadesOptions::default()).expect("second signing failed");
+    pades_verify(&twice, &anchors()).expect("the clean two-signature document verifies");
+    let sigs = openfirma_pades::inspect::signatures(&twice).expect("the syntax reads");
+    assert_eq!(sigs.len(), 2, "the fixture is a document signed twice");
+    let first = sigs[0].object;
+
+    // the first signature's dictionary, replaced by something that is not one
+    let attacked = append_written(&twice, first.num, b"<< /Nothing (aqui) >>");
+
+    // what a reader sees: one signature, and it is not the one that vanished
+    let after = openfirma_pades::inspect::signatures(&attacked).expect("the syntax reads");
+    assert_eq!(
+        after.len(),
+        1,
+        "the reader no longer finds the signature the first revision made"
+    );
+    assert_ne!(after[0].object, first);
+
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("a covered signature dictionary may not be rewritten");
+    let text = error.to_string();
+    assert!(
+        text.contains("no archive may append"),
+        "the refusal says what was violated: {text}"
+    );
+    assert!(
+        text.contains(&format!("{} 0 R", first.num)),
+        "and names the object whose signature disappeared: {text}"
+    );
+}
+
 /// Append one revision defining object `num` with `body` verbatim.
 fn append_written(pdf: &[u8], num: u32, body: &[u8]) -> Vec<u8> {
     let mut out = pdf.to_vec();

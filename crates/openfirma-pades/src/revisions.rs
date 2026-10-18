@@ -732,7 +732,22 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     // rewrites; here the two states DO differ as objects — /Info dictionaries
     // are brand-new copies carrying a new ModDate, which is what every signing
     // library's incremental update writes and no shadow attack hides behind it.
-    if is_type(newer, "/Sig") || is_type(older, "/Sig") {
+    // Round 2, N-5: an object that *was* a signature dictionary may not be
+    // rewritten. `is_type(older, "/Sig")` used to license the rewrite by the
+    // type of the old body, so a later revision could turn the covered
+    // dictionary into anything at all: the signature vanishes from
+    // `inspect::signatures`, and the verdict speaks about the signatures it can
+    // see, so "all 1 signature(s) verify" is said over a document that had two.
+    // A new signature is a *new* object — and the rewrite whose bytes are
+    // identical never reaches this point, `redefinitions_after` drops it — so
+    // there is no shape here to license.
+    if is_type(older, "/Sig") {
+        return Change::NotAllowed {
+            object: *object,
+            detail: describe_change(newer),
+        };
+    }
+    if is_type(newer, "/Sig") {
         return Change::NewSignature(*object);
     }
     if is_type(newer, "/DocTimeStamp") || is_type(older, "/DocTimeStamp") {
