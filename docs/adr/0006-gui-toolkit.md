@@ -12,27 +12,45 @@ brief's structural rule (and this project's oldest failure mode) is that a
 GUI which re-decides what the library decided drifts: one format signing one
 way in the terminal and another way in the window is worse than no window.
 
-The comparison target was measured, not imagined, from the AutoFirma 1.9.1
-sources (`/tmp/opencode/autofirma-src`, `principal/Firma.java`,
-`principal/Validacion.java`) and the shipped jar's behaviour:
+The comparison target was measured on the program the 1.9.1 package actually
+installs: `afirma-simple/src/main/java/es/gob/afirma/standalone/ui/`
+(`SignPanel`, `SignPanelFilePanel`, `SignatureConfigInfoPanel`,
+`SignDetailPanel`, `ValidationInfoPanel`, `SimpleAfirma`), read against the
+shipped jar's own class list. An earlier draft of this note measured a
+different UI that lives in the same repository — `afirma-standalone`'s
+`afirma-ui-standalone`, `es.gob.afirma.ui.principal.Firma` and
+`principal.Validacion` — which is not the installed program at all: the jar
+carries `es/gob/afirma/standalone/ui/*` and no `es/gob/afirma/ui/principal/…`.
+Round 2 of the review caught the citation (review 06, I-1); the flows below are
+read off the right sources:
 
-* **AutoFirma, simple sign** (the "Firma" tab): Examinar + open-dialog accept
-  = 2 clicks; certificate dialog ≥ 1 (more when a keystore needs its PIN
-  dialog first); format combo click + item = 2; the CAdES "include the
-  original content?" yes/no prompt = 1; the informational result dialog OK =
-  1; the save dialog (navigate + save) ≈ 2–3; final OK = 1. **≈ 8–9 clicks**,
-  several of them on questions ("¿formato?, ¿encapsular?") a person cannot
-  answer without reading help.
-* **AutoFirma, verify** (the "Validación" tab): it wants the *signature*
-  file — an exported `.csig` — and offers a separate "documento firmado"
-  slot; what a citizen holds is one signed PDF, so the flow starts with an
-  export most people cannot perform. The result screen is a certificate
-  tree, not an answer.
+* **AutoFirma, sign** (a single window; `SignPanel` holds everything, and the
+  PDF options — visible signature, stamp, certification level — are checkboxes
+  on that same panel): file in (its button plus the file dialog ≈ 3 clicks, or
+  one drop), "Firmar" = 1, a wait dialog, the confirm-to-sign dialog = 1 (its
+  preference ships as `confirmToSign = true`), the certificate dialog = 1–2
+  (one more per keystore that asks its PIN first), and for a single document
+  **no save dialog at all**: the signature is written next to the original with
+  a `_signed` suffix. ≈ 6–7 clicks, two of them on questions — "¿firmo?" and
+  "¿qué certificado?" — with, one dialog deeper, the signature format and the
+  PDF options a person cannot answer without reading help.
+* **AutoFirma, verify**: opening a signed document in that same window
+  validates its signatures as it loads (`SignPanel.validate`, with
+  `CHECK_CERTIFICATES`) and paints the answer inline — `ValidationInfoPanel`
+  shows "Firma válida" (with an icon) or the red sentence, plus a link whose
+  dialog (`ValidationInfoDialog`) is the tree of signatures and certificates.
+  The earlier draft said this flow began with exporting a `.csig`, which is
+  what the other UI did; the installed one does not. What is true of the
+  installed one: the answer is a tree of certificates to interpret, one
+  document at a time, in the same window, on the same panel and behind the same
+  dialogs as signing.
 
 The counted target for openfirma follows from that measurement: **drop the
 file (drag — zero clicks), pick the certificate (1), press Firmar (1)**; the
 result is written next to the original and its path is on the screen with an
-open-folder link. Verify is **drop, read** — one file, plain-language lines.
+open-folder link. Verify is **drop, read**: the signed document the citizen
+already has, one line per signature in words, with the certificate tree behind
+a details control instead of being the answer.
 
 ## Decision
 
@@ -138,6 +156,21 @@ open-folder link. Verify is **drop, read** — one file, plain-language lines.
 > certificate's own profile and key strength, its validity dates, the algorithm
 > policy), the chain step does not, and each line is amber and says so. Nothing
 > in the window can turn "nobody checked who issued this" into a green line.
+> **Update (2026-10-19, review 06 finding I-1):** the comparison above was
+> re-measured on the sources of the program the package installs. The earlier
+> citation pointed at `afirma-standalone/afirma-ui-standalone`'s
+> `es.gob.afirma.ui.principal.Firma`/`Validacion`, a second, older UI that
+> ships in the same repository but not in the 1.9.1 package (the jar's class
+> list has `es/gob/afirma/standalone/ui/*` and no `es/gob/afirma/ui/principal/…`),
+> and the numbers and the verify flow it described were that UI's. Two things
+> changed with the right sources: a single document costs ≈ 6–7 clicks, not
+> 8–9 (there is no save dialog — the signature lands next to the original with
+> a `_signed` suffix), and verify does **not** start by exporting a `.csig`:
+> the installed window validates a signed document as it loads it and paints
+> the answer inline. What stands is the difference this ADR is about — that
+> answer is a certificate tree, in the same panel that signs, and openfirma's
+> verify screen exists to be one plain sentence per signature instead.
+
 * The GUI ships on the targets a windowing system builds for (Linux x86_64,
   macOS, Windows); cross-compilations without one build the workspace with
   `--exclude openfirma-gui` / `--no-default-features` (the reason stands in
