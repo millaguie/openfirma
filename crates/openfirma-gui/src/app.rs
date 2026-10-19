@@ -1115,50 +1115,8 @@ impl App {
                 if catalog.entries.is_empty() {
                     // The doors (A-6): the cards this machine has middleware
                     // for come FIRST and by human name — nobody types a module
-                    // path to sign with their DNIe. "Add a certificate" and
-                    // the manual descriptor stay reachable from every picker
-                    // state, not only an empty one (the old dead end).
-                    if ui.button(tr.p12_button.clone()).clicked() {
-                        let title = tr.dialog_open_cert.clone();
-                        let picked = self.open_file(&title);
-                        if let Some(p) = picked {
-                            catalog.entries.retain(|c| c.pending_p12.is_none());
-                            catalog.entries.push(CertificateChoice {
-                                display: format!("{}…", display_name(&p)),
-                                origin: display_name(&p),
-                                // A .p12 file's owner is inside it, and the
-                                // password is what unlocks that truth: the row
-                                // answers "quién es el titular" after the one
-                                // field it costs (A-7's p12 half — AutoFirma's
-                                // dialog reads the container to show the same).
-                                issuer: None,
-                                valid_until: None,
-                                badges: Vec::new(),
-                                source: None,
-                                pending_p12: Some(p),
-                            });
-                        }
-                    }
-                    let mut links: Vec<(String, String)> = keystore_io::suggested_stores();
-                    // One row per descriptor, labelled by what it is; the old
-                    // "Abrir nss / Abrir windows" jargon is B-2's own words.
-                    for (family, descriptor) in links.drain(..) {
-                        let label = match family.as_str() {
-                            "dnie" => tr.store_dnie.clone(),
-                            "opensc" => tr.store_opensc.clone(),
-                            "fnmt" => tr.store_fnmt.clone(),
-                            "firefox" | "nssdb" => {
-                                format!("{} ({})", tr.store_firefox, descriptor)
-                            }
-                            _ => descriptor.clone(),
-                        };
-                        if ui.link(label).clicked() {
-                            self.deferred.push(Deferred::OpenStore(descriptor));
-                        }
-                    }
-                    if ui.button(tr.open_keystore.clone()).clicked() {
-                        self.show_add_store = true;
-                    }
+                    // path to sign with their DNIe.
+                    self.render_picker_doors(ui, catalog);
                 } else {
                     for (i, e) in catalog.entries.iter().enumerate() {
                         let sel = *selected == Some(i);
@@ -1190,6 +1148,15 @@ impl App {
                             *password_error = false;
                         }
                     }
+                    // A-6: the doors stay reachable with rows on screen. This
+                    // was the dead end the review walked into — one store row
+                    // listed, and the only way to add another `.p12` or open a
+                    // card was gone from the window — while the comment above
+                    // the empty branch claimed they were "reachable from every
+                    // picker state". They are now, because both branches render
+                    // the same function.
+                    ui.add_space(6.0);
+                    self.render_picker_doors(ui, catalog);
                 }
             });
 
@@ -1466,6 +1433,53 @@ impl App {
     fn render_opening_store(&mut self, ui: &mut Ui) {
         ui.spinner();
         ui.label(self.tr.opening_store.clone());
+    }
+
+    /// The picker's doors: add a `.p12`, open one of the stores this machine
+    /// has middleware for, or type a descriptor by hand (A-6). One function for
+    /// the empty picker and for the one that already lists rows, so the two
+    /// cannot drift apart again — that is how the manual descriptor became
+    /// unreachable the moment a store's row appeared.
+    fn render_picker_doors(&mut self, ui: &mut Ui, catalog: &mut CertCatalog) {
+        let tr = self.tr.clone();
+        if ui.button(tr.p12_button.clone()).clicked() {
+            let title = tr.dialog_open_cert.clone();
+            let picked = self.open_file(&title);
+            if let Some(p) = picked {
+                catalog.entries.retain(|c| c.pending_p12.is_none());
+                catalog.entries.push(CertificateChoice {
+                    display: format!("{}…", display_name(&p)),
+                    origin: display_name(&p),
+                    // A .p12 file's owner is inside it, and the password is
+                    // what unlocks that truth: the row answers "quién es el
+                    // titular" after the one field it costs (A-7's p12 half —
+                    // AutoFirma's dialog reads the container to show the same).
+                    issuer: None,
+                    valid_until: None,
+                    badges: Vec::new(),
+                    source: None,
+                    pending_p12: Some(p),
+                });
+            }
+        }
+        let mut links: Vec<(String, String)> = keystore_io::suggested_stores();
+        // One row per descriptor, labelled by what it is; the old "Abrir nss /
+        // Abrir windows" jargon is B-2's own words.
+        for (family, descriptor) in links.drain(..) {
+            let label = match family.as_str() {
+                "dnie" => tr.store_dnie.clone(),
+                "opensc" => tr.store_opensc.clone(),
+                "fnmt" => tr.store_fnmt.clone(),
+                "firefox" | "nssdb" => format!("{} ({})", tr.store_firefox, descriptor),
+                _ => descriptor.clone(),
+            };
+            if ui.link(label).clicked() {
+                self.deferred.push(Deferred::OpenStore(descriptor));
+            }
+        }
+        if ui.button(tr.open_keystore.clone()).clicked() {
+            self.show_add_store = true;
+        }
     }
 
     /// A-1: the one job whose screen the citizen used to watch do nothing.

@@ -174,6 +174,12 @@ fn a_p12_picked_through_the_fixture_signs_with_its_password() {
             .is_some(),
         "the password field is reachable by its label (screen-reader rule)"
     );
+    // A-6: the row is on screen and the doors are still there. The dead end
+    // the review walked into was exactly this state — one row listed, and the
+    // way to add another certificate or open a card gone from the window,
+    // while a comment claimed it was "reachable from every picker state".
+    harness.get_by_label_contains("Abrir un archivo de certificado");
+    harness.get_by_label_contains("Otro almacén (escribe su ruta o nombre)…");
 
     // 3. type the password into the field and sign. Typing alone does not
     // focus the widget for egui's TextEdit, so the test stands in for the
