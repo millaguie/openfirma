@@ -118,7 +118,9 @@ cargo run -p openfirma-gui       # the window (Spanish and English; docs/adr/000
 ```
 
 The GUI needs no flags: drop the document, pick the certificate, sign — the
-result lands next to the original (`documento.signed.pdf`). Verifying is
+result lands next to the original, every extension it had kept
+(`documento.pdf` → `documento.pdf.signed.pdf`; `informe.v1.pdf` →
+`informe.v1.signed.pdf`). Verifying is
 dropping a signed file and reading the verdicts. The authorities it verifies
 against are configuration, read once at startup from `$OPENFIRMA_TRUST` — the
 same knob the CLI reads; the window never asks you to choose a CA (a question
