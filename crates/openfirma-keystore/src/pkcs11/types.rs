@@ -494,9 +494,20 @@ cryptoki_packed! {
     ///           (p = 4 on i686, 8 on x86_64/aarch64)
     /// ```
     ///
-    /// A third ABI fact lives here, also measured: `extern "system"` fn
-    /// pointers are pointer-sized on all Windows MSVC ABIs (the far-pointer
-    /// worry only applies to 16-bit DOS ABIs), so packed slots step exactly p.
+    /// A third ABI fact lives here, and it is why every field below is
+    /// `extern "C"` rather than `extern "system"`: on 32-bit Windows
+    /// `extern "system"` is stdcall, and PKCS#11 fixes no convention there
+    /// (the spec header writes a bare `(*name)`, NSS expands `PR_CALLBACK`
+    /// to nothing on WIN32, OpenSC's `CK_SPEC` is only `dllimport`), so every
+    /// real module — softokn3, OpenSC, the FNMT middleware — is cdecl. Calling
+    /// one through stdcall leaves the stack unbalanced after `C_Initialize`
+    /// and never returns cleanly from there. On x86_64 and aarch64 the two
+    /// spellings are the same ABI; the difference only exists where the bug
+    /// shipped (the `i686-pc-windows-msvc` zip of the release job). Review 04,
+    /// N1, and `the_function_table_is_declared_with_the_c_convention` below.
+    /// `extern "C" fn` pointers are pointer-sized on all Windows MSVC ABIs
+    /// (the far-pointer worry only applies to 16-bit DOS ABIs), so packed
+    /// slots still step exactly p.
     /// The offset assertions at the bottom of this file are the executable
     /// version of every claim above, and the loader reads the table with
     /// `read_unaligned` because pack(1) permits a vendor DLL to place slot 1
@@ -523,38 +534,38 @@ cryptoki_packed! {
     // three MSVC ABIs — init 2, finalize +p, sign_init 2+43p exactly).
     #[cfg(not(windows))]
     _pad0: [u8; 6],
-    pub initialize: extern "system" fn(init_args: *mut c_void) -> CkRv,
-    pub finalize: extern "system" fn(reserved: *mut c_void) -> CkRv,
+    pub initialize: extern "C" fn(init_args: *mut c_void) -> CkRv,
+    pub finalize: extern "C" fn(reserved: *mut c_void) -> CkRv,
     _get_info: *mut c_void,
     /// Declared here because the list contains it even though we obtain the
     /// list itself through the exported `C_GetFunctionList` symbol.
     _get_function_list: *mut c_void,
-    pub get_slot_list: extern "system" fn(
+    pub get_slot_list: extern "C" fn(
         token_present: u8,
         p_slot_list: *mut CkSlotId,
         pul_count: *mut CkUlong,
     ) -> CkRv,
     /// Read at list time to keep only slots whose token is present.
-    pub get_slot_info: extern "system" fn(slot_id: CkSlotId, p_info: *mut CkSlotInfo) -> CkRv,
-    pub get_token_info: extern "system" fn(slot_id: CkSlotId, p_info: *mut CkTokenInfo) -> CkRv,
+    pub get_slot_info: extern "C" fn(slot_id: CkSlotId, p_info: *mut CkSlotInfo) -> CkRv,
+    pub get_token_info: extern "C" fn(slot_id: CkSlotId, p_info: *mut CkTokenInfo) -> CkRv,
     _get_mechanism_list: *mut c_void,
     _get_mechanism_info: *mut c_void,
     _init_token: *mut c_void,
     _init_pin: *mut c_void,
     _set_pin: *mut c_void,
-    pub open_session: extern "system" fn(
+    pub open_session: extern "C" fn(
         slot_id: CkSlotId,
         flags: CkUlong,
         application: *mut c_void,
         notify: *mut c_void,
         ph_session: *mut CkSessionHandle,
     ) -> CkRv,
-    pub close_session: extern "system" fn(session: CkSessionHandle) -> CkRv,
+    pub close_session: extern "C" fn(session: CkSessionHandle) -> CkRv,
     _close_all_sessions: *mut c_void,
     _get_session_info: *mut c_void,
     _get_operation_state: *mut c_void,
     _set_operation_state: *mut c_void,
-    pub login: extern "system" fn(
+    pub login: extern "C" fn(
         session: CkSessionHandle,
         user_type: CkUlong,
         p_pin: *mut u8,
@@ -565,25 +576,25 @@ cryptoki_packed! {
     _copy_object: *mut c_void,
     _destroy_object: *mut c_void,
     _get_object_size: *mut c_void,
-    pub get_attribute_value: extern "system" fn(
+    pub get_attribute_value: extern "C" fn(
         session: CkSessionHandle,
         object: CkObjectHandle,
         p_template: *mut CkAttribute,
         ul_count: CkUlong,
     ) -> CkRv,
     _set_attribute_value: *mut c_void,
-    pub find_objects_init: extern "system" fn(
+    pub find_objects_init: extern "C" fn(
         session: CkSessionHandle,
         p_template: *mut CkAttribute,
         ul_count: CkUlong,
     ) -> CkRv,
-    pub find_objects: extern "system" fn(
+    pub find_objects: extern "C" fn(
         session: CkSessionHandle,
         p_object: *mut CkObjectHandle,
         ul_max_object_count: CkUlong,
         pul_count: *mut CkUlong,
     ) -> CkRv,
-    pub find_objects_final: extern "system" fn(session: CkSessionHandle) -> CkRv,
+    pub find_objects_final: extern "C" fn(session: CkSessionHandle) -> CkRv,
     _encrypt_init: *mut c_void,
     _encrypt: *mut c_void,
     _encrypt_update: *mut c_void,
@@ -597,7 +608,7 @@ cryptoki_packed! {
     _digest_update: *mut c_void,
     _digest_key: *mut c_void,
     _digest_final: *mut c_void,
-    pub sign_init: extern "system" fn(
+    pub sign_init: extern "C" fn(
         session: CkSessionHandle,
         p_mechanism: *mut CkMechanism,
         key: CkObjectHandle,
@@ -606,7 +617,7 @@ cryptoki_packed! {
     /// raw digest and the module builds the DigestInfo; for `CKM_ECDSA` they
     /// are the digest already, exactly as the mechanism documents. Either way
     /// openfirma never hands a token anything but a digest.
-    pub sign: extern "system" fn(
+    pub sign: extern "C" fn(
         session: CkSessionHandle,
         p_data: *mut u8,
         ul_data_len: CkUlong,
@@ -632,7 +643,7 @@ cryptoki_packed! {
 pub fn function_slot_offset(k: usize) -> usize {
     use core::mem::{offset_of, size_of};
     let ptr = size_of::<*const c_void>();
-    if cfg!(windows) || size_of::<extern "system" fn()>() == 4 {
+    if cfg!(windows) || size_of::<extern "C" fn()>() == 4 {
         match k {
             1 => offset_of!(CkFunctionList, initialize),
             2 => offset_of!(CkFunctionList, finalize),
@@ -720,7 +731,7 @@ const _: () = {
 
     let ptr = core::mem::size_of::<*const c_void>();
     let ulong = core::mem::size_of::<CkUlong>();
-    assert!(ptr == core::mem::size_of::<extern "system" fn()>());
+    assert!(ptr == core::mem::size_of::<extern "C" fn()>());
 
     // CK_ATTRIBUTE (ulong + pointer + ulong) is what openfirma hands the
     // module in C_GetAttributeValue/C_FindObjectsInit, so its shape *is* the
@@ -819,3 +830,85 @@ const _: () = {
     assert!(core::mem::offset_of!(CkFunctionList, sign_init) == base + 42 * ptr);
     assert!(core::mem::offset_of!(CkFunctionList, sign) == base + 43 * ptr);
 };
+
+#[cfg(test)]
+mod the_calling_convention {
+    use super::*;
+
+    /// Review 04, N1. What a `fn` type is *declared* with is visible to
+    /// `type_name`, and the two spellings differ even where they are the same
+    /// machine ABI (`extern "system"` prints as `system` on Linux too), so this
+    /// test bites on every target rather than only where the bug shipped.
+    ///
+    /// The table is materialized from bytes with a real function address in
+    /// each declared slot — never called, only asked its type — because a
+    /// struct literal cannot name private fields and zeros would be invalid
+    /// `fn` values. Reading it is the same `read_unaligned` the loader does.
+    #[test]
+    fn the_function_table_is_declared_with_the_c_convention() {
+        extern "C" fn stub() {}
+        let addr = stub as *const c_void;
+        let mut bytes = [0u8; core::mem::size_of::<CkFunctionList>()];
+        for k in [1usize, 2, 5, 6, 7, 13, 14, 19, 25, 27, 28, 29, 43, 44] {
+            let at = unsafe { bytes.as_mut_ptr().add(function_slot_offset(k)) };
+            unsafe { at.cast::<*const c_void>().write_unaligned(addr) };
+        }
+        let list: CkFunctionList =
+            unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<CkFunctionList>()) };
+        for (name, declared) in [
+            (
+                "C_Initialize",
+                core::any::type_name_of_val(&list.initialize),
+            ),
+            ("C_Finalize", core::any::type_name_of_val(&list.finalize)),
+            (
+                "C_GetSlotList",
+                core::any::type_name_of_val(&list.get_slot_list),
+            ),
+            (
+                "C_GetSlotInfo",
+                core::any::type_name_of_val(&list.get_slot_info),
+            ),
+            (
+                "C_GetTokenInfo",
+                core::any::type_name_of_val(&list.get_token_info),
+            ),
+            (
+                "C_OpenSession",
+                core::any::type_name_of_val(&list.open_session),
+            ),
+            (
+                "C_CloseSession",
+                core::any::type_name_of_val(&list.close_session),
+            ),
+            ("C_Login", core::any::type_name_of_val(&list.login)),
+            (
+                "C_GetAttributeValue",
+                core::any::type_name_of_val(&list.get_attribute_value),
+            ),
+            (
+                "C_FindObjectsInit",
+                core::any::type_name_of_val(&list.find_objects_init),
+            ),
+            (
+                "C_FindObjects",
+                core::any::type_name_of_val(&list.find_objects),
+            ),
+            (
+                "C_FindObjectsFinal",
+                core::any::type_name_of_val(&list.find_objects_final),
+            ),
+            ("C_SignInit", core::any::type_name_of_val(&list.sign_init)),
+            ("C_Sign", core::any::type_name_of_val(&list.sign)),
+        ] {
+            assert!(
+                !declared.contains("system"),
+                "{name} is declared {declared}. `extern \"system\"` is stdcall on \
+                 32-bit Windows, where no real PKCS#11 module is: the spec header \
+                 writes a bare `(*name)`, NSS expands PR_CALLBACK to nothing on \
+                 WIN32 and OpenSC's CK_SPEC is only dllimport, so the first \
+                 C_Initialize would leave the stack unbalanced."
+            );
+        }
+    }
+}
