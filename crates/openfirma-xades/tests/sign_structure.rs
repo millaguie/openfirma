@@ -690,3 +690,41 @@ fn a_document_with_a_repeated_id_refuses_to_sign() {
     let input = br#"<doc Id="a"><b Id="c"/><c/></doc>"#;
     xades_sign(input, &signer, &XadesOptions::default()).expect("unique Ids must sign");
 }
+
+/// A signature is not a document that can be signed. The data reference's filter
+/// is `not(ancestor-or-self::ds:Signature)`, so when the root itself is the
+/// signature the digest covers an empty node-set and the output cannot validate
+/// anywhere — `xmlsec1` calls it a REFERENCE failure. AutoFirma refuses the same
+/// shape too (it digests the empty string and errors), so the difference here is
+/// only that the refusal is legible and no broken file is written.
+#[test]
+fn a_document_whose_root_is_a_signature_is_not_signed() {
+    let Some(signer) = load_signer("signer-rsa.crt", "signer-rsa.key", &[]) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let inputs: &[&[u8]] = &[
+        // the shape reached by saving a signature out of a browser and pointing
+        // the signer at the file
+        br#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo/></ds:Signature>"#,
+        // the same element with no prefix at all: the namespace is what counts
+        br#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo/></Signature>"#,
+        // and bound to some other prefix, which every validator reads the same way
+        br#"<x:Signature xmlns:x="http://www.w3.org/2000/09/xmldsig#"/>"#,
+    ];
+    for &input in inputs {
+        let err = xades_sign(input, &signer, &XadesOptions::default())
+            .expect_err("a signature cannot be its own signed document");
+        assert!(
+            err.to_string().contains("is a ds:Signature"),
+            "the refusal must name the element: {err}"
+        );
+    }
+
+    // A signature *inside* a document is the opposite case, and the common one:
+    // that is what co-signing looks like. The root is what gets signed, the filter
+    // removes the older signature's subtree, and it keeps working.
+    let input = br#"<doc><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo/></Signature></doc>"#;
+    xades_sign(input, &signer, &XadesOptions::default())
+        .expect("a document carrying an older signature must still sign");
+}

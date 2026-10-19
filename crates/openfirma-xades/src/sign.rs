@@ -82,6 +82,26 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
         }
     })?;
 
+    // A document whose root element *is* a `ds:Signature` has nothing to sign. The
+    // data reference carries the filter `not(ancestor-or-self::ds:Signature)`, so
+    // when the root itself is one the removal takes the very node the reference
+    // points at: the digest covers nothing, and the file produced fails everywhere
+    // it is checked. Measured with `tools/golden/AutofirmaGolden` on
+    // `<ds:Signature><ds:SignedInfo/></ds:Signature>`: AutoFirma accepts it and
+    // writes 7 723 bytes, and then its own validator answers `UNKOWN_ERROR` on
+    // what it wrote and `xmlsec1 verify` answers ERROR. Signing anyway is therefore
+    // a signature that cannot be validated by anyone, including the tool that made
+    // it, which is why this is refused instead of produced: a divergence from
+    // AutoFirma, and the over-refusing kind on purpose. What the filter matches is
+    // the namespace URI, not the letters, so a foreign prefix bound to it is the
+    // same element here as in every validator.
+    if doc.root.namespace.as_deref() == Some(DS_NS) && doc.root.name.local == "Signature" {
+        return Err(Error::Xml(
+            "the input's root element is a ds:Signature, so enveloped XAdES has nothing to              sign: the data reference's filter (`not(ancestor-or-self::ds:Signature)`) removes              the element the reference points at, and the digest would cover no content. Sign              the document the signature belongs to; countersigning a signature is a different              feature and is not implemented"
+                .to_string(),
+        ));
+    }
+
     let key_alg = signer.key_algorithm()?;
     let sig_method_uri = signature_method_uri(key_alg, opts.digest)?;
     let digest_uri = digest_method_uri(opts.reference_digest);
