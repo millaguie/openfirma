@@ -14,24 +14,80 @@ use std::net::{SocketAddr, TcpStream};
 /// its own "16 requests in flight and answered a new connection with 503"), so
 /// a refusal here is not the listener dying and must not be read as one.
 ///
-/// A caller retries; so does this. Twenty attempts 150 ms apart is three
-/// seconds, well inside every patience loop in these tests, and the refusal
-/// that persists is a different animal — a port nobody is listening on — whose
-/// panic says exactly that instead of guessing which of the two happened.
+/// The two cases get their own patience, because they are different animals.
+/// A port nobody is listening on answers ECONNREFUSED immediately and is the
+/// failure this helper reports, so it gets 20 attempts (three seconds) —
+/// long enough for a listener that is still binding. `AddrNotAvailable` never
+/// reached the listener at all: the kernel had no local port to give THIS
+/// connect, and the round-two run's two heaviest tests (hundreds of loopback
+/// sockets each, thirty seconds each) exhausted the three-second budget while
+/// the endpoint stayed up. That case waits thirty seconds, which is spent only
+/// when the kernel — not the endpoint — is saying no, and both messages still
+/// say which of the two happened instead of guessing.
 pub fn connect(addr: SocketAddr) -> TcpStream {
-    const ATTEMPTS: usize = 20;
-    for attempt in 0..ATTEMPTS {
+    let mut refusals = 0usize;
+    let mut no_local_port = 0usize;
+    loop {
         match TcpStream::connect(addr) {
             Ok(stream) => return stream,
-            Err(error) if attempt + 1 == ATTEMPTS => panic!(
-                "the endpoint at {addr} refused {ATTEMPTS} connections in a row ({error}); \
-                 either nothing is listening or the OS kept refusing the local port"
-            ),
             Err(error) => {
+                // `AddrNotAvailable` is EADDRNOTAVAIL: the kernel could not
+                // pick a source address/port. Everything else is the peer's
+                // own answer.
+                let kernel_said_no = error.kind() == std::io::ErrorKind::AddrNotAvailable;
+                let spent = if kernel_said_no {
+                    no_local_port += 1;
+                    no_local_port
+                } else {
+                    refusals += 1;
+                    refusals
+                };
+                if spent >= budget_for(error.kind()) {
+                    panic!(
+                        "the endpoint at {addr} refused {spent} connections in a row ({error}); \
+                         either nothing is listening or the OS kept refusing the local port"
+                    );
+                }
                 eprintln!("openfirma tests: connecting to {addr} was refused ({error}); retrying");
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }
         }
     }
-    unreachable!("the loop returns or panics")
+}
+
+/// A port nobody is listening on answers ECONNREFUSED immediately and is the
+/// failure `connect` reports, so it gets 20 attempts (three seconds) — long
+/// enough for a listener that is still binding. `AddrNotAvailable` never
+/// reached the listener at all: the kernel had no local port to give THIS
+/// connect, and the round-two run's two heaviest tests (hundreds of loopback
+/// sockets each, thirty seconds each) exhausted the three-second budget while
+/// the endpoint stayed up. That one waits thirty seconds, spent only when the
+/// kernel — not the endpoint — is saying no.
+fn budget_for(kind: std::io::ErrorKind) -> usize {
+    const REFUSALS: usize = 20;
+    const NO_LOCAL_PORT: usize = 200;
+    if kind == std::io::ErrorKind::AddrNotAvailable {
+        NO_LOCAL_PORT
+    } else {
+        REFUSALS
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::budget_for;
+
+    /// The two refusals are different animals and must not share a patience:
+    /// a listener that is not answering gets three seconds, a kernel that has
+    /// no local port to hand out gets thirty. Collapsing them back into one
+    /// budget is what the macOS run punished.
+    #[test]
+    fn the_kernels_refusal_gets_a_longer_patience_than_the_endpoints() {
+        assert_eq!(budget_for(std::io::ErrorKind::ConnectionRefused), 20);
+        assert_eq!(budget_for(std::io::ErrorKind::AddrNotAvailable), 200);
+        assert!(
+            budget_for(std::io::ErrorKind::AddrNotAvailable)
+                > budget_for(std::io::ErrorKind::ConnectionRefused)
+        );
+    }
 }
