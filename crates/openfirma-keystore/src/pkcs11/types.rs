@@ -872,51 +872,33 @@ mod the_calling_convention {
         }
         let list: CkFunctionList =
             unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<CkFunctionList>()) };
+        // The declared type of one slot, asked of a **copy** of the field.
+        // A reference to a field of this struct is unaligned where the table is
+        // packed (Windows: `repr(C, packed)`), and rustc refuses to build one
+        // — E0793 — so `&list.initialize` compiled on Linux and macOS and
+        // reddened both Windows jobs the first time round 2's N1 test ran
+        // there. The copy is load-bearing, not cosmetic.
+        macro_rules! declared {
+            ($slot:ident) => {{
+                let value = list.$slot;
+                core::any::type_name_of_val(&value)
+            }};
+        }
         for (name, declared) in [
-            (
-                "C_Initialize",
-                core::any::type_name_of_val(&list.initialize),
-            ),
-            ("C_Finalize", core::any::type_name_of_val(&list.finalize)),
-            (
-                "C_GetSlotList",
-                core::any::type_name_of_val(&list.get_slot_list),
-            ),
-            (
-                "C_GetSlotInfo",
-                core::any::type_name_of_val(&list.get_slot_info),
-            ),
-            (
-                "C_GetTokenInfo",
-                core::any::type_name_of_val(&list.get_token_info),
-            ),
-            (
-                "C_OpenSession",
-                core::any::type_name_of_val(&list.open_session),
-            ),
-            (
-                "C_CloseSession",
-                core::any::type_name_of_val(&list.close_session),
-            ),
-            ("C_Login", core::any::type_name_of_val(&list.login)),
-            (
-                "C_GetAttributeValue",
-                core::any::type_name_of_val(&list.get_attribute_value),
-            ),
-            (
-                "C_FindObjectsInit",
-                core::any::type_name_of_val(&list.find_objects_init),
-            ),
-            (
-                "C_FindObjects",
-                core::any::type_name_of_val(&list.find_objects),
-            ),
-            (
-                "C_FindObjectsFinal",
-                core::any::type_name_of_val(&list.find_objects_final),
-            ),
-            ("C_SignInit", core::any::type_name_of_val(&list.sign_init)),
-            ("C_Sign", core::any::type_name_of_val(&list.sign)),
+            ("C_Initialize", declared!(initialize)),
+            ("C_Finalize", declared!(finalize)),
+            ("C_GetSlotList", declared!(get_slot_list)),
+            ("C_GetSlotInfo", declared!(get_slot_info)),
+            ("C_GetTokenInfo", declared!(get_token_info)),
+            ("C_OpenSession", declared!(open_session)),
+            ("C_CloseSession", declared!(close_session)),
+            ("C_Login", declared!(login)),
+            ("C_GetAttributeValue", declared!(get_attribute_value)),
+            ("C_FindObjectsInit", declared!(find_objects_init)),
+            ("C_FindObjects", declared!(find_objects)),
+            ("C_FindObjectsFinal", declared!(find_objects_final)),
+            ("C_SignInit", declared!(sign_init)),
+            ("C_Sign", declared!(sign)),
         ] {
             assert!(
                 !declared.contains("system"),

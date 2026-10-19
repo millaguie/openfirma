@@ -1718,6 +1718,11 @@ mod tests {
              this pins"
         );
         let info = info.expect("the stub answered CKR_OK");
-        assert_eq!(info.flags, CKF_TOKEN_PRESENT);
+        // Read by value: `CkSlotInfo` is a packed struct on Windows, and a
+        // reference to one of its fields is unaligned — rustc refuses to build
+        // that (E0793), which is how this line reddened both Windows jobs the
+        // first time it ran there.
+        let flags = info.flags;
+        assert_eq!(flags, CKF_TOKEN_PRESENT);
     }
 }
