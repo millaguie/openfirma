@@ -5,12 +5,19 @@
 //! - `AfirmaWebSocketServerManager.startService` opens an **SSL WebSocket**
 //!   (`wss://127.0.0.1:<port>`, autoscript.js builds the URL from the literal
 //!   `"wss://"`) with a context from `SecureSocketUtils`: a PKCS#12 keystore
-//!   named `autofirma.pfx` installed by every installer, whose password is the
-//!   hardcoded string in that same file. The certificate it contains is the
-//!   one shipped with the package — an unpublished self-signed cert; browsers
-//!   accept the endpoint because a `wss:` WebSocket connection never asks the
-//!   user (certificate errors on WebSockets are silent), not because anyone
-//!   trusted it.
+//!   named `autofirma.pfx`, whose password is the hardcoded string in that same
+//!   file ("654321"). The keystore is not shipped with the package: AutoFirma's
+//!   configurator GENERATES it (`CertUtil.ROOT_CERTIFICATE_PRINCIPAL =
+//!   "CN=Autofirma ROOT"`, plus a `127.0.0.1` leaf signed by that CA) and then
+//!   IMPORTS the CA into the browser's trust store — its own bundled `certutil`
+//!   for Firefox's NSS profiles on Linux (`-A -n "Autofirma ROOT" -i
+//!   autofirma.cer -t "TCP,TCP,TCP"`), the OS store or the keychain on Windows
+//!   and macOS — so the page's connection verifies against a CA that machine
+//!   trusts. An earlier revision of this comment called the certificate "an
+//!   unpublished self-signed cert" that browsers accepted only because `wss`
+//!   certificate errors are silent; that premise was wrong, and ADR-0005's M-7
+//!   section records the correction. (The constant password and the generated
+//!   CA are still AutoFirma's own design; nothing here trusts either.)
 //! - The server binds a random port **out of band**: the page picks up to
 //!   three ports from 49152..65535 (`AfirmaUtils.getRandomPorts` in
 //!   autoscript.js), puts them in `afirma://websocket?ports=…&v=4&jvc=…&idsession=…`,

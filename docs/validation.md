@@ -167,7 +167,11 @@ comes from, and the attack surface has tests that assert refusal *by named
 reason*: cross-site Origin, rebound Host, GET-as-CSRF, token replay, chunked
 and oversized bodies (`crates/openfirma-browser/tests/fake_sede.rs`). The
 threat model and why the transport is plain HTTP on loopback rather than the
-self-signed wss AutoFirma uses is docs/adr/0005-browser-protocol.md.
+TLS WebSocket AutoFirma's configurator sets up (a generated `CN=Autofirma ROOT`
+CA whose certificate it installs into the browser's own store) is
+docs/adr/0005-browser-protocol.md, whose M-7 section corrects the older claim
+that browsers accepted AutoFirma's endpoint because WebSocket TLS errors are
+silent.
 
 Gotcha found while setting this up: **`openssl cms -verify -content` is broken
 for detached signatures in 3.6.5**. It rejects detached CMS produced by openssl

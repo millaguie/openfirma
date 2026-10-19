@@ -318,21 +318,21 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 /// A /sign path is safe to re-ask when its id could never have been minted —
-/// our tokens are exactly 16 lowercase alphanumerics (token.rs), so a guessed
-/// or truncated id can only ever be refused, burning nothing. `request` trusts
-/// nothing else: every other /sign path is treated as carrying a real one-shot
-/// token and must go through [`ask`] instead. Test-harness bookkeeping alone.
+/// our tokens are exactly 20 lowercase alphanumerics (token.rs, filling
+/// `UrlParameters`' `MAX_ID_LENGTH`), so a guessed or truncated id can only
+/// ever be refused, burning nothing. `request` trusts nothing else: every other
+/// /sign path is treated as carrying a real one-shot token and must go through
+/// [`ask`] instead. Test-harness bookkeeping alone.
 ///
 /// Note what counts as mintable: `/sign/deadbeefdeadbeef` — the id several probes
-/// used to carry — IS 16 lowercase hex chars, so it was never credential-free and
-/// those requests got tries=1. They now pass UNMINTABLE_SIGN_PATH below, whose
-/// hyphen no token generator emits, so a socket-layer answer discard retries
-/// instead of panicking (CI run 39081681732: Windows discarded the refused
-/// answer once and the "credential-free" probe had no retry left).
+/// used to carry, 16 lowercase hex chars, which WAS a possible token when they
+/// were 16 long — is now under the length and cannot be one, so it retries
+/// instead of panicking. Requests aimed at a real token still go through
+/// [`ask`] with its one try.
 fn sign_path_may_reask(path: &str) -> bool {
     match path.strip_prefix("/sign/") {
         Some(id) => {
-            !(id.len() == 16
+            !(id.len() == 20
                 && id
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
