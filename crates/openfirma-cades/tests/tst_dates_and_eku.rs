@@ -234,7 +234,6 @@ fn a_tsa_certificate_with_a_soft_extended_key_usage_is_not_a_tsa() {
         std::env::temp_dir().join(format!("openfirma-tst-profile-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let ca = load(&dir, "ca.crt");
-    let now = SystemTime::now();
 
     for (name, eku_line, expected) in [
         (
@@ -255,6 +254,12 @@ fn a_tsa_certificate_with_a_soft_extended_key_usage_is_not_a_tsa() {
                 return;
             }
         };
+        // the clock taken AFTER the mint: `notBefore` is the second the
+        // certificate was issued in, so judging under an instant captured before
+        // that asks whether a certificate was valid before it existed. The macOS
+        // leg caught it, where the openssl call finished one second later than
+        // the Linux one and `now` was already history.
+        let now = SystemTime::now();
         let tsa = tsa_signer(&pem);
         let token = tsa_token(&tsa, midpoint_of(&cert));
         let err = tsp::verify_token_signature(&token, std::slice::from_ref(&ca), now)
