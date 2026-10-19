@@ -189,7 +189,15 @@ impl App {
     /// TextEdit's contents in its per-widget state — M-8 measured it holding
     /// a PIN after the screen moved on; deleting the state is the only
     /// answer immediate mode gives).
-    fn mirror_secret(field: &Arc<std::sync::Mutex<Zeroizing<String>>>, out: &mut String) {
+    ///
+    /// The mirror is itself a `Zeroizing`, not a `String` (M-8's remaining
+    /// half): it is a full copy of the secret, it lives in a local that egui
+    /// grows and reallocates as the citizen types, and a plain `String` left
+    /// the freed buffers behind with the password still in them.
+    fn mirror_secret(
+        field: &Arc<std::sync::Mutex<Zeroizing<String>>>,
+        out: &mut Zeroizing<String>,
+    ) {
         if let Ok(guard) = field.lock() {
             out.clear();
             out.push_str(&guard);
@@ -824,6 +832,15 @@ impl App {
         }
     }
 
+    /// What the password field currently holds (M-8: the tests assert the
+    /// secret is gone once the screen it belonged to is).
+    pub fn typed_password_for_test(&self) -> String {
+        self.password_input
+            .lock()
+            .map(|p| p.to_string())
+            .unwrap_or_default()
+    }
+
     pub fn fail_for_test(&mut self, plain: &str, technical: &str) {
         self.screen = Screen::Failed {
             error: ErrorReport {
@@ -1171,9 +1188,9 @@ impl App {
             // check caught what a password field without one would do to a
             // user of assistive technology — an unnamed box.
             let label = ui.label(tr.password_label.clone());
-            let mut mirror = String::new();
+            let mut mirror = Zeroizing::new(String::new());
             App::mirror_secret(&self.password_input, &mut mirror);
-            let edit = egui::TextEdit::singleline(&mut mirror)
+            let edit = egui::TextEdit::singleline(&mut *mirror)
                 .password(true)
                 .id(p12_password_id())
                 .desired_width(320.0);
@@ -1203,6 +1220,12 @@ impl App {
             }
         });
         if go_back {
+            // M-8's other remaining half: the typed password does not outlive
+            // the screen it was typed on. Leaving the picker wiped the widget
+            // state and the `Zeroizing` here — the *frame's* `Zeroizing` copy
+            // (once a plain `String`, `mirror_secret`) is what the field is
+            // rendered from now, so there is no third buffer to go looking for.
+            App::forget_secret(ui, p12_password_id(), &self.password_input);
             put_back!(Screen::Idle);
         }
 
@@ -1382,7 +1405,7 @@ impl App {
         ui.group(|ui| {
             ui.colored_label(palette(ui).note, tr.add_store_help.clone());
             let mut d = std::mem::take(&mut self.descriptor_input);
-            let mut p = String::new();
+            let mut p = Zeroizing::new(String::new());
             App::mirror_secret(&self.pin_input, &mut p);
             ui.add_sized(
                 [(ui.available_width() - 150.0).max(240.0), 26.0],
@@ -1390,7 +1413,7 @@ impl App {
             );
             ui.add_sized(
                 [300.0, 26.0],
-                egui::TextEdit::singleline(&mut p)
+                egui::TextEdit::singleline(&mut *p)
                     .password(true)
                     .hint_text(tr.keystore_pin.clone()),
             );

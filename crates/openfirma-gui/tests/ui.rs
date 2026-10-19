@@ -496,6 +496,65 @@ fn a_wrong_password_stays_on_the_picker_with_its_rows_and_a_sentence() {
 }
 
 #[test]
+fn the_typed_password_does_not_outlive_the_picker_it_was_typed_on() {
+    // M-8's remaining half. The field was wiped when a signing job started
+    // and nowhere else: type the password for the wrong `.p12`, press "Elegir
+    // otro documento", and the secret was still in the field's `Zeroizing` —
+    // and in egui's own remembered text — while the citizen looked at the
+    // drop zone. The frame's copy (`mirror_secret`) is a `Zeroizing` now, and
+    // leaving the screen wipes the field and the widget state with it.
+    let dir = temp_doc("password-outlives");
+    let doc = dir.join("doc.pdf");
+    std::fs::write(&doc, b"%PDF-1.4 placeholder").unwrap();
+    let mut app = fixture_app(None);
+    let row = CertificateChoice {
+        display: "otro.p12…".into(),
+        origin: "otro.p12".into(),
+        issuer: None,
+        valid_until: None,
+        badges: Vec::new(),
+        source: None,
+        pending_p12: Some(PathBuf::from("otro.p12")),
+    };
+    app.set_screen_for_test(Screen::Picked {
+        path: doc.clone(),
+        content: b"%PDF-1.4 placeholder".to_vec(),
+        format: openfirma_core::workflow::Format::Pdf,
+        chosen_format: "pades-b-b".into(),
+        catalog: openfirma_gui::wizard::CertCatalog {
+            entries: vec![row],
+            errors: Vec::new(),
+        },
+        selected: Some(0),
+        advanced: false,
+        tsa_url: String::new(),
+        digest: openfirma_core::DigestAlg::Sha256,
+        reason: String::new(),
+        password_error: false,
+    });
+    app.force_password_for_test("la-del-p12".into());
+    let mut harness = harness_for(app);
+    harness.run();
+    assert_eq!(
+        harness.state().typed_password_for_test(),
+        "la-del-p12",
+        "the field holds what was typed while its screen is on"
+    );
+    harness.get_by_label("Elegir otro documento").click();
+    harness.run();
+    assert!(
+        matches!(harness.state().screen_ref_for_test(), Screen::Idle),
+        "the back button leaves the picker"
+    );
+    assert_eq!(
+        harness.state().typed_password_for_test(),
+        "",
+        "leaving the picker takes the typed password with it"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn a_wrong_password_returns_to_the_picker_with_its_document_and_a_sentence() {
     // 06-N-5, through the button a person presses and the REAL worker.
     // `render_picked` had swapped the Picked screen into a local and left
