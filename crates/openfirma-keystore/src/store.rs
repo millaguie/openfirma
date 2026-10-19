@@ -218,13 +218,18 @@ impl FilteredStore {
     }
 }
 
-// `dyn SystemStore` carries no auto traits of its own, so the wrapper would
-// not be Send/Sync without this line — yet every real backend is shared
-// through `Arc<dyn SystemStore>` across threads already (the CLI builds that
-// very type for its signers in `boxed_signer`), and FilteredStore only ever
-// forwards to such an Arc.
-unsafe impl Send for FilteredStore {}
-unsafe impl Sync for FilteredStore {}
+// Round 2, 04-N9: this used to carry `unsafe impl Send/Sync` with a comment
+// claiming the wrapper would not be Send/Sync without them. That was false —
+// `SystemStore: Send + Sync`, so `Arc<dyn SystemStore>` is both and so is the
+// wrapper, automatically. An `unsafe impl` that asserts something the compiler
+// already knows is worse than redundant: it is a promise nothing checks, and
+// it would keep compiling if the supertraits were ever dropped. What replaces
+// it is the check itself, made by the compiler: if the supertraits go, this
+// stops building instead of silently becoming a lie.
+const _: fn() = || {
+    fn assert_send_and_sync<T: Send + Sync>() {}
+    assert_send_and_sync::<FilteredStore>();
+};
 
 impl SystemStore for FilteredStore {
     fn certificates(&self) -> openfirma_core::Result<Vec<StoreCertificate>> {

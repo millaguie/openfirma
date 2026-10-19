@@ -100,12 +100,6 @@ unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
 impl Module {
-    /// The table pointer itself, for the two slots handled outside the typed
-    /// prefix (`C_GetSlotInfo`).
-    fn raw_table(&self) -> *const c_void {
-        self.functions.cast()
-    }
-
     fn f(&self) -> FunctionListGuard<'_> {
         // The library field's address read here is the liveness statement of
         // this type: `functions` points into the mapped image that `library`
@@ -146,6 +140,33 @@ impl std::ops::Deref for FunctionListGuard<'_> {
     type Target = CkFunctionList;
     fn deref(&self) -> &CkFunctionList {
         self.list
+    }
+}
+
+impl FunctionListGuard<'_> {
+    /// Spec function slot `k`'s address, derived the way every other slot
+    /// lookup in this crate is (`function_slot_offset`) — including for the
+    /// slots the typed prefix does not declare: NSS's softokn3 exports a v2
+    /// function list whose slot 6 exists and answers (measured on its 3.131: a
+    /// real pointer, CKR_FUNCTION_CANCELED when called), while older or
+    /// partial modules leave it null, and PKCS#11 says an application must
+    /// treat an absent function as unsupported rather than call through it.
+    /// Deriving the offset from the declared struct is not incidental: the
+    /// old code computed it with `add(6)` (8-byte slots from the table base),
+    /// which on Windows' packed table points into the middle of two functions
+    /// — a garbage pointer that was then transmuted to `extern "C" fn` and
+    /// called on the first `keystores list` against a real module (review
+    /// M-1).
+    ///
+    /// Taking `&self` is the whole point (round 2, 04-N9): the guard exists
+    /// exactly while the module's call lock is held, so a pointer that comes
+    /// out of here is one the caller may only use with that lock still in
+    /// hand. `C_GetSlotInfo` used to be reached through a bare `*const c_void`
+    /// — the one call into a module made beside the serialised ones, against
+    /// modules like SoftHSM whose unlocked shared-object store is why all the
+    /// others are serialised.
+    fn raw_slot(&self, k: usize) -> *const c_void {
+        function_slot_at(self.list as *const CkFunctionList as *const c_void, k)
     }
 }
 
@@ -512,7 +533,7 @@ impl SystemStore for Pkcs11Store {
 /// info call with any other error is skipped, not fatal: a reader without its
 /// card must not stop a software token in another slot from being found.
 fn slots_with_tokens(module: &Module) -> Result<Vec<CkSlotId>> {
-    let has_slot_info = !slot_info_ptr(module).is_null();
+    let has_slot_info = !module.f().raw_slot(6).is_null();
     let mut count: CkUlong = 0;
     check(
         (module.f().get_slot_list)(1, std::ptr::null_mut(), &mut count),
@@ -529,39 +550,37 @@ fn slots_with_tokens(module: &Module) -> Result<Vec<CkSlotId>> {
     }
     let mut with_tokens = Vec::new();
     for slot in slots {
-        let mut info = CkSlotInfo::default();
-        // SAFETY: get_slot_info was checked non-null above; transmuting a
-        // void* into its declared extern "C" signature is justified by the
-        // PKCS#11 v2.40 table layout (offset 48 == C_GetSlotInfo).
-        let call: extern "C" fn(CkSlotId, *mut CkSlotInfo) -> CkRv =
-            unsafe { std::mem::transmute_copy(&slot_info_ptr(module)) };
-        let rv = call(slot, &mut info);
-        if rv == CKR_OK && info.flags & CKF_TOKEN_PRESENT != 0 {
-            with_tokens.push(slot);
+        // One call, its own guard: the raw slot read runs with the module's
+        // call lock held, and the guard is owned for exactly the call's life.
+        if let Some(info) = get_slot_info(module.f(), slot) {
+            if info.flags & CKF_TOKEN_PRESENT != 0 {
+                with_tokens.push(slot);
+            }
         }
     }
     Ok(with_tokens)
 }
 
-/// Raw access to the `C_GetSlotInfo` slot. The reason it is read as a raw
-/// pointer rather than through the typed table: NSS's softokn3 exports a v2
-/// function list whose slot 6 exists and answers (measured on its 3.131: a
-/// real pointer, CKR_FUNCTION_CANCELED when called), while older or partial
-/// modules leave it null — and PKCS#11 says an application must treat an
-/// absent function as unsupported rather than call through it. Unlike the
-/// functions openfirma requires, which `load_and_init` checks by name.
-fn slot_info_ptr(module: &Module) -> *const c_void {
-    // Read the pointer at slot 6 through the SAME offset rule the rest of this
-    // crate uses (`function_slot_offset`, `types.rs`), and unaligned like
-    // `load_and_init` does. The old code used `add(6)` — pointer arithmetic
-    // that assumes 8-byte slots from the table base — which is correct only on
-    // LP64 Unix. On Windows the table is packed with 4-byte `CK_ULONG`s, so
-    // slot 6 sits at byte 42 (x64) / 22 (i686), not 48/24: `add(6)` read the
-    // tail of one function and the head of the next, producing a garbage
-    // pointer that was then transmuted to `extern "C" fn` and CALLED on the
-    // first `keystores list` against a real module (review M-1). Deriving the
-    // offset from the declared struct keeps this slot and the others in step.
-    function_slot_at(module.raw_table(), 6)
+/// One `C_GetSlotInfo`, made with the module's guard in hand. The guard is
+/// taken **by value** on purpose: dropping it before the call would leave the
+/// raw call unserialised, and a test can see exactly that (the stub checks
+/// whether the lock was still held when it ran). `None` when the module does
+/// not answer the slot at all — a null slot, or any error the module returns
+/// (a reader without its card must not stop a software token in another slot
+/// from being found).
+fn get_slot_info(guard: FunctionListGuard<'_>, slot: CkSlotId) -> Option<CkSlotInfo> {
+    let ptr = guard.raw_slot(6);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the slot was checked non-null just above and transmuting a
+    // void* into its declared extern "C" signature is justified by the
+    // PKCS#11 v2.40 table layout (slot 6 == C_GetSlotInfo); the guard is still
+    // alive, so the call is serialised against every other module call.
+    let call: extern "C" fn(CkSlotId, *mut CkSlotInfo) -> CkRv =
+        unsafe { std::mem::transmute_copy(&ptr) };
+    let mut info = CkSlotInfo::default();
+    (call(slot, &mut info) == CKR_OK).then_some(info)
 }
 
 /// Reads spec function slot `k` out of a function-list base pointer, using this
@@ -1622,5 +1641,83 @@ mod tests {
             without_a_pin("DNIe", Ok(vec![1, 2]), false).unwrap(),
             vec![1, 2]
         );
+    }
+
+    /// Round 2, 04-N9. `C_GetSlotInfo` is the one module function this crate
+    /// reaches through a raw slot pointer (NSS's softokn3 answers it while
+    /// older modules leave it null), and it used to be the one call into a
+    /// module made with no call lock held — beside calls that exist precisely
+    /// because SoftHSM's unlocked shared-object store needs them serialised.
+    ///
+    /// The stub below is the witness: it asks whether the lock was held while
+    /// it ran. The guard is a module's call lock taken by hand, exactly the
+    /// way `Module::f` takes the real one, so no live module is needed for
+    /// the property to be checked.
+    #[test]
+    fn the_raw_slot_info_call_runs_under_the_modules_call_lock() {
+        use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+
+        static LOCK_IN_PLAY: AtomicPtr<Mutex<()>> = AtomicPtr::new(std::ptr::null_mut());
+        static SAW_THE_LOCK_HELD: AtomicBool = AtomicBool::new(false);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        extern "C" fn slot_info_stub(_slot: CkSlotId, info: *mut CkSlotInfo) -> CkRv {
+            // SAFETY: `get_slot_info` hands a live `CkSlotInfo` (it always
+            // passes a local), and the stub owns filling it when it says OK.
+            unsafe { (*info).flags = CKF_TOKEN_PRESENT };
+            let lock = LOCK_IN_PLAY.load(Ordering::SeqCst);
+            // SAFETY: the test stores this pointer only for the duration of
+            // the call under test, with the Mutex alive across it, and clears
+            // it right after. try_lock on a lock this thread already holds
+            // answers WouldBlock instead of deadlocking, which is the answer
+            // the assertion below wants.
+            let held = !lock.is_null() && unsafe { (*lock).try_lock().is_err() };
+            SAW_THE_LOCK_HELD.store(held, Ordering::SeqCst);
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            CKR_OK
+        }
+
+        // A table with the stub in slot 6, built from bytes for the same
+        // reason the ABI tests do it: a `CkFunctionList` literal cannot name
+        // the function-pointer type of every declared slot, and zero is not a
+        // callable address.
+        let mut bytes = [0u8; std::mem::size_of::<CkFunctionList>()];
+        // SAFETY: an unaligned write into a byte buffer sized for the struct,
+        // at the offset `function_slot_offset` computes for slot 6.
+        unsafe {
+            bytes
+                .as_mut_ptr()
+                .add(function_slot_offset(6))
+                .cast::<*const c_void>()
+                .write_unaligned(slot_info_stub as *const c_void)
+        };
+        // SAFETY: slot 6 now holds the stub and everything else stays zero;
+        // nothing here calls any other slot.
+        let table: CkFunctionList =
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<CkFunctionList>()) };
+
+        let module_lock = Mutex::new(());
+        LOCK_IN_PLAY.store(
+            std::ptr::from_ref(&module_lock).cast_mut(),
+            Ordering::SeqCst,
+        );
+        let info = {
+            let guard = FunctionListGuard {
+                list: &table,
+                _guard: module_lock.lock().unwrap(),
+            };
+            get_slot_info(guard, 7)
+        };
+        LOCK_IN_PLAY.store(std::ptr::null_mut(), Ordering::SeqCst);
+
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "the stub must have run");
+        assert!(
+            SAW_THE_LOCK_HELD.load(Ordering::SeqCst),
+            "C_GetSlotInfo must run with the module's call lock held: taking the \
+             guard by value and dropping it before the call is the regression \
+             this pins"
+        );
+        let info = info.expect("the stub answered CKR_OK");
+        assert_eq!(info.flags, CKF_TOKEN_PRESENT);
     }
 }

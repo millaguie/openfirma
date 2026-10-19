@@ -415,16 +415,23 @@ impl Default for CkSlotInfo {
 
 cryptoki_packed! {
     /// `CK_INFO`, read nowhere yet but part of the documented prefix (slot 3
-    /// of the table needs it declared). Its *trailing* ulong-after-bytes is
+    /// of the table needs it declared). Its ulong-between-two-byte-arrays is
     /// exactly where packing changes byte placement, so it carries the cfg'd
     /// repr like the function list.
+    ///
+    /// Field order follows the header to the letter (round 2, 04-N9):
+    /// `cryptokiVersion`, `manufacturerID[32]`, `flags`, `libraryDescription
+    /// [32]`, `libraryVersion`. It used to put `flags` second, which is not
+    /// any ABI's `CK_INFO` — harmless only because nothing reads it yet, and
+    /// exactly the sort of "close enough" that stops being harmless the day
+    /// something does.
     #[derive(Clone, Copy, Default)]
     pub struct CkInfo {
         pub cryptoki_version: CkVersion,
-        /// `CK_FLAGS` is a `CK_ULONG`: the ulong between two byte pairs is
+        pub manufacturer_id: [u8; 32],
+        /// `CK_FLAGS` is a `CK_ULONG`: the ulong between two byte arrays is
         /// where platforms disagree on padding — see the struct's repr note.
         pub flags: CkUlong,
-        pub manufacturer_id: [u8; 32],
         pub library_description: [u8; 32],
         pub library_version: CkVersion,
     }
@@ -771,15 +778,23 @@ const _: () = {
         assert!(core::mem::offset_of!(CkMechanism, ul_parameter_len) == 2 * ptr);
     }
 
-    // CK_INFO carries the version pair, then the ulong flags between fixed
-    // char arrays. Under pack(1)/packed that is 2 + sizeof(ulong) for flags —
-    // exact everywhere openfirma reads it (nowhere today; slot 3's shape must
-    // simply stay honest), and monotonic member order is all C guarantees:
+    // CK_INFO, in the header's own field order (round 2, 04-N9): the version
+    // pair, then the 32-byte manufacturer, then the ulong flags between the two
+    // char arrays. Monotonic member order is all C guarantees without a
+    // compiler probe per target — and it is enough to have caught the order
+    // this struct shipped with, which put the ulong second:
     assert!(core::mem::offset_of!(CkInfo, cryptoki_version) == 0);
-    assert!(core::mem::offset_of!(CkInfo, flags) >= core::mem::size_of::<CkVersion>());
+    assert!(core::mem::offset_of!(CkInfo, manufacturer_id) == core::mem::size_of::<CkVersion>());
     assert!(
-        core::mem::offset_of!(CkInfo, manufacturer_id)
+        core::mem::offset_of!(CkInfo, flags) >= core::mem::offset_of!(CkInfo, manufacturer_id) + 32
+    );
+    assert!(
+        core::mem::offset_of!(CkInfo, library_description)
             >= core::mem::offset_of!(CkInfo, flags) + ulong
+    );
+    assert!(
+        core::mem::offset_of!(CkInfo, library_version)
+            >= core::mem::offset_of!(CkInfo, library_description) + 32
     );
 
     // CK_SLOT_INFO / CK_TOKEN_INFO: the fixed char arrays (64+32 and 96 bytes

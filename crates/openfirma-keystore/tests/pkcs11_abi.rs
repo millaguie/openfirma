@@ -185,6 +185,41 @@ fn slot_and_token_info_read_their_flags_where_the_header_puts_them() {
 }
 
 #[test]
+fn ck_info_follows_the_headers_field_order() {
+    // The header, in order: `CK_VERSION cryptokiVersion; CK_UTF8CHAR
+    // manufacturerID[32]; CK_FLAGS flags; CK_UTF8CHAR libraryDescription[32];
+    // CK_VERSION libraryVersion;` — round 2, 04-N9: this struct had `flags`
+    // second, which is no ABI's CK_INFO. Nothing reads it yet, so the order is
+    // the contract; the offsets are what an implementation of C_GetInfo would
+    // read, and each packing rule gives them exactly.
+    let ulong = size_of::<CkUlong>();
+    assert_eq!(offset_of!(CkInfo, cryptoki_version), 0);
+    // the 32-byte array no ABI pads, right behind the version pair
+    assert_eq!(offset_of!(CkInfo, manufacturer_id), 2);
+    if cfg!(windows) {
+        // pack(1): no padding anywhere. (MSVC's own headers keep `unsigned
+        // long` an 8-aligned *type* even at /Zp1, which would put `flags` six
+        // bytes later; this struct is never read and the field order is what
+        // the finding was about, so the packed-1 numbers are what is pinned.)
+        assert_eq!(offset_of!(CkInfo, flags), 34);
+        assert_eq!(offset_of!(CkInfo, library_description), 38);
+        assert_eq!(offset_of!(CkInfo, library_version), 70);
+        assert_eq!(size_of::<CkInfo>(), 72);
+    } else {
+        // natural alignment: the ulong rounds its own offset up to its width,
+        // and everything after it follows in declared order.
+        let flags = (2 + 32usize).next_multiple_of(ulong);
+        assert_eq!(offset_of!(CkInfo, flags), flags);
+        assert_eq!(offset_of!(CkInfo, library_description), flags + ulong);
+        assert_eq!(offset_of!(CkInfo, library_version), flags + ulong + 32);
+        assert_eq!(
+            size_of::<CkInfo>(),
+            (flags + ulong + 32 + 2).next_multiple_of(ulong)
+        );
+    }
+}
+
+#[test]
 fn the_table_is_dense_and_sized_through_c_sign() {
     // Slot 44 is C_Sign and the last declared entry; the image must cover it.
     let span = offset_of!(CkFunctionList, sign) + size_of::<*const u8>();

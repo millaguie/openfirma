@@ -462,6 +462,13 @@ impl SystemStore for WindowsStore {
                 if !duplicate.is_null() {
                     ctx = duplicate;
                 }
+                // And give back the one this call handed us. The enum owns
+                // exactly one reference per context it returns, and it is the
+                // *next* call that would free this one — the call we are
+                // walking away from. Leaving the loop without it leaked a
+                // reference per signature (round 2, 04-N9); `duplicate` above
+                // is what survives.
+                unsafe { CertFreeCertificateContext(probe) };
                 break;
             }
         }
