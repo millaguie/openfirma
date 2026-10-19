@@ -673,6 +673,20 @@ fn technical_of(r: &VerifyReport) -> Vec<String> {
     } else {
         lines.push("nivel: B-B".into());
     }
+    // Una contrafirma es otra persona apoyada en esta firma; quien es forma parte
+    // del veredicto. Sólo se llega aquí con contrafirmas verificadas: una que no
+    // verifica hace rechazar la firma entera (ronda dos, 01-N12).
+    for cs in &r.countersignatures {
+        lines.push(format!(
+            "contrafirma verificada de {} ({}{})",
+            cs.signer_subject,
+            cs.digest.name(),
+            match cs.signing_time {
+                Some(t) => format!(", {}", fmt_utc(t)),
+                None => String::new(),
+            }
+        ));
+    }
     lines.push(format!("comprobaciones superadas: {}", r.passed.join(", ")));
     lines
 }

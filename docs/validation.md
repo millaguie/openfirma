@@ -240,7 +240,14 @@ it builds the chain from the signer up to the trust anchors given on the
 command line, verifying each link's signature with the issuer's public key and
 every certificate's validity dates against a validation time (`--at`, default
 now). It verifies *every* signature in a document, so a co-signed PDF passes
-only when all of its signatures do. Since B-LT it also judges the archive:
+only when all of its signatures do — and a countersignature (RFC 5652 6's
+`id-aa-countersign`) is one of those signatures: its `messageDigest` is checked
+against the `signatureValue` it sits on, its own signature under its own
+certificate, and its chain to the caller's anchors. An unverifiable
+countersignature refuses the signature rather than being listed and passed over,
+and a verified one is named in the report and in `openfirma verify`'s output (round
+two's N12, where the attribute was known by OID and never looked at while the
+verdict said every signature verified). Since B-LT it also judges the archive:
 when a PDF carries a `/DSS`, every archived certificate must parse, every
 archived CRL must verify **under the key of the CA it names** and speak for the
 instant the archive is about, every archived OCSP response must be a successful

@@ -2666,6 +2666,21 @@ fn print_report(r: &openfirma_cades::VerifyReport) {
     if !unsigned.is_empty() {
         println!("  unsigned attrs: {}", unsigned.join(", "));
     }
+    // A countersignature is somebody else standing on this signature, so who they
+    // are is part of the verdict and not a detail buried in an OID list. Every one
+    // of these was verified: an unverifiable one makes the signature refuse
+    // (round two's N12).
+    for cs in &r.countersignatures {
+        println!(
+            "  countersigned by: {} ({}{})",
+            cs.signer_subject,
+            cs.digest.name(),
+            match cs.signing_time {
+                Some(t) => format!(", {}", fmt_system_time(t)),
+                None => String::new(),
+            }
+        );
+    }
     println!("  checks passed:  {}", r.passed.join(", "));
 }
 
@@ -2708,6 +2723,8 @@ fn attribute_names(a: &openfirma_cades::Attributes) -> (Vec<String>, Vec<String>
         .map(|o| {
             if *o == oid::ID_SIGNATURE_TIME_STAMP_TOKEN {
                 "signatureTimeStampToken".to_string()
+            } else if *o == oid::ID_COUNTER_SIGNATURE {
+                "counterSignature".to_string()
             } else {
                 o.to_string()
             }

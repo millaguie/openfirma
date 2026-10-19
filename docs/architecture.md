@@ -56,7 +56,9 @@ done mid-review because it renames the seam every frontend crosses.
   re-tagged signed attributes, `signingCertificateV2`, and chain building
   against supplied trust anchors. The CAdES long-term levels ES-LT/ES-LTA are
   deliberately out of scope: the long-term path is PAdES B-LT/B-LTA
-  (`docs/pades.md`). Planned: countersignature and cofirm trees.
+  (`docs/pades.md`). A countersignature that arrives is verified like any other
+  signature (round two's 01-N12); *producing* countersignatures, and the cofirm
+  tree, are still planned.
 - **openfirma-pades**: minimal PDF reader (last trailer, classic cross-reference
   tables *and* cross-reference streams, object streams, FlateDecode with the PNG
   and TIFF predictors, dictionary surgery at the byte level so untouched objects

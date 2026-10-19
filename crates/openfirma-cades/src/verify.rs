@@ -18,9 +18,11 @@
 //!   every link's signature verified with the issuer's public key, and every
 //!   certificate valid at the validation time.
 //!
+//! - every `id-aa-countersign` attribute verifies over the signature's own
+//!   value, under its own certificate and chain (RFC 5652 6).
+//!
 //! What is *not* checked, because it is layer 3/4 territory in
-//! docs/validation.md: revocation (CRL/OCSP), certificate policies, and the
-//! countersignature tree. Chain construction itself follows RFC 5280: an
+//! docs/validation.md: revocation (CRL/OCSP) and certificate policies. Chain construction itself follows RFC 5280: an
 //! issuer is only ever accepted when `basicConstraints` says `cA = TRUE`, its
 //! `keyUsage` (when present) allows `keyCertSign`, its `pathLenConstraint`
 //! still leaves room, and no critical extension escapes interpretation — nor a
@@ -119,6 +121,10 @@ pub const CHECK_SIGNING_CERTIFICATE_V2: &str = "signingCertificateV2";
 pub const CHECK_CERTIFICATE_CHAIN: &str = "certificateChain";
 /// Name of the check on the certificates' validity dates.
 pub const CHECK_VALIDITY_DATES: &str = "validityDates";
+/// Every `id-aa-countersign` attribute of the SignerInfo: a signature over this
+/// signature's own value, under its own certificate and its own chain. Absent
+/// from `passed` when the signature carries no countersignature at all.
+pub const CHECK_COUNTERSIGNATURES: &str = "countersignatures";
 
 /// No real PKI is deeper, and a chain that looks deeper is a loop or an attack.
 const MAX_CHAIN_DEPTH: usize = 16;
@@ -399,6 +405,36 @@ pub struct VerifyReport {
     /// a token is present and none verified, [`TimestampTokenStatus::problem`]
     /// says why, and no frontend may show the signature as timestamped.
     pub timestamp: TimestampTokenStatus,
+    /// The countersignatures of this signature, each verified: who countersigned
+    /// and how. Empty when the signature carries none. An unverifiable one is a
+    /// refusal rather than an entry, because a countersignature is a signature
+    /// and this verifier's word is that every signature it can see holds (round
+    /// two's N12: the attribute used to be listed by OID and left unchecked while
+    /// the verdict said every signature verified).
+    pub countersignatures: Vec<Countersignature>,
+}
+
+/// One verified `id-aa-countersign` attribute: RFC 5652 6's signature over
+/// another signature's value.
+#[derive(Clone, Debug)]
+pub struct Countersignature {
+    /// Subject of the countersigner's certificate, as an RFC 4514 style string.
+    pub signer_subject: String,
+    /// The digest algorithm the countersignature itself uses, which need not be
+    /// the one the signature it countersigns uses.
+    pub digest: DigestAlg,
+    /// Its `signingTime`, when it carries one. That attribute is the
+    /// countersigner's own word: what makes the countersignature true is its
+    /// signature, not this field.
+    pub signing_time: Option<SystemTime>,
+    /// Subjects from the countersigner upwards, its chain. The anchor itself is
+    /// not included unless it is embedded, exactly as in
+    /// [`VerifyReport::chain_subjects`].
+    pub chain_subjects: Vec<String>,
+    /// Subject of the trust anchor its chain reached, or `None` under
+    /// [`AnchorPolicy::IntegrityWithoutAnchors`], with the same meaning it has
+    /// there: nothing about who stands behind this countersigner was established.
+    pub trust_anchor: Option<String>,
 }
 
 /// The value of each unsigned attribute whose OID is `wanted`, whole-value
@@ -815,7 +851,15 @@ fn verify_signer_info(
         }
     }
 
+    // A countersignature is a signature. It is verified here rather than listed
+    // and left alone, and it fails the verdict when it does not hold up.
+    let countersignatures = verify_countersignatures(sd, si, opts)?;
+    if !countersignatures.is_empty() {
+        passed.push(CHECK_COUNTERSIGNATURES);
+    }
+
     Ok(VerifyReport {
+        countersignatures,
         signer_subject: subject(cert),
         digest: si.digest_alg,
         signature_alg: signature_alg.to_string(),
@@ -835,6 +879,136 @@ fn verify_signer_info(
         passed,
         timestamp,
     })
+}
+
+/// Verify every `id-aa-countersign` attribute of a SignerInfo (RFC 5652 6).
+///
+/// A countersignature is a signature over a signature: its authenticated
+/// attributes carry a `messageDigest` over the outer `signatureValue`, and its own
+/// `signatureValue` runs over those attributes re-tagged as a `SET OF`, under a
+/// certificate of its own that has to reach a trust anchor like any other.
+///
+/// None of that used to happen. The attribute was named in `openfirma-core`'s OID
+/// table and counted into [`Attributes::unsigned_attributes`], and the verdict
+/// still read "all 1 signature(s) verify" — round two's N12, where a claim about a
+/// signature was made without checking that signature. Since this verifier's
+/// contract is that every signature it can see verifies (a co-signed PDF already
+/// refuses when one of its signatures does), an unverifiable countersignature
+/// refuses here too rather than being reported and passed over.
+///
+/// What is *not* demanded: an ESS signer-certificate attribute. A countersignature
+/// is RFC 5652 material, not a CAdES profile, and its `sid` — issuer and serial,
+/// or subject key identifier — is authenticated by the very signature being
+/// checked, so it is bound to its certificate without one. When the attribute is
+/// there, it has to match.
+fn verify_countersignatures(
+    sd: &SignedData<'_>,
+    outer: &SignerInfo<'_>,
+    opts: &VerifyOptions,
+) -> Result<Vec<Countersignature>> {
+    let Some(content) = outer.unsigned_attrs else {
+        return Ok(Vec::new());
+    };
+    let values = unsigned_values(content, oid::ID_COUNTER_SIGNATURE)?;
+    let mut out = Vec::with_capacity(values.len());
+    for (i, value) in values.iter().enumerate() {
+        let label = format!("countersignature {}", i + 1);
+        let refused = |why: String| Error::Verification(format!("{label}: {why}"));
+
+        // The attribute's value is the countersignature's own SignerInfo.
+        let inner = der_cursor(value.whole)
+            .expect(tlv::TAG_SEQUENCE, "a countersignature's SignerInfo")
+            .map_err(|e| refused(detail_of(&e)))?;
+        let cs = parse_signer_info(inner.content).map_err(|e| refused(detail_of(&e)))?;
+
+        check_algorithm_policy(CHECK_SIGNATURE_VALUE, cs.digest_alg, &opts.algorithms)
+            .map_err(|e| refused(detail_of(&e)))?;
+
+        let cert = find_signer_cert(sd, &cs.sid).map_err(|e| refused(detail_of(&e)))?;
+        check_key_strength(
+            CHECK_SIGNATURE_VALUE,
+            cert.key_info().map_err(|e| refused(detail_of(&e)))?,
+            &opts.algorithms,
+        )
+        .map_err(|e| refused(detail_of(&e)))?;
+
+        // A countersignature with no authenticated attributes signs nothing but
+        // itself: RFC 5652 6 gives it a messageDigest over the signature value,
+        // and that digest is what ties it to THIS signature rather than to a
+        // perfectly valid countersignature over somebody else's.
+        let attrs_content = cs.signed_attrs.ok_or_else(|| {
+            refused(
+                "the countersignature carries no signedAttrs, so it binds itself to nothing:                  RFC 5652 6 gives a countersignature a messageDigest over the signature value                  it countersigns"
+                    .to_string(),
+            )
+        })?;
+        let attrs = parse_attributes(attrs_content).map_err(|e| refused(detail_of(&e)))?;
+        let claimed = attrs.message_digest.ok_or_else(|| {
+            refused(
+                "the countersignature's authenticated attributes carry no messageDigest, so                  nothing says which signature it countersigns"
+                    .to_string(),
+            )
+        })?;
+        let computed = cs.digest_alg.digest(outer.signature);
+        if claimed != computed.as_slice() {
+            return Err(refused(format!(
+                "its messageDigest is {} but the {} of the signature value it countersigns is                  {}, so it countersigns a different signature and says nothing about this one",
+                hex::encode(claimed),
+                cs.digest_alg.name(),
+                hex::encode(&computed)
+            )));
+        }
+
+        let key_alg = cert.key_algorithm().map_err(|e| refused(detail_of(&e)))?;
+        check_signature_algorithm(&cs.signature_alg_oid, cs.digest_alg, key_alg)
+            .map_err(|e| refused(detail_of(&e)))?;
+        let retagged = tlv::tlv(tlv::TAG_SET, attrs_content);
+        let prehash = cs.digest_alg.digest(&retagged);
+        verify_prehash(cert, cs.digest_alg, &prehash, cs.signature)
+            .map_err(|e| refused(detail_of(&e)))?;
+
+        // An ESS signer-certificate attribute, when present, has to name this
+        // certificate; absence is allowed for the reason in the doc comment.
+        match (attrs.signing_cert_v2, attrs.signing_cert) {
+            (Some(v2), _) => check_signing_certificate_v2(&v2, cert, false)
+                .map_err(|e| refused(detail_of(&e)))?,
+            (None, Some(v1)) => {
+                check_signing_certificate_v2(&v1, cert, true).map_err(|e| refused(detail_of(&e)))?
+            }
+            (None, None) => {}
+        }
+
+        // and it stands on somebody the caller trusts, the same rule the outer
+        // signature is under: a countersignature from a certificate nobody
+        // vouches for is a name, not an authority.
+        let (chain_subjects, trust_anchor) = match opts.anchors {
+            AnchorPolicy::Required => {
+                let (subjects, anchor) = build_chain(
+                    cert,
+                    &sd.certificates,
+                    &opts.trust_anchors,
+                    opts.validation_time,
+                    &opts.algorithms,
+                )
+                .map_err(|e| refused(detail_of(&e)))?;
+                (subjects, Some(anchor))
+            }
+            AnchorPolicy::IntegrityWithoutAnchors => {
+                check_signer_certificate(cert, opts.validation_time, &opts.algorithms)
+                    .map_err(|e| refused(detail_of(&e)))?;
+                (Vec::new(), None)
+            }
+        };
+
+        out.push(Countersignature {
+            signer_subject: subject(cert),
+            digest: cs.digest_alg,
+            signing_time: attrs.signing_time,
+            chain_subjects,
+            trust_anchor,
+        });
+    }
+    Ok(out)
 }
 
 fn find_signer_cert<'s>(
