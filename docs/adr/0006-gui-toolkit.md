@@ -39,11 +39,15 @@ read off the right sources:
   `CHECK_CERTIFICATES`) and paints the answer inline — `ValidationInfoPanel`
   shows "Firma válida" (with an icon) or the red sentence, plus a link whose
   dialog (`ValidationInfoDialog`) is the tree of signatures and certificates.
-  The earlier draft said this flow began with exporting a `.csig`, which is
-  what the other UI did; the installed one does not. What is true of the
-  installed one: the answer is a tree of certificates to interpret, one
+  The menu also carries a viewer of its own (`MainMenu` → `VisorFirma` →
+  `VisorPanel.validateSign`), which takes a signature file
+  (`csig`, `xsig`, `pdf`, `sig`, `p7s`) and answers per signature with the same
+  kind of tree. The earlier draft said verification began with exporting a
+  `.csig`; that was the other UI, and it is wrong for this one — the citizen
+  can open the signed document they hold and read the answer inline. What is
+  true of this one: the answer is a tree of certificates to interpret, one
   document at a time, in the same window, on the same panel and behind the same
-  dialogs as signing.
+  dialogs as signing, and the viewer is another way into the same tree.
 
 The counted target for openfirma follows from that measurement: **drop the
 file (drag — zero clicks), pick the certificate (1), press Firmar (1)**; the
@@ -167,9 +171,11 @@ a details control instead of being the answer.
 > 8–9 (there is no save dialog — the signature lands next to the original with
 > a `_signed` suffix), and verify does **not** start by exporting a `.csig`:
 > the installed window validates a signed document as it loads it and paints
-> the answer inline. What stands is the difference this ADR is about — that
-> answer is a certificate tree, in the same panel that signs, and openfirma's
-> verify screen exists to be one plain sentence per signature instead.
+> the answer inline (its menu's own viewer also accepts a signature file, but
+> nothing needs one to be exported). What stands is the difference this ADR is
+> about — that answer is a certificate tree, in the same panel that signs, and
+> openfirma's verify screen exists to be one plain sentence per signature
+> instead.
 
 * The GUI ships on the targets a windowing system builds for (Linux x86_64,
   macOS, Windows); cross-compilations without one build the workspace with
