@@ -1232,26 +1232,7 @@ impl App {
             self.deferred.push(Deferred::AskOverwrite(taken));
             put_back!(Screen::Idle);
         }
-        let key = selected.and_then(|i| catalog.entries.get(i)).map(|e| {
-            if e.pending_p12.is_some() {
-                let password = self
-                    .password_input
-                    .lock()
-                    .map(|p| Zeroizing::new(p.to_string()))
-                    .unwrap_or_else(|_| Zeroizing::new(String::new()));
-                KeySource::P12 {
-                    path: e.pending_p12.clone().expect("pending row owns its path"),
-                    password,
-                    alias: None,
-                    display: e.display.clone(),
-                }
-            } else {
-                // A selectable row without a pending .p12 always has its
-                // source thunk (store entries set it when built).
-                e.key()
-                    .expect("a picker row is either pending-password or sourced")
-            }
-        });
+        let key = self.key_for_row(catalog, *selected);
         let Some(key) = key else {
             put_back!(taken);
         };
@@ -1332,6 +1313,35 @@ impl App {
 
     /// Ask "this name already exists" once per attempt: save dialog answers,
     /// overwrite confirms, decline returns to the picker untouched (A-3).
+    /// The key the chosen row signs with, or `None` when there is no row to
+    /// sign with at all. One function for BOTH doors that start a signing job
+    /// — the picker's own button and the overwrite answer — because having
+    /// two is what killed the window: `sign_to` asked the row for a
+    /// `KeySource` through `entry.key()` alone, and a `.p12` row has none (it
+    /// signs with the password the citizen just typed, held in this struct),
+    /// so `expect` ended the process on the second signature over one
+    /// document (round 2, 06-N-1). A pending row reads its password here; a
+    /// store row brings the thunk that was built when its slot opened.
+    fn key_for_row(&self, catalog: &CertCatalog, selected: Option<usize>) -> Option<KeySource> {
+        let entry = selected.and_then(|i| catalog.entries.get(i))?;
+        match &entry.pending_p12 {
+            Some(path) => {
+                let password = self
+                    .password_input
+                    .lock()
+                    .map(|p| Zeroizing::new(p.to_string()))
+                    .unwrap_or_else(|_| Zeroizing::new(String::new()));
+                Some(KeySource::P12 {
+                    path: path.clone(),
+                    password,
+                    alias: None,
+                    display: entry.display.clone(),
+                })
+            }
+            None => entry.key(),
+        }
+    }
+
     fn ask_overwrite(&mut self, back: Screen) {
         let tr = &self.tr;
         // The OS save dialog is the confirmation AutoFirma uses — its own
@@ -1397,9 +1407,9 @@ impl App {
         let Some(i) = selected.filter(|_| !needs_password) else {
             back_to!();
         };
-        let key = catalog.entries[i]
-            .key()
-            .expect("a picker row is either pending-password or sourced");
+        let Some(key) = self.key_for_row(catalog, Some(i)) else {
+            back_to!();
+        };
         // All checks passed: take the owned fields out of the parked screen
         // (`back` keeps its other variants intact; only these move).
         let (path, content, chosen_format, tsa_url, digest, reason) = match back {

@@ -195,6 +195,94 @@ fn a_p12_picked_through_the_fixture_signs_with_its_password() {
 }
 
 #[test]
+fn signing_the_same_document_again_with_a_p12_asks_and_writes_the_new_name() {
+    // 06-N-1 through the window: the picker's own button (not a hand-built
+    // screen), the Done screen's "Firmar otro documento", and the overwrite
+    // answer the save dialog gives. `sign_to` — the overwrite answer's door —
+    // asked the row for a `KeySource` through `entry.key()` alone, and a
+    // `.p12` row has none: it signs with the password just typed. The `expect`
+    // that stood in for the missing case ended the PROCESS on the second
+    // signature over one document — the window vanished mid-flow.
+    let p12 = testdata().join("certs/signer-rsa.p12");
+    let dir = temp_doc("p12-resign");
+    let doc = dir.join("nota.txt");
+    if require(p12.is_file(), "the test PKI").is_none() {
+        return;
+    }
+    std::fs::write(&doc, b"una nota para firmar dos veces\n").unwrap();
+
+    let app = fixture_app(Some(doc.clone()));
+    let mut harness = harness_for(app);
+    harness.run();
+
+    // first signature: document, .p12 row, password, sign
+    harness
+        .query_all_by_label_contains("Examinar")
+        .next()
+        .unwrap()
+        .click();
+    harness.run();
+    harness.state_mut().dialogs_for_test().fixture_open = Some(p12.clone());
+    harness
+        .get_by_label_contains("Abrir un archivo de certificado")
+        .click();
+    harness.run();
+    harness
+        .state_mut()
+        .force_password_for_test("openfirma".into());
+    harness.run();
+    harness.get_by_label("Firmar").click();
+    harness.step();
+    drain_worker(&mut harness);
+    harness.run();
+    harness.get_by_label_contains("Firma guardada");
+    let first = dir.join("nota.txt.csig");
+    assert!(
+        first.is_file(),
+        "the first signature sits next to the original"
+    );
+
+    // second signature over the same document: the done screen's own way back
+    harness
+        .get_by_label_contains("Firmar otro documento")
+        .click();
+    harness.run();
+    harness.state_mut().dialogs_for_test().fixture_open = Some(doc.clone());
+    harness
+        .query_all_by_label_contains("Examinar")
+        .next()
+        .unwrap()
+        .click();
+    harness.run();
+    harness.state_mut().dialogs_for_test().fixture_open = Some(p12.clone());
+    harness
+        .get_by_label_contains("Abrir un archivo de certificado")
+        .click();
+    harness.run();
+    harness
+        .state_mut()
+        .force_password_for_test("openfirma".into());
+    harness.run();
+    // the output exists, so the window asks where to write before truncating
+    // anybody's data; the dialog's answer is the new name, delivered through
+    // the fixture like every other OS dialog here
+    let second = dir.join("nota-segunda.csig");
+    harness.state_mut().dialogs_for_test().fixture_save = Some(second.clone());
+    harness.get_by_label("Firmar").click();
+    harness.step();
+    drain_worker(&mut harness);
+    harness.run();
+    harness.get_by_label_contains("Firma guardada");
+    assert!(
+        second.is_file(),
+        "the second signature was written where the dialog said"
+    );
+    assert!(first.is_file(), "and the first one was left alone");
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn signing_parks_the_picker_behind_a_spinner_and_keeps_exactly_one_job() {
     // A-1 through real widgets: pressing the sign button parks the picker
     // behind `Signing` and starts exactly one worker; a second click — with
