@@ -477,6 +477,13 @@ pub fn is_xdg_mime_available() -> bool {
 /// Remove THIS product's registration: our desktop entry, and the default
 /// association only while it still points at us ([finding A-2]: uninstalling
 /// openfirma must never unregister a reinstalled AutoFirma).
+///
+/// Finding 04-N7: `xdg-mime default ""` is not a removal. Measured, it leaves
+/// `x-scheme-handler/afirma=openfirma-afirma.desktop` in `mimeapps.list`, so
+/// `xdg-mime query default` kept answering openfirma after an unregister while
+/// GLib — which re-resolves by looking for the .desktop file it names — went
+/// back to AutoFirma. The line that names OUR file is therefore deleted from
+/// the file that holds it; a line naming anybody else is not touched.
 #[cfg(target_os = "linux")]
 pub fn linux_unregister() -> Result<(), crate::dispatch::BrowserError> {
     let (path, _) = linux_install_paths();
@@ -490,7 +497,112 @@ pub fn linux_unregister() -> Result<(), crate::dispatch::BrowserError> {
             .args(["default", "", MIME_TYPE])
             .output();
     }
+    forget_our_association()?;
     Ok(())
+}
+
+/// The `mimeapps.list` files the desktop reads, most specific first: the one
+/// `xdg-mime default` writes under `$XDG_CONFIG_HOME` (the modern location) and
+/// the legacy `$XDG_DATA_HOME/applications/mimeapps.list` an older tool wrote.
+/// Path arithmetic only, so it is callable (and testable) on every platform.
+#[cfg(target_os = "linux")]
+fn mimeapps_lists() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+    if let Some(config) = config {
+        out.push(config.join("mimeapps.list"));
+    }
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
+    if let Some(data) = data {
+        out.push(data.join("applications/mimeapps.list"));
+    }
+    out
+}
+
+/// Deletes openfirma's own association line from each `mimeapps.list` that has
+/// one. Read-only when there is nothing of ours in the file.
+#[cfg(target_os = "linux")]
+fn forget_our_association() -> Result<(), crate::dispatch::BrowserError> {
+    forget_our_association_in(&mimeapps_lists())
+}
+
+/// The same, over an explicit list — what the tests drive, so the rule can be
+/// checked without moving the running process's `HOME`.
+#[cfg(any(target_os = "linux", test))]
+fn forget_our_association_in(paths: &[PathBuf]) -> Result<(), crate::dispatch::BrowserError> {
+    for path in paths {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            // Absent is the common case (a session that never registered);
+            // unreadable is worth a message, not a failure: the rest of the
+            // unregister already happened.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(browser_error(format!("reading {}: {e}", path.display())));
+            }
+        };
+        let Some(cleaned) = without_our_association(&text) else {
+            continue;
+        };
+        std::fs::write(path, cleaned)
+            .map_err(|e| browser_error(format!("writing {}: {e}", path.display())))?;
+    }
+    Ok(())
+}
+
+/// One `mimeapps.list`'s text with openfirma's association removed, or `None`
+/// when it held none (so the caller writes nothing).
+///
+/// Section-agnostic on purpose: the value must BE `DESKTOP_FILE` to be removed,
+/// which is openfirma's own file name, so this can never delete another
+/// handler's entry — including AutoFirma's, whose name is its own. A
+/// `;`-separated value list keeps everything but our entry; only a line left
+/// with no value at all goes. Line endings and comments are preserved: the
+/// split is on `\n` alone, so a `\r` stays where it was.
+#[cfg(any(target_os = "linux", test))]
+fn without_our_association(text: &str) -> Option<String> {
+    let prefix = format!("{MIME_TYPE}=");
+    let mut changed = false;
+    let mut kept_lines: Vec<String> = Vec::new();
+    // Splitting on '\n' alone keeps a '\r' attached to its line (this file is
+    // rewritten, not reflowed) and makes the trailing newline the last, empty
+    // element — which the join puts back byte for byte.
+    for line in text.split('\n') {
+        let (body, cr) = match line.strip_suffix('\r') {
+            Some(body) => (body, "\r"),
+            None => (line, ""),
+        };
+        let Some(value) = body.strip_prefix(&prefix) else {
+            kept_lines.push(line.to_string());
+            continue;
+        };
+        let entries: Vec<&str> = value.split(';').filter(|e| !e.is_empty()).collect();
+        let kept: Vec<&str> = entries
+            .iter()
+            .copied()
+            .filter(|e| *e != DESKTOP_FILE)
+            .collect();
+        if kept.len() == entries.len() {
+            // Our file was not on this line: it belongs to another handler.
+            kept_lines.push(line.to_string());
+            continue;
+        }
+        changed = true;
+        if kept.is_empty() {
+            // With our name out of it the line said nothing; drop it whole.
+            continue;
+        }
+        let trailing = if value.ends_with(';') { ";" } else { "" };
+        kept_lines.push(format!("{MIME_TYPE}={}{trailing}{cr}", kept.join(";")));
+    }
+    changed.then(|| kept_lines.join("\n"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -961,6 +1073,86 @@ mod tests {
         assert!(autofirma_paths(&relative, None, Some("relative/share".as_ref())).is_empty());
         let nothing = |_p: &Path| false;
         assert!(autofirma_paths(&nothing, None, None).is_empty());
+    }
+
+    /// Finding 04-N7: `xdg-mime default ""` does not remove the association
+    /// line, so an unregistered openfirma stayed the answer of `xdg-mime query
+    /// default` while GLib (which re-resolves through the .desktop file)
+    /// already went back to AutoFirma. The line naming our file is what has to
+    /// go — and only that line.
+    #[test]
+    fn an_unregister_takes_our_own_association_line_out() {
+        let with_ours = format!(
+            "# a comment the user wrote\n[Default Applications]\n\
+             text/plain=otro.desktop\n{MIME_TYPE}={DESKTOP_FILE}\n\
+             x-scheme-handler/otro=otro.desktop\n"
+        );
+        assert_eq!(
+            without_our_association(&with_ours).expect("our line was there to take out"),
+            "# a comment the user wrote\n[Default Applications]\n\
+             text/plain=otro.desktop\nx-scheme-handler/otro=otro.desktop\n"
+        );
+
+        // A list that names ours FIRST keeps the others, and the desktop's own
+        // separators survive.
+        let mixed = format!("[Default Applications]\n{MIME_TYPE}={DESKTOP_FILE};otro.desktop;\n");
+        assert_eq!(
+            without_our_association(&mixed).unwrap(),
+            format!("[Default Applications]\n{MIME_TYPE}=otro.desktop;\n")
+        );
+
+        // Another handler under OUR mime type is not ours to delete: this is the
+        // reinstalled-AutoFirma case A-2 exists for.
+        let theirs = format!("[Default Applications]\n{MIME_TYPE}=afirma.desktop\n");
+        assert!(
+            without_our_association(&theirs).is_none(),
+            "another handler's line must come back untouched (as None: no write)"
+        );
+        assert!(without_our_association("[Default Applications]\n").is_none());
+        assert!(without_our_association("").is_none());
+
+        // Carriage returns survive a file that had them, including on the line
+        // that is dropped: the others keep their own ending.
+        let crlf = format!("[Default Applications]\r\n{MIME_TYPE}={DESKTOP_FILE}\r\n");
+        assert_eq!(
+            without_our_association(&crlf).unwrap(),
+            "[Default Applications]\r\n"
+        );
+    }
+
+    /// The live half of 04-N7, driven over explicit paths so nothing has to
+    /// move this process's HOME: the file that names our desktop entry loses
+    /// that line, a file that names somebody else's is rewritten not at all,
+    /// and a missing candidate is not an error.
+    #[test]
+    fn an_unregister_leaves_other_files_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("openfirma-mimeapps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = dir.join("mimeapps.list");
+        let theirs = dir.join("legacy-mimeapps.list");
+        let absent = dir.join("never-written.list");
+        std::fs::write(
+            &ours,
+            format!("[Default Applications]\n{MIME_TYPE}={DESKTOP_FILE}\n"),
+        )
+        .unwrap();
+        let foreign = format!("[Default Applications]\n{MIME_TYPE}=afirma.desktop\n");
+        std::fs::write(&theirs, &foreign).unwrap();
+
+        forget_our_association_in(&[ours.clone(), theirs.clone(), absent.clone()]).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&ours).unwrap(),
+            "[Default Applications]\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&theirs).unwrap(),
+            foreign,
+            "AutoFirma's own line is not ours to remove"
+        );
+        assert!(!absent.exists(), "a candidate that is not there is skipped");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Finding 04-N1: what decides a takeover is the handler answering NOW.

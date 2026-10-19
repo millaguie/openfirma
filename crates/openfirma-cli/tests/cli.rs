@@ -1440,3 +1440,64 @@ fn serve_takes_its_standing_consent_from_the_config_not_from_the_flag() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Finding 04-N7 through the binary a user runs: `--unregister` has to take
+/// openfirma's association line out of `mimeapps.list`. `xdg-mime default ""`
+/// does not, so `xdg-mime query default` kept answering openfirma after an
+/// unregister while GLib — which re-resolves through the .desktop file —
+/// already went back to AutoFirma. Linux-only: that is where both the
+/// freedesktop file and the cfg'd unregister path live.
+#[cfg(target_os = "linux")]
+#[test]
+fn unregister_removes_our_association_line_and_leaves_the_rest() {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace("::", "_");
+    let root = std::env::temp_dir().join(format!("openfirma-{}-{test}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let config = home.join(".config");
+    let applications = home.join(".local/share/applications");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&applications).unwrap();
+    // What a registration leaves behind: our desktop entry, our line in
+    // mimeapps.list, and somebody else's line beside it.
+    let desktop = applications.join("openfirma-afirma.desktop");
+    std::fs::write(&desktop, b"[Desktop Entry]\nType=Application\n").unwrap();
+    let mimeapps = config.join("mimeapps.list");
+    std::fs::write(
+        &mimeapps,
+        "[Default Applications]\n\
+         x-scheme-handler/afirma=openfirma-afirma.desktop\n\
+         x-scheme-handler/otro=otro-desktop.desktop\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("OPENFIRMA_ASSUME_XDG_MIME", "1")
+        .args(["afirma-uri", "--unregister"])
+        .output()
+        .expect("the binary must run");
+    assert!(
+        out.status.success(),
+        "--unregister refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let text = std::fs::read_to_string(&mimeapps).unwrap();
+    assert!(
+        !text.contains("x-scheme-handler/afirma="),
+        "the association line must be gone, not merely superseded: {text}"
+    );
+    assert!(
+        text.contains("x-scheme-handler/otro=otro-desktop.desktop"),
+        "another handler's line is not ours to remove: {text}"
+    );
+    assert!(!desktop.exists(), "the desktop entry goes with it");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
