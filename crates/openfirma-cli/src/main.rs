@@ -3751,36 +3751,40 @@ mod tests {
 
         // (a) A password file anyone can read: B-2's rule refuses it. (The
         // round-two report reproduced exactly this pair and the .desktop entry
-        // was on disk afterwards, registered.)
-        let loose = dir.join("pw-loose.txt");
-        std::fs::write(&loose, b"secreto\n").unwrap();
+        // was on disk afterwards, registered.) That rule reads a POSIX mode,
+        // which only unix has — `check_private` says so itself on the
+        // platforms that do not, so this half runs where it means something.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let loose = dir.join("pw-loose.txt");
+            std::fs::write(&loose, b"secreto\n").unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            let err = with_home(&dir, || {
+                register_scheme(
+                    Some(p12.clone()),
+                    Some(loose.clone()),
+                    Some(&cfg),
+                    false,
+                    false,
+                )
+                .unwrap_err()
+                .to_string()
+            });
+            assert!(err.contains("legible por otros"), "{err}");
+            assert!(
+                !desktop.exists(),
+                "--register took the scheme before refusing: {}",
+                desktop.display()
+            );
+            assert!(
+                !cfg.exists(),
+                "--register wrote the handler config before refusing: {}",
+                cfg.display()
+            );
         }
-        let err = with_home(&dir, || {
-            register_scheme(
-                Some(p12.clone()),
-                Some(loose.clone()),
-                Some(&cfg),
-                false,
-                false,
-            )
-            .unwrap_err()
-            .to_string()
-        });
-        assert!(err.contains("legible por otros"), "{err}");
-        assert!(
-            !desktop.exists(),
-            "--register took the scheme before refusing: {}",
-            desktop.display()
-        );
-        assert!(
-            !cfg.exists(),
-            "--register wrote the handler config before refusing: {}",
-            cfg.display()
-        );
 
         // (b) A .p12 that is not there at all: the other named refusal, and
         // the same absence.
@@ -3890,6 +3894,22 @@ mod tests {
     /// caller-side half (each test takes HOME_LOCK before calling) is the
     /// discipline this same test models: it never moves HOME outside its own
     /// guard below.
+    /// Whether MOVING_HOME is free right now. A POISONED marker is free: it
+    /// means a sibling test panicked inside its own `with_home` window, whose
+    /// guard was dropped during unwinding (`lock_quiet` takes the mutex back
+    /// from the poison). Reading that as "held" made this test blame
+    /// `with_home` for a neighbour's failure — which is exactly what happened on
+    /// the Windows runners once the register-order test started panicking
+    /// there. What must never be true is the marker being HELD outside a
+    /// window.
+    fn moving_home_is_free() -> bool {
+        match MOVING_HOME.try_lock() {
+            Ok(_) => true,
+            Err(std::sync::TryLockError::Poisoned(_)) => true,
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
+    }
+
     #[test]
     fn home_moves_only_inside_the_locked_window() {
         // Sampled AFTER taking HOME_LOCK: an earlier read raced a sibling
@@ -3906,7 +3926,7 @@ mod tests {
         // from inside the window below, where a `try_lock` answers "busy"
         // with certainty; a background poller racing a microsecond-long
         // set/restore would only measure scheduler noise.
-        let free_outside = MOVING_HOME.try_lock().is_ok();
+        let free_outside = moving_home_is_free();
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -3931,7 +3951,7 @@ mod tests {
         // outside it, HOME is back to what it was and the marker is free
         // again, even while the poller keeps sampling.
         assert_eq!(std::env::var_os("HOME"), real);
-        let free_after = MOVING_HOME.try_lock().is_ok();
+        let free_after = moving_home_is_free();
         let _ = stop.send(());
         poller.join().unwrap();
 
