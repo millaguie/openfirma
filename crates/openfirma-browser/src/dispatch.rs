@@ -554,6 +554,11 @@ pub fn execute_with_consent(
     // Same gate as `execute`: refuse by name before anything asks the key.
     execute_gate(uri)?;
     let signer = match key {
+        // A P12 arrives consented: the caller held the container's password and
+        // handed it over, which is the whole of what a prompt would establish
+        // (04-N6: the CLI's argv key takes this arm and signs without asking,
+        // even on a tty — argv IS the yes). The prompt below belongs to the
+        // Unattended door, whose key has no such vouching behind it.
         KeySource::P12 { path, password } => load_p12(path, Some(password))?,
         KeySource::Unattended(u) => {
             let summary = summarize(uri);

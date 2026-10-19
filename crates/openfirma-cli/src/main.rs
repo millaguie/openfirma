@@ -1555,8 +1555,13 @@ fn main() -> Result<()> {
                 // very person typing the command (whose consent IS the
                 // invocation — dispatch's Unattended door grants that case with
                 // Consent::Granted, while an un-opted CONFIG key stays refused
-                // until its file says allow_unattended = true). A tty still
-                // prompts on top either way.
+                // until its file says allow_unattended = true). Neither door
+                // prompts, even when a tty is right there: for argv the
+                // invocation is the yes, and for the opt-in the file already
+                // said it. The tty prompt below belongs to the OTHER door — a
+                // config key whose file declared nothing (04-N6 measured the
+                // old comment's claim here to be false: `--p12` on a real tty,
+                // answering "n", still signed).
                 openfirma_browser::dispatch::KeySource::P12 {
                     path: &container,
                     password: &password,

@@ -1,6 +1,6 @@
 # ADR-0005 — The browser protocol (afirma://) and its loopback endpoint
 
-**Status:** accepted, amended 2026-10-17 by wave 4d's review findings (C-1, A-1..A-5, M-1..M-9, B-1..B-6 from `/tmp/review/05-browser.md`); every rule below is recorded line-by-line against the AutoFirma 1.9.1 sources (`tools/fetch-autofirma.sh`, corpus location in `docs/validation.md`).
+**Status:** accepted, amended 2026-10-17 by wave 4d's review findings (C-1, A-1..A-5, M-1..M-9, B-1..B-6 from `/tmp/review/05-browser.md`), and again 2026-10-19 by round two's browser findings (04-N1: `--register` asks the OS who holds the scheme now; 04-N3: the endpoint takes its standing consent from the config file; 04-N5: the config stores paths the handler can find; 04-N7: `--unregister` removes its own association line; 04-N9: `dat=` is refused; 04-N10: the desktop entry escapes for the file and for `Exec`; 04-N6: this file no longer promises a tty prompt an argv key never gets). Every rule below is recorded line-by-line against the AutoFirma 1.9.1 sources (`tools/fetch-autofirma.sh`, corpus location in `docs/validation.md`).
 
 ## Context
 
@@ -130,14 +130,21 @@ exactly the moment of signing. openfirma keeps that invariant headlessly:
   An unattended key signs only with its owner's per-key `allow_unattended`
   opt-in plus a stored password, or through a consent callback that answered
   yes; otherwise refusal, never silence (`consent-required`, AF600002/SAF_04).
-* The CLI scheme path (`afirma-uri`) prompts on a terminal (operation, app
-  name, digest and size of the exact bytes) — AutoFirma's dialog, in text.
-  A key handed over **argv** carries its own consent: the human typing the
-  command owns both the key and the secret they supplied; that case signs
-  through the same Unattended machinery with `Consent::Granted` (and still
-  prompts when a tty exists). A **config-file** key without `allow_unattended
-  = true` IN THE FILE never signs quietly — the file's own declaration is the
-  only standing authority; a CLI flag alone cannot launder a config key.
+* The CLI scheme path (`afirma-uri`) can prompt on a terminal (operation, app
+  name, digest and size of the exact bytes) — AutoFirma's dialog, in text. The
+  prompt belongs to the door that still has a question: a **config-file** key
+  whose file says nothing (`allow_unattended` absent), where the human at the
+  terminal is the authority the file withheld. A key handed over **argv**
+  carries its own consent and never prompts, not even on a tty: the person who
+  typed the command supplied the key and its secret, so the invocation IS the
+  yes. (Review 04, N6 measured exactly that — a real tty, the prompt answered
+  "n", and the call signed anyway; an earlier revision of this bullet claimed
+  the opposite, "(and still prompts when a tty exists)".) A page cannot use
+  that rule to launder its own key: the OS hands a scheme handler the URI and
+  nothing else, so argv keys exist only where a human typed them. A
+  **config-file** key without `allow_unattended = true` IN THE FILE never signs
+  quietly — the file's own declaration is the only standing authority; a CLI
+  flag alone cannot launder a config key.
 * The endpoint (`afirma-serve`) refuses to start over an argv key without
   `--allow-unattended`, and over a config key whose file lacks
   `allow_unattended = true` (the flag alone is not enough — deliberate, the
@@ -170,18 +177,28 @@ travels only over the connection the page itself opened.
 
 **The honest gap (why wss is NOT here).** Current sedes speak to AutoFirma's
 HTTPS/WebSocket endpoint (`AfirmaWebSocketServerV4Sup`, `wss://localhost:port/
-servicios`). autoscript.js selects it when the page finds the secure endpoint;
-it also keeps the plain-socket path in its compatibility branches, and that is
-the path openfirma answers today. Making wss work requires (a) serving TLS with
-the CA AutoFirma's configurator generates — `CN=Autofirma ROOT`, plus a
-`127.0.0.1` leaf (see M-7 below: NOT "silent self-signed acceptance", Firefox
-gets the cert imported by the configurator), and (b) shipping that CA into each
-browser's trust store, which is exactly the installer behavior this project has
-not yet reviewed for its own security properties. ADR-0005 therefore keeps the
-endpoint on plain TCP + one-shot token, refuses nothing the plain channel can
-honestly answer, and names the wss gap openly: a real sede that demands wss
-gets no answer from openfirma until an ADR amends this section with a reviewed
-TLS design. This is a recorded limitation, not an accident.
+servicios`). Both clients inside autoscript.js are TLS: the WebSocket one builds
+`wss://127.0.0.1:<port>` and the older HTTPS one `https://127.0.0.1:<port>`
+(corpus copy, `afirma-ui-miniapplet-deploy/src/main/webapp/js/autoscript.js`,
+lines 2053 and 3006), so there is **no plain-HTTP branch for a page to take**.
+The "plain-socket path in its compatibility branches" an earlier revision of
+this ADR pointed at does not exist, and that revision overstated what runs
+today: openfirma's endpoint (plain TCP + one-shot token in the URL path, above)
+is a channel THIS project's callers speak — `fake_sede`, the crosscheck tools,
+and `afirma-serve --issue-token` plus curl as the README shows — and no shipped
+page builds that request. Said plainly: with `--register` run on a machine that
+has AutoFirma installed, a real sede's page gets no answer from openfirma at
+all; the scheme handler is what a person or a script invokes. Making wss work
+requires (a) serving TLS with the CA AutoFirma's configurator generates —
+`CN=Autofirma ROOT`, plus a `127.0.0.1` leaf (see M-7 below: NOT "silent
+self-signed acceptance", Firefox gets the cert imported by the configurator),
+and (b) shipping that CA into each browser's trust store, which is exactly the
+installer behavior this project has not yet reviewed for its own security
+properties. ADR-0005 therefore keeps the endpoint on plain TCP + one-shot
+token, refuses nothing the plain channel can honestly answer, and names the wss
+gap openly: a real sede that demands wss gets no answer from openfirma until an
+ADR amends this section with a reviewed TLS design. This is a recorded
+limitation, not an accident.
 
 ### M-7 — what AutoFirma actually does about TLS (correcting the old premise)
 
@@ -196,11 +213,17 @@ matters because a future TLS ADR must decide about exactly this installer step.
 
 ## Consequences
 
-* `cargo test --workspace` pins all of the above: 16 lib tests, autoscript_wire
-  (7, recorded page predicates), fake_sede end-to-end (11, URL-safe shapes and
-  wire texts included), prehash_golden (4, A-4 both directions + gate ordering),
-  uri_parse (13, recorded URIs byte-exact), sede_crosscheck (openssl at the
-  end of a full flow). The golden suite stays 12/12 MATCH against AutoFirma's
+* `cargo test --workspace` pins all of the above, file by file: the crate's lib
+  tests, `autoscript_wire` (recorded page predicates, the error parser and the
+  session-id rules), `fake_sede` end-to-end (URL-safe shapes, wire texts,
+  consent and the endpoint's own limits), `prehash_golden` (A-4 in both
+  directions, plus gate ordering), `uri_parse` (recorded URIs, byte-exact),
+  `format_auto` (the shape `auto` resolves to, read off the signed bytes),
+  `empty_payload` (04-N9: `dat=` is not a document), `desktop_entry` (04-N10:
+  GLib loads the entry a quoted path produces), and `sede_crosscheck` (openssl
+  at the end of a full flow). Counts are deliberately not written here — the
+  run's own result lines are the count, and the numbers in this bullet were
+  stale within a wave. The golden suite stays 12/12 MATCH against AutoFirma's
   jar output.
 * Any error path added later must go through `write_error_wire` with a table
   entry; autoscript_wire's predicate test fails if someone writes an error form
