@@ -208,9 +208,13 @@ pub struct Options {
 
 /// Canonicalizes a whole document: prolog PIs and comments, the root, the
 /// epilog, no declaration, no DTD, nothing outside the root that is
-/// whitespace. Comments follow `opts.with_comments`, like every other node:
-/// the enveloped-signature transform of Base64 and every validator works on
-/// the comment-excluding form, and the same option decides the prolog.
+/// whitespace. Comments follow `opts.with_comments`, like every other node.
+///
+/// The signing path does NOT use this: the data reference is the root element
+/// subtree ([`root_element`]), because the enveloped transform never hands a
+/// document-level sibling to the digest — see `sign.rs`, where a whole-document
+/// form made every input with a prolog or epilog PI unverifiable. This function
+/// exists for the canonicalization test suite, which is about documents.
 pub fn document(doc: &Document, opts: &Options) -> Vec<u8> {
     let mut out = Vec::new();
     for node in &doc.prolog {
@@ -218,14 +222,7 @@ pub fn document(doc: &Document, opts: &Options) -> Vec<u8> {
             out.push(b'\n');
         }
     }
-    // `render_decls` with a `None` parent prints the live axis — exactly
-    // what the spec's §3.3 example (`e6`: an `xmlns=""` cancelling nothing
-    // prints nothing) requires at a whole-document root, where there is no
-    // rendering ancestor to owe an undeclaration to. Children get the root's
-    // live axis as their parent view below.
-    let mut scope = Scope::default();
-    let mark = scope.push_element(&doc.root);
-    element_with_context(&doc.root, &mut scope, mark, None, &[], opts, &mut out);
+    out.extend_from_slice(&root_element(doc, opts));
     for node in &doc.epilog {
         // the leading newline separates the node from whatever came before,
         // even when that was a comment this mode drops
@@ -235,6 +232,30 @@ pub fn document(doc: &Document, opts: &Options) -> Vec<u8> {
             out.truncate(at);
         }
     }
+    out
+}
+
+/// Canonicalizes the document element and nothing else: the namespace axis it
+/// carries, its content, no sibling of its own.
+///
+/// This is the data reference's target, and the reason it is a function of its
+/// own rather than a call to [`subtree`] with an empty context: a subtree root
+/// prints the context it is handed (that is §2.3's rule for a fragment), while
+/// a document element prints what it declares. Passing the root as a subtree
+/// with an empty inherited axis therefore loses every `xmlns` on it — which is
+/// what `ns-root.xml` would have caught, had the signing code been the only
+/// user of the difference. See `sign.rs` for why the reference is the root
+/// element and never the whole document.
+pub fn root_element(doc: &Document, opts: &Options) -> Vec<u8> {
+    let mut out = Vec::new();
+    // `render_decls` with a `None` parent prints the live axis — exactly
+    // what the spec's §3.3 example (`e6`: an `xmlns=""` cancelling nothing
+    // prints nothing) requires at a whole-document root, where there is no
+    // rendering ancestor to owe an undeclaration to. Children get the root's
+    // live axis as their parent view below.
+    let mut scope = Scope::default();
+    let mark = scope.push_element(&doc.root);
+    element_with_context(&doc.root, &mut scope, mark, None, &[], opts, &mut out);
     out
 }
 
@@ -470,7 +491,7 @@ fn element_with_context(
             }
             None => out.extend_from_slice(b" xmlns=\""),
         }
-        escape_attr(&uri, out);
+        escape_attr_into(&uri, out);
         out.push(b'"');
     }
 
@@ -492,7 +513,7 @@ fn element_with_context(
         out.push(b' ');
         write_qname(&attr.name, out);
         out.extend_from_slice(b"=\"");
-        escape_attr(&attr.value, out);
+        escape_attr_into(&attr.value, out);
         out.push(b'"');
     }
     out.push(b'>');
@@ -609,6 +630,11 @@ fn write_qname(name: &xml::QName, out: &mut Vec<u8>) {
 /// Escapes text for character data: `>` as well as `&` and `<`, because text
 /// is not attribute values. The signing code builds its template by hand, and
 /// one escaper in the crate beats two that could drift apart (finding B-4).
+///
+/// Deliberately NOT identical to the canonicalizer's `escape_text_into` below:
+/// that one also writes the CR as a reference, which is canonical-form business
+/// (§2.3) and not the template's. `tests::the_two_writers_of_one_text_agree`
+/// pins exactly where the pair may differ.
 pub fn escape_text(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
@@ -639,16 +665,48 @@ fn escape_text_into(text: &str, out: &mut Vec<u8>) {
     }
 }
 
-fn escape_attr(value: &str, out: &mut Vec<u8>) {
+/// What an attribute value's character becomes in the canonical form (C14N 1.0
+/// §2.3): `&`, `<`, `"`, and the three whitespace characters that
+/// attribute-value normalization would otherwise flatten into a space — a value
+/// that has to survive a round trip has to escape those.
+///
+/// One table for both writers below. Round two's B-4: `sign.rs` had its own
+/// `escape_attr`, without the three whitespace rows, so two functions of the
+/// same name in one crate meant two different things and nothing said which.
+const fn attr_escape(c: char) -> Option<&'static str> {
+    match c {
+        '&' => Some("&amp;"),
+        '<' => Some("&lt;"),
+        '"' => Some("&quot;"),
+        '\t' => Some("&#x9;"),
+        '\n' => Some("&#xA;"),
+        '\r' => Some("&#xD;"),
+        _ => None,
+    }
+}
+
+/// Attribute-value escaping as a `String`, for the code that assembles text
+/// instead of canonical bytes (`sign.rs`'s template). Same table as the
+/// canonicalizer's writer, which is the point: the two cannot disagree about
+/// what a value means.
+pub fn escape_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
     for c in value.chars() {
-        match c {
-            '&' => out.extend_from_slice(b"&amp;"),
-            '<' => out.extend_from_slice(b"&lt;"),
-            '"' => out.extend_from_slice(b"&quot;"),
-            '\t' => out.extend_from_slice(b"&#x9;"),
-            '\n' => out.extend_from_slice(b"&#xA;"),
-            '\r' => out.extend_from_slice(b"&#xD;"),
-            _ => {
+        match attr_escape(c) {
+            Some(replacement) => out.push_str(replacement),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// Byte-level escaping for attribute values, writing straight into the
+/// canonical output buffer.
+fn escape_attr_into(value: &str, out: &mut Vec<u8>) {
+    for c in value.chars() {
+        match attr_escape(c) {
+            Some(replacement) => out.extend_from_slice(replacement.as_bytes()),
+            None => {
                 let mut buf = [0u8; 4];
                 out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
@@ -725,6 +783,44 @@ mod tests {
             doc_c14n(b"<t><![CDATA[<raw> & ]]></t>"),
             "<t>&lt;raw&gt; &amp; </t>"
         );
+    }
+
+    /// One table, two writers (round two, B-4: `sign.rs` carried its own
+    /// `escape_attr` without the whitespace rows while its comment claimed the
+    /// same rules, and nothing could notice). The `String` form the signing
+    /// template uses has to say exactly what the canonicalizer's byte writer
+    /// says. The text pair is allowed to differ in ONE character — the CR,
+    /// which the canonical form must keep as a reference and the template does
+    /// not touch — and that is pinned too, so a future change to either pair
+    /// lands here.
+    #[test]
+    fn the_two_writers_of_one_table_agree() {
+        let nasty = "\t\n\r &<>\"'ß\u{1F600}";
+        let mut as_bytes = Vec::new();
+        escape_attr_into(nasty, &mut as_bytes);
+        assert_eq!(
+            escape_attr(nasty),
+            String::from_utf8(as_bytes).expect("the byte writer emits UTF-8")
+        );
+        for needed in ["&#x9;", "&#xA;", "&#xD;", "&amp;", "&lt;", "&quot;"] {
+            assert!(
+                escape_attr(nasty).contains(needed),
+                "the String form lost {needed}: {}",
+                escape_attr(nasty)
+            );
+        }
+        let plain = "a\t\n&<>bß";
+        let mut text_bytes = Vec::new();
+        escape_text_into(plain, &mut text_bytes);
+        assert_eq!(
+            escape_text(plain),
+            String::from_utf8(text_bytes).expect("UTF-8")
+        );
+        // …and the one place the text pair differs, named rather than hidden
+        assert_eq!(escape_text("a\rb"), "a\rb");
+        let mut cr = Vec::new();
+        escape_text_into("a\rb", &mut cr);
+        assert_eq!(cr, b"a&#xD;b");
     }
 
     #[test]

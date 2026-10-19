@@ -4,10 +4,10 @@
 //! self-consistency; the *independent* verdicts live in
 //! xmlsec_crosscheck.rs and autofirma_verify.rs.
 
-use std::path::{Path, PathBuf};
+mod common;
 
+use common::{load_signer, require_or_skip};
 use openfirma_core::alg::DigestAlg;
-use openfirma_core::cert::CertificateHandle;
 use openfirma_core::signer::{Signer, SoftwareSigner};
 use openfirma_xades::c14n::{self, Options};
 use openfirma_xades::xml::{Child, Element, parse};
@@ -17,54 +17,6 @@ const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
 
 const INPUT: &[u8] = include_bytes!("../../../testdata/inputs/simple.xml");
-
-fn certs_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
-}
-
-/// CI sets OPENFIRMA_REQUIRE_TESTS so a missing tool or a missing test PKI
-/// fails the build instead of quietly skipping. Only the keystore-scoped
-/// opt-out (OPENFIRMA_ALLOW_SKIP, read exclusively by openfirma-keystore's
-/// tests) may relax this; every other skip stays mandatory — review 07, H-2:
-/// one flag for everything let a broken PKI step go green with nothing
-/// verified on macOS and Windows.
-fn require_or_skip(reason: &str) {
-    let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
-    let allowed = std::env::var("OPENFIRMA_ALLOW_NONKEYSTORE_SKIP").is_ok();
-    if required && !allowed {
-        panic!("cannot run the test: {reason}");
-    }
-    eprintln!("skipped, {reason}");
-}
-
-/// Returns None when the material is missing, which skips the test. Material
-/// that is present but cannot be loaded is a bug, not a skip.
-fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> {
-    let dir = certs_dir();
-    let (Ok(cert_pem), Ok(key_pem)) = (
-        std::fs::read_to_string(dir.join(cert)),
-        std::fs::read_to_string(dir.join(key)),
-    ) else {
-        return None;
-    };
-    let signer = SoftwareSigner::from_pkcs8_pem(&cert_pem, &key_pem).unwrap_or_else(|e| {
-        panic!(
-            "{cert} / {key} are present but unusable: {e}. \
-             Keys must be PKCS#8 PEM, rerun tools/gen-testcert.sh"
-        )
-    });
-    let handles = chain
-        .iter()
-        .map(|c| {
-            let pem = std::fs::read_to_string(dir.join(c)).unwrap_or_else(|e| {
-                panic!("{c} is listed in the test PKI but cannot be read: {e}")
-            });
-            CertificateHandle::from_pem(&pem)
-                .unwrap_or_else(|e| panic!("{c} is not a certificate: {e}"))
-        })
-        .collect();
-    Some(signer.with_chain(handles))
-}
 
 // ---- small tree walkers, so the assertions stay readable ----
 
@@ -437,6 +389,67 @@ fn the_declaration_is_always_the_normalized_one() {
         );
         assert!(out.ends_with("</nota>"));
     }
+}
+
+/// Nothing outside the root reaches the output, which is what AutoFirma's
+/// serializer does and — the part that matters — the only shape whose digests a
+/// validator can reproduce. Measured on three inputs (a prolog `xml-stylesheet`,
+/// an epilog PI, and both together): AutoFirma wrote none of them and its
+/// signature verified with xmlsec1; ours kept them and xmlsec1 answered
+/// `REFERENCE` failure every time, because the data reference is the root
+/// subtree and a document-level sibling never reaches it.
+///
+/// The input keeps them (the reader parses prolog and epilog, and the encoding
+/// check reads them): they are simply not signed, so they are not written
+/// either. A file with a stylesheet PI comes out without it, exactly as it does
+/// from AutoFirma — `docs/xades.md` says so.
+#[test]
+fn document_level_pis_and_comments_are_not_in_the_signed_file() {
+    let Some(signer) = load_signer("signer-rsa.crt", "signer-rsa.key", &[]) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let input = include_bytes!("../../../testdata/inputs/pi-doc-level.xml");
+    // the fixture really carries the shapes this is about
+    let before = parse(input).expect("the fixture parses");
+    assert!(
+        before
+            .prolog
+            .iter()
+            .any(|n| matches!(n, openfirma_xades::xml::DocLevelNode::Pi { .. }))
+            && before
+                .epilog
+                .iter()
+                .any(|n| matches!(n, openfirma_xades::xml::DocLevelNode::Pi { .. })),
+        "the fixture lost the document-level PIs it exists to test"
+    );
+
+    let signed = sign_input(&signer, input);
+    let out = std::str::from_utf8(&signed).expect("output is utf-8");
+    assert!(
+        out.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?><documento"),
+        "something was written between the declaration and the root: {out}"
+    );
+    assert!(
+        out.ends_with("</documento>"),
+        "bytes after the root end tag: {out}"
+    );
+    assert!(!out.contains("<!--"), "a comment survived: {out}");
+    // the declaration is the only `<?` in the whole file: no prolog PI, no
+    // epilog PI, and none relocated in front of the root either
+    assert_eq!(
+        out.matches("<?").count(),
+        1,
+        "processing instructions outside the root survived"
+    );
+    // and our own reader agrees the output has no document-level siblings
+    let after = parse(&signed).expect("our output parses");
+    assert!(
+        after.prolog.is_empty() && after.epilog.is_empty(),
+        "the signed file carries document-level nodes"
+    );
+    // the root's content is untouched, PI-free document or not
+    assert!(out.contains("<titulo>Documento con instrucciones de proceso"));
 }
 
 /// A self-closing root has to be opened for the signature, the DOM appendChild

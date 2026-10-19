@@ -10,23 +10,19 @@
 //! whatever the spacing, and a name that cannot be read as a quoted value is
 //! refused rather than treated as absent.
 
-use openfirma_core::cert::CertificateHandle;
+mod common;
+
+use common::{load_signer, require_or_skip};
 use openfirma_core::signer::SoftwareSigner;
 use openfirma_xades::xml::parse;
 use openfirma_xades::{XadesOptions, xades_sign};
 
 fn signer() -> Option<SoftwareSigner> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs");
-    let cert = std::fs::read_to_string(dir.join("signer-rsa.crt")).ok()?;
-    let key = std::fs::read_to_string(dir.join("signer-rsa.key")).ok()?;
-    let chain: Vec<CertificateHandle> = ["intermediate.crt", "ca.crt"]
-        .iter()
-        .map(|name| {
-            CertificateHandle::from_pem(&std::fs::read_to_string(dir.join(name)).unwrap()).unwrap()
-        })
-        .collect();
-    let signer = SoftwareSigner::from_pkcs8_pem(&cert, &key).ok()?;
-    Some(signer.with_chain(chain))
+    load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    )
 }
 
 /// The reporter's two documents: valid UTF-8 bytes that are also meaningful
@@ -140,8 +136,7 @@ fn the_declaration_is_the_production() {
 #[test]
 fn signing_a_document_that_declares_latin1_refuses_it() {
     let Some(signer) = signer() else {
-        let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
-        assert!(!required, "test PKI missing, run tools/gen-testcert.sh");
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
         return;
     };
     let input = b"<?xml version = \"1.0\"  encoding = \"ISO-8859-1\" ?><doc>caf\xc3\xa9</doc>";

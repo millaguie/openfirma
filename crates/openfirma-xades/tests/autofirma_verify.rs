@@ -13,33 +13,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use openfirma_core::cert::CertificateHandle;
-use openfirma_core::signer::SoftwareSigner;
+mod common;
+
+use common::{load_signer, require_or_skip, write_tmp};
 use openfirma_xades::{XadesOptions, xades_sign};
 
 const INPUT: &[u8] = include_bytes!("../../../testdata/inputs/simple.xml");
 
-fn certs_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
-}
-
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// CI sets OPENFIRMA_REQUIRE_TESTS so a missing tool or a missing test PKI
-/// fails the build instead of quietly skipping. Only the keystore-scoped
-/// opt-out (OPENFIRMA_ALLOW_SKIP, read exclusively by openfirma-keystore's
-/// tests) may relax this; every other skip stays mandatory — review 07, H-2:
-/// one flag for everything let a broken PKI step go green with nothing
-/// verified on macOS and Windows.
-fn require_or_skip(reason: &str) {
-    let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
-    let allowed = std::env::var("OPENFIRMA_ALLOW_NONKEYSTORE_SKIP").is_ok();
-    if required && !allowed {
-        panic!("cannot run the test: {reason}");
-    }
-    eprintln!("skipped, {reason}");
 }
 
 fn tool(name: &str) -> bool {
@@ -113,36 +95,6 @@ fn autofirma_verify(jar: &Path, driver: &Path, file: &Path) -> (bool, String) {
     (out.status.success(), text)
 }
 
-fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> {
-    let dir = certs_dir();
-    let (Ok(cert_pem), Ok(key_pem)) = (
-        std::fs::read_to_string(dir.join(cert)),
-        std::fs::read_to_string(dir.join(key)),
-    ) else {
-        return None;
-    };
-    let signer = SoftwareSigner::from_pkcs8_pem(&cert_pem, &key_pem).unwrap_or_else(|e| {
-        panic!("{cert} / {key} are present but unusable: {e}, rerun tools/gen-testcert.sh")
-    });
-    let handles = chain
-        .iter()
-        .map(|c| {
-            let pem = std::fs::read_to_string(dir.join(c))
-                .unwrap_or_else(|e| panic!("{c} cannot be read: {e}"));
-            CertificateHandle::from_pem(&pem).unwrap_or_else(|e| panic!("{c}: {e}"))
-        })
-        .collect();
-    Some(signer.with_chain(handles))
-}
-
-fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("openfirma-xades-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(name);
-    std::fs::write(&path, bytes).unwrap();
-    path
-}
-
 #[test]
 fn autofirma_verifies_what_openfirma_signed() {
     if !tool("java") || !tool("javac") {
@@ -213,6 +165,44 @@ fn autofirma_verifies_signatures_over_documents_with_namespaced_roots() {
         );
         std::fs::remove_file(&path).ok();
     }
+}
+
+/// The reference implementation's own verdict on a document that carries
+/// document-level processing instructions, which is the shape whose signature no
+/// validator used to accept: our data reference digested the whole document, PI
+/// included, while the enveloped transform (and so AutoFirma, and so xmlsec1)
+/// stops at the root element. AutoFirma's validator is the one whose answer
+/// matters most here — it is the same Santuario stack that produced the file
+/// AutoFirma signs, and it measured as KO when the digest covered a PI.
+#[test]
+fn autofirma_verifies_a_signature_over_a_document_with_document_level_pis() {
+    if !tool("java") || !tool("javac") {
+        eprintln!("skipped, no JDK on this machine");
+        return;
+    }
+    let Some(jar) = jar() else {
+        eprintln!("skipped, no autofirma.jar ($AUTOFIRMA_JAR or tools/fetch-autofirma.sh)");
+        return;
+    };
+    let Some(signer) = load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let driver = driver_dir(&jar);
+    let input = include_bytes!("../../../testdata/inputs/pi-doc-level.xml");
+    let signed = xades_sign(input, &signer, &XadesOptions::default()).expect("signing");
+    let path = write_tmp("autofirma-verify-pis.xml", &signed);
+    let (ok, text) = autofirma_verify(&jar, &driver, &path);
+    assert!(
+        ok && text.contains("OK"),
+        "AutoFirma's own validator rejected our signature over a document with \
+         document-level PIs:\n{text}"
+    );
+    std::fs::remove_file(&path).ok();
 }
 
 /// The ECDSA path has no AutoFirma golden (AutoFirma cannot sign it, see

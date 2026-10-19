@@ -463,6 +463,13 @@ run_xades_case simple "$INPUTS/simple.xml" signer-rsa
 # both sides, so a regression here cannot hide on one side of the diff.
 run_xades_case nsroot "$INPUTS/ns-root.xml" signer-rsa
 
+# A document-level processing instruction is the shape this project had
+# backwards: the data reference canonicalized the whole document, PI included,
+# and no validator could reproduce the digest. AutoFirma writes no document-level
+# PI at all, and neither do we now; both sides are recomputed with lxml and
+# verified by xmlsec1 here, so a regression shows up as a DIFF and as a refusal.
+run_xades_case doclevel-pis "$INPUTS/pi-doc-level.xml" signer-rsa
+
 # A legal person is not a natural person with a different name: the subject
 # carries a CIF in serialNumber and an organizationIdentifier, and there is no
 # human in it at all. Both implementations must treat it as unremarkable.

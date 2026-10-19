@@ -9,33 +9,15 @@
 //! on this JVM (docs/xades.md, deviation 5), so xmlsec1 is the only
 //! independent verdict our ECDSA path gets.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-use openfirma_core::cert::CertificateHandle;
-use openfirma_core::signer::SoftwareSigner;
+mod common;
+
+use common::{certs_dir, load_signer, require_or_skip, write_tmp};
 use openfirma_xades::{XadesOptions, xades_sign};
 
 const INPUT: &[u8] = include_bytes!("../../../testdata/inputs/simple.xml");
-
-fn certs_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/certs")
-}
-
-/// CI sets OPENFIRMA_REQUIRE_TESTS so a missing tool or a missing test PKI
-/// fails the build instead of quietly skipping. Only the keystore-scoped
-/// opt-out (OPENFIRMA_ALLOW_SKIP, read exclusively by openfirma-keystore's
-/// tests) may relax this; every other skip stays mandatory — review 07, H-2:
-/// one flag for everything let a broken PKI step go green with nothing
-/// verified on macOS and Windows.
-fn require_or_skip(reason: &str) {
-    let required = std::env::var("OPENFIRMA_REQUIRE_TESTS").is_ok();
-    let allowed = std::env::var("OPENFIRMA_ALLOW_NONKEYSTORE_SKIP").is_ok();
-    if required && !allowed {
-        panic!("cannot run the crosscheck: {reason}");
-    }
-    eprintln!("skipped, {reason}");
-}
 
 fn xmlsec_available() -> bool {
     Command::new("xmlsec1")
@@ -144,41 +126,6 @@ fn xmlsec_verify(file: &Path) -> (bool, String) {
     (out.status.success(), text)
 }
 
-fn load_signer(cert: &str, key: &str, chain: &[&str]) -> Option<SoftwareSigner> {
-    let dir = certs_dir();
-    let (Ok(cert_pem), Ok(key_pem)) = (
-        std::fs::read_to_string(dir.join(cert)),
-        std::fs::read_to_string(dir.join(key)),
-    ) else {
-        return None;
-    };
-    let signer = SoftwareSigner::from_pkcs8_pem(&cert_pem, &key_pem).unwrap_or_else(|e| {
-        panic!("{cert} / {key} are present but unusable: {e}, rerun tools/gen-testcert.sh")
-    });
-    let handles = chain
-        .iter()
-        .map(|c| {
-            let pem = std::fs::read_to_string(dir.join(c))
-                .unwrap_or_else(|e| panic!("{c} cannot be read: {e}"));
-            CertificateHandle::from_pem(&pem).unwrap_or_else(|e| panic!("{c}: {e}"))
-        })
-        .collect();
-    Some(signer.with_chain(handles))
-}
-
-fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
-    // Kept in a fixed directory under TEMP: the CI's macOS runners showed an
-    // external verifier rejecting a freshly written file that our own checks had
-    // just passed, which is what a race with per-directory temp cleanup looks
-    // like. A path we own and do not delete until the next run removes that
-    // variable from the diagnosis; tamper tests still clean up right away.
-    let dir = std::env::temp_dir().join("openfirma-xades-crosscheck");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(name);
-    std::fs::write(&path, bytes).unwrap();
-    path
-}
-
 #[test]
 fn xmlsec_verifies_the_rsa_signature() {
     if !xmlsec_available() {
@@ -263,6 +210,69 @@ fn xmlsec_verifies_signatures_over_documents_with_namespaced_roots() {
         assert!(
             text.contains("SignedInfo References (ok/all): 2/2"),
             "not both references verified for {name}:\n{text}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+/// A document-level processing instruction sits outside the signed object: the
+/// enveloped transform hands the ROOT ELEMENT to the digest, so whatever the
+/// input had above or below the root is not in the bytes a validator
+/// recomputes. Canonicalizing the whole document for the data reference — which
+/// is what this line used to do — therefore signed something nobody would
+/// reproduce: `xmlsec1` answered `REFERENCE` failure (data and digest do not
+/// match) for all three shapes below, on both our earlier file and the byte
+/// identical shape AutoFirma produced for the same input… except that AutoFirma's
+/// file verified, because its serializer writes no document-level PI at all and
+/// its digest is the root subtree.
+///
+/// The reference implementation and the validator agree, so this is the shape
+/// we sign now: root subtree only, document-level PIs not written (`docs/xades.md`).
+#[test]
+fn xmlsec_verifies_a_signature_over_a_document_with_document_level_pis() {
+    if !xmlsec_available() {
+        tool_or_skip("xmlsec1", "xmlsec1 not found, install xmlsec1");
+        return;
+    }
+    let Some(signer) = load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "pi-prolog-only.xml",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<?xml-stylesheet type=\"text/xsl\" href=\"hoja.xsl\"?>\n<doc Id=\"r\"><a>x</a></doc>\n",
+        ),
+        (
+            "pi-epilog-only.xml",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<doc Id=\"r\"><a>x</a></doc>\n<?epilog-pi after the root?>\n",
+        ),
+        (
+            "pi-both.xml",
+            include_bytes!("../../../testdata/inputs/pi-doc-level.xml"),
+        ),
+    ];
+    for (name, input) in cases {
+        let signed = xades_sign(input, &signer, &XadesOptions::default())
+            .unwrap_or_else(|e| panic!("signing {name}: {e}"));
+        let text = String::from_utf8_lossy(&signed).into_owned();
+        for dropped in ["xml-stylesheet", "epilog-pi"] {
+            assert!(
+                !text.contains(dropped),
+                "{name}: the document-level PI `{dropped}` survived into the signed \
+                 file, where no digest covers it"
+            );
+        }
+        let path = write_tmp(name, &signed);
+        let (ok, out) = xmlsec_verify(&path);
+        assert!(ok, "xmlsec1 rejected the signature over {name}:\n{out}");
+        assert!(
+            out.contains("SignedInfo References (ok/all): 2/2"),
+            "not both references verified for {name}:\n{out}"
         );
         std::fs::remove_file(&path).ok();
     }

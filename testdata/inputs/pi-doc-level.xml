@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="hoja.xsl"?>
+<!-- Un comentario en el prólogo: ni AutoFirma ni nosotros lo escribimos. -->
+<documento Id="doc-pis" version="1.0">
+  <titulo>Documento con instrucciones de proceso a nivel de documento</titulo>
+  <cuerpo>Las PI del prólogo y del epílogo quedan fuera del objeto firmado:
+    un validador las recomputa sin ellas, y firmarlas sería prometer algo
+    que nadie puede comprobar.</cuerpo>
+</documento>
+<!-- Y otro en el epílogo. -->
+<?epilog-pi también se va con la serialización?>

@@ -39,15 +39,28 @@ element**. Serialization of the output, measured:
 - the declaration is normalized to exactly `<?xml version="1.0" encoding="UTF-8"?>`:
   `standalone` is dropped, a missing declaration is added, no newline follows it,
 - nothing follows the root end tag: a trailing newline in the input is dropped,
-- document-level **comments** (outside the root) are dropped, including a
-  locally-unresolvable `xml-stylesheet`'s neighbouring comment; document-level
-  **processing instructions are kept**, right after the declaration and before
-  the root element. Measured against AutoFirma's own output: its serializer is
-  a DOM `Document` node saved whole (declaration first, every PI child of the
-  Document written in order, the comments it never inserts simply absent), and
-  xmlsec1 verifies over them. A prolog PI that had been dropped used to make
-  the whole-document reference digest diverge: the data transform canonicalizes
-  the document *including its prolog PIs* (docs review 03, follow-up of C-1).
+- document-level nodes (anything outside the root) do **not** survive: comments
+  and processing instructions alike, an `xml-stylesheet` among them. Measured
+  against AutoFirma on three inputs — a prolog PI, an epilog PI, and both
+  together (`testdata/inputs/pi-doc-level.xml` carries that shape) — whose
+  output contained none of them and no comment either; it writes the declaration
+  and the document element and stops.
+  That is not only fidelity. The data reference is the **root element subtree**:
+  the enveloped transform hands that to the canonicalizer, the XPath filter
+  agrees, and every validator recomputes exactly that, so a document-level
+  sibling is never in the bytes a digest covers — keeping one would put an
+  unprotected node inside a signed file. The reader still parses prolog and
+  epilog nodes (the encoding check reads them) and the input keeps them; the
+  output does not, and the CLI says nothing about it, as AutoFirma says nothing.
+  An earlier version of this section claimed the opposite — that the data
+  transform "canonicalizes the document *including its prolog PIs*", following
+  the C-1 follow-up — and the code did that, which made every PI-carrying input
+  produce a signature that `xmlsec1` rejected with `REFERENCE` failure while
+  AutoFirma's own signature over the same file verified. Round two found it
+  where B-4's stale comment pointed; the tests that pin it are
+  `sign_structure::document_level_pis_and_comments_are_not_in_the_signed_file`,
+  `xmlsec_crosscheck::xmlsec_verifies_a_signature_over_a_document_with_document_level_pis`
+  and `autofirma_verify::autofirma_verifies_a_signature_over_a_document_with_document_level_pis`.
 
 ## SignedInfo
 

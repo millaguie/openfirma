@@ -132,12 +132,24 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
     };
     // The root carries the Id we just validated, so URI="#id" resolves to it
     // — and nothing else in the document may carry it (the duplicate check
-    // above guarantees that). Without an Id the reference is URI="", which is
-    // the whole document too. Either way the target is the root, and the
-    // canonical form of a root element is identical whether taken as a
-    // subtree of its own declarations or as the whole document: nothing is
-    // in scope above the root (review 03, C-1).
-    let data_c14n = c14n::document(&doc, &data_opts);
+    // above guarantees that). Without an Id the reference is URI="", which
+    // names the document; the enveloped transform then hands on the root
+    // element, and so do the XPath filter and every validator: the node-set
+    // that reaches the digest never contains a sibling of the root.
+    //
+    // Canonicalizing the whole DOCUMENT instead — which this line used to do,
+    // on the reasoning that a root looks the same from either side — is what
+    // broke it, because whole-document C14N also writes the document-level
+    // processing instructions, and they are exactly what the transform chain
+    // drops. Measured on inputs with a prolog PI, an epilog PI, or both (an
+    // `xml-stylesheet` among them, and `testdata/inputs/pi-doc-level.xml`
+    // carries that shape): `xmlsec1 --verify` reported `REFERENCE` failure on
+    // our file every time, while AutoFirma's own signature over the same three
+    // inputs verified OK — and its serializer had written no document-level PI
+    // at all. So the root subtree is the target, here and in the output (see
+    // `splice_into_document`), and a document-level PI is dropped rather than
+    // signed.
+    let data_c14n = c14n::root_element(&doc, &data_opts);
     let data_digest = opts.reference_digest.digest(&data_c14n);
 
     let cert = signer.certificate();
@@ -236,7 +248,7 @@ pub fn xades_sign(input: &[u8], signer: &dyn Signer, opts: &XadesOptions) -> Res
              <ds:DigestValue>{sp_digest}</ds:DigestValue>\
              </ds:Reference>\
              </ds:SignedInfo>",
-            escape_attr(&data_uri),
+            c14n::escape_attr(&data_uri),
         )
     };
 
@@ -450,29 +462,26 @@ fn subtree_in_context<'e>(
 
 /// The output file: the normalized declaration, then the input bytes of the
 /// root element with the signature inserted before its end tag. Nothing
-/// outside the root survives, which is what AutoFirma's serializer does.
+/// outside the root survives, which is what AutoFirma's serializer does: on
+/// three inputs carrying a prolog PI, an epilog PI, or both (an
+/// `xml-stylesheet` among them, `testdata/inputs/pi-doc-level.xml`), its
+/// output contained none of them and no comment either — it writes the
+/// declaration and the document element and stops. That is also the only
+/// shape whose digests a validator can recompute: everything outside the root
+/// is past the enveloped transform, so keeping a PI would put an unprotected
+/// node inside a signed file. The reader still parses them (a document that
+/// lies about its encoding is refused by what it declares, PI included); they
+/// are simply not part of what gets signed or written.
 fn splice_into_document(input: &[u8], doc: &xml::Document, signature: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() + signature.len() + 64);
     out.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
-    // Prolog and epilog nodes the measured AutoFirma serialization keeps:
-    // processing instructions, in source order (its DOM serializer writes
-    // every child of the Document node except the document element, and its
-    // parser has consumed the declaration). Comments are what it drops —
-    // including the prolog and epilog ones, as measured byte for byte — and
-    // whitespace between them is not significant. DTDs cannot be here: the
-    // reader refuses them.
-    for node in doc.prolog.iter().chain(doc.epilog.iter()) {
-        if let xml::DocLevelNode::Pi { target, data } = node {
-            out.extend_from_slice(b"<?");
-            out.extend_from_slice(target.as_bytes());
-            if !data.is_empty() {
-                out.push(b' ');
-                out.extend_from_slice(data.as_bytes());
-            }
-            out.extend_from_slice(b"?>");
-        }
-    }
-
+    // And nothing else: the input's document-level processing instructions and
+    // comments are not written. Measured against AutoFirma (`docs/xades.md`),
+    // and not only for fidelity — the data reference is the root subtree, so a
+    // PI kept here would sit inside a signed file covered by no digest. The
+    // prolog/epilog vectors still exist on the parsed document (the encoding
+    // check reads them); they just have no part in the output. DTDs cannot be
+    // here at all: the reader refuses them.
     let root = &doc.root;
     if root.self_closing {
         // <root attrs/> becomes <root attrs><ds:Signature .../></root>: the
@@ -684,22 +693,6 @@ fn rsa_public_key_bytes(cert: &openfirma_core::CertificateHandle) -> Result<(Vec
 
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-/// Escapes a string for an XML attribute value. Same rules as the
-/// canonicalizer's byte-level `escape_attr` (`c14n.rs`), on Strings because
-/// signing builds template text, not canonical output.
-fn escape_attr(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// Length of one ECDSA signature coordinate in the P1363 form.
