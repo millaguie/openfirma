@@ -21,7 +21,7 @@
 //! ASCII bytes cannot appear inside a UTF-8 multi byte sequence, so scanning
 //! bytes is safe for the whole UTF-8 repertoire.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use openfirma_core::{Error, Result};
 
@@ -171,9 +171,100 @@ struct Parser<'a> {
     pos: usize,
 }
 
-/// In scope namespace bindings while descending: (prefix, uri). The default
-/// namespace is the entry with prefix None.
-type Scope = Vec<(Option<String>, String)>;
+/// The namespace bindings in scope while descending the tree: the stack of
+/// declarations on the current path plus, for each prefix, the innermost entry
+/// that names it.
+///
+/// The first version was a plain `Vec` that every child CLONED and that
+/// `resolve_ns` scanned back to front, so a document carrying thousands of
+/// prefixes on its root and thousands of untouched children cost the product of
+/// the two: round two's N-5 measured 37 s for 4 000 prefixes × 20 000 children
+/// and 126 s for 20 000 × 20 000 (288 KB and 706 KB), in a debug build. This is
+/// the same shape `c14n::Scope` already used for the same finding: descending
+/// costs one push per declaration, ascending one pop per declaration, and
+/// resolving a name is one hash lookup. Nothing is copied per child, so no cap
+/// on prefixes or elements per document was needed — the cost of a big document
+/// is now proportional to the document.
+#[derive(Debug, Default)]
+struct Scope {
+    stack: Vec<(Option<String>, String)>,
+    /// innermost binding of each *prefixed* declaration: prefix → index into
+    /// `stack`. A `String` key is queried by `&str`, so resolving costs no
+    /// allocation; the default namespace is the field below rather than a
+    /// `None` key, which no borrowed lookup could reach.
+    prefixes: HashMap<String, usize>,
+    /// innermost `xmlns` (the default namespace), or `None` when none is in
+    /// scope. `Some(idx)` whose URI is empty is `xmlns=""`: no default.
+    default: Option<usize>,
+    /// what each pushed entry shadowed, in push order, so `ascend` puts the
+    /// outer binding back one declaration at a time instead of rebuilding the
+    /// whole table
+    undo: Vec<(Prefix, Option<usize>)>,
+}
+
+/// Which of the two kinds of declaration a stack entry is.
+#[derive(Debug, Clone)]
+enum Prefix {
+    Named(String),
+    Default,
+}
+
+impl Scope {
+    /// Push one element's declarations, returning the mark `ascend` unwinds to.
+    fn push_element(&mut self, decls: &[(Option<String>, String)]) -> usize {
+        let mark = self.stack.len();
+        for (prefix, uri) in decls {
+            let at = self.stack.len();
+            match prefix {
+                Some(p) => self.undo.push((
+                    Prefix::Named(p.clone()),
+                    self.prefixes.insert(p.clone(), at),
+                )),
+                None => self.undo.push((Prefix::Default, self.default.replace(at))),
+            }
+            self.stack.push((prefix.clone(), uri.clone()));
+        }
+        mark
+    }
+
+    /// Leave an element: undo exactly the declarations pushed above `mark`.
+    fn ascend(&mut self, mark: usize) {
+        while self.stack.len() > mark {
+            self.stack.pop();
+            let (prefix, outer) = self
+                .undo
+                .pop()
+                .expect("one undo record per pushed declaration");
+            match (prefix, outer) {
+                (Prefix::Named(p), Some(at)) => {
+                    self.prefixes.insert(p, at);
+                }
+                (Prefix::Named(p), None) => {
+                    self.prefixes.remove(&p);
+                }
+                (Prefix::Default, outer) => self.default = outer,
+            }
+        }
+    }
+
+    /// The namespace a name with this prefix is in. `is_element` separates the
+    /// two rules an unprefixed name follows: an element takes the default
+    /// namespace when one is declared, an attribute is in no namespace at all.
+    fn resolve(&self, prefix: Option<&str>, is_element: bool) -> Option<&str> {
+        match prefix {
+            Some("xml") => Some("http://www.w3.org/XML/1998/namespace"),
+            Some(p) => self.prefixes.get(p).map(|&at| self.stack[at].1.as_str()),
+            // an unprefixed attribute is in no namespace at all
+            None if !is_element => None,
+            // an unprefixed element is in the default namespace, when one is
+            // declared; xmlns="" declares none
+            None => self
+                .default
+                .map(|at| self.stack[at].1.as_str())
+                .filter(|uri| !uri.is_empty()),
+        }
+    }
+}
 
 /// The encoding name a declaration declares ("" when it declares none). XML
 /// names encodings case-insensitively and the ASCII case folds are all inside
@@ -350,7 +441,7 @@ impl<'a> Parser<'a> {
         let mut root_span = (0usize, 0usize);
         let mut prolog = Vec::new();
         let mut epilog = Vec::new();
-        let mut scope: Scope = Vec::new();
+        let mut scope = Scope::default();
         loop {
             self.skip_space();
             if self.pos >= self.src.len() {
@@ -648,40 +739,40 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let pushed = scope.len();
-        for (prefix, uri) in &ns_decls {
-            // no shadow removal here: resolve_ns scans back to front, so the
-            // last declaration of a prefix wins, and the truncate at the end
-            // of the element restores the outer scope exactly
-            scope.push((prefix.clone(), uri.clone()));
-        }
+        let mark = scope.push_element(&ns_decls);
 
         let element_ns = match name.prefix.as_deref() {
             // a prefixed name must have its prefix declared; an unprefixed
             // one simply takes the default namespace, which may be none
             Some(_) => Some(
-                resolve_ns(scope, name.prefix.as_deref(), true).ok_or_else(|| {
-                    self.err(&format!(
-                        "the prefix {:?} of <{}> is not declared",
-                        name.prefix,
-                        name.to_string_with_prefix()
-                    ))
-                })?,
+                scope
+                    .resolve(name.prefix.as_deref(), true)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        self.err(&format!(
+                            "the prefix {:?} of <{}> is not declared",
+                            name.prefix,
+                            name.to_string_with_prefix()
+                        ))
+                    })?,
             ),
-            None => resolve_ns(scope, None, true),
+            None => scope.resolve(None, true).map(str::to_string),
         };
 
         for (attr_name, value) in pending_attrs {
             let attr_ns = match &attr_name.prefix {
                 None => None,
                 Some(p) => {
-                    let ns = resolve_ns(scope, Some(p), false).ok_or_else(|| {
-                        self.err(&format!(
-                            "the prefix {p:?} of the attribute {} on <{}> is not declared",
-                            attr_name.to_string_with_prefix(),
-                            name.to_string_with_prefix()
-                        ))
-                    })?;
+                    let ns = scope
+                        .resolve(Some(p), false)
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            self.err(&format!(
+                                "the prefix {p:?} of the attribute {} on <{}> is not declared",
+                                attr_name.to_string_with_prefix(),
+                                name.to_string_with_prefix()
+                            ))
+                        })?;
                     Some(ns)
                 }
             };
@@ -736,8 +827,14 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 if self.src[self.pos] == b'<' {
-                    let mut inner_scope = scope.clone();
-                    let el = self.parse_element(&mut inner_scope, depth + 1)?;
+                    // The child gets the SAME scope, not a copy of it:
+                    // `parse_element` pushes its own declarations and ascends
+                    // back to the mark it was handed, so the parent's bindings
+                    // are exactly what they were when it returns. Cloning per
+                    // child is what made a document with thousands of prefixes
+                    // and thousands of children cost their product (round two,
+                    // N-5).
+                    let el = self.parse_element(scope, depth + 1)?;
                     children.push(Child::Element(Box::new(el)));
                     continue;
                 }
@@ -761,7 +858,7 @@ impl<'a> Parser<'a> {
             close_tag = (close_start, self.pos);
         }
 
-        scope.truncate(pushed);
+        scope.ascend(mark);
 
         Ok(Element {
             name,
@@ -999,27 +1096,6 @@ impl<'a> Parser<'a> {
             .count()
             + 1;
         Error::Xml(format!("{what} (line {line})"))
-    }
-}
-
-fn resolve_ns(scope: &Scope, prefix: Option<&str>, is_element: bool) -> Option<String> {
-    match prefix {
-        Some("xml") => Some("http://www.w3.org/XML/1998/namespace".to_string()),
-        Some(p) => scope
-            .iter()
-            .rev()
-            .find(|(declared, _)| declared.as_deref() == Some(p))
-            .map(|(_, uri)| uri.clone()),
-        // an unprefixed attribute is in no namespace at all
-        None if !is_element => None,
-        // an unprefixed element is in the default namespace, when one is
-        // declared; xmlns="" declares none
-        None => scope
-            .iter()
-            .rev()
-            .find(|(declared, _)| declared.is_none())
-            .map(|(_, uri)| uri.clone())
-            .filter(|uri| !uri.is_empty()),
     }
 }
 
@@ -1345,9 +1421,9 @@ mod tests {
         assert!(e.contains("iso-8859-1"), "{e}");
         assert!(e.contains("iconv"), "{e}");
         // a declaration that puts anything before version is outside
-        // production [24] and refused, whatever it declares there; the check
-        // that matters (case-insensitive names) runs on the position-anchored
-        // spelling too
+        // production [24] and refused, whatever it declares there; the names
+        // themselves are case-sensitive, like every other XML name (libxml2:
+        // "Malformed declaration expecting version")
         assert!(parse(b"<?xml standalone=\"no\"?>").is_err());
         assert!(parse(b"<?xml version=\"1.0\" ENCODING=\"ISO-8859-1\"?><doc/>").is_err());
         assert!(parse(b"<?xml version=\"1.0\" encoding=\"utf8\"?><doc/>").is_ok());
@@ -1450,6 +1526,106 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "parsing 10 000 attributes took {elapsed:?}"
         );
+    }
+
+    /// The scope a child is handed is the parent's own, unwound on the way
+    /// out, so a sibling's redeclaration must not leak. Round two's N-1
+    /// panicked in `c14n`'s copy of this structure; the reader has its own
+    /// copy now, so the same shape is pinned here: the innermost declaration
+    /// wins inside its element, the outer one is back for the next sibling,
+    /// and a default rebound 500 levels down unwinds to the top.
+    #[test]
+    fn a_siblings_redeclaration_leaves_the_outer_binding_intact() {
+        let doc = parse(
+            br#"<root xmlns:p="urn:outer" xmlns="urn:root">
+                 <mid xmlns:p="urn:inner"><p:leaf/></mid>
+                 <other xmlns:p="urn:third"><p:leaf2/></other>
+                 <after xmlns="urn:own"><p:leaf3/></after>
+                 <back/>
+               </root>"#,
+        )
+        .unwrap();
+        assert_eq!(doc.root.namespace.as_deref(), Some("urn:root"));
+        let elements: Vec<&Element> = doc
+            .root
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                Child::Element(el) => Some(&**el),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(elements.len(), 4, "whitespace is text, not an element");
+        fn first_child(el: &Element) -> &Element {
+            el.children
+                .iter()
+                .find_map(|c| match c {
+                    Child::Element(inner) => Some(&**inner),
+                    _ => None,
+                })
+                .expect("the element has an element child")
+        }
+        // an element's own name is resolved after the declarations IT writes
+        // are pushed, so `mid` is in the root's default while its prefixed
+        // child sees `mid`'s own binding.
+        assert_eq!(elements[0].namespace.as_deref(), Some("urn:root"));
+        assert_eq!(
+            first_child(elements[0]).namespace.as_deref(),
+            Some("urn:inner"),
+            "a prefixed child takes the inner redeclaration"
+        );
+        assert_eq!(
+            first_child(elements[1]).namespace.as_deref(),
+            Some("urn:third"),
+            "the second sibling rebinds `p` for itself and its children"
+        );
+        // `after` rebinds only the DEFAULT: its prefixed child goes back out to
+        // the root's `p`, because nothing between them rebound it
+        assert_eq!(elements[2].namespace.as_deref(), Some("urn:own"));
+        assert_eq!(
+            first_child(elements[2]).namespace.as_deref(),
+            Some("urn:outer")
+        );
+        // the sibling that follows every redeclaration resolves against the
+        // ROOT's default, not against anything a sibling declared
+        assert_eq!(elements[3].namespace.as_deref(), Some("urn:root"));
+
+        // 500 levels each rebinding the default: the innermost wins at the
+        // bottom, and the root's own binding is what it always was. This is
+        // also the shape the reviewer timed (0.20 s), so cost and correctness
+        // are pinned by one document. It runs on a thread with a stack like the
+        // CLI's main thread, for the reason `nesting_past_the_cap_…` spells
+        // out: 500 frames of unoptimized parser recursion need more than a
+        // test thread's 2 MiB.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut deep = String::from("<root xmlns=\"urn:top\">");
+                for i in 0..500 {
+                    deep.push_str(&format!("<e{i} xmlns=\"urn:level{i}\">"));
+                }
+                for i in (0..500).rev() {
+                    deep.push_str(&format!("</e{i}>"));
+                }
+                deep.push_str("</root>");
+                let doc = parse(deep.as_bytes()).expect("500 levels must parse");
+                assert_eq!(doc.root.namespace.as_deref(), Some("urn:top"));
+                let mut node = &doc.root;
+                for _ in 0..500 {
+                    let Child::Element(child) = &node.children[0] else {
+                        panic!("the nesting stops early");
+                    };
+                    node = child;
+                }
+                assert_eq!(
+                    node.namespace.as_deref(),
+                    Some("urn:level499"),
+                    "the innermost declaration wins at the bottom of the chain"
+                );
+            })
+            .expect("cannot spawn the probe thread")
+            .join()
+            .expect("a 500-level document must parse, not abort");
     }
 
     #[test]

@@ -68,6 +68,50 @@ fn thousands_of_namespace_prefixes_canonicalize_in_linear_time() {
 }
 
 #[test]
+fn thousands_of_inherited_prefixes_do_not_cost_elements_times_prefixes() {
+    // Round two, N-5: the same finding on the READER's side, which the M-2 fix
+    // had left open. `xml::parse` handed every child a CLONE of the namespace
+    // scope and resolved each name by scanning it back to front, so the cost
+    // was elements × prefixes-in-scope. The reviewer's debug binary needed
+    // 37.4 s for 4 000 prefixes over 20 000 children and 126 s for
+    // 20 000 × 20 000 — and this is the shape a generated file really has
+    // (a schema's worth of prefixes on the root, thousands of untouched
+    // children). `xml::Scope` is a stack with an innermost table now, so
+    // descending costs one push per declaration, ascending one pop, and a name
+    // one lookup; the same two shapes take 126 ms and 409 ms end to end
+    // through `openfirma sign` (docs/validation-log.md), and parse in about
+    // 130 ms together here. The budget below is ~15x that, which is what the
+    // two halves of the old code need to be caught by: with the per-child
+    // clone put back the first shape costs 14.4 s, and with the linear
+    // back-to-front scan put back the second costs 2.6 s.
+    //
+    // That is also why no "at most N prefixes per document" cap was added:
+    // with the cost proportional to the file, a cap would only refuse large
+    // legitimate documents, and `MAX_DEPTH` already bounds the recursion.
+    for (prefixes, children) in [(4_000usize, 20_000usize), (20_000, 20_000)] {
+        let mut doc = String::from("<root");
+        for i in 0..prefixes {
+            doc.push_str(&format!(" xmlns:p{i}=\"urn:p{i}\""));
+        }
+        doc.push('>');
+        for _ in 0..children {
+            doc.push_str("<c/>");
+        }
+        doc.push_str("</root>");
+        let started = Instant::now();
+        let parsed = xml::parse(doc.as_bytes()).expect("the synthetic document must parse");
+        let took = started.elapsed();
+        assert_eq!(parsed.root.ns_decls.len(), prefixes);
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "{prefixes} prefixes over {children} children ({} bytes) took {took:?}: \
+             the reader is copying or scanning its namespace scope per element again",
+            doc.len()
+        );
+    }
+}
+
+#[test]
 fn a_deep_inheritance_chain_does_not_re_render_unchanged_bindings() {
     // a chain of elements, each inheriting everything and declaring nothing:
     // linear in depth at both the scope push and the render decision
