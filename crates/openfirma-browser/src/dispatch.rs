@@ -1140,6 +1140,14 @@ fn sign_from_uri(uri: &AfirmaUri, signer: &dyn Signer) -> Result<BrowserResult, 
     // PDF → PAdES, FacturaE refused by name (openfirma has no FacturaE), XML →
     // XAdES, anything else CAdES. A PDF asked as format=AUTO therefore signs as
     // PAdES instead of dying on the file-shape gate.
+    //
+    // Whether the caller asked for `auto` has to survive this match, because
+    // the resolved shape is what the REQUEST must be built from (04-N2): the
+    // raw text went back through `protocol_request_for`, whose table entry for
+    // Auto is CAdES, so a PDF or an XML asked as `auto` was signed as a
+    // detached CMS — while the answer, and the CLI's own line, named the
+    // resolved shape. Both halves now come from one resolution.
+    let asked_auto = matches!(format, Format::Auto);
     let format = match format {
         Format::Auto => {
             if content.starts_with(b"%PDF-") {
@@ -1168,15 +1176,16 @@ fn sign_from_uri(uri: &AfirmaUri, signer: &dyn Signer) -> Result<BrowserResult, 
 
     // The browser protocol is one more frontend over the ONE dispatcher
     // (finding M-4): a sede's format= names the shared shape, and everything
-    // else — options, refusals, label table — is `crate::signing`'s.
-    let mut req = protocol_request_for(format_text, digest)?;
-    if matches!(format, Format::Auto) {
-        // resolve_format above already replaced Auto with the resolved shape;
-        // reaching here would mean the request and the format disagree, so the
-        // request is rebuilt from the resolution instead of the raw text.
-        req = protocol_request_for_format(format);
-        req.digest = digest;
-    }
+    // else — options, refusals, label table — is `crate::signing`'s. Its own
+    // level ids ("pades-b-lt") go through the raw-text door so the level the
+    // caller named is the level that gets built; `auto` goes through the
+    // resolution above, which is the only place the document is known.
+    let mut req = if asked_auto {
+        protocol_request_for_format(format)
+    } else {
+        protocol_request_for(format_text, digest)?
+    };
+    req.digest = digest;
     // `precalculatedHashAlgorithm` was applied to the request before anything
     // read the payload: it names the hash algorithm that produced `dat`, and by
     // AutoFirma's rule (`CAdESParameters.load`) that algorithm IS the
@@ -1218,6 +1227,9 @@ fn sign_from_uri(uri: &AfirmaUri, signer: &dyn Signer) -> Result<BrowserResult, 
     Ok(BrowserResult {
         payload: sign_response(signer.certificate(), &produced),
         kind: ResultKind::Signature {
+            // `Format::Auto` cannot reach here: the resolution above replaced
+            // it, and it is the same match the request was built from (04-N2),
+            // so the format this answer names is the format in the payload.
             format: match format {
                 Format::Cades | Format::Auto => "CAdES".to_string(),
                 Format::Pades => "PAdES".to_string(),
