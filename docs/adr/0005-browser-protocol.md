@@ -129,7 +129,15 @@ exactly the moment of signing. openfirma keeps that invariant headlessly:
   explicit `P12` (somebody standing here said sign) or as an `UnattendedKey`.
   An unattended key signs only with its owner's per-key `allow_unattended`
   opt-in plus a stored password, or through a consent callback that answered
-  yes; otherwise refusal, never silence (`consent-required`, AF600002/SAF_04).
+  yes; otherwise refusal, never silence. The refusal travels as AutoFirma's
+  cancellation pair — 500001/CANCEL, `err-11:=` — because that is what its own
+  dialog produces when it is dismissed: no signature, and a page that must not
+  retry. It answered 600002/SAF_04 ("La operacion no esta soportada") until
+  round two's 04-N8, which sent a sedes' users to look for an upgrade over a
+  key that merely had no opt-in. The machine code (`consent-required`) and the
+  message keep it apart from a user who actually answered no (`cancelled`), and
+  the person at the desktop is told what happened through the notifier where
+  one exists (04-N8; the CLI's `tell_the_user_about_the_refusal`).
 * The CLI scheme path (`afirma-uri`) can prompt on a terminal (operation, app
   name, digest and size of the exact bytes) — AutoFirma's dialog, in text. The
   prompt belongs to the door that still has a question: a **config-file** key

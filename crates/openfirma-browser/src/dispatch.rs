@@ -565,9 +565,18 @@ pub fn execute_with_consent(
             let needs_password = u.password.is_none();
             if !u.allow_unattended && !matches!(consent, Consent::Prompt(_)) {
                 // Granted (or any consent that cannot ask a human) without the
-                // owner's opt-in is not authority to sign quietly.
+                // owner's opt-in is not authority to sign quietly. 04-N8: this
+                // is NOT "operation not supported" (600002/SAF_04 is what it
+                // used to answer, and the report found the sede quoting
+                // "La operacion no esta soportada" at a user whose key simply
+                // had no opt-in). The outcome for the page is the one AutoFirma
+                // answers when its dialog is dismissed — no signature, do not
+                // retry — so it travels as the cancellation pair
+                // (500001/CANCEL, `err-11:=`), the same one `user_cancelled`
+                // uses. The MACHINE code and the message keep the two apart in
+                // logs and in the endpoint's reason header.
                 return Err(BrowserError::with_wire(
-                    WireError::UNSUPPORTED_OPERATION,
+                    WireError::CANCELLED,
                     "consent-required",
                     format!(
                         "the key {} may not sign a browser call without the user's \
@@ -762,7 +771,9 @@ pub fn execute(uri: &AfirmaUri, key: &KeySource<'_>) -> Result<BrowserResult, Br
         // `execute_with_consent`.
         KeySource::Unattended(u) => {
             return Err(BrowserError::with_wire(
-                WireError::UNSUPPORTED_OPERATION,
+                // Same pair as the consent gate above, for the same reason
+                // (04-N8): nothing was signed, the page must not retry.
+                WireError::CANCELLED,
                 "consent-required",
                 format!(
                     "the key {} may not sign a browser call without the user's consent \

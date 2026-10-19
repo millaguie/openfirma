@@ -1586,15 +1586,28 @@ fn main() -> Result<()> {
                 // dispatch refuses by name ("consent-required").
                 openfirma_browser::dispatch::Consent::Granted
             };
-            let result = openfirma_browser::dispatch::execute_with_consent(&parsed, &key, consent)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "{}",
-                        e.wire(openfirma_browser::dispatch::wire_target(
-                            parsed.protocol_version.as_deref()
-                        ))
-                    )
-                })?;
+            let result =
+                match openfirma_browser::dispatch::execute_with_consent(&parsed, &key, consent) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        // 04-N8: a handler the desktop session launched has no
+                        // terminal and no window, so a refusal for want of consent
+                        // reaches nobody — the page shows its own generic outcome
+                        // and the person in front of the screen never learns that
+                        // a web page asked for a signature, that openfirma did not
+                        // sign, or what would change that. Tell them where they
+                        // are (best effort, Linux only, see the function).
+                        if e.code == "consent-required" {
+                            tell_the_user_about_the_refusal();
+                        }
+                        anyhow::bail!(
+                            "{}",
+                            e.wire(openfirma_browser::dispatch::wire_target(
+                                parsed.protocol_version.as_deref()
+                            ))
+                        );
+                    }
+                };
             match output {
                 Some(path) => std::fs::write(&path, &result.payload)
                     .with_context(|| format!("writing {}", path.display()))?,
@@ -2431,6 +2444,44 @@ fn dup_fd(number: u32) -> Option<std::fs::File> {
         .write(true)
         .open(format!("/proc/self/fd/{number}"))
         .ok()
+}
+
+/// 04-N8: tell the person at the desktop that a page asked for a signature and
+/// openfirma did not sign. The handler is launched by the desktop session, so
+/// there is no terminal to print to and no window to show: without this the
+/// page gets its (now honest) cancellation and the human sees nothing, never
+/// learning why nothing was signed or what would change it.
+///
+/// Best effort by construction, and the refusal never depends on it: only where
+/// a freedesktop notifier is on PATH, only on Linux, its own output swallowed,
+/// and any failure ignored. macOS (`osascript -e 'display notification …'`) and
+/// Windows (a toast) have their own notifiers and neither is implemented here
+/// — a quiet refusal on two platforms is named, not guessed at (the record in
+/// `docs/validation.md` says which).
+fn tell_the_user_about_the_refusal() {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(paths) = std::env::var_os("PATH") else {
+            return;
+        };
+        if !std::env::split_paths(&paths).any(|dir| dir.join("notify-send").is_file()) {
+            return;
+        }
+        // Spanish because this text lands on a person's desktop next to the
+        // browser, like the GUI's own sentences; the library's English message
+        // stays in the command's stderr and in the wire text.
+        let _ = std::process::Command::new("notify-send")
+            .args([
+                "--app-name=openfirma",
+                "--urgency=normal",
+                "openfirma ha rechazado una firma pedida desde el navegador",
+                "Se pidio firmar, pero la clave de firma no tiene \
+                 allow_unattended = true, asi que openfirma no firma sin que \
+                 alguien lo confirme. Autoriza esa clave al registrarla, o firma \
+                 desde la ventana de openfirma.",
+            ])
+            .output();
+    }
 }
 
 /// The consent prompter for a terminal session (finding A-3): shows exactly

@@ -1441,6 +1441,134 @@ fn serve_takes_its_standing_consent_from_the_config_not_from_the_flag() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Finding 04-N8, both halves: what a page reads, and who tells the human.
+///
+/// The refusal used to answer 600002/SAF_04 ("La operacion no esta soportada"),
+/// which sends a sede's user looking for an upgrade over a key that merely had
+/// no `allow_unattended = true`; it answers AutoFirma's cancellation pair now,
+/// the same one its own dialog produces when it is dismissed. And a handler the
+/// desktop session starts has no terminal to print to, so the person in front
+/// of the screen is told through a desktop notification.
+///
+/// PATH is the whole interface to `notify-send`, so the measurement is a
+/// `notify-send` of our own on PATH that records its arguments: the proof is
+/// that file appearing, not a reading of the source. Linux-only — macOS and
+/// Windows have no notifier here, which the record names.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_consent_refusal_is_a_cancellation_and_tells_the_desktop() {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace("::", "_");
+    let root = std::env::temp_dir().join(format!("openfirma-{}-{test}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let pki = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/certs/signer-rsa.p12"
+    ));
+    if !pki.is_file() {
+        if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+            panic!("OPENFIRMA_REQUIRE_TESTS is set and testdata/certs/signer-rsa.p12 is missing");
+        }
+        eprintln!("skipped: the test PKI is absent, run tools/gen-testcert.sh");
+        return;
+    }
+    let p12 = root.join("clave.p12");
+    std::fs::copy(pki, &p12).unwrap();
+    let pw = root.join("pw.txt");
+    std::fs::write(&pw, b"openfirma\n").unwrap();
+    // The key is never opened (the refusal comes first) but it has to BE a key
+    // the config could name: the config is read before the call is made.
+    let cfg = root.join("clave.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "p12 = \"{}\"\npassword_file = \"{}\"\n",
+            p12.display(),
+            pw.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for file in [&pw, &cfg] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    // The notifier the CLI will find, and the file it leaves behind.
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let marker = root.join("notificado.txt");
+    let notifier = bin.join("notify-send");
+    std::fs::write(
+        &notifier,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&notifier, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let doc = b"%PDF-1.5\n%%EOF\n";
+    let uri = format!(
+        "afirma://sign?op=sign&format=CAdES&algorithm=SHA256withRSA&dat={}",
+        dat_param(doc)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .env("PATH", &path)
+        .args([
+            "afirma-uri",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--output",
+            root.join("firma.bin").to_str().unwrap(),
+            &uri,
+        ])
+        .output()
+        .expect("the handler must run");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !out.status.success(),
+        "a key with no opt-in and no terminal must not sign: {stderr}"
+    );
+    assert!(
+        stderr.contains("AF500001"),
+        "the page must read the cancellation, not \"operation not supported\": {stderr}"
+    );
+    assert!(
+        !stderr.contains("600002"),
+        "600002/SAF_04 is the code the report found misleading here: {stderr}"
+    );
+
+    let notified = std::fs::read_to_string(&marker)
+        .unwrap_or_else(|e| panic!("the desktop was never told ({e}); the refusal was: {stderr}"));
+    assert!(
+        notified.contains("openfirma ha rechazado una firma pedida desde el navegador"),
+        "the notification must say what happened: {notified}"
+    );
+    assert!(
+        notified.contains("allow_unattended = true"),
+        "and what would change it: {notified}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Finding 04-N7 through the binary a user runs: `--unregister` has to take
 /// openfirma's association line out of `mimeapps.list`. `xdg-mime default ""`
 /// does not, so `xdg-mime query default` kept answering openfirma after an

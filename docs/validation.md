@@ -416,6 +416,15 @@ exists, so an end-to-end trámite through a real sede's autoscript is not yet
 possible; what *is* proven is every layer under it — URI parsing from recorded
 URIs, dispatch, wire response shapes, and the endpoint's refusals.
 
+One more limit on the same path, from round two's 04-N8: a refusal for want of
+consent reaches the person at the desktop through `notify-send` on Linux only
+(looked up on PATH, its output swallowed, any failure ignored). macOS's
+`osascript -e 'display notification …'` and Windows's toast have no
+implementation here, so on those two the refusal is still silent to a human
+while the page receives it; the tests measure the Linux half with a
+`notify-send` of their own. Everything on this path that cannot be measured on
+the machines this project builds on is listed here rather than implied.
+
 ## 5. GUI manual checklist (what kittest cannot reach)
 
 The window's logic — screens, routing, verdicts, error wording, the close
