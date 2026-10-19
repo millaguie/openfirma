@@ -27,7 +27,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use openfirma_cades::tsp;
-use openfirma_cades::verify::VerifyOptions;
+use openfirma_cades::verify::{AnchorPolicy, VerifyOptions};
 use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
 use openfirma_core::signer::{Signer, SoftwareSigner};
@@ -433,6 +433,34 @@ fn b_lt_accepts_an_ocsp_response_for_the_intermediate() {
     assert_eq!(dss_report.ocsps, 1);
     assert_eq!(dss_report.chains.len(), 1);
     assert!(dss_report.uncovered.is_empty());
+
+    // 06-C-1, the PAdES half: rebuilding the chain from the archive alone is
+    // the same "who issued it" question the CMS verdict skips when no
+    // authority is named. The document is still judged — every archived
+    // certificate parses, every CRL and OCSP response verifies under its
+    // issuer's key, the /VRI coverage is checked — and the chain nobody can
+    // name is reported as not rebuilt instead of failing the whole document.
+    let unanchored = VerifyOptions {
+        trust_anchors: Vec::new(),
+        anchors: AnchorPolicy::IntegrityWithoutAnchors,
+        ..anchors()
+    };
+    let report = pades_verify(&signed, &unanchored)
+        .expect("no anchor is needed for the checks that do not use one");
+    assert_eq!(report.signatures[0].reports[0].trust_anchor, None);
+    let dss_report = report.dss.expect("the /DSS verdict");
+    assert!(dss_report.chains.is_empty(), "{:?}", dss_report.chains);
+    // The response was issued by the intermediate, which IS archived, so it
+    // was checked even without an anchor. The root's CRL names a CA that is
+    // neither archived nor (here) an anchor, so nobody could check it: it is
+    // counted as unchecked, never reported as a verified datum.
+    assert_eq!(dss_report.ocsps, 1);
+    assert!(dss_report.crls.is_empty(), "{:?}", dss_report.crls);
+    assert_eq!(dss_report.unchecked, 1);
+    assert!(
+        dss_report.uncovered.is_empty(),
+        "whether the /VRI covers every signature is not a chain question"
+    );
 }
 
 #[test]

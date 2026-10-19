@@ -38,12 +38,15 @@ pub fn report(err: &Error, tr: &Tr) -> crate::wizard::ErrorReport {
         // verdict shape) or a certificate/anchor refusal naming an authoring
         // rule the user must see verbatim.
         Error::Verification(_) | Error::Certificate(_) => technical.clone(),
+        // A refusal to read a configured authority file (B-5) names the file
+        // and its reason; the verdict that follows says its issuer was not
+        // checked rather than quietly pretending it was.
         Error::Other(_) if is_anchor_refusal(&technical) => {
             format!("{} {technical}", tr.fail_anchor_read)
         }
-        // The internal no-anchors mark never reaches this screen through the
-        // verdict path (it is the ask-the-anchor state); if anything else
-        // raises it, say what it means in the window's language.
+        // 06-C-1 removed the ask-the-anchor path, so this library phrase is
+        // not a state the verdict path produces; if some other caller raises
+        // it, the window says what it means and where the authority comes from.
         Error::Other(m) if m.contains("no trust anchors") => tr.fail_no_anchors_internal.clone(),
         Error::Other(_) => technical.clone(),
         // Parser chatter is for the details control only.

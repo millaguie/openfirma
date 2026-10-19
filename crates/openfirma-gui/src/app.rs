@@ -68,8 +68,10 @@ pub struct App {
     /// checker inside UI closures.
     scratch: Screen,
     /// One sentence shown on the idle screen while a question waits for its
-    /// answer (today: the ask-the-anchor note of the verify path). It exists
-    /// so "no sé en quién confiar" never looks like a dead drop zone.
+    /// answer (today: what a configured authority file that cannot be read
+    /// means for the verdict that is about to run, and the note that none is
+    /// configured at all — 06-C-1). It exists so "no sé en quién confiar"
+    /// never looks like a dead drop zone.
     pending_note: Option<String>,
     /// The worker thread's answer channel (A-1): `Some` while one job runs,
     /// taken the frame its answer is drained. Signing and verifying share it
@@ -83,6 +85,13 @@ pub struct App {
     /// picked file without signatures gets the "no tiene ninguna firma" line
     /// instead of the sign screen — both verbs can now be told apart.
     verify_intent: bool,
+    /// The trust authorities this window verifies against — configuration,
+    /// read ONCE at startup from `$OPENFIRMA_TRUST` through the shared loader
+    /// (06-C-1). The window never asks the citizen to choose one: a file
+    /// dialog cannot answer "which CAs do you trust?", and its wrong answer is
+    /// a certificate the attacker minted, picked after seeing the document.
+    /// Empty means every verdict says the issuer was not checked.
+    anchors: Vec<PathBuf>,
     /// Dialog fixtures for this App (tests set it via [`App::with_dialogs`];
     /// production keeps the default, which runs real rfd dialogs).
     dialogs: Dialogs,
@@ -93,9 +102,6 @@ pub struct App {
 /// keystore call cannot nest inside them).
 enum Deferred {
     OpenStore(String),
-    /// Ask the OS for the trust-anchor file of the verify path; its answer
-    /// finishes the load that started it.
-    AskAnchor(PathBuf),
     /// Ask the OS for the ORIGINAL document of a detached `.csig` (A-4).
     AskContent(PathBuf),
     /// The chosen output already exists: ask where to write before truncating
@@ -164,6 +170,7 @@ impl Default for App {
             worker_rx: None,
             pins: PinCache::default(),
             verify_intent: false,
+            anchors: openfirma_core::workflow::default_trust_anchors(),
         }
     }
 }
@@ -315,10 +322,11 @@ impl App {
         catalog
     }
 
-    /// The verify half of `load_path`, including the ask-for-an-anchor step:
-    /// with no trust anchors configured there is nothing to chain to, and
-    /// inventing one would be exactly the unfounded success this project
-    /// bans — so the screen says what it needs and opens one file picker.
+    /// The verify half of `load_path`. The authority this window verifies
+    /// against is configuration, read once at startup (see [`App::anchors`]);
+    /// there is no ask-for-an-anchor step any more (06-C-1). With none
+    /// configured the verify runs the checks that need no authority and says
+    /// so on every line.
     fn verify_file(&mut self, path: PathBuf, bytes: Vec<u8>) {
         let content = companion_of(&path);
         // A `.csig` IS a detached signature (the library's own name for one),
@@ -343,35 +351,26 @@ impl App {
         bytes: Vec<u8>,
         content_path: Option<PathBuf>,
     ) {
-        let anchors = openfirma_core::workflow::default_trust_anchors();
-        if anchors.is_empty() {
-            // The ask-the-user step (docs/adr/0006-gui-toolkit.md): "who do you trust?" is one
-            // file picker, nothing more clever, and the reason shows on the
-            // drop screen while it waits for the pick. Declining leaves the
-            // zone where it was — a half-finished verify is not an error.
-            self.pending_note = Some(format!(
-                "{} {}",
-                self.tr.no_trust_anchors, self.tr.anchor_hint
-            ));
-            self.deferred.push(Deferred::AskAnchor(path));
-            return;
-        }
-        // B-5: anchors that cannot be read are the user's configuration
-        // failing out loud — every broken file is named with its reason in
-        // the note while a valid one still verifies. All-broken falls back to
-        // the ask, because choosing works when reading did not.
+        // B-5: an authority that cannot be read is the user's configuration
+        // failing out loud — named with its reason in the note while the
+        // verdict still runs. What is NOT done is what the review walked
+        // through (06-C-1): a file dialog asking the citizen which CA to
+        // trust, whose answer is a certificate the attacker can mint. No
+        // anchors configured means the verdict says the issuer was not
+        // checked.
         let mut certs = Vec::new();
         let mut notes: Vec<String> = Vec::new();
-        for p in &anchors {
+        for p in &self.anchors {
             match openfirma_core::workflow::load_trust_anchors(p) {
                 Ok(list) => certs.extend(list),
                 Err(e) => notes.push(format!("{} {}", self.tr.fail_anchor_read, e)),
             }
         }
-        if certs.is_empty() && !notes.is_empty() {
+        if certs.is_empty() {
+            notes.push(self.tr.no_trust_anchors.clone());
+        }
+        if !notes.is_empty() {
             self.pending_note = Some(notes.join(" "));
-            self.deferred.push(Deferred::AskAnchor(path));
-            return;
         }
         let content = match content_path {
             Some(p) => match keystore_io::read_file(&p) {
@@ -383,18 +382,6 @@ impl App {
             },
             None => None,
         };
-        if certs.is_empty() {
-            // No anchors at all AND nothing broken to name: the ask state.
-            self.pending_note = Some(format!(
-                "{} {}",
-                self.tr.no_trust_anchors, self.tr.anchor_hint
-            ));
-            self.deferred.push(Deferred::AskAnchor(path));
-            return;
-        }
-        if !notes.is_empty() {
-            self.pending_note = Some(notes.join(" "));
-        }
         // A-1: the whole verify (read is done, but chain work on a big PDF
         // or a slow disk must not stall a frame) goes to the worker.
         self.start_verify(LoadJob {
@@ -403,32 +390,6 @@ impl App {
             content,
             anchors: certs,
         });
-    }
-
-    fn finish_anchor(&mut self, path: PathBuf, anchor: Option<PathBuf>) {
-        let Some(anchor) = anchor else { return }; // declined: stay idle
-        match openfirma_core::workflow::load_trust_anchors(&anchor) {
-            Ok(certs) => {
-                // Reload the file (it may have changed between dialogs — one
-                // read is cheap and stale verdicts are not).
-                match keystore_io::read_file(&path) {
-                    Ok(bytes) => {
-                        let content = companion_of(&path);
-                        self.start_verify(LoadJob {
-                            path,
-                            bytes,
-                            content: content.as_deref().and_then(companion_of_ok),
-                            anchors: certs,
-                        });
-                    }
-                    Err(e) => self.fail(errors::report(&e, &self.tr), path),
-                }
-            }
-            Err(msg) => self.fail(
-                errors::report(&openfirma_core::Error::Other(msg.clone()), &self.tr),
-                path,
-            ),
-        }
     }
 
     fn fail(&mut self, error: ErrorReport, path: PathBuf) {
@@ -689,6 +650,16 @@ impl App {
     /// wizard, and a test supplies answers without windows).
     pub fn with_dialogs(&mut self, dialogs: Dialogs) {
         self.dialogs = dialogs;
+    }
+
+    /// Point this window's verify path at a set of authority files: production
+    /// reads them from `$OPENFIRMA_TRUST` at startup ([`App::anchors`]), and a
+    /// test needs that same state without a process-wide environment variable
+    /// (H-17: the env is shared by every test thread in the binary). This is a
+    /// configuration source, not a shortcut — the whole verify flow below runs
+    /// exactly as it does in the window.
+    pub fn set_anchors_for_test(&mut self, anchors: Vec<PathBuf>) {
+        self.anchors = anchors;
     }
 
     // ------------------------------------------------------------- test seams
@@ -1650,6 +1621,14 @@ impl App {
         details_open.resize(verdicts.lines.len(), false);
         let tr = self.tr.clone();
         ui.heading(display_name(path));
+        // 06-C-1: the authority is configuration, and what configuration
+        // could not be used is said here, in the same amber as the drop
+        // screen, NOT only while the worker runs — the verdict below says
+        // "the issuer was not checked" and this is the sentence that explains
+        // why and what to change.
+        if let Some(note) = self.pending_note.clone() {
+            ui.colored_label(ui.visuals().warn_fg_color, note);
+        }
         if verdicts.lines.is_empty() {
             ui.label(tr.verdict_unsigned.clone());
         }
@@ -2043,12 +2022,6 @@ fn companion_of(signature: &Path) -> Option<PathBuf> {
     (candidate != signature && candidate.is_file()).then_some(candidate)
 }
 
-/// `Some(path)` only when it is a real readable file (the None form is what
-/// "no content supplied" means for the verifier).
-fn companion_of_ok(path: &Path) -> Option<Vec<u8>> {
-    path.is_file().then(|| std::fs::read(path).ok())?
-}
-
 /// One verdict line as the sentence the screen leads with (A-5): the status
 /// in plain Spanish first, then who it is about. `verdicts::` builds the
 /// strings; this only arranges them — no verdict logic here.
@@ -2128,15 +2101,6 @@ impl eframe::App for App {
         while let Some(action) = self.deferred.pop() {
             match action {
                 Deferred::OpenStore(d) => self.open_descriptor(&d),
-                Deferred::AskAnchor(path) => {
-                    // The anchor picker carries its own title (review C-1): it
-                    // asks for a certification AUTHORITY to trust, not "your
-                    // certificate" — and whatever gets picked passes core's
-                    // anchor rule, which refuses a CA:FALSE leaf outright.
-                    let title = self.tr.dialog_open_anchor.clone();
-                    let anchor = self.open_file(&title);
-                    self.finish_anchor(path, anchor);
-                }
                 Deferred::AskContent(sig_path) => {
                     let title = self.tr.dialog_content_for_detached.clone();
                     match (self.open_file(&title), std::fs::read(&sig_path)) {

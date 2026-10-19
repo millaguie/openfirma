@@ -119,10 +119,14 @@ cargo run -p openfirma-gui       # the window (Spanish UI; docs/adr/0006-gui-too
 
 The GUI needs no flags: drop the document, pick the certificate, sign — the
 result lands next to the original (`documento.signed.pdf`). Verifying is
-dropping a signed file and reading the verdicts; without trust anchors it
-asks for one certificate to trust (`$OPENFIRMA_TRUST` answers for both
-frontends). Everything the window does has the CLI spelling above; the
-window never adds a capability the terminal lacks.
+dropping a signed file and reading the verdicts. The authorities it verifies
+against are configuration, read once at startup from `$OPENFIRMA_TRUST` — the
+same knob the CLI reads; the window never asks you to choose a CA (a question
+nobody can answer, and the one door an impostor's own certificate could walk
+through). With none configured it says, on every line, that the document's
+integrity was checked and **who issued the certificate was not**. Everything
+the window does has the CLI spelling above; the window never adds a capability
+the terminal lacks.
 
 Signing with a real certificate means signing from its PKCS#12 container.
 The password goes in a file nobody but you can read, or in the environment —

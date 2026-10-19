@@ -20,6 +20,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use openfirma_cades::verify::AnchorPolicy;
 use openfirma_cades::{VerifyOptions, VerifyReport};
 use openfirma_core::Error;
 
@@ -33,27 +34,32 @@ pub fn now() -> SystemTime {
     SystemTime::now()
 }
 
-/// The mark [`verdict_lines`] returns when the reason is simply that no trust
-/// anchor was supplied; the UI turns it into its ask-the-user screen.
-pub const NO_ANCHORS_MARK: &str = "openfirma: no trust anchors were supplied";
-
 /// Verify one file and render the verdict list. `content` is the ORIGINAL
 /// document when `bytes` is a detached signature (found beside the `.csig`
 /// or chosen by the user — review 06, A-4); `None` for an attached/PDF one,
-/// where the covered bytes travel with the signature themselves. An empty
-/// anchor list is not an error but the ask-the-anchor state, carried as
-/// [`NO_ANCHORS_MARK`], because inventing anchors would be exactly the
-/// unfounded success this project bans.
+/// where the covered bytes travel with the signature themselves.
+///
+/// An empty anchor list is neither an error nor a question (06-C-1): it is the
+/// configuration this window was started with (`$OPENFIRMA_TRUST`, read once),
+/// and the verification then runs every check that does not need an authority
+/// and SAYS the issuer was not checked ([`AnchorPolicy::IntegrityWithoutAnchors`]).
+/// It used to be a mark the UI turned into "now choose a certificate to
+/// trust", a question a citizen cannot answer and the one door an attacker
+/// walks through: the review put its own CA in front of that dialog and read
+/// "Firma válida (AGENCIA TRIBUTARIA)" off the screen.
 pub fn verdict_lines(
     bytes: &[u8],
     content: Option<&[u8]>,
     anchors: Vec<openfirma_core::CertificateHandle>,
     tr: &Tr,
 ) -> Result<VerdictList, openfirma_core::Error> {
-    if anchors.is_empty() {
-        return Err(Error::Verification(NO_ANCHORS_MARK.into()));
-    }
+    let policy = if anchors.is_empty() {
+        AnchorPolicy::IntegrityWithoutAnchors
+    } else {
+        AnchorPolicy::Required
+    };
     let opts = VerifyOptions {
+        anchors: policy,
         trust_anchors: anchors,
         validation_time: now(),
         ts_mode: false,
@@ -432,12 +438,28 @@ fn pdf_list_from_report(report: &openfirma_pades::DocumentReport, tr: &Tr) -> Ve
         }
     }
     if let Some(dss) = &report.dss {
+        // "todos legibles y cada dato firmado por la autoridad que lo emite"
+        // is a claim about what was checked, so it is only made over the
+        // datums that WERE checked: with no authority configured some are
+        // counted as unchecked instead (06-C-1), and the sentence says so
+        // rather than moving the number silently.
+        let checked = dss.ocsps + dss.crls.len();
         notes.push(format!(
             "El documento guarda datos de validación ({} certificados, {} CRLs, {} respuestas \
-             OCSP), todos legibles y cada CRL firmada por la autoridad que la emite.",
+             OCSP). {checked} dato(s) se han comprobado (legibles, y cada uno firmado por la \
+             autoridad que lo emite){}",
             dss.certificates,
             dss.crls.len(),
-            dss.ocsps
+            dss.ocsps,
+            if dss.unchecked == 0 {
+                ".".to_string()
+            } else {
+                format!(
+                    "; {} NO se han podido comprobar, porque los emitió una autoridad que no \
+                     está entre las configuradas.",
+                    dss.unchecked
+                )
+            }
         ));
         for chain in &dss.chains {
             notes.push(format!(
@@ -454,15 +476,27 @@ fn pdf_list_from_report(report: &openfirma_pades::DocumentReport, tr: &Tr) -> Ve
     }
 }
 
-/// The green line of a signature every check passed.
+/// The line of a signature every check passed — every check, that is, except
+/// the one a caller with no authority cannot run. `trust_anchor: None` means
+/// the issuer was not checked (06-C-1): the signature is sound over its bytes
+/// and green is not available, because green is the claim that the chain
+/// reached a named authority. The line is amber and says exactly what ran.
 fn valid_line(r: &VerifyReport, tr: &Tr) -> VerdictLine {
     let stamped = r.timestamp.verified();
+    let (status, why_not) = if r.trust_anchor.is_some() {
+        (crate::wizard::VerdictStatus::Valid, None)
+    } else {
+        (
+            crate::wizard::VerdictStatus::Unknown,
+            Some(tr.integrity_without_issuer.clone()),
+        )
+    };
     VerdictLine {
-        status: crate::wizard::VerdictStatus::Valid,
+        status,
         signer: signer_display(&r.signer_subject).unwrap_or_default(),
         when: time_line(r.attributes.signing_time, stamped, tr),
-        why_not: None,
-        trust_anchor: Some(r.trust_anchor.clone()),
+        why_not,
+        trust_anchor: r.trust_anchor.clone(),
         technical: technical_of(r),
     }
 }
@@ -606,7 +640,12 @@ fn technical_of(r: &VerifyReport) -> Vec<String> {
         format!("digest: {}", r.digest.name()),
         format!("algoritmo de firma: {}", r.signature_alg),
         format!("sujeto (DN): {}", r.signer_subject),
-        format!("cadena hasta la autoridad de confianza: {}", r.trust_anchor),
+        format!(
+            "cadena hasta la autoridad de confianza: {}",
+            r.trust_anchor
+                .as_deref()
+                .unwrap_or("(NO comprobada: no hay ninguna autoridad de confianza configurada)")
+        ),
     ];
     for (i, s) in r.chain_subjects.iter().enumerate() {
         lines.push(format!("cadena {}: {s}", i + 1));
@@ -944,18 +983,50 @@ mod tests {
     }
 
     #[test]
-    fn no_anchors_is_the_distinguished_answer() {
-        // An empty anchor list never reaches the verifier: it is this mark,
-        // which the UI renders as its ask-the-user screen. A file that isn't
-        // even a signature must not be blamed first for the anchors.
-        let err = match verdict_lines(b"nada", None, Vec::new(), &Tr::es()) {
-            Ok(_) => panic!("no anchors must never verify against nothing"),
-            Err(e) => e,
+    fn no_anchors_is_an_honest_verdict_not_a_prompt_to_pick_one() {
+        // 06-C-1: an empty anchor list used to be a distinguished answer the
+        // window turned into "now choose a certificate to trust" — a question
+        // a citizen cannot answer, and one whose wrong answer (an impostor's
+        // own root, picked after seeing the file) reads as "Firma válida". It
+        // is now what it can be: the checks that need no authority ran, and
+        // the line says the issuer was not checked. Amber, never green.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+        let (Ok(cert), Ok(key)) = (
+            std::fs::read_to_string(dir.join("certs/signer-rsa.crt")),
+            std::fs::read_to_string(dir.join("certs/signer-rsa.key")),
+        ) else {
+            eprintln!("SKIP: the test PKI is absent, run tools/gen-testcert.sh");
+            if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+                panic!("OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing");
+            }
+            return;
         };
-        match err {
-            Error::Verification(m) => assert_eq!(m, NO_ANCHORS_MARK),
-            other => panic!("expected the no-anchors mark, got {other:?}"),
-        }
+        let signer = openfirma_core::signer::SoftwareSigner::from_pkcs8_pem(&cert, &key)
+            .expect("the test PKI is unusable");
+        let signed = openfirma_pades::pades_sign(
+            &std::fs::read(dir.join("inputs/simple.pdf")).expect("the fixture PDF"),
+            &signer,
+            &openfirma_pades::PadesOptions::default(),
+        )
+        .expect("the fixture signs");
+
+        let tr = Tr::es();
+        let list = verdict_lines(&signed, None, Vec::new(), &tr)
+            .expect("no authority configured is a verdict, not an error");
+        assert_eq!(list.lines.len(), 1, "{list:?}");
+        assert!(matches!(
+            list.lines[0].status,
+            crate::wizard::VerdictStatus::Unknown
+        ));
+        assert!(list.lines[0].trust_anchor.is_none());
+        assert_eq!(
+            list.lines[0].why_not.as_deref(),
+            Some(tr.integrity_without_issuer.as_str())
+        );
+        assert!(
+            list.document.is_none(),
+            "the document itself is sound: {list:?}"
+        );
     }
 
     #[test]

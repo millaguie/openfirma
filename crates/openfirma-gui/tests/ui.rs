@@ -628,23 +628,17 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     let out = dir.join("doc.pdf.signed.pdf");
     std::fs::write(&out, &signed).unwrap();
 
-    // No anchors configured (the clean-machine case): the window must ask
-    // for one and finish through the fixture's answer — the ask-the-anchor
-    // step, which is exactly AutoFirma's missing "where do I click here?".
-    // The anchor is chain.crt: the GUI's own verifier needs both roots of the
-    // test PKI (the CA alone leaves the intermediate unnamed), exactly as
-    // `openfirma verify --trust testdata/certs/chain.crt` gets fed.
-    let mut app = fixture_app(Some(testdata().join("certs/chain.crt")));
-    app.load_path_for_test(out.clone());
-    assert!(
-        app.pending_note_for_test().is_some(),
-        "without anchors the window says who it needs to trust before verifying"
-    );
-    // The anchor answer then starts a worker (A-1); kittest has no frame loop
-    // to drain it, so the test answers through the app's own transition.
+    // The authority is configuration, read once at startup (06-C-1), exactly
+    // as `openfirma verify --trust testdata/certs/chain.crt` gets fed: the
+    // test PKI needs BOTH its certificates (the CA alone leaves the
+    // intermediate unnamed). No window asks the citizen to choose one.
     let answer = verified_answer_for(&out);
+    let mut app = fixture_app(None);
+    app.set_anchors_for_test(vec![testdata().join("certs/chain.crt")]);
+    app.load_path_for_test(out.clone());
+    // The verify starts a worker (A-1); kittest has no frame loop to drain it,
+    // so the test answers through the app's own transition.
     let mut harness = harness_for(app);
-    harness.run(); // the deferred ask fires; the fixture answers with chain.crt
     harness
         .state_mut()
         .deliver_verify_answer_for_test(Ok(answer));
@@ -661,6 +655,62 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
         ),
         "after the anchor the verdict screen stands"
     );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn no_configured_authority_is_an_amber_verdict_never_a_green_one() {
+    // 06-C-1, through the window and its real worker. On a machine with no
+    // authority configured, dropping a signed PDF used to open a file dialog
+    // asking the citizen which CA to trust — a question they cannot answer,
+    // and the review walked the wrong answer through it: the impostor's own
+    // root, picked after seeing the document, made the screen read "Firma
+    // válida". Now the window runs every check that needs no authority and
+    // every line says the issuer was not checked. Amber, never green — and no
+    // dialog: `fixture_app(None)` has no dialog to answer, so a window that
+    // still asked would sit on the drop zone instead of a verdict.
+    let p12 = testdata().join("certs/signer-rsa.p12");
+    let dir = temp_doc("no-anchors-verdict");
+    let doc = dir.join("doc.pdf");
+    if require(
+        p12.is_file() && testdata().join("inputs/simple.pdf").is_file(),
+        "the test PKI",
+    )
+    .is_none()
+    {
+        return;
+    }
+    std::fs::copy(testdata().join("inputs/simple.pdf"), &doc).unwrap();
+    let signed = sign_through_gui_code(&doc, &p12);
+    let out = dir.join("doc.pdf.signed.pdf");
+    std::fs::write(&out, &signed).unwrap();
+
+    let mut app = fixture_app(None);
+    app.load_path_for_test(out.clone());
+    let mut harness = harness_for(app);
+    drain_worker(&mut harness);
+    harness.run();
+    assert!(
+        matches!(
+            harness.state().screen_ref_for_test(),
+            Screen::Verified { .. }
+        ),
+        "no authority configured is a verdict, not a question"
+    );
+    // The line says exactly what ran: integrity good, issuer unchecked.
+    harness.get_by_label_contains("se ha comprobado quién emitió el certificado");
+    // And the whole screen never claims validity.
+    assert!(
+        harness.query_by_label_contains("Firma válida").is_none(),
+        "green is reserved for a chain that reached a named authority"
+    );
+    // The note on the drop screen says how to fix it, in configuration.
+    let note = harness
+        .state()
+        .pending_note_for_test()
+        .expect("the window says why the issuer was not checked");
+    assert!(note.contains("OPENFIRMA_TRUST"), "{note}");
 
     std::fs::remove_dir_all(dir).ok();
 }
@@ -688,14 +738,15 @@ fn the_windows_own_csig_verifies_against_its_original_and_asks_when_it_is_gone()
     std::fs::write(&csig, &signed).unwrap();
 
     // (1) the original sits beside the signature, as the GUI itself wrote it
-    let mut app = fixture_app(Some(testdata().join("certs/chain.crt")));
+    //
+    // The authority is configuration now, not a dialog (06-C-1):
+    // `set_anchors_for_test` is the same list production reads from
+    // `$OPENFIRMA_TRUST` once at startup, and everything below — worker,
+    // verdict screen — is the window's own path.
+    let mut app = fixture_app(None);
+    app.set_anchors_for_test(vec![testdata().join("certs/chain.crt")]);
     app.load_path_for_test(csig.clone());
-    assert!(
-        app.pending_note_for_test().is_some(),
-        "verification waits for the configured anchor before it reads anything"
-    );
     let mut harness = harness_for(app);
-    harness.run(); // the deferred ask fires and the fixture answers with chain.crt
     drain_worker(&mut harness);
     harness.run();
     harness.get_by_label_contains("Firma válida");
@@ -741,10 +792,15 @@ fn a_document_that_fails_as_a_whole_is_never_a_valid_signature() {
     let doc = dir.join("certificado.pdf");
     std::fs::write(&doc, &pdf).unwrap();
 
-    let mut app = fixture_app(Some(testdata().join("certs/chain.crt")));
+    // Anchors ARE configured here on purpose. Without them every line is
+    // amber for the missing authority (06-C-1), and the assertion below that
+    // reads "no line may be green" would pass for the wrong reason; with the
+    // chain named, a green line is exactly what the pre-fix code painted over
+    // this document.
+    let mut app = fixture_app(None);
+    app.set_anchors_for_test(vec![testdata().join("certs/chain.crt")]);
     app.load_path_for_test(doc.clone());
     let mut harness = harness_for(app);
-    harness.run(); // the anchor question fires and the fixture answers it
     drain_worker(&mut harness);
     harness.run();
     assert!(
@@ -781,10 +837,10 @@ fn the_verdicts_way_out_is_on_screen() {
     let doc = dir.join("certificado.pdf");
     std::fs::write(&doc, &pdf).unwrap();
 
-    let mut app = fixture_app(Some(testdata().join("certs/chain.crt")));
+    let mut app = fixture_app(None);
+    app.set_anchors_for_test(vec![testdata().join("certs/chain.crt")]);
     app.load_path_for_test(doc.clone());
     let mut harness = harness_for(app);
-    harness.run();
     drain_worker(&mut harness);
     harness.run();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW);
@@ -870,7 +926,13 @@ fn a_drop_while_a_result_stands_unseen_is_refused_out_loud() {
 }
 
 #[test]
-fn a_leaf_picked_as_anchor_is_refused_not_green() {
+fn a_leaf_configured_as_authority_is_refused_and_never_green() {
+    // The window no longer asks which CA to trust (06-C-1) — so what this test
+    // owns is the other half of that removal: a configured authority that is a
+    // leaf (a signer's own certificate, CA:FALSE) is refused by the loader with
+    // its reason shown, and the verdict that follows does NOT turn green.
+    // Before, this file was the answer to a dialog, and a green line stood over
+    // it.
     let p12 = testdata().join("certs/signer-rsa.p12");
     let leaf = testdata().join("certs/signer-rsa.crt");
     let dir = temp_doc("leaf-anchor");
@@ -888,26 +950,23 @@ fn a_leaf_picked_as_anchor_is_refused_not_green() {
     let out = dir.join("doc.pdf.signed.pdf");
     std::fs::write(&out, &signed).unwrap();
 
-    // same drop as the verify test above, but the fixture answers the anchor
-    // picker with the signer's own leaf instead of a CA
-    let mut app = fixture_app(Some(leaf.clone()));
+    let mut app = fixture_app(None);
+    app.set_anchors_for_test(vec![leaf.clone()]);
     app.load_path_for_test(out.clone());
+    let note = app
+        .pending_note_for_test()
+        .expect("a configured authority that cannot be used says so");
+    assert!(
+        note.contains("CA:FALSE") || note.contains("autoridad"),
+        "the refusal must say why the configured file cannot anchor anything: {note}"
+    );
     let mut harness = harness_for(app);
-    harness.run(); // the deferred ask fires; the fixture answers with the leaf
-    match harness.state().screen_ref_for_test() {
-        Screen::Failed { error, .. } => {
-            let text = format!("{} / {}", error.plain, error.technical);
-            assert!(
-                text.contains("CA:FALSE") || text.contains("autoridad"),
-                "the refusal must say why the picked file cannot anchor anything: {text}"
-            );
-        }
-        other => {
-            let _ = other;
-            panic!("a leaf anchor must land on Failed, not some other screen");
-        }
-    }
-    // and under no reading does a green verdict stand for this pick
+    drain_worker(&mut harness);
+    harness.run();
+    // The refusal to read the authority does not stop the verdict: the window
+    // is honest about what it could not check (amber), and under no reading
+    // does a green verdict stand.
+    harness.get_by_label_contains("No se ha podido usar el archivo");
     assert!(harness.query_by_label_contains("Firma válida").is_none());
     std::fs::remove_dir_all(dir).ok();
 }

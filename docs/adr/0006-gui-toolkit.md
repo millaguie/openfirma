@@ -96,7 +96,8 @@ open-folder link. Verify is **drop, read** — one file, plain-language lines.
 5. **Tests are windowless and end-to-end.** `egui_kittest` drives the same
    `App` the binary runs (`tests/ui.rs`: 8 tests — first screen, detection
    routing, .p12 three-click sign, store-style row without a second password,
-   dropped-file entry, verdicts with the ask-the-anchor step, plain-vs-
+   dropped-file entry, verdicts (including the amber "issuer not checked" of a
+   machine with no configured authority), plain-vs-
    technical errors, and the close button bouncing off an unsaved result).
    File pickers are fixture answers behind `Dialogs` (their real behaviour is
    OS furniture: it belongs to the manual checklist, docs/validation.md). The
@@ -122,8 +123,20 @@ open-folder link. Verify is **drop, read** — one file, plain-language lines.
   tests hold both sides to the shared functions); the reverse gains nothing
   from this ADR.
 * `$OPENFIRMA_TRUST` becomes the one trust-anchoring knob both frontends
-  read; with no anchors, verify asks for one certificate file instead of
-  guessing (an unfounded ✓ is exactly the failure this project bans).
+  read. ~~with no anchors, verify asks for one certificate file instead of
+  guessing (an unfounded ✓ is exactly the failure this project bans)~~ — see
+  the update below.
+
+> **Update (2026-10-19, review 06 finding C-1):** the ask-for-an-anchor step is
+> gone. Asking the citizen which CA to trust is a question they cannot answer,
+> and the review walked the wrong answer through it: an impostor's own root,
+> chosen after seeing the document, made the screen read "Firma válida". The
+> window now reads `$OPENFIRMA_TRUST` ONCE at startup and verifies under
+> `AnchorPolicy::IntegrityWithoutAnchors` when that list is empty: every check
+> that needs no authority runs (the signature over its digest, the signer
+> certificate's own profile and key strength, its validity dates, the algorithm
+> policy), the chain step does not, and each line is amber and says so. Nothing
+> in the window can turn "nobody checked who issued this" into a green line.
 * The GUI ships on the targets a windowing system builds for (Linux x86_64,
   macOS, Windows); cross-compilations without one build the workspace with
   `--exclude openfirma-gui` / `--no-default-features` (the reason stands in

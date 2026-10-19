@@ -2480,7 +2480,10 @@ fn print_report(r: &openfirma_cades::VerifyReport) {
     for (i, s) in r.chain_subjects.iter().enumerate() {
         println!("    {}. {s}", i + 1);
     }
-    println!("  trust anchor:   {}", r.trust_anchor);
+    println!(
+        "  trust anchor:   {}",
+        r.trust_anchor.as_deref().unwrap_or("(not checked)")
+    );
     let (signed, unsigned) = attribute_names(&r.attributes);
     println!("  signed attrs:   {}", signed.join(", "));
     if !unsigned.is_empty() {

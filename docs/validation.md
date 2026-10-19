@@ -237,11 +237,23 @@ at the validation time, every archived OCSP response must be a successful
 answer, the chain of every `/VRI`-covered signature must rebuild from the
 archived data alone with at least one revocation datum per CA certificate and
 nothing in the chain revoked by the archived data, and every document
-time-stamp token must imprint the bytes its own `/ByteRange` covers. What it
-still does not do is everything that makes layers 3 and 4 necessary: no
-certificate policy (key usage, basic constraints, qualification), no signature
-policy, no OCSP response signature validation and no time-stamp token
-signature validation (openssl does both in the crosscheck suite). A file that
+time-stamp token must imprint the bytes its own `/ByteRange` covers. With NO
+authority configured — the window on a machine without `$OPENFIRMA_TRUST` —
+that chain step does not run and is reported as not run:
+`VerifyOptions::anchors` is `AnchorPolicy::IntegrityWithoutAnchors`, the
+report carries no trust anchor (`VerifyReport::trust_anchor` is `None`) and
+does not list `certificateChain` among the checks that passed, and archived
+validation data is judged only as far as the document alone allows — a datum
+that names a CA neither archived nor configured is counted as
+`unchecked`, never as verified. Every other check (the signature over its
+digest, the signer certificate's own profile and key strength, its validity
+dates, the algorithm policy) runs exactly the same way, so nothing about a bad
+signature slips through: what is missing is the answer to "who issued this",
+and nothing more.
+
+What it still does not do is everything that makes layers 3 and 4 necessary: no
+certificate policy (key usage, basic constraints, qualification) and no
+signature policy. A file that
 passes `openfirma verify` is cryptographically sound and chains to an anchor
 *you* chose; whether a regulator agrees is still a question for DSS and
 VALIDe. And it shares the codebase with the encoder,
@@ -427,7 +439,9 @@ wording, a real certificate that never enters the repository.
       its row needs no password to sign; a wrong PIN says so on the picker.
 - [ ] verify: drop a signed PDF → verdict lines with who/when; the details
       toggle shows chain and byte ranges; with no `$OPENFIRMA_TRUST` the
-      window asks for an anchor and finishes from one picked file.
+      verifier runs the checks that need no authority and every line says the
+      issuer was NOT checked (amber) — never a green line, and never a file
+      dialog asking which CA to trust.
 - [ ] close (window ✗ / Alt-F4) over an unsaved result opens the guard; "Seguir
       trabajando" keeps everything, "Cerrar sin guardar" ends the run and
       leaves written files exactly where their screen said.

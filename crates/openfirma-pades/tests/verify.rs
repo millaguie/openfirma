@@ -108,7 +108,8 @@ fn a_single_pades_signature_verifies() {
         r.signer_subject
     );
     assert_eq!(r.digest, DigestAlg::Sha256);
-    assert!(r.trust_anchor.contains("Root CA"), "{}", r.trust_anchor);
+    let anchor = r.trust_anchor.as_deref().expect("the chain step ran");
+    assert!(anchor.contains("Root CA"), "{anchor}");
     // PAdES leaves signingTime out on purpose, the time lives in /M
     assert!(r.attributes.signing_time.is_none());
     assert!(r.attributes.message_digest && r.attributes.signing_certificate_v2);

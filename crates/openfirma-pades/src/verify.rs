@@ -29,7 +29,7 @@
 //! makes.
 
 use openfirma_cades::revocation::{self, CrlReport, OcspCertId};
-use openfirma_cades::verify::VerifyOptions;
+use openfirma_cades::verify::{AnchorPolicy, VerifyOptions};
 use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
 use openfirma_core::{Error, Result};
@@ -99,8 +99,21 @@ pub struct DssReport {
     pub certificates: usize,
     /// One report per CRL archived under `/CRLs`, each signature verified.
     pub crls: Vec<CrlReport>,
-    /// Successful OCSP responses archived under `/OCSPs`.
+    /// OCSP responses archived under `/OCSPs` that VERIFIED. Under
+    /// [`AnchorPolicy::IntegrityWithoutAnchors`] a response whose responder CA
+    /// could not be named is counted in [`Self::unchecked`] instead.
     pub ocsps: usize,
+    /// Archived CRLs and OCSP responses whose signature NOBODY checked.
+    ///
+    /// Under the strict [`AnchorPolicy::Required`] this is always 0: an
+    /// archived datum that cannot be verified is a refusal naming it. Under
+    /// [`AnchorPolicy::IntegrityWithoutAnchors`] the caller named no authority,
+    /// so a datum issued by a CA that is in neither the archive nor (there
+    /// being none) the anchors cannot be judged at all — it is counted here
+    /// instead of failing a document whose signatures are sound. Whatever this
+    /// number is, the archive is NOT called coherent: no frontend may report
+    /// these bytes as verified.
+    pub unchecked: usize,
     /// The `/VRI` keys: the upper case hex SHA-1 of each archived signature
     /// value.
     pub vri_keys: Vec<String>,
@@ -826,9 +839,16 @@ fn verify_dss(
     let mut issuers = cert_handles.clone();
     issuers.extend_from_slice(&opts.trust_anchors);
     let mut crls: Vec<(Vec<u8>, CrlReport)> = Vec::with_capacity(dss.crls.len());
+    let mut unchecked = 0usize;
     for (i, (_, der)) in dss.crls.iter().enumerate() {
         match revocation::verify_crl(der, &issuers, opts.validation_time) {
             Ok(report) => crls.push((der.clone(), report)),
+            // 06-C-1: with no authority named, a datum that does not verify
+            // against the archive alone is not a broken archive — it is a
+            // datum nobody could check (its CA is not archived and the caller
+            // named no anchor), and this mode never uses it: the per-link
+            // revocation proof below is skipped too. Counted, never claimed.
+            Err(_) if opts.anchors != AnchorPolicy::Required => unchecked += 1,
             Err(e) => {
                 return Err(fail_dss(&format!(
                     "CRL {} archived under /CRLs is not a revocation datum: {}",
@@ -844,9 +864,16 @@ fn verify_dss(
     // An archived response is evidence years after signing with no network to
     // re-ask, so an unverifiable one is refused, not counted (A4).
     let mut ocsp_ids: Vec<OcspCertId> = Vec::new();
+    let mut verified_ocsps = 0usize;
     for (i, (_, der)) in dss.ocsps.iter().enumerate() {
         let status = revocation::read_ocsp_response(der, &issuers, opts.validation_time);
         if !status.verified() {
+            // 06-C-1: same rule as the CRLs above — no authority named means
+            // an unverifiable datum is counted, not refused.
+            if opts.anchors != AnchorPolicy::Required {
+                unchecked += 1;
+                continue;
+            }
             return Err(fail_dss(&format!(
                 "OCSP response {} archived under /OCSPs is not a revocation datum: {}",
                 i + 1,
@@ -854,7 +881,10 @@ fn verify_dss(
             )));
         }
         match revocation::parse_ocsp_response(der) {
-            Ok(ids) => ocsp_ids.extend(ids),
+            Ok(ids) => {
+                verified_ocsps += 1;
+                ocsp_ids.extend(ids);
+            }
             Err(e) => {
                 return Err(fail_dss(&format!(
                     "OCSP response {} archived under /OCSPs is not a revocation datum: {}",
@@ -893,6 +923,16 @@ fn verify_dss(
                      from the validation data alone",
                     i + 1
                 )));
+            }
+            // 06-C-1: rebuilding the chain is the "who issued it" step, and a
+            // caller who named no authority did not ask for it. What was judged
+            // above (every archived certificate parses, every CRL and OCSP
+            // response verifies) stays judged; the chain itself and the
+            // per-link revocation proof need a named anchor, so they are
+            // skipped here rather than failed, and no `DssChain` is reported
+            // for a chain nobody built.
+            if opts.anchors != AnchorPolicy::Required {
+                continue;
             }
             let chain = openfirma_cades::verify::chain_certificates(
                 signer,
@@ -982,7 +1022,11 @@ fn verify_dss(
     Ok(Some(DssReport {
         certificates: cert_handles.len(),
         crls: crls.into_iter().map(|(_, report)| report).collect(),
-        ocsps: dss.ocsps.len(),
+        // Responses that were checked, not responses that are present: the
+        // field has said "successful" since it existed, and under the
+        // no-anchor policy the two numbers differ.
+        ocsps: verified_ocsps,
+        unchecked,
         vri_keys,
         chains,
         uncovered,

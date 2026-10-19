@@ -87,10 +87,14 @@ pub struct Tr {
     /// stamp (B-4).
     pub declared_time_note: String,
     pub chain_line: String,
+    /// Shown while verifying when no authority is configured: what was
+    /// checked and what was not (06-C-1).
     pub no_trust_anchors: String,
-    /// Ask-the-anchor wording done right (review 06 B-2): what to do when the
-    /// user does not know — get the issuer's certificate from its own site.
-    pub anchor_hint: String,
+    /// The qualifier of a verdict line every check passed EXCEPT the one that
+    /// names the issuer, because no authority is configured (06-C-1). Its
+    /// status is amber: green is the claim that the chain reached an
+    /// authority the user trusts.
+    pub integrity_without_issuer: String,
     pub verify_another: String,
     // --- plain-language verification reasons (A-5) --------------------------
     /// The document was modified after signing.
@@ -123,7 +127,6 @@ pub struct Tr {
     pub dialog_open_cert: String,
     /// Title of the anchor picker (review C-1): the file it asks for is a
     /// certification authority to trust, not the user's own certificate.
-    pub dialog_open_anchor: String,
     pub dialog_save_sig: String,
     pub dialog_content_for_detached: String,
     // --- failures the library writes in English but the window must show
@@ -247,12 +250,14 @@ impl Tr {
                 .into(),
             chain_line: "Confía en la autoridad".into(),
             no_trust_anchors:
-                "openfirma solo da el visto bueno a una firma cuando llega hasta una autoridad \
-                 en la que tú confías. Elige ahora el certificado de esa autoridad."
+                "No hay ninguna autoridad de confianza configurada: se comprueba que el \
+                 documento no haya cambiado desde la firma, pero NO quién emitió el \
+                 certificado. Para comprobarlo también, pon en la variable OPENFIRMA_TRUST el \
+                 fichero de la autoridad (por ejemplo, la raíz de la FNMT)."
                     .into(),
-            anchor_hint:
-                "¿No sabes cuál es? Suele ser el «certificado de raíz» o «cadena» en la web del \
-                 emisor de tu certificado (la FNMT, tu empresa, tu administración)."
+            integrity_without_issuer:
+                "la firma es correcta sobre el documento, pero NO se ha comprobado quién \
+                 emitió el certificado: no hay ninguna autoridad de confianza configurada"
                     .into(),
             verify_another: "Verificar otro archivo".into(),
             reason_digest:
@@ -284,16 +289,14 @@ impl Tr {
             discard_result: "Cerrar sin esperar".into(),
             dialog_open_file: "Elige el documento".into(),
             dialog_open_cert: "Elige tu certificado".into(),
-            dialog_open_anchor: "Elige el certificado de la autoridad en la que confías".into(),
             dialog_save_sig: "Guardar la firma".into(),
             dialog_content_for_detached: "Elige el documento que se firmó".into(),
             fail_wrong_password:
                 "La contraseña del certificado no es correcta o el archivo está dañado.".into(),
             fail_anchor_read: "No se ha podido usar el archivo elegido como autoridad:".into(),
             fail_no_anchors_internal:
-                "No se ha indicado ninguna autoridad en la que confiar (variable \
-                 OPENFIRMA_TRUST). Elige el certificado de la autoridad para comprobar esta \
-                 firma."
+                "El verificador no tiene ninguna autoridad de confianza con la que comprobar \
+                 esta firma: configura la variable OPENFIRMA_TRUST."
                     .into(),
             fail_tsa_unverified:
                 "El sello de tiempo no se ha podido comprobar: demuestra la hora solo si \
@@ -391,12 +394,14 @@ impl Tr {
             declared_time_note: "time declared by the signer, no stamp confirms it".into(),
             chain_line: "Trusts the authority".into(),
             no_trust_anchors:
-                "openfirma only approves a signature that chains up to an authority you trust. \
-                 Choose that authority's certificate now."
+                "No trust authority is configured: what is checked is that the document has \
+                 not changed since it was signed, but NOT who issued the certificate. To check \
+                 that too, set OPENFIRMA_TRUST to the authority's file (the FNMT root, for \
+                 instance)."
                     .into(),
-            anchor_hint:
-                "Don't know which one? It is usually the \"root\" or \"chain\" certificate on \
-                 the website of your certificate's issuer (FNMT, your company, your agency)."
+            integrity_without_issuer:
+                "the signature is sound over the document, but WHO issued the certificate was \
+                 NOT checked: no trust authority is configured"
                     .into(),
             verify_another: "Verify another file".into(),
             reason_digest:
@@ -424,15 +429,14 @@ impl Tr {
             discard_result: "Close without waiting".into(),
             dialog_open_file: "Choose the document".into(),
             dialog_open_cert: "Choose your certificate".into(),
-            dialog_open_anchor: "Choose the authority certificate you trust".into(),
             dialog_save_sig: "Save the signature".into(),
             dialog_content_for_detached: "Choose the document that was signed".into(),
             fail_wrong_password: "The certificate's password is wrong, or the file is damaged."
                 .into(),
             fail_anchor_read: "The chosen authority file could not be used:".into(),
             fail_no_anchors_internal:
-                "No trust anchor was supplied (OPENFIRMA_TRUST). Choose the authority's \
-                 certificate to check this signature."
+                "The verifier has no trust authority to check this signature against: set \
+                 OPENFIRMA_TRUST."
                     .into(),
             fail_tsa_unverified:
                 "The time-stamp could not be checked: it proves the time only if you trust \
@@ -526,7 +530,7 @@ mod tests {
                 &tr.declared_time_note,
                 &tr.chain_line,
                 &tr.no_trust_anchors,
-                &tr.anchor_hint,
+                &tr.integrity_without_issuer,
                 &tr.verify_another,
                 &tr.reason_digest,
                 &tr.reason_chain,
@@ -543,7 +547,6 @@ mod tests {
                 &tr.discard_result,
                 &tr.dialog_open_file,
                 &tr.dialog_open_cert,
-                &tr.dialog_open_anchor,
                 &tr.dialog_save_sig,
                 &tr.dialog_content_for_detached,
                 &tr.fail_wrong_password,

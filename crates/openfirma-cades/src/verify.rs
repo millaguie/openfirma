@@ -117,12 +117,45 @@ pub const CHECK_VALIDITY_DATES: &str = "validityDates";
 /// No real PKI is deeper, and a chain that looks deeper is a loop or an attack.
 const MAX_CHAIN_DEPTH: usize = 16;
 
+/// What the caller demands of the signer certificate's chain.
+///
+/// A frontend that has no authority to name must not pick one out of a file
+/// dialog: "which CAs do you trust?" is not a question a citizen can answer,
+/// and a screen that lets the answer be given after seeing the verdict can be
+/// made to say "valid" for a certificate the same person just minted. This is
+/// the choice between the two honest answers — refuse, or check what can be
+/// checked and say what was not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnchorPolicy {
+    /// The default, and what the CLI does: the chain has to reach one of
+    /// `trust_anchors`, or the signature does not verify. An empty pool is a
+    /// hard failure ("trusting nothing verifies nothing").
+    #[default]
+    Required,
+    /// The caller has no anchor to name and asks for the checks that do not
+    /// need one. Everything about the signature is still judged — its value
+    /// over the `messageDigest`, the signer certificate's own profile rules
+    /// and key strength, its validity dates, the algorithm policy — and only
+    /// the step that says WHO ISSUED the signer's certificate is skipped. A
+    /// report produced this way carries `trust_anchor: None` and does not
+    /// list [`CHECK_CERTIFICATE_CHAIN`] among `passed`, so no frontend can
+    /// present it as a valid signature: the window shows it as "integrity
+    /// checked, issuer not checked", which is exactly what ran.
+    IntegrityWithoutAnchors,
+}
+
 /// What the verifier is handed besides the signature itself.
 #[derive(Clone)]
 pub struct VerifyOptions {
     /// Roots (or any certificate the caller trusts) the signer's chain has to
-    /// reach. At least one, or every verification fails.
+    /// reach. At least one, or every verification fails — unless
+    /// [`Self::anchors`] is [`AnchorPolicy::IntegrityWithoutAnchors`], where
+    /// the chain step is skipped on purpose and reported as skipped.
     pub trust_anchors: Vec<CertificateHandle>,
+
+    /// Whether the chain step has to succeed, or is skipped and said to be
+    /// skipped. See [`AnchorPolicy`]. Its default is the strict one.
+    pub anchors: AnchorPolicy,
 
     /// The instant the validity dates are judged against. A signature made
     /// yesterday verifies today by default; pass the claimed signing time to
@@ -193,6 +226,7 @@ impl Default for VerifyOptions {
     fn default() -> Self {
         Self {
             trust_anchors: Vec::new(),
+            anchors: AnchorPolicy::default(),
             validation_time: SystemTime::now(),
             ts_mode: false,
             algorithms: AlgorithmPolicy::default(),
@@ -206,6 +240,7 @@ impl VerifyOptions {
     pub fn new(trust_anchors: Vec<CertificateHandle>) -> Self {
         Self {
             trust_anchors,
+            anchors: AnchorPolicy::default(),
             validation_time: SystemTime::now(),
             ts_mode: false,
             algorithms: AlgorithmPolicy::default(),
@@ -218,6 +253,7 @@ impl VerifyOptions {
     pub fn tst(trust_anchors: Vec<CertificateHandle>, validation_time: SystemTime) -> Self {
         Self {
             trust_anchors,
+            anchors: AnchorPolicy::default(),
             validation_time,
             ts_mode: true,
             algorithms: AlgorithmPolicy::default(),
@@ -342,8 +378,11 @@ pub struct VerifyReport {
     /// Subjects from the signer upwards. The trust anchor itself is not part
     /// of this list unless it is also embedded in the signature.
     pub chain_subjects: Vec<String>,
-    /// Subject of the trust anchor the chain reached.
-    pub trust_anchor: String,
+    /// Subject of the trust anchor the chain reached, or `None` when the
+    /// caller asked for [`AnchorPolicy::IntegrityWithoutAnchors`] and this
+    /// step did not run. A `None` here is a signature whose issuer nobody
+    /// checked: it may never be presented as valid, whatever else passed.
+    pub trust_anchor: Option<String>,
     /// What the signature carries besides the mandatory attributes.
     pub attributes: Attributes,
     /// The checks that passed, by their [`CHECK_SIGNER_CERTIFICATE`] style
@@ -625,14 +664,27 @@ fn verify_signer_info(
     passed.push(CHECK_SIGNING_CERTIFICATE_V2);
 
     // (e) chain to a trust anchor, dates against the validation time
-    let (chain_subjects, trust_anchor) = build_chain(
-        cert,
-        &sd.certificates,
-        &opts.trust_anchors,
-        opts.validation_time,
-        &opts.algorithms,
-    )?;
-    passed.push(CHECK_CERTIFICATE_CHAIN);
+    let (chain_subjects, trust_anchor) = match opts.anchors {
+        AnchorPolicy::Required => {
+            let (subjects, anchor) = build_chain(
+                cert,
+                &sd.certificates,
+                &opts.trust_anchors,
+                opts.validation_time,
+                &opts.algorithms,
+            )?;
+            passed.push(CHECK_CERTIFICATE_CHAIN);
+            (subjects, Some(anchor))
+        }
+        // The caller has no authority to name. Every check that does not need
+        // one still runs, and the report says the chain step did not: no
+        // `certificateChain` among `passed`, no anchor to show, no chain to
+        // print. A frontend reading this may not paint it green.
+        AnchorPolicy::IntegrityWithoutAnchors => {
+            check_signer_certificate(cert, opts.validation_time, &opts.algorithms)?;
+            (Vec::new(), None)
+        }
+    };
     passed.push(CHECK_VALIDITY_DATES);
 
     // B7: a caller with a trusted clock (a timestamped archive being audited,
@@ -1266,18 +1318,7 @@ fn build_chain_refs<'c, 'a>(
             "no trust anchors were supplied, so no chain can ever be accepted",
         ));
     }
-    check_validity(signer, at)?;
-    // the signer's own key was already judged with the signature-value check
-    // by verify_signer_info; chain_certificates callers (PAdES /DSS) get it
-    // here, where no signature value exists to judge it against
-    check_key_strength(
-        CHECK_CERTIFICATE_CHAIN,
-        signer
-            .key_info()
-            .map_err(|e| fail(CHECK_CERTIFICATE_CHAIN, detail_of(&e)))?,
-        policy,
-    )?;
-    check_certificate_rules(signer, CertRole::Signer)?;
+    check_signer_certificate(signer, at, policy)?;
     let mut chain: Vec<&'c CertificateHandle> = vec![signer];
     let mut visited: Vec<&[u8]> = vec![signer.der()];
     let mut current: &'c CertificateHandle = signer;
@@ -1415,6 +1456,31 @@ fn build_chain<'c>(
     // root), and build_chain_refs returns exactly the elements for either
     // case; the anchor's subject travels separately as trust_anchor.
     Ok((chain.iter().map(|c| subject(c)).collect(), subject(anchor)))
+}
+
+/// The checks that judge the SIGNER certificate on its own, with no issuer in
+/// the picture: its validity dates, its key strength, and the profile rules a
+/// signer certificate must satisfy. Split out of the chain walk so that
+/// [`AnchorPolicy::IntegrityWithoutAnchors`] runs exactly these and no fewer —
+/// "the issuer was not checked" may never quietly mean "the dates were not
+/// checked either", which is what a caller reading `passed` would conclude.
+fn check_signer_certificate(
+    signer: &CertificateHandle,
+    at: SystemTime,
+    policy: &AlgorithmPolicy,
+) -> Result<()> {
+    check_validity(signer, at)?;
+    // the signer's own key was already judged with the signature-value check
+    // by verify_signer_info; chain_certificates callers (PAdES /DSS) get it
+    // here, where no signature value exists to judge it against
+    check_key_strength(
+        CHECK_CERTIFICATE_CHAIN,
+        signer
+            .key_info()
+            .map_err(|e| fail(CHECK_CERTIFICATE_CHAIN, detail_of(&e)))?,
+        policy,
+    )?;
+    check_certificate_rules(signer, CertRole::Signer)
 }
 
 /// Builds the certificate chain from `signer` up to one of the `anchors`

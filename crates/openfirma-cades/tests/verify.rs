@@ -15,9 +15,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use openfirma_cades::verify::{
-    AlgorithmPolicy, CHECK_CERTIFICATE_CHAIN, CHECK_CONTENT_TYPE, CHECK_MESSAGE_DIGEST,
-    CHECK_SIGNATURE_VALUE, CHECK_SIGNER_CERTIFICATE, CHECK_SIGNING_CERTIFICATE_V2,
-    CHECK_VALIDITY_DATES, VerifyOptions, verify,
+    AlgorithmPolicy, AnchorPolicy, CHECK_CERTIFICATE_CHAIN, CHECK_CONTENT_TYPE,
+    CHECK_MESSAGE_DIGEST, CHECK_SIGNATURE_VALUE, CHECK_SIGNER_CERTIFICATE,
+    CHECK_SIGNING_CERTIFICATE_V2, CHECK_VALIDITY_DATES, VerifyOptions, verify,
 };
 use openfirma_cades::{CadesOptions, attributes, sign};
 use openfirma_core::alg::DigestAlg;
@@ -291,7 +291,8 @@ fn encapsulated_cades_verifies_and_the_report_is_complete() {
         "{:?}",
         r.chain_subjects
     );
-    assert!(r.trust_anchor.contains("Root CA"), "{}", r.trust_anchor);
+    let anchor = r.trust_anchor.as_deref().expect("the chain step ran");
+    assert!(anchor.contains("Root CA"), "{anchor}");
     assert_eq!(
         r.passed,
         vec![
@@ -493,7 +494,78 @@ fn an_embedded_root_reaches_the_anchor() {
         &VerifyOptions::new(anchors(&["ca.crt"])),
     )
     .expect("the chain must reach the embedded root");
-    assert!(reports[0].trust_anchor.contains("Root CA"));
+    assert!(
+        reports[0]
+            .trust_anchor
+            .as_deref()
+            .is_some_and(|a| a.contains("Root CA"))
+    );
+}
+
+/// 06-C-1, the library half: a caller with no authority to name gets every
+/// check that does not need one, and a report that says the chain step did not
+/// run. That report is what the window shows as "integrity checked, issuer not
+/// checked" instead of asking the citizen which CA to trust — a question whose
+/// wrong answer (the impostor's own root, chosen after seeing the verdict)
+/// reads as "Firma válida".
+#[test]
+fn integrity_without_anchors_checks_everything_but_the_issuer() {
+    let Some(signer) = load_signer_with_chain(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        return require_or_skip("the test PKI is missing, run tools/gen-testcert.sh");
+    };
+    let signature = sign(CONTENT, &signer, &default_opts()).expect("signing failed");
+
+    // The baseline this test stands on: with the root named, the same call
+    // reaches it.
+    let with = verify(
+        &signature,
+        Some(CONTENT),
+        &VerifyOptions::new(anchors(&["ca.crt"])),
+    )
+    .expect("the chain reaches the root");
+    assert!(with[0].trust_anchor.is_some());
+    assert!(with[0].passed.contains(&CHECK_CERTIFICATE_CHAIN));
+
+    // With no anchor named, and the policy that says so, the chain step is
+    // skipped and SAID to be skipped — no anchor, no chain, no
+    // `certificateChain` among the checks that passed.
+    let mut opts = VerifyOptions::new(Vec::new());
+    opts.anchors = AnchorPolicy::IntegrityWithoutAnchors;
+    let reports = verify(&signature, Some(CONTENT), &opts)
+        .expect("no anchor is needed for the checks that do not use one");
+    let r = &reports[0];
+    assert_eq!(r.trust_anchor, None);
+    assert!(r.chain_subjects.is_empty());
+    assert!(
+        !r.passed.contains(&CHECK_CERTIFICATE_CHAIN),
+        "{:?}",
+        r.passed
+    );
+    // Everything else still ran: the signature over its digest, the signer
+    // certificate's own profile, its dates.
+    assert!(r.passed.contains(&CHECK_MESSAGE_DIGEST), "{:?}", r.passed);
+    assert!(
+        r.passed.contains(&CHECK_SIGNER_CERTIFICATE),
+        "{:?}",
+        r.passed
+    );
+    assert!(r.passed.contains(&CHECK_VALIDITY_DATES), "{:?}", r.passed);
+
+    // Skipping the issuer is not skipping the signature.
+    let mut broken = signature.clone();
+    tamper_signature(&mut broken);
+    let err = verify(&broken, Some(CONTENT), &opts).expect_err("a tampered signature");
+    assert!(err.to_string().contains(CHECK_SIGNATURE_VALUE), "{err}");
+
+    // Nor the signer's dates: the report above is not a green light for a
+    // certificate that was not valid when it signed.
+    opts.validation_time = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 365 * 40);
+    let err = verify(&signature, Some(CONTENT), &opts).expect_err("a signer from 1986");
+    assert!(err.to_string().contains(CHECK_VALIDITY_DATES), "{err}");
 }
 
 #[test]
