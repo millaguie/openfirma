@@ -17,17 +17,21 @@
 //! refused even in one that can: nothing says the signature is as old as that
 //! datum claims, and `signingTime` is the signer's own unauthenticated word.
 //!
-//! openssl stamps the current time and cannot be talked out of it, so the seal
-//! here is built with openfirma's own CMS writer (`content_type =
-//! id-ct-TSTInfo`, the RFC 3161 2.2 shape) over a TSA certificate minted at run
-//! time with a ten-year-past `notBefore`: without that certificate a stamp dated
-//! in the past would be refused by the rule round two's N8 added — the honest
-//! answer to a forged date — and this file would be testing the wrong refusal.
-//! The revocation datum is assembled byte by byte for the same reason: openssl's
+//! The shape is a document signed and sealed today and then validated a month
+//! later, which is what `--at` asks for and what an archive is actually used
+//! for: at that instant an ordinary day-long datum has closed, and only the
+//! seal places the evidence. The seal itself is dated *now*, so it can be made
+//! with the test PKI's own TSA certificate — and that is deliberate, not a
+//! convenience. openssl stamps the current time and cannot be talked out of it,
+//! so a seal dated in the past has to be built with openfirma's own CMS writer
+//! (`content_type = id-ct-TSTInfo`, the RFC 3161 2.2 shape); and a minted TSA
+//! certificate with a past `notBefore` needs `openssl x509 -req -not_before`,
+//! which exists only from OpenSSL 3.2 while the Linux CI legs run 3.0.13. A
+//! test that only passes on the newest openssl is a test that reports nothing.
+//! The revocation datum is assembled byte by byte for a second reason: openssl's
 //! `ocsp` app only ever answers for the future.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -77,13 +81,6 @@ fn signer() -> Option<SoftwareSigner> {
     Some(s.with_chain(vec![load("intermediate.crt"), load("ca.crt")]))
 }
 
-fn run(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
 // ---------------------------------------------------------------------------
 // DER helpers. The same small set the openfirma-cades tests use: the two crates
 // cannot share test code without a published test-support crate, which is a
@@ -125,13 +122,6 @@ fn generalized(when: SystemTime) -> Vec<u8> {
     der(0x18, format!("{century}{yy}{rest}").as_bytes())
 }
 
-/// `CCYYMMDDHHMMSSZ`, the form openssl's `-not_before` and `-not_after` want,
-/// read out of the DER value above so the two spellings cannot disagree.
-fn openssl_date(when: SystemTime) -> String {
-    let value = generalized(when);
-    String::from_utf8_lossy(&value[2..]).to_string()
-}
-
 fn sha256_with_rsa() -> Vec<u8> {
     let mut alg = der(
         0x06,
@@ -144,70 +134,11 @@ fn sha256_with_rsa() -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // The pieces of the document
 
-/// A TSA certificate minted now, valid from ten years ago to a year ahead, so a
-/// stamp dated in the past passes the rule that refuses a `genTime` outside the
-/// TSA certificate's own validity (01-N8) instead of dying there.
-fn mint_tsa_cert(scratch: &Path) -> Option<(CertificateHandle, String)> {
-    let dir = certs_dir();
-    let csr = scratch.join("tsa-old.csr");
-    let ext = scratch.join("tsa-old.ext");
-    let crt = scratch.join("tsa-old.crt");
-    std::fs::write(
-        &ext,
-        "basicConstraints = critical, CA:FALSE\nkeyUsage = critical, digitalSignature, \
-         nonRepudiation\nextendedKeyUsage = critical, timeStamping\nsubjectKeyIdentifier = \
-         hash\n",
-    )
-    .unwrap();
-    let now = SystemTime::now();
-    if !run(
-        "openssl",
-        &[
-            "req",
-            "-new",
-            "-key",
-            dir.join("tsa.key").to_str()?,
-            "-subj",
-            "/CN=TSA de pruebas antigua",
-            "-out",
-            csr.to_str()?,
-        ],
-    ) {
-        return None;
-    }
-    let minted = run(
-        "openssl",
-        &[
-            "x509",
-            "-req",
-            "-in",
-            csr.to_str()?,
-            "-CA",
-            dir.join("ca.crt").to_str()?,
-            "-CAkey",
-            dir.join("ca.key").to_str()?,
-            "-CAcreateserial",
-            "-CAserial",
-            scratch.join("ca.srl").to_str()?,
-            "-not_before",
-            &openssl_date(now - Duration::from_secs(3_650 * 86_400)),
-            "-not_after",
-            &openssl_date(now + Duration::from_secs(365 * 86_400)),
-            "-extfile",
-            ext.to_str()?,
-            "-out",
-            crt.to_str()?,
-        ],
-    );
-    if !minted {
-        return None;
-    }
-    let pem = std::fs::read_to_string(&crt).ok()?;
-    Some((CertificateHandle::from_pem(&pem).ok()?, pem))
-}
-
-fn tsa_signer(cert_pem: &str) -> SoftwareSigner {
-    SoftwareSigner::from_pkcs8_pem(cert_pem, &text("tsa.key"))
+/// The test PKI's time-stamping authority: `keyUsage` and a critical
+/// `extendedKeyUsage` of just `timeStamping`, which is the shape round two's N8
+/// demands of a TSA, so the seals below are accepted for the right reason.
+fn tsa_signer() -> SoftwareSigner {
+    SoftwareSigner::from_pkcs8_pem(&text("tsa.crt"), &text("tsa.key"))
         .expect("the test TSA key is PKCS#8 PEM")
         .with_chain(vec![load("intermediate.crt"), load("ca.crt")])
 }
@@ -295,7 +226,7 @@ fn answer(
 
 /// The document: B-B signature, B-LT archive carrying `datum` for the signer's
 /// CA plus the fixture CRL for the root's link, and, when `seal` is set, a B-LTA
-/// document time-stamp dated at `when`.
+/// document time-stamp.
 fn document(
     datum: Vec<u8>,
     seal: Option<openfirma_cades::TimestampFn>,
@@ -317,17 +248,19 @@ fn document(
     )
 }
 
-fn verify(pdf: &[u8]) -> Result<openfirma_pades::DocumentReport, openfirma_core::Error> {
-    pades_verify(pdf, &VerifyOptions::new(vec![load("ca.crt")]))
+fn verify_at(
+    pdf: &[u8],
+    when: SystemTime,
+) -> Result<openfirma_pades::DocumentReport, openfirma_core::Error> {
+    pades_verify(pdf, &VerifyOptions::new(vec![load("ca.crt")]).at(when))
 }
 
-/// The seal's instant, in the past by a month: recent enough to be a document
-/// anyone would archive, old enough that its CRL has long since aged out.
-fn sealed_at() -> SystemTime {
-    let rough = SystemTime::now() - Duration::from_secs(30 * 86_400);
-    // whole seconds: RFC 3161's GeneralizedTime carries no fraction, so a seal
-    // dated with a fraction comes back truncated to the second, and the equality
-    // below would then be about a codec rather than about the rule
+/// The moment a document signed today is fixed by its seal: now, in whole
+/// seconds. RFC 3161's GeneralizedTime carries no fraction, so a seal dated with
+/// a fraction comes back truncated to the second and the equalities below would
+/// be about a codec rather than about the rule.
+fn sealed_now() -> SystemTime {
+    let rough = SystemTime::now();
     UNIX_EPOCH
         + Duration::from_secs(
             rough
@@ -337,12 +270,18 @@ fn sealed_at() -> SystemTime {
         )
 }
 
-/// A B-LT document whose revocation datum expired weeks ago still verifies,
-/// because the document carries a verified seal from inside that datum's window:
-/// the datum speaks for the moment the document was sealed, which is the moment
-/// the level is about. Round two's N10 — before this rule, `verify` refused the
-/// document with "the instant being asked about is outside that interval" a week
-/// after signing, and a "long term" format lasted one CRL period.
+/// A month later, the instant a citizen or a court comes back to the archive.
+fn a_month_later(when: SystemTime) -> SystemTime {
+    when + Duration::from_secs(30 * 86_400)
+}
+
+/// A B-LT document whose revocation datum had closed still verifies a month
+/// later, because the document carries a verified seal from inside that datum's
+/// window: the datum speaks for the moment the document was sealed, which is the
+/// moment the level is about. Round two's N10 — before this rule, `verify`
+/// refused the document with "the instant being asked about is outside that
+/// interval" a week after signing, and a "long term" format lasted one CRL
+/// period.
 #[test]
 fn a_b_lt_document_outlives_the_window_of_its_archived_evidence() {
     let dir = certs_dir();
@@ -350,14 +289,9 @@ fn a_b_lt_document_outlives_the_window_of_its_archived_evidence() {
         require_or_skip("test PKI with keys missing, rerun tools/gen-testcert.sh");
         return;
     }
-    let scratch = std::env::temp_dir().join(format!("openfirma-archived-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch).unwrap();
-    let Some((_, tsa_pem)) = mint_tsa_cert(&scratch) else {
-        require_or_skip("openssl could not mint the TSA certificate");
-        return;
-    };
 
-    let when = sealed_at();
+    let when = sealed_now();
+    let at = a_month_later(when);
     let from = when - Duration::from_secs(3600);
     let to = when + Duration::from_secs(3600);
     let intermediate = load("intermediate.crt");
@@ -367,18 +301,19 @@ fn a_b_lt_document_outlives_the_window_of_its_archived_evidence() {
     let subject = load("signer-rsa.crt");
     let datum = answer(&intermediate, &issuer_key, &subject, from, to);
 
-    // the datum really has aged out: that is the whole point of the test, and
-    // asserting it here stops the document passing because the dates drifted
+    // the datum really has closed by the instant this document is validated: that
+    // is the whole point of the test, and asserting it here stops the document
+    // passing because the dates drifted
     assert!(
-        to < SystemTime::now(),
-        "the fixture datum's window closed in the past"
+        to < at,
+        "the fixture datum's window closed before the instant being asked about"
     );
 
-    let seal = seal_provider(tsa_signer(&tsa_pem), when);
+    let seal = seal_provider(tsa_signer(), when);
     let signed = document(datum.clone(), Some(seal)).expect("a B-LTA document must be produced");
 
-    let report = verify(&signed)
-        .expect("an archived datum that covered the sealing moment must still verify today");
+    let report = verify_at(&signed, at)
+        .expect("an archived datum that covered the sealing moment must still verify a month on");
     assert!(
         report.document_timestamps[0].verified(),
         "the seal must be verified for the archive to be judged about it: {:?}",
@@ -395,17 +330,15 @@ fn a_b_lt_document_outlives_the_window_of_its_archived_evidence() {
     );
 
     // and the same datum, in a document with no seal to place it, is refused: the
-    // wall clock judges, and the window closed a month ago
+    // wall clock of the caller's instant judges, and the window closed weeks ago
     let unsealed = document(datum, None).expect("a B-LT document must be produced");
-    let err = verify(&unsealed)
+    let err = verify_at(&unsealed, at)
         .expect_err("without a seal nothing places the datum, so it must not pass")
         .to_string();
     assert!(
         err.contains("outside that interval"),
         "the refusal must say the window does not reach the instant: {err}"
     );
-
-    std::fs::remove_dir_all(&scratch).ok();
 }
 
 /// A document re-sealed later is still judged about its FIRST seal: the archive's
@@ -421,14 +354,9 @@ fn an_archive_is_judged_about_its_first_seal_not_its_last() {
         require_or_skip("test PKI with keys missing, rerun tools/gen-testcert.sh");
         return;
     }
-    let scratch = std::env::temp_dir().join(format!("openfirma-firstseal-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch).unwrap();
-    let Some((_, tsa_pem)) = mint_tsa_cert(&scratch) else {
-        require_or_skip("openssl could not mint the TSA certificate");
-        return;
-    };
 
-    let first = sealed_at();
+    let first = sealed_now();
+    let at = a_month_later(first);
     let intermediate = load("intermediate.crt");
     let issuer_key =
         SoftwareSigner::from_pkcs8_pem(&text("intermediate.crt"), &text("intermediate.key"))
@@ -441,18 +369,16 @@ fn an_archive_is_judged_about_its_first_seal_not_its_last() {
         first + Duration::from_secs(3600),
     );
 
-    let seal = seal_provider(tsa_signer(&tsa_pem), first);
+    let seal = seal_provider(tsa_signer(), first);
     let signed = document(datum, Some(seal)).expect("a B-LTA document must be produced");
-    // and a second seal, a month later, over everything including the first
-    let second = seal_provider(
-        tsa_signer(&tsa_pem),
-        first + Duration::from_secs(30 * 86_400),
-    );
+    // and a second seal, three weeks later, over everything including the first
+    let second = seal_provider(tsa_signer(), first + Duration::from_secs(21 * 86_400));
     let resealed =
         openfirma_pades::ltv::add_document_timestamp(&signed, &second, DigestAlg::Sha256, 8192)
             .expect("resealing an archive is allowed");
 
-    let report = verify(&resealed).expect("the first seal is the instant the archive is about");
+    let report = verify_at(&resealed, at)
+        .expect("the first seal is the instant the archive is about, and the datum reached it");
     assert_eq!(
         report.document_timestamps.len(),
         2,
@@ -461,10 +387,8 @@ fn an_archive_is_judged_about_its_first_seal_not_its_last() {
     let dss = report.dss.expect("the document carries validation data");
     assert_eq!(
         dss.evidence_about, first,
-        "the verdict is about the first seal, not the one added a month later"
+        "the verdict is about the first seal, not the one added three weeks later"
     );
-
-    std::fs::remove_dir_all(&scratch).ok();
 }
 
 /// An old datum does not become evidence just because the document has a seal: it
@@ -479,14 +403,8 @@ fn evidence_that_predates_the_seal_is_still_refused() {
         require_or_skip("test PKI with keys missing, rerun tools/gen-testcert.sh");
         return;
     }
-    let scratch = std::env::temp_dir().join(format!("openfirma-predated-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch).unwrap();
-    let Some((_, tsa_pem)) = mint_tsa_cert(&scratch) else {
-        require_or_skip("openssl could not mint the TSA certificate");
-        return;
-    };
 
-    let when = sealed_at();
+    let when = sealed_now();
     let from = when - Duration::from_secs(60 * 86_400);
     let to = when - Duration::from_secs(59 * 86_400);
     let intermediate = load("intermediate.crt");
@@ -496,15 +414,13 @@ fn evidence_that_predates_the_seal_is_still_refused() {
     let subject = load("signer-rsa.crt");
     let stale = answer(&intermediate, &issuer_key, &subject, from, to);
 
-    let seal = seal_provider(tsa_signer(&tsa_pem), when);
+    let seal = seal_provider(tsa_signer(), when);
     let signed = document(stale, Some(seal)).expect("a B-LTA document must be produced");
-    let err = verify(&signed)
+    let err = verify_at(&signed, when)
         .expect_err("validation data from before the seal says nothing about the signing")
         .to_string();
     assert!(
         err.contains("outside that interval"),
         "the refusal must name the window and the instant: {err}"
     );
-
-    std::fs::remove_dir_all(&scratch).ok();
 }

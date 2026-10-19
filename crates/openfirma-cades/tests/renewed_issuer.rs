@@ -17,16 +17,24 @@
 //!
 //! A renewed pair cannot be conjured out of `testdata/certs`, which holds one
 //! certificate per name, so this file mints its own: one CSR, one key, two
-//! certificates from the test root — one valid from three years ago to
-//! yesterday, one current — and a leaf issued under that key. Everything lands
-//! in a scratch directory, including the serial file (`-CAcreateserial` would
-//! otherwise write into `testdata/certs`, where parallel tests race it).
+//! certificates from the test root — one that has run out, one current — and a
+//! leaf issued under that key. Everything lands in a scratch directory, including
+//! the serial file (`-CAcreateserial` would otherwise write into
+//! `testdata/certs`, where parallel tests race it).
+//!
+//! "Has run out" is made with `-days 1` and asked about a month later, through
+//! the instant the caller supplies. The alternative — `openssl x509 -req
+//! -not_before/-not_after`, which writes a certificate valid only in the past —
+//! is OpenSSL 3.2 and newer, while the Linux CI legs run 3.0.13; and a test that
+//! only runs on the newest openssl reports nothing. A certificate is out of date
+//! *at an instant*, which is what `chain_certificates` takes as an argument
+//! anyway, so nothing about the finding is lost: the refused candidate really is
+//! invalid at the instant the chain is being judged.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use der::{Encode as _, asn1::GeneralizedTime};
 use openfirma_cades::verify::chain_certificates;
 use openfirma_core::cert::CertificateHandle;
 
@@ -58,16 +66,14 @@ fn load(path: &Path) -> CertificateHandle {
     CertificateHandle::from_pem(&pem).expect("the certificate openssl wrote is PEM")
 }
 
-/// `CCYYMMDDHHMMSSZ`, the shape openssl's `-not_before` and `-not_after` want.
-fn openssl_date(when: SystemTime) -> String {
-    let der = GeneralizedTime::from_system_time(when)
-        .expect("in range")
-        .to_der()
-        .expect("it encodes");
-    String::from_utf8_lossy(&der[2..]).to_string()
+/// The instant the chain is judged: a month past the minting, so that the copy
+/// issued with `-days 1` is out of date and the one issued with `-days 400` is
+/// not. Everything else here is valid at both instants.
+fn a_month_later() -> SystemTime {
+    SystemTime::now() + Duration::from_secs(30 * 86_400)
 }
 
-/// The three pieces: the expired and current copies of one intermediate (same
+/// The three pieces: the out-of-date and current copies of one intermediate (same
 /// subject, same key, both issued by the test root) and a leaf issued under that
 /// key.
 struct Pair {
@@ -91,7 +97,7 @@ fn mint(tag: &str) -> Option<Pair> {
     let ca_key = root_dir.join("ca.key");
     let ca_srl = scratch.join("ca.srl");
 
-    // one key, one request: the two certificates differ only in their dates
+    // one key, one request: the two certificates differ only in how long they run
     let int_key = scratch.join("int.key");
     let int_csr = scratch.join("int.csr");
     if !run(
@@ -119,10 +125,9 @@ fn mint(tag: &str) -> Option<Pair> {
     )
     .ok()?;
 
-    let now = SystemTime::now();
     let expired = scratch.join("int-old.crt");
     let current = scratch.join("int-new.crt");
-    // the expired copy: valid from three years ago until yesterday
+    // the copy that has run out by the instant the chain is judged
     if !run(
         "openssl",
         &[
@@ -139,17 +144,15 @@ fn mint(tag: &str) -> Option<Pair> {
             ca_srl.to_str()?,
             "-extfile",
             ext.to_str()?,
-            "-not_before",
-            &openssl_date(now - Duration::from_secs(3 * 365 * 86_400)),
-            "-not_after",
-            &openssl_date(now - Duration::from_secs(86_400)),
+            "-days",
+            "1",
             "-out",
             expired.to_str()?,
         ],
     ) {
         return None;
     }
-    // and the current copy of the very same request, same subject and same key
+    // and the current copy of the very same request: same name, same key
     if !run(
         "openssl",
         &[
@@ -235,7 +238,7 @@ fn mint(tag: &str) -> Option<Pair> {
     })
 }
 
-/// The whole point: with the expired copy first in the pool, the chain still
+/// The whole point: with the out-of-date copy first in the pool, the chain still
 /// reaches the root through the current one.
 #[test]
 fn an_expired_copy_of_the_issuing_ca_does_not_end_the_search() {
@@ -243,7 +246,7 @@ fn an_expired_copy_of_the_issuing_ca_does_not_end_the_search() {
         require_or_skip("openssl or the test root key is unavailable");
         return;
     };
-    let at = SystemTime::now();
+    let at = a_month_later();
     let anchors = [pair.root.clone()];
 
     for (order, pool) in [
@@ -262,8 +265,8 @@ fn an_expired_copy_of_the_issuing_ca_does_not_end_the_search() {
         assert_eq!(
             chain[1].der(),
             pair.current.der(),
-            "the link used must be the certificate that is valid, not the expired one with \
-             the same name and key"
+            "the link used must be the certificate that is valid at the instant, not the expired \
+             one with the same name and key"
         );
         assert_eq!(chain[2].der(), pair.root.der(), "and it stands on the root");
     }
@@ -272,20 +275,19 @@ fn an_expired_copy_of_the_issuing_ca_does_not_end_the_search() {
 }
 
 /// The refusal survives where there is nothing else to try: an archive that
-/// carries only the expired copy is still refused, and now says why in terms of
-/// the candidate rather than pretending nobody signed it.
+/// carries only the out-of-date copy is still refused, and now says why in terms
+/// of the candidate rather than pretending nobody signed it.
 #[test]
 fn a_pool_with_only_the_expired_copy_is_still_refused() {
     let Some(pair) = mint("refusal") else {
         require_or_skip("openssl or the test root key is unavailable");
         return;
     };
-    let at = SystemTime::now();
     let err = chain_certificates(
         &pair.leaf,
         std::slice::from_ref(&pair.expired),
         std::slice::from_ref(&pair.root),
-        at,
+        a_month_later(),
     )
     .expect_err(
         "an expired issuer is still an expired issuer, with or without a better candidate around",
@@ -345,11 +347,14 @@ fn a_trust_store_with_an_expired_root_and_its_renewal_still_builds() {
          subjectKeyIdentifier = hash\n",
     )
     .unwrap();
-    let now = SystemTime::now();
     let expired = scratch.join("root-old.crt");
     let current = scratch.join("root-new.crt");
-    let selfsign = |out: &Path, extra: &[&str]| {
-        let mut args = vec![
+    // both copies self-signed under one key: a renewal of a root keeps its name
+    // and its key, and that is precisely what makes the pair indistinguishable to
+    // a search that stops at the first candidate whose key verifies
+    let ok = run(
+        "openssl",
+        &[
             "x509",
             "-req",
             "-in",
@@ -358,25 +363,27 @@ fn a_trust_store_with_an_expired_root_and_its_renewal_still_builds() {
             key.to_str().unwrap(),
             "-extfile",
             ext.to_str().unwrap(),
-        ];
-        args.extend_from_slice(extra);
-        args.push("-out");
-        args.push(out.to_str().unwrap());
-        run("openssl", &args)
-    };
-    let old_dates = [
-        "-not_before".to_string(),
-        openssl_date(now - Duration::from_secs(6 * 365 * 86_400)),
-        "-not_after".to_string(),
-        openssl_date(now - Duration::from_secs(86_400)),
-    ];
-    let new_dates = ["-days".to_string(), "400".to_string()];
-    let ok = selfsign(
-        &expired,
-        &old_dates.iter().map(String::as_str).collect::<Vec<_>>(),
-    ) && selfsign(
-        &current,
-        &new_dates.iter().map(String::as_str).collect::<Vec<_>>(),
+            "-days",
+            "1",
+            "-out",
+            expired.to_str().unwrap(),
+        ],
+    ) && run(
+        "openssl",
+        &[
+            "x509",
+            "-req",
+            "-in",
+            csr.to_str().unwrap(),
+            "-signkey",
+            key.to_str().unwrap(),
+            "-extfile",
+            ext.to_str().unwrap(),
+            "-days",
+            "400",
+            "-out",
+            current.to_str().unwrap(),
+        ],
     );
     if !ok {
         require_or_skip("openssl could not self-sign the pair of roots");
@@ -443,9 +450,12 @@ fn a_trust_store_with_an_expired_root_and_its_renewal_still_builds() {
         &leaf,
         &[],
         &[expired.clone(), current.clone()],
-        SystemTime::now(),
+        a_month_later(),
     )
-    .expect("the store's second root is the same CA and is valid: refusing the first must not refuse the chain");
+    .expect(
+        "the store's second root is the same CA and is valid: refusing the first must not \
+             refuse the chain",
+    );
     assert_eq!(chain.len(), 2, "leaf and the root that stands: {chain:?}");
     assert_eq!(chain[1].der(), current.der(), "the valid copy stands");
 
