@@ -177,10 +177,11 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Resolves a Firefox profile to its database location in softokn3 spelling.
 /// With `wanted`, the profiles.ini section whose `Name=` matches; without it,
-/// the default: `Default=1` on a `[ProfileX]` section, else the `Default=` of
-/// an `[Install…]` section (Firefox writes that one on modern profiles and it
-/// is what the browser itself opens), first install wins. Profiles may be
-/// marked `IsRelative=0`, in which case their `Path=` is already absolute.
+/// the profile Firefox itself opens with no choice: the `Default=` of an
+/// `[Install…]` section (the dedicated profile), or `Default=1` on a
+/// `[ProfileX]` section under snap, where the dedicated profile is not used.
+/// Profiles may be marked `IsRelative=0`, in which case their `Path=` is
+/// already absolute.
 fn firefox_profile_db(wanted: Option<&str>) -> Result<String> {
     let mut looked = Vec::new();
     for parent in firefox_parents() {
@@ -213,6 +214,7 @@ fn profiles_ini(ini: &Path, wanted: Option<&str>) -> Result<Option<PathBuf>> {
         .map_err(|e| Error::Keystore(format!("{}: {e}", ini.display())))?;
     let parent = ini.parent().unwrap_or(Path::new("."));
     let mut fallback: Option<PathBuf> = None;
+    let mut dedicated: Option<PathBuf> = None;
     let (mut section, mut name, mut path, mut relative, mut default) =
         (String::new(), String::new(), String::new(), true, false);
     let flush = |section: &str,
@@ -264,6 +266,27 @@ fn profiles_ini(ini: &Path, wanted: Option<&str>) -> Result<Option<PathBuf>> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
+        if section.starts_with("Install") {
+            // The [Install…] section's `Default=` names the profile this
+            // installation of Firefox opens; see the precedence at the end of
+            // this function. First install section wins, which on a machine
+            // that has used one browser is the only one there is.
+            if key.trim().eq_ignore_ascii_case("default") && dedicated.is_none() {
+                let v = value.trim();
+                if !v.is_empty() {
+                    // NSS profile directories keep their separators as `/`
+                    // even in Windows profiles.ini spellings, and an install
+                    // descriptor may be absolute.
+                    let replaced = v.replace('\\', std::path::MAIN_SEPARATOR_STR);
+                    dedicated = Some(if Path::new(&replaced).is_absolute() {
+                        PathBuf::from(replaced)
+                    } else {
+                        parent.join(replaced)
+                    });
+                }
+            }
+            continue;
+        }
         match key.trim().to_ascii_lowercase().as_str() {
             "name" => name = value.trim().to_string(),
             // NSS profile directories keep their separators as `/` even in
@@ -277,31 +300,41 @@ fn profiles_ini(ini: &Path, wanted: Option<&str>) -> Result<Option<PathBuf>> {
     if let Some(found) = flush(&section, &name, &path, relative, default, &mut fallback)? {
         return Ok(Some(found));
     }
-    // No Default=1 anywhere: Firefox's own second rule is the [Install…]
-    // section's Default= (profiles.ini written by Firefox 67+ keeps it there
-    // even when no profile carries the flag). The two rules are strictly
-    // ordered — nsToolkitProfileService::GetSelectedProfile consults the
-    // Default=1 profiles first and only calls GetInstallDefaultsProfile when
-    // none answered — so a bare `Default=` inside an [Install…] section may
-    // never override a profile that carries its own Default=1, however late
-    // in the file it appears. Gating on fallback.is_none() is exactly that
-    // precedence; reading both keys without the gate let an Install line beat
-    // a trailing Default=1 (review finding #3).
-    if wanted.is_none() && fallback.is_none() {
-        for line in text.lines() {
-            let line = line.trim();
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            if key.trim().eq_ignore_ascii_case("default") && !value.trim().is_empty() {
-                let root = parent.join(value.trim().replace('\\', std::path::MAIN_SEPARATOR_STR));
-                if root.is_dir() {
-                    return Ok(Some(root));
-                }
-            }
+    if wanted.is_some() {
+        // The caller named a profile and none matched: the defaults below are
+        // not that profile, so there is nothing to answer with.
+        return Ok(None);
+    }
+    // Which profile Firefox itself opens when none is named
+    // (`nsToolkitProfileService::GetDefaultProfile`): with
+    // `mUseDedicatedProfile` — true unless the browser is confined as a snap
+    // (`!IsSnapEnvironment() && !UseLegacyProfiles()`) — it is the dedicated
+    // profile, the one the [Install…] section's `Default=` names, even though
+    // Firefox 67+ also leaves `Default=1` on the empty `default` profile it
+    // creates first. Under snap the dedicated profile is not used and
+    // `Default=1` wins. AutoFirma's own reader agrees for a version 2 file:
+    // `NSPreferences.getActiveProfile` answers with the install section's
+    // `defaultProfilePath`, not the flag.
+    //
+    // Round 2 (04-N5) measured the old order — the flag first, whatever the
+    // version and however late the install section was — and `nss:firefox`
+    // opened the empty `default` profile while the citizen's certificates sat
+    // in `default-release`. The round-1 reading of the C++ it was justified
+    // with was wrong: `GetSelectedProfile` (what a person chooses in the
+    // profile dialog) is not `GetDefaultProfile` (what the browser opens with
+    // no choice), and only the latter decides here.
+    let in_snap = ini.components().any(|c| c.as_os_str() == "snap");
+    let (first, second) = if in_snap {
+        (fallback, dedicated)
+    } else {
+        (dedicated, fallback)
+    };
+    for candidate in [first, second].into_iter().flatten() {
+        if candidate.is_dir() {
+            return Ok(Some(candidate));
         }
     }
-    Ok(fallback)
+    Ok(None)
 }
 
 /// Every directory a profiles.ini can live in: the native spelling of each
@@ -341,14 +374,31 @@ fn firefox_parents() -> Vec<PathBuf> {
     } else if let Some(home) = home_dir() {
         dirs.push(home.join(".mozilla").join("firefox"));
         dirs.push(home.join(".thunderbird"));
-        // snap keeps the whole profile tree under a versioned directory; take
-        // every revision's common root rather than guessing the current one.
+        // snap: the confined application's own data directory is its `common`
+        // one — `$SNAP_USER_COMMON`, i.e. `~/snap/<app>/common` — and that is
+        // where the profile tree lives, not under a revision number. AutoFirma
+        // reads exactly this path (`MozillaKeyStoreUtilities`). Round 2 found
+        // the walk below, which skips `common` itself; on a machine where
+        // Firefox is the snap package it found nothing and the README already
+        // claimed it did.
         let snap = home.join("snap");
+        for (app, profile_dir) in [
+            ("firefox", ".mozilla/firefox"),
+            ("thunderbird", ".thunderbird"),
+        ] {
+            dirs.push(snap.join(app).join("common").join(profile_dir));
+        }
+        // A revision tree keeps its own `common` directory when a snap is
+        // pinned (`snap refresh --hold`): same shape one level down. Taken
+        // after the live `common` above, so the running profile wins.
         for app in ["firefox", "thunderbird"] {
             let Ok(entries) = std::fs::read_dir(snap.join(app)) else {
                 continue;
             };
             for entry in entries.flatten() {
+                if entry.file_name() == "common" {
+                    continue; // already pushed
+                }
                 dirs.push(entry.path().join("common").join(".mozilla").join("firefox"));
                 dirs.push(entry.path().join("common").join(".thunderbird"));
             }
@@ -677,25 +727,52 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_default_beats_the_install_default_whatever_the_order() {
-        // Review finding #3, against Firefox's own nsToolkitProfileService:
-        // GetSelectedProfile tries Default=1 profiles first and only asks the
-        // [Install…] section when none answered. Here the Install line names
-        // a different profile than the trailing Default=1 — file order would
-        // answer zzz, the real precedence answers yyy.
+    fn the_install_sections_default_is_the_profile_firefox_opens() {
+        // Round 2 (04-N5), against Firefox's own nsToolkitProfileService:
+        // GetDefaultProfile answers with the DEDICATED profile — the
+        // `[Install…] Default=` — because mUseDedicatedProfile is true unless
+        // the browser runs confined as a snap. Firefox 67+ still leaves
+        // `Default=1` on the empty `default` profile it creates first; the
+        // round-1 rule (the flag first, whatever the version) opened that
+        // empty profile while the citizen's certificates sat in
+        // `default-release`, and AutoFirma's own reader opens the install
+        // section's `defaultProfilePath` for the same file.
         let dir = tmp("precedence");
         std::fs::write(
             dir.join("profiles.ini"),
-            "[InstallABC]\nDefault=zzz.other\n\n\
-             [Profile0]\nName=real\nIsRelative=1\nPath=yyy.default\nDefault=1\n",
+            "[InstallABC]\nDefault=zzz.default-release\n\n\
+             [Profile0]\nName=default\nIsRelative=1\nPath=yyy.default\nDefault=1\n\n\
+             [Profile1]\nName=release\nIsRelative=1\nPath=zzz.default-release\n",
         )
         .unwrap();
         std::fs::create_dir_all(dir.join("yyy.default")).unwrap();
-        std::fs::create_dir_all(dir.join("zzz.other")).unwrap();
+        std::fs::create_dir_all(dir.join("zzz.default-release")).unwrap();
         let got = profiles_ini(&dir.join("profiles.ini"), None)
             .unwrap()
-            .expect("the Default=1 profile");
-        assert_eq!(got, dir.join("yyy.default"));
+            .expect("the install default");
+        assert_eq!(got, dir.join("zzz.default-release"));
+    }
+
+    #[test]
+    fn under_snap_the_profile_flag_decides_again() {
+        // The other half of 04-N5: `mUseDedicatedProfile` is false when the
+        // browser runs as a snap, so the same file read from
+        // `~/snap/firefox/common/.mozilla/firefox` answers with Default=1.
+        let dir = tmp("snap-precedence");
+        let snap = dir.join("snap/firefox/common/.mozilla/firefox");
+        std::fs::create_dir_all(snap.join("yyy.default")).unwrap();
+        std::fs::create_dir_all(snap.join("zzz.default-release")).unwrap();
+        std::fs::write(
+            snap.join("profiles.ini"),
+            "[InstallABC]\nDefault=zzz.default-release\n\n\
+             [Profile0]\nName=default\nIsRelative=1\nPath=yyy.default\nDefault=1\n\n\
+             [Profile1]\nName=release\nIsRelative=1\nPath=zzz.default-release\n",
+        )
+        .unwrap();
+        let got = profiles_ini(&snap.join("profiles.ini"), None)
+            .unwrap()
+            .expect("the snap default");
+        assert_eq!(got, snap.join("yyy.default"));
     }
 
     #[test]
@@ -845,6 +922,11 @@ mod tests {
         // locked window; that is precisely what it exists to pin down.
         let dir = tmp("parents");
         std::fs::create_dir_all(dir.join(".mozilla/firefox")).unwrap();
+        // The live snap layout: `$SNAP_USER_COMMON` is `~/snap/firefox/common`,
+        // with no revision number in it (round 2, 04-N4 — the old walk looked
+        // only under `<revision>/common` and found nothing on a real machine).
+        std::fs::create_dir_all(dir.join("snap/firefox/common/.mozilla/firefox")).unwrap();
+        // A pinned revision keeps its own common tree one level down.
         std::fs::create_dir_all(dir.join("snap/firefox/4285/common/.mozilla/firefox")).unwrap();
         std::fs::create_dir_all(dir.join(".var/app/org.mozilla.firefox/.mozilla/firefox")).unwrap();
         let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -870,8 +952,12 @@ mod tests {
                 "{parents:?}"
             );
             assert!(
+                parents.contains(&dir.join("snap/firefox/common/.mozilla/firefox")),
+                "the live snap data directory is what Firefox uses: {parents:?}"
+            );
+            assert!(
                 parents.contains(&dir.join("snap/firefox/4285/common/.mozilla/firefox")),
-                "{parents:?}"
+                "a pinned revision keeps its own tree: {parents:?}"
             );
             assert!(
                 parents.contains(&dir.join(".var/app/org.mozilla.firefox/.mozilla/firefox")),
