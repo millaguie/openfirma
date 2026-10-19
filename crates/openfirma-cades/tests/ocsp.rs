@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use openfirma_cades::read_ocsp_response;
-use openfirma_cades::revocation::parse_der_time;
+use openfirma_cades::revocation::{RevocationTime, parse_der_time};
 use openfirma_core::CertificateHandle;
 
 fn certs_dir() -> PathBuf {
@@ -45,7 +45,11 @@ fn an_ocsp_response_is_only_trusted_when_its_signer_and_validity_check_out() {
     let at = std::time::SystemTime::now();
 
     // La respuesta auténtica, validada bajo su CA.
-    let status = read_ocsp_response(&ocsp, &[ca.clone(), intermediate.clone()], at);
+    let status = read_ocsp_response(
+        &ocsp,
+        &[ca.clone(), intermediate.clone()],
+        RevocationTime::at(at),
+    );
     assert!(
         status.verified(),
         "la respuesta auténtica debe verificarse: {:?}",
@@ -64,7 +68,11 @@ fn an_ocsp_response_is_only_trusted_when_its_signer_and_validity_check_out() {
         .expect("la respuesta OCSP lleva producedAt en UTCTime");
     let mut forged = ocsp.clone();
     forged[utc + 14] ^= 1;
-    let status = read_ocsp_response(&forged, &[ca.clone(), intermediate.clone()], at);
+    let status = read_ocsp_response(
+        &forged,
+        &[ca.clone(), intermediate.clone()],
+        RevocationTime::at(at),
+    );
     // `signature_verified` stays false when the certificate that made the
     // statement can no longer be recognised as its signer: nothing verified
     // may be counted as a revocation datum either way.
@@ -76,7 +84,7 @@ fn an_ocsp_response_is_only_trusted_when_its_signer_and_validity_check_out() {
 
     // Con un pool que no contiene al CertID-named issuer, la respuesta queda
     // desasociada de toda cadena aunque su firma sea legible para el lector.
-    let status = read_ocsp_response(&ocsp, std::slice::from_ref(&ca), at);
+    let status = read_ocsp_response(&ocsp, std::slice::from_ref(&ca), RevocationTime::at(at));
     assert!(
         !status.verified() && !status.chains_to_issuer,
         "el CertID nombra a la intermedia y ese pool no la incluye: {:?}",
@@ -91,7 +99,11 @@ fn an_ocsp_response_is_only_trusted_when_its_signer_and_validity_check_out() {
     let unauth = dir.join("ocsp-unauthorized.der");
     if unauth.is_file() {
         let forged = std::fs::read(&unauth).unwrap();
-        let status = read_ocsp_response(&forged, &[ca.clone(), intermediate.clone()], at);
+        let status = read_ocsp_response(
+            &forged,
+            &[ca.clone(), intermediate.clone()],
+            RevocationTime::at(at),
+        );
         assert!(
             !status.verified(),
             "una respuesta firmada por un certificado sin OCSPSigning no es \
@@ -149,7 +161,11 @@ fn an_ocsp_response_is_only_trusted_when_its_signer_and_validity_check_out() {
             .expect("la respuesta OCSP lleva thisUpdate y nextUpdate")
     };
     let late = next_update + std::time::Duration::from_secs(60);
-    let status = read_ocsp_response(&ocsp, &[ca.clone(), intermediate.clone()], late);
+    let status = read_ocsp_response(
+        &ocsp,
+        &[ca.clone(), intermediate.clone()],
+        RevocationTime::at(late),
+    );
     assert!(
         !status.verified() && status.signature_verified && !status.current,
         "una respuesta caducada no cubre la validación: {:?}",

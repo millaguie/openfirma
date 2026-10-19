@@ -60,7 +60,11 @@ fn der_corpus_refuses_through_every_cms_and_tsp_entry_point() {
         let _ = tsp::token_imprint(&bytes);
         // CRL/OCSP readers may refuse however they like — they must only
         // never panic, so the results are dropped.
-        let _ = revocation::verify_crl(&bytes, &[], std::time::SystemTime::now());
+        let _ = revocation::verify_crl(
+            &bytes,
+            &[],
+            revocation::RevocationTime::at(std::time::SystemTime::now()),
+        );
         let _ = revocation::parse_ocsp_response(&bytes);
     }
 }
@@ -134,7 +138,11 @@ fn feed_all(family: &str, bytes: &[u8]) {
             let _ = verify(bytes, None, &VerifyOptions::new(Vec::new()));
             let _ = tsp::token_imprint(bytes);
             let _ = tsp::token_from_response(bytes, DigestAlg::Sha256, b"sweep", None);
-            let _ = revocation::verify_crl(bytes, &[], std::time::SystemTime::now());
+            let _ = revocation::verify_crl(
+                bytes,
+                &[],
+                revocation::RevocationTime::at(std::time::SystemTime::now()),
+            );
             let _ = revocation::parse_ocsp_response(bytes);
         }
         "xml" => {

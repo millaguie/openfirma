@@ -62,9 +62,10 @@ pub struct OcspStatus {
     /// rized with `id-kp-OCSPSigning` and that chains to it (RFC 6960
     /// 4.2.2.2). False also when the named CA is not in the pool at all.
     pub chains_to_issuer: bool,
-    /// `at` falls inside `thisUpdate <= at < nextUpdate` (nextUpdate absent
-    /// means no upper bound known to RFC 6960, which keeps the statement cu-
-    /// rrent — same reading as a CRL without one).
+    /// Whether the window speaks for the instant the caller asked about, per
+    /// [`speaks_for`]: the instant inside `thisUpdate <= about < nextUpdate`, or
+    /// the answer newer than the instant. An absent `nextUpdate` bounds nothing,
+    /// which counts against the datum, not for it (round two's N6).
     pub current: bool,
     /// `thisUpdate` of the first SingleResponse.
     pub this_update: SystemTime,
@@ -86,6 +87,91 @@ impl OcspStatus {
     }
 }
 
+/// The two instants a revocation check needs, because they are not the same
+/// thing and one field for both is what made an archive rot (round two's N10).
+///
+/// [`Self::about`] is the instant whose revocation state is being asked about:
+/// the signing moment when a verified time-stamp pins the document to one, the
+/// validation time otherwise. [`Self::at`] is the clock the check is made under,
+/// and nothing may speak from after it.
+///
+/// A live check has one instant and passes it as both ( [`Self::at`] ).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RevocationTime {
+    /// The instant the revocation state is being judged at.
+    pub about: SystemTime,
+    /// The clock of the check: no datum may be newer than this.
+    pub at: SystemTime,
+}
+
+impl RevocationTime {
+    /// One instant for both roles: the shape of a live check, where the question
+    /// is "what is the status now" and the answer has to be current now.
+    pub fn at(instant: SystemTime) -> Self {
+        Self {
+            about: instant,
+            at: instant,
+        }
+    }
+
+    /// An archive's check: the status as of `about`, read today (`at`).
+    pub fn archive(about: SystemTime, at: SystemTime) -> Self {
+        Self { about, at }
+    }
+}
+
+/// How long a revocation datum that does not say is assumed to speak: 48 hours.
+///
+/// RFC 6960 2.2.4 makes `nextUpdate` a SHOULD and RFC 5280 5.1.2.5 lets a CRL
+/// leave it out altogether, so a validator meets answers whose issuer refused to
+/// bound itself and has to decide something. Treating the absence as "for ever"
+/// is round two's N6. Treating it as "worth nothing" would refuse responders that
+/// are merely terse. The convention every validator ends up using is a fixed
+/// window on `thisUpdate`, and 48 hours is the widest gap mainstream responders
+/// (including the test PKI's openssl) actually use between two answers.
+const MAX_UNDATED_WINDOW: std::time::Duration = std::time::Duration::from_secs(48 * 3600);
+
+/// Whether a revocation datum speaks for the instant being asked about.
+///
+/// `this_update` is the moment the list or answer was true; `next_update`, when
+/// the issuer named one, is its promise that nothing changed until then. A datum
+/// is evidence about `about` in exactly two shapes:
+///
+/// - its window covers the instant (`this_update <= about < next_update`), which
+///   is what data fetched for the moment looks like, and
+/// - it is not older than the instant (`about <= this_update`). A CRL lists every
+///   revocation its issuer knew at `thisUpdate`, and an OCSP answer is the state
+///   as of that moment, so a list from June that does not name the certificate
+///   proves it was not revoked in January either. This is the shape of an archive
+///   whose validation data was added, or refreshed, after the signature.
+///
+/// Nothing speaks from the future, which is what `at` is for. And a datum older
+/// than the instant with no `next_update` to bound it says nothing about that
+/// instant: an answer from years ago without `nextUpdate` used to count as
+/// current for ever, which is round two's N6.
+fn speaks_for(
+    this_update: SystemTime,
+    next_update: Option<SystemTime>,
+    about: SystemTime,
+    at: SystemTime,
+) -> bool {
+    if this_update > at {
+        return false;
+    }
+    if about <= this_update {
+        return true;
+    }
+    match next_update {
+        // the issuer bounded itself: the window either reaches the instant or it
+        // does not, and there is nothing to assume
+        Some(next) => about < next,
+        // it did not, so the assumed window is all there is
+        None => about
+            .duration_since(this_update)
+            .is_ok_and(|age| age <= MAX_UNDATED_WINDOW),
+    }
+}
+
 /// Reads AND verifies an OCSP response the way [`verify_crl`] does a CRL, so
 /// archived validation data can be trusted on its own years after signing
 /// (adversarial review A4). The signature is taken over the whole `tbsRes-
@@ -97,8 +183,15 @@ impl OcspStatus {
 /// tion OID. A response signed by nobody in that set — even one whose crypto-
 /// graphic signature is perfectly readable under a leaf key — makes no state-
 /// ment and reports `signature_verified`/`chains_to_issuer` accordingly.
-pub fn read_ocsp_response(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> OcspStatus {
-    match read_and_check(der, issuers, at) {
+///
+/// `time.about` is the instant the interval is judged against, and `time.at` the
+/// clock nothing may outrun: see [`RevocationTime`] and [`speaks_for`].
+pub fn read_ocsp_response(
+    der: &[u8],
+    issuers: &[CertificateHandle],
+    time: RevocationTime,
+) -> OcspStatus {
+    match read_and_check(der, issuers, time) {
         Ok(status) => status,
         Err(e) => OcspStatus {
             signature_verified: false,
@@ -112,7 +205,14 @@ pub fn read_ocsp_response(der: &[u8], issuers: &[CertificateHandle], at: SystemT
     }
 }
 
-fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> Result<OcspStatus> {
+fn read_and_check(
+    der: &[u8],
+    issuers: &[CertificateHandle],
+    time: RevocationTime,
+) -> Result<OcspStatus> {
+    // the responder's certificate is judged under today's clock (an expired
+    // delegate is not a speaker today); the interval is judged about `about`.
+    let at = time.at;
     // ---- structure down to tbsResponseData, kept as whole TLV bytes -------
     let mut outer = der_cursor(der);
     let resp = outer.expect(tlv::TAG_SEQUENCE, "the OCSPResponse")?;
@@ -399,10 +499,7 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
     }
 
     // ---- interval ----------------------------------------------------------
-    let current = match next_update {
-        Some(next) => this_update <= at && at < next,
-        None => this_update <= at,
-    };
+    let current = speaks_for(this_update, next_update, time.about, at);
 
     let problem: Option<String> = if !signature_verified {
         Some(
@@ -417,17 +514,30 @@ fn read_and_check(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
                 .to_string(),
         )
     } else if !current {
-        Some(match next_update {
-            Some(next) => format!(
-                "the OCSP answer speaks for [{}, {}) and the validation time is outside \
-                 that interval",
+        Some(if this_update > at {
+            format!(
+                "the OCSP answer's thisUpdate, {}, is after the time it is being checked \
+                 at, {}, so it cannot describe any state that has happened",
                 fmt_time(this_update),
-                fmt_time(next)
-            ),
-            None => format!(
-                "the OCSP answer's thisUpdate, {}, is after the validation time",
-                fmt_time(this_update)
-            ),
+                fmt_time(at)
+            )
+        } else if let Some(next) = next_update {
+            format!(
+                "the OCSP answer speaks for [{}, {}) and the instant being asked about, {}, \
+                 is outside that interval and older than its thisUpdate",
+                fmt_time(this_update),
+                fmt_time(next),
+                fmt_time(time.about)
+            )
+        } else {
+            format!(
+                "the OCSP answer's thisUpdate, {}, is more than 48 hours older than the \
+                 instant being asked about, {}, and it names no nextUpdate: RFC 6960 2.2.4 asks \
+                 a responder to say how long an answer speaks, and this one did not, so beyond \
+                 the window a validator assumes it is no evidence about that instant",
+                fmt_time(this_update),
+                fmt_time(time.about)
+            )
         })
     } else {
         None
@@ -504,8 +614,8 @@ pub struct OcspCertId {
 /// Parses a DER `CertificateList` (RFC 5280), finds the CA that issued it
 /// among `issuers`, and verifies its signature under that CA's public key.
 ///
-/// `at` is the validation time: a CRL whose `nextUpdate` has passed says
-/// nothing about the present and is refused, with the way out named.
+/// The list's dates are judged about `time.about` and under `time.at`: see
+/// [`RevocationTime`] and [`speaks_for`] for which windows count as evidence.
 /// The CRL entry-less extensions whose presence a reader understands enough
 /// to ignore safely when non-critical (RFC 5280 5.2): the issuing-distribution-
 /// point family and the delta indicator are NOT in this list, because they
@@ -576,7 +686,13 @@ fn crl_extensions(tbs_content: &[u8]) -> Vec<(ObjectIdentifier, bool)> {
 /// carrying the CA's name and a key of its own, archived in the same `/Certs`
 /// pool as everything else, satisfied this function, and its empty CRL looked
 /// like the CA's own statement while the signer's real CRL revoked it.
-pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> Result<CrlReport> {
+pub fn verify_crl(
+    der: &[u8],
+    issuers: &[CertificateHandle],
+    time: RevocationTime,
+) -> Result<CrlReport> {
+    // as in the OCSP path: candidate issuers are judged under today's clock
+    let at = time.at;
     let mut outer = der_cursor(der);
     let list = outer.expect(tlv::TAG_SEQUENCE, "the CertificateList")?;
     if !outer.done() {
@@ -700,18 +816,33 @@ pub fn verify_crl(der: &[u8], issuers: &[CertificateHandle], at: SystemTime) -> 
         if this_update > at {
             return Err(Error::Verification(format!(
                 "the CRL was issued in the future (thisUpdate {}), which cannot be the \
-                 revocation state at the validation time",
+                 revocation state at the time it is being checked at",
                 fmt_time(this_update)
             )));
         }
-        if let Some(next) = next_update {
-            if at > next {
-                return Err(Error::Verification(format!(
-                    "the CRL expired at {}; it says nothing about the validation time. \
-                     Fetch or regenerate a current one (for the test PKI: tools/gen-testcert.sh)",
-                    fmt_time(next)
-                )));
-            }
+        if !speaks_for(this_update, next_update, time.about, at) {
+            // Two ways to fail, and they need different words: a window that
+            // stopped before the instant asked about, and a list that promised
+            // nothing about how long it spoke.
+            return Err(Error::Verification(match next_update {
+                Some(next) => format!(
+                    "the CRL speaks for [{}, {}) and the instant being asked about, {}, is \
+                     outside that interval and older than its thisUpdate: nothing here says \
+                     the certificate was not revoked then",
+                    fmt_time(this_update),
+                    fmt_time(next),
+                    fmt_time(time.about)
+                ),
+                None => format!(
+                    "the CRL's thisUpdate, {}, is older than the instant being asked about, \
+                     {}, and it names no nextUpdate: RFC 5280 5.1.2.5 leaves an absent \
+                     nextUpdate as meaning no next update is available, so nothing bounds how \
+                     long the \
+                     list spoke and it is no evidence about that instant",
+                    fmt_time(this_update),
+                    fmt_time(time.about)
+                ),
+            }));
         }
         // A CRL is only a revocation datum if its signer may sign CRLs: the
         // candidate whose key verified the signature but whose keyUsage says
@@ -1039,26 +1170,44 @@ mod tests {
         let int = cert("intermediate.crt");
         let ca = cert("ca.crt");
 
-        let report = verify_crl(&int_crl, &[int.clone(), ca.clone()], SystemTime::now())
-            .expect("the intermediate's CRL must verify under the intermediate");
+        let report = verify_crl(
+            &int_crl,
+            &[int.clone(), ca.clone()],
+            RevocationTime::at(SystemTime::now()),
+        )
+        .expect("the intermediate's CRL must verify under the intermediate");
         assert!(report.issuer.contains("Intermediate"), "{}", report.issuer);
         assert!(
             report.revoked_serials.is_empty(),
             "an empty CRL revokes nothing"
         );
 
-        let report = verify_crl(&ca_crl, &[int.clone(), ca.clone()], SystemTime::now())
-            .expect("the root's CRL must verify under the root");
+        let report = verify_crl(
+            &ca_crl,
+            &[int.clone(), ca.clone()],
+            RevocationTime::at(SystemTime::now()),
+        )
+        .expect("the root's CRL must verify under the root");
         assert!(report.issuer.contains("Root CA"), "{}", report.issuer);
 
         // and each CRL only verifies under its own CA: the issuer name is not
         // enough, the key has to match it
-        let err = verify_crl(&int_crl, std::slice::from_ref(&ca), SystemTime::now()).unwrap_err();
+        let err = verify_crl(
+            &int_crl,
+            std::slice::from_ref(&ca),
+            RevocationTime::at(SystemTime::now()),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("none of the 1 certificate"),
             "{err}"
         );
-        let err = verify_crl(&ca_crl, std::slice::from_ref(&int), SystemTime::now()).unwrap_err();
+        let err = verify_crl(
+            &ca_crl,
+            std::slice::from_ref(&int),
+            RevocationTime::at(SystemTime::now()),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("none of the 1 certificate"),
             "{err}"
@@ -1086,8 +1235,12 @@ mod tests {
             .expect("the root key of the test PKI must load");
 
         let fake = fake_crl_signed_by(&int, &root_signer);
-        let err = verify_crl(&fake, std::slice::from_ref(&int), SystemTime::now())
-            .expect_err("a CRL signed by the wrong key must not verify");
+        let err = verify_crl(
+            &fake,
+            std::slice::from_ref(&int),
+            RevocationTime::at(SystemTime::now()),
+        )
+        .expect_err("a CRL signed by the wrong key must not verify");
         let text = err.to_string();
         assert!(text.contains("signed by a different key"), "{text}");
     }

@@ -66,7 +66,14 @@ fn indefinite_lengths_are_refused_by_every_reader() {
     let ber = [0x30u8, 0x80, 0x05, 0x00, 0x00, 0x00];
     assert!(tsp::token_imprint(&ber).is_err());
     assert!(revocation::parse_ocsp_response(&ber).is_err());
-    assert!(revocation::verify_crl(&ber, &[], std::time::SystemTime::now()).is_err());
+    assert!(
+        revocation::verify_crl(
+            &ber,
+            &[],
+            revocation::RevocationTime::at(std::time::SystemTime::now())
+        )
+        .is_err()
+    );
 }
 
 /// The byte-sweep: cut a genuine token-shaped DER at every offset and mutate
@@ -110,7 +117,7 @@ fn every_truncation_and_length_mutation_of_a_token_is_an_error() {
         let _ = tsp::token_from_response(input, DigestAlg::Sha256, b"x", None);
         let _ = tsp::token_from_attribute(input, DigestAlg::Sha256, b"x");
         let _ = revocation::parse_ocsp_response(input);
-        let _ = revocation::verify_crl(input, &[], now);
+        let _ = revocation::verify_crl(input, &[], revocation::RevocationTime::at(now));
     }
 }
 

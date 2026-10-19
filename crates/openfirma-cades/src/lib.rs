@@ -23,7 +23,7 @@ pub mod tsa;
 pub mod tsp;
 pub mod verify;
 
-pub use revocation::read_ocsp_response;
+pub use revocation::{RevocationTime, read_ocsp_response};
 pub use signed_data::{
     AUTOFIRMA_DEFAULT_CONTENT_DESCRIPTION, CadesOptions, TimestampFn, sign, sign_with_digest,
 };

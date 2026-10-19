@@ -1098,14 +1098,18 @@ fn a_crl_signed_by_an_impostor_copying_the_ca_name_is_not_a_datum() {
         openfirma_cades::revocation::verify_crl(
             &forged,
             std::slice::from_ref(&impostor_handle),
-            now
+            openfirma_cades::revocation::RevocationTime::at(now),
         )
         .is_ok(),
         "the impostor really signed this CRL: the archive has a readable datum"
     );
     assert!(
-        openfirma_cades::revocation::verify_crl(&forged, std::slice::from_ref(&intermediate), now)
-            .is_err(),
+        openfirma_cades::revocation::verify_crl(
+            &forged,
+            std::slice::from_ref(&intermediate),
+            openfirma_cades::revocation::RevocationTime::at(now),
+        )
+        .is_err(),
         "the CA whose name the CRL carries never signed it"
     );
 
@@ -1288,7 +1292,7 @@ fn an_ocsp_response_from_a_responder_without_the_signing_eku_is_not_a_datum() {
     let status = openfirma_cades::read_ocsp_response(
         &resp,
         &[ca.clone(), intermediate.clone()],
-        std::time::SystemTime::now(),
+        openfirma_cades::revocation::RevocationTime::at(std::time::SystemTime::now()),
     );
     assert!(
         !status.verified(),
@@ -1498,7 +1502,7 @@ fn an_ocsp_responder_that_hangs_from_a_sub_ca_is_not_a_delegate() {
     let status = openfirma_cades::read_ocsp_response(
         &resp,
         &[ca.clone(), intermediate.clone()],
-        std::time::SystemTime::now(),
+        openfirma_cades::revocation::RevocationTime::at(std::time::SystemTime::now()),
     );
     assert!(
         status.signature_verified,
@@ -1606,7 +1610,7 @@ fn an_ocsp_response_about_another_certificate_is_not_a_datum() {
     let status = openfirma_cades::read_ocsp_response(
         &resp,
         &[ca.clone(), intermediate.clone()],
-        std::time::SystemTime::now(),
+        openfirma_cades::revocation::RevocationTime::at(std::time::SystemTime::now()),
     );
     assert!(
         status.verified(),

@@ -28,7 +28,7 @@
 //! the "does the signature cover the latest revision" judgement a PDF viewer
 //! makes.
 
-use openfirma_cades::revocation::{self, CrlReport, OcspCertId};
+use openfirma_cades::revocation::{self, CrlReport, OcspCertId, RevocationTime};
 use openfirma_cades::verify::{AnchorPolicy, VerifyOptions};
 use openfirma_core::alg::DigestAlg;
 use openfirma_core::cert::CertificateHandle;
@@ -841,7 +841,7 @@ fn verify_dss(
     let mut crls: Vec<(Vec<u8>, CrlReport)> = Vec::with_capacity(dss.crls.len());
     let mut unchecked = 0usize;
     for (i, (_, der)) in dss.crls.iter().enumerate() {
-        match revocation::verify_crl(der, &issuers, opts.validation_time) {
+        match revocation::verify_crl(der, &issuers, RevocationTime::at(opts.validation_time)) {
             Ok(report) => crls.push((der.clone(), report)),
             // 06-C-1: with no authority named, a datum that does not verify
             // against the archive alone is not a broken archive — it is a
@@ -866,7 +866,8 @@ fn verify_dss(
     let mut ocsp_ids: Vec<OcspCertId> = Vec::new();
     let mut verified_ocsps = 0usize;
     for (i, (_, der)) in dss.ocsps.iter().enumerate() {
-        let status = revocation::read_ocsp_response(der, &issuers, opts.validation_time);
+        let status =
+            revocation::read_ocsp_response(der, &issuers, RevocationTime::at(opts.validation_time));
         if !status.verified() {
             // 06-C-1: same rule as the CRLs above — no authority named means
             // an unverifiable datum is counted, not refused.
@@ -966,8 +967,12 @@ fn verify_dss(
                 let (child, parent) = (&pair[0], &pair[1]);
                 let serial = child.serial_number().as_bytes().to_vec();
                 let crl = crls.iter().find(|(der, _)| {
-                    revocation::verify_crl(der, std::slice::from_ref(parent), opts.validation_time)
-                        .is_ok()
+                    revocation::verify_crl(
+                        der,
+                        std::slice::from_ref(parent),
+                        RevocationTime::at(opts.validation_time),
+                    )
+                    .is_ok()
                 });
                 let by_ocsp = ocsp_ids.iter().any(|id| {
                     id.serial == serial && ltv::ocsp_id_names_ca(id, parent).unwrap_or(false)
