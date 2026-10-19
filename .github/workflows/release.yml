@@ -219,9 +219,15 @@ jobs:
         # once claimed aarch64 Windows carried the window and called the arm64
         # Linux runner "cross"; both were false.)
         #
+        # This goes to a FILE handed to the release as its body (round two's
+        # N-3): everything used to be appended to $GITHUB_STEP_SUMMARY, which is
+        # the workflow run page — a place a person downloading a binary never
+        # visits. The action prepends this body to the generated commit list, so
+        # the caveats are the first thing on the release page and the commits
+        # follow underneath.
         run: |
+          notes="$RUNNER_TEMP/RELEASE_NOTES.md"
           {
-            echo ""
             echo "### openfirma-gui (the window)"
             echo ""
             echo "Ships inside the artifacts for \`x86_64-unknown-linux-gnu\`,"
@@ -241,9 +247,12 @@ jobs:
             echo "has ever been loaded there: CI provisions no SoftHSM for the"
             echo "Windows runners. The Windows certificate store has never run"
             echo "against a real card either."
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > "$notes"
+          # the run page keeps it too, but it is no longer the only copy
+          cat "$notes" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: softprops/action-gh-release@62c96d0c4e8a889135c1f3a25910db8dbe0e85f7 # v2.3.4
         with:
           files: dist/*
+          body_path: ${{ runner.temp }}/RELEASE_NOTES.md
           generate_release_notes: true
