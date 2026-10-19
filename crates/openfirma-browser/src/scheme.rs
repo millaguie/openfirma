@@ -243,13 +243,17 @@ fn autofirma_paths(
             .collect(),
     };
     for root in roots {
-        // An entry with no root at all is not a data root (XDG's rule: a
-        // relative `XDG_DATA_DIRS` entry is ignored). Spelled `is_relative`
-        // rather than `!is_absolute` because these roots are POSIX paths and on
-        // Windows `/usr/share` is rooted but not, by `Path`'s definition,
-        // absolute — the rule is about the relative entries, which is what the
-        // check refuses on every platform.
-        if root.is_relative() {
+        // A relative `XDG_DATA_DIRS` entry is not a data root (XDG's rule).
+        // Asked as "does the first component root it", not via `is_absolute` or
+        // `is_relative`: on Windows those answer a different question for one
+        // of these POSIX paths (`/usr/share` has a root but no drive, and
+        // `is_relative` is defined as `!is_absolute`, so it skipped BOTH
+        // defaults on the Windows runners — the second round trip this test
+        // needed, after the separators).
+        if !matches!(
+            root.components().next(),
+            Some(std::path::Component::RootDir | std::path::Component::Prefix(_))
+        ) {
             continue;
         }
         for name in ["afirma.desktop", "autofirma.desktop"] {
@@ -1093,9 +1097,16 @@ mod tests {
         let deb_launcher = Path::new("/usr/share")
             .join("applications")
             .join("afirma.desktop");
+        // Both entries of the XDG default are roots on their own: a change that
+        // collapsed the list back into one colon-joined string would stop
+        // finding this one.
+        let local_launcher = Path::new("/usr/local/share")
+            .join("applications")
+            .join("afirma.desktop");
         let deb_wanted = [
             per_user.clone(),
             deb_launcher.clone(),
+            local_launcher.clone(),
             PathBuf::from("/usr/lib/Autofirma"),
         ];
         let deb = |p: &Path| deb_wanted.iter().any(|w| w == p);
