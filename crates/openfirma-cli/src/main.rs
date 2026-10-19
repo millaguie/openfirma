@@ -1265,6 +1265,14 @@ fn main() -> Result<()> {
                         dss.crls.len(),
                         dss.ocsps
                     );
+                    // A revocation statement is about a moment, and the moment an
+                    // archive speaks for is its first verified seal rather than
+                    // today: saying which instant was used is what keeps the
+                    // verdict from claiming more than the evidence says (01-N10).
+                    println!(
+                        "  revocation judged as of {}: the instant this archive speaks for",
+                        fmt_system_time(dss.evidence_about)
+                    );
                     for crl in &dss.crls {
                         println!(
                             "  CRL issued by {}: {} revoked, next update {}",

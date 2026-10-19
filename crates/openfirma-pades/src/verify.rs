@@ -28,6 +28,8 @@
 //! the "does the signature cover the latest revision" judgement a PDF viewer
 //! makes.
 
+use std::time::SystemTime;
+
 use openfirma_cades::revocation::{self, CrlReport, OcspCertId, RevocationTime};
 use openfirma_cades::verify::{AnchorPolicy, VerifyOptions};
 use openfirma_core::alg::DigestAlg;
@@ -123,6 +125,12 @@ pub struct DssReport {
     /// the validation data predates them. They verify as signatures, they
     /// just are not archived.
     pub uncovered: Vec<usize>,
+    /// The instant the archived datums' windows were judged about: the first
+    /// time-stamp whose TSA signature verified, or `validation_time` when nothing
+    /// in the document is pinned that way. A revocation statement is about a
+    /// moment, and a verdict that does not say which moment knows less than it
+    /// claims (round two's N10).
+    pub evidence_about: SystemTime,
 }
 
 /// The verdict over a whole document.
@@ -270,8 +278,12 @@ pub fn verify(pdf: &[u8], opts: &VerifyOptions) -> Result<DocumentReport> {
         }
     }
 
+    // The archived validation data is evidence about the past, and the past it
+    // speaks for is the moment the document was first sealed by a TSA this
+    // verifier trusted: see [`archived_instant`].
+    let archived = archived_instant(&sig_reports, &dts_reports);
     let mut dss = None;
-    match verify_dss(pdf, &signatures, opts) {
+    match verify_dss(pdf, &signatures, opts, archived) {
         Ok(report) => dss = report,
         Err(e) => failures.push(format!("validation data (/DSS): {}", unwrap(&e))),
     }
@@ -812,7 +824,14 @@ fn verify_dss(
     pdf: &[u8],
     signatures: &[inspect::Signature],
     opts: &VerifyOptions,
+    archived: Option<SystemTime>,
 ) -> Result<Option<DssReport>> {
+    // One instant for the datums' own windows, another for everything that has to
+    // be true today: see [`openfirma_cades::RevocationTime`].
+    let revocation_time = match archived {
+        Some(when) => RevocationTime::archive(when, opts.validation_time),
+        None => RevocationTime::at(opts.validation_time),
+    };
     let Some(dss) = ltv::read_dss(pdf)? else {
         return Ok(None);
     };
@@ -841,7 +860,7 @@ fn verify_dss(
     let mut crls: Vec<(Vec<u8>, CrlReport)> = Vec::with_capacity(dss.crls.len());
     let mut unchecked = 0usize;
     for (i, (_, der)) in dss.crls.iter().enumerate() {
-        match revocation::verify_crl(der, &issuers, RevocationTime::at(opts.validation_time)) {
+        match revocation::verify_crl(der, &issuers, revocation_time) {
             Ok(report) => crls.push((der.clone(), report)),
             // 06-C-1: with no authority named, a datum that does not verify
             // against the archive alone is not a broken archive — it is a
@@ -866,8 +885,7 @@ fn verify_dss(
     let mut ocsp_ids: Vec<OcspCertId> = Vec::new();
     let mut verified_ocsps = 0usize;
     for (i, (_, der)) in dss.ocsps.iter().enumerate() {
-        let status =
-            revocation::read_ocsp_response(der, &issuers, RevocationTime::at(opts.validation_time));
+        let status = revocation::read_ocsp_response(der, &issuers, revocation_time);
         if !status.verified() {
             // 06-C-1: same rule as the CRLs above — no authority named means
             // an unverifiable datum is counted, not refused.
@@ -967,12 +985,8 @@ fn verify_dss(
                 let (child, parent) = (&pair[0], &pair[1]);
                 let serial = child.serial_number().as_bytes().to_vec();
                 let crl = crls.iter().find(|(der, _)| {
-                    revocation::verify_crl(
-                        der,
-                        std::slice::from_ref(parent),
-                        RevocationTime::at(opts.validation_time),
-                    )
-                    .is_ok()
+                    revocation::verify_crl(der, std::slice::from_ref(parent), revocation_time)
+                        .is_ok()
                 });
                 let by_ocsp = ocsp_ids.iter().any(|id| {
                     id.serial == serial && ltv::ocsp_id_names_ca(id, parent).unwrap_or(false)
@@ -1035,7 +1049,41 @@ fn verify_dss(
         vri_keys,
         chains,
         uncovered,
+        evidence_about: revocation_time.about,
     }))
+}
+
+/// The instant an archive's revocation evidence may be judged at: the earliest
+/// time-stamp in the document whose TSA signature verified.
+///
+/// A seal fixes the bytes under it to a moment, and that moment is the closest
+/// this verifier can place the signing: a CRL or OCSP answer archived with the
+/// document speaks for it, whether or not it still speaks for today. Without
+/// this the archived data of a B-LT document is judged against the wall clock,
+/// and a perfectly ordinary CRL — one with a `nextUpdate` a week out, as every
+/// CA issues — turns a signature that verified for decades into one that stops
+/// verifying next Tuesday. Round two's N10 measured exactly that, and a level
+/// whose name is "long term" cannot last one CRL period.
+///
+/// The earliest seal, not the latest, because it is the weaker claim: it is the
+/// only instant this verifier can point at that certainly follows the signature.
+/// Two limits follow from that and are named rather than papered over. An archive
+/// whose validation data predates every seal in its own document still fails —
+/// the data may be genuine, but nothing here says the signature is as old as the
+/// data claims, and `signingTime` is the signer's own unauthenticated word. And
+/// the chain's own validity dates are still judged at `validation_time`, so a
+/// document whose CA certificate has since expired still fails too.
+fn archived_instant(
+    signatures: &[SignatureReport],
+    timestamps: &[DocTimeStampReport],
+) -> Option<SystemTime> {
+    let from_signatures = signatures.iter().flat_map(|sig| {
+        sig.reports
+            .iter()
+            .filter_map(|report| report.timestamp.gen_time())
+    });
+    let from_stamps = timestamps.iter().filter_map(|stamp| stamp.gen_time);
+    from_signatures.chain(from_stamps).min()
 }
 
 fn fail_dss(detail: &str) -> Error {

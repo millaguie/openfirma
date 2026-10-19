@@ -242,13 +242,23 @@ every certificate's validity dates against a validation time (`--at`, default
 now). It verifies *every* signature in a document, so a co-signed PDF passes
 only when all of its signatures do. Since B-LT it also judges the archive:
 when a PDF carries a `/DSS`, every archived certificate must parse, every
-archived CRL must verify **under the key of the CA it names** and be current
-at the validation time, every archived OCSP response must be a successful
+archived CRL must verify **under the key of the CA it names** and speak for the
+instant the archive is about, every archived OCSP response must be a successful
 answer, the chain of every `/VRI`-covered signature must rebuild from the
 archived data alone with at least one revocation datum per CA certificate and
 nothing in the chain revoked by the archived data, and every document
 time-stamp token must imprint the bytes its own `/ByteRange` covers. With NO
 authority configured — the window on a machine without `$OPENFIRMA_TRUST` —
+Which instant the archived data is judged about is the first time-stamp in the
+document whose TSA signature verified, and the validation time when nothing in
+the document is pinned that way: a CRL or OCSP answer that covers the moment the
+document was sealed proves the certificate was not revoked then, which is what
+B-LT claims, whether or not it still speaks for today. Without that rule an
+ordinary CRL — one with a `nextUpdate` a week out, which is what every CA issues
+— made a B-LT document stop verifying a week after signing (round two's N10), and
+validation data that predates every seal in its own document is still refused.
+`DssReport::evidence_about` names the instant, and `openfirma verify` prints it.
+
 that chain step does not run and is reported as not run:
 `VerifyOptions::anchors` is `AnchorPolicy::IntegrityWithoutAnchors`, the
 report carries no trust anchor (`VerifyReport::trust_anchor` is `None`) and

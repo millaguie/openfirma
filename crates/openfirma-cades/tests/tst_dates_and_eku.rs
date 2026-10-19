@@ -320,6 +320,8 @@ fn mint_tsa_cert(
         "-CAkey",
         dir.join("ca.key").to_str()?,
         "-CAcreateserial",
+        "-CAserial",
+        scratch.join("ca.srl").to_str()?,
         "-days",
         "400",
         "-extfile",
