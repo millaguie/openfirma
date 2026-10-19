@@ -215,15 +215,27 @@ fn autofirma_paths(
         }
     }
     // And the launcher the OS actually reads, wherever XDG says applications
-    // live (`/usr/local/share:/usr/share` when unset): the .deb ships
-    // `afirma.desktop` and the .rpm `autofirma.desktop`, and seeing that file
-    // is seeing the registration itself.
-    let dirs = data_dirs
-        .map(|v| v.to_owned())
-        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
-    for root in std::env::split_paths(&dirs) {
-        // XDG requires absolute entries; a relative one is not a data root.
-        if !root.is_absolute() {
+    // live. The default is a LIST, not the string `/usr/local/share:/usr/share`
+    // split apart: `split_paths` separates by the platform's own character, so
+    // on Windows that string is one path no data directory ever equals. The two
+    // POSIX roots are what the XDG rule means here; a user-provided
+    // `XDG_DATA_DIRS` is split the platform's way, which is what its own rule
+    // says.
+    let roots: Vec<PathBuf> = match data_dirs {
+        Some(v) => std::env::split_paths(v).collect(),
+        None => ["/usr/local/share", "/usr/share"]
+            .iter()
+            .map(PathBuf::from)
+            .collect(),
+    };
+    for root in roots {
+        // An entry with no root at all is not a data root (XDG's rule: a
+        // relative `XDG_DATA_DIRS` entry is ignored). Spelled `is_relative`
+        // rather than `!is_absolute` because these roots are POSIX paths and on
+        // Windows `/usr/share` is rooted but not, by `Path`'s definition,
+        // absolute — the rule is about the relative entries, which is what the
+        // check refuses on every platform.
+        if root.is_relative() {
             continue;
         }
         for name in ["afirma.desktop", "autofirma.desktop"] {
@@ -903,37 +915,43 @@ mod tests {
     /// install, asked through an injected filesystem so no root is needed.
     #[test]
     fn autofirma_evidence_covers_the_layouts_the_packages_install() {
-        let deb = |p: &Path| {
-            matches!(
-                p.to_str().unwrap_or_default(),
-                "/usr/lib/Autofirma"
-                    | "/usr/share/applications/afirma.desktop"
-                    | "/home/ana/.local/share/autofirma"
-            )
-        };
+        // Every path is BUILT, never compared as a string: the function joins
+        // components, and a Windows `Path` renders them with its own separator,
+        // so a literal here would pin the test to POSIX instead of to the rule
+        // it is about (which is what failed the first version of it on the
+        // Windows runners).
+        let per_user = Path::new("/home/ana").join(".local/share/autofirma");
+        let deb_launcher = Path::new("/usr/share")
+            .join("applications")
+            .join("afirma.desktop");
+        let deb_wanted = [
+            per_user.clone(),
+            deb_launcher.clone(),
+            PathBuf::from("/usr/lib/Autofirma"),
+        ];
+        let deb = |p: &Path| deb_wanted.iter().any(|w| w == p);
+        let mut got = autofirma_paths(&deb, Some(Path::new("/home/ana")), None);
+        got.sort();
+        let mut want = deb_wanted.to_vec();
+        want.sort();
         assert_eq!(
-            autofirma_paths(&deb, Some(Path::new("/home/ana")), None),
-            vec![
-                PathBuf::from("/usr/lib/Autofirma"),
-                PathBuf::from("/home/ana/.local/share/autofirma"),
-                PathBuf::from("/usr/share/applications/afirma.desktop"),
-            ],
+            got, want,
             "the .deb's own layout — the one the round-two report found invisible"
         );
 
         // The .rpm's: `%{_libdir}/autofirma` plus a launcher reached through
-        // XDG_DATA_DIRS instead of the default `/usr/local/share:/usr/share`.
+        // XDG_DATA_DIRS instead of the two POSIX defaults.
         let rpm = |p: &Path| {
-            matches!(
-                p.to_str().unwrap_or_default(),
-                "/usr/lib64/autofirma" | "/opt/xdg/share/applications/autofirma.desktop"
-            )
+            p == Path::new("/usr/lib64/autofirma")
+                || p == Path::new("/opt/xdg/share/applications/autofirma.desktop")
         };
         assert_eq!(
             autofirma_paths(&rpm, None, Some("/opt/xdg/share".as_ref())),
             vec![
                 PathBuf::from("/usr/lib64/autofirma"),
-                PathBuf::from("/opt/xdg/share/applications/autofirma.desktop"),
+                PathBuf::from("/opt/xdg/share")
+                    .join("applications")
+                    .join("autofirma.desktop"),
             ]
         );
 
