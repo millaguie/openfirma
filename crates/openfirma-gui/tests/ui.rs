@@ -38,11 +38,17 @@ fn require(ok: bool, what: &str) -> Option<()> {
     }
 }
 
+/// The window the tests render into: a realistic small window, so "is the way
+/// out on screen?" is a question the harness can answer — the rect the buttons
+/// report is in these coordinates. Shared with the tests that assert a control
+/// is INSIDE it (06-N-9).
+const WINDOW: egui::Vec2 = egui::Vec2::new(760.0, 560.0);
+
 /// An App under the harness, with fixture dialogs: exactly what `main` builds
 /// except where a path arrives from.
 fn harness_for(app: App) -> Harness<'static, App> {
     Harness::builder()
-        .with_size(egui::vec2(760.0, 560.0))
+        .with_size(WINDOW)
         .allow_missing_glyphs() // the ✓ of the Done screen is not in the default font
         .build_eframe(move |cc| {
             let mut a = app;
@@ -620,6 +626,46 @@ fn a_document_that_fails_as_a_whole_is_never_a_valid_signature() {
     assert!(
         harness.query_by_label_contains("Firma válida").is_none(),
         "no line may read as valid while the document as a whole is refused"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn the_verdicts_way_out_is_on_screen() {
+    // 06-N-9: `auto_shrink([false, false])` made the verdict area consume every
+    // remaining pixel of the window, which laid the notes and the exit button
+    // out BELOW the bottom edge — five pixels of the button showed, whatever
+    // the window size, and the only way back was to close the window. What is
+    // asserted here is the pixel truth the screenshot showed: the button's own
+    // rectangle lies inside the window, and clicking where it now is still
+    // takes the window home.
+    let Some(pdf) = certified_then_signed_pdf() else {
+        eprintln!("SKIP: the test PKI is absent, run tools/gen-testcert.sh");
+        return;
+    };
+    let dir = temp_doc("verdict-exit");
+    let doc = dir.join("certificado.pdf");
+    std::fs::write(&doc, &pdf).unwrap();
+
+    let mut app = fixture_app(Some(testdata().join("certs/chain.crt")));
+    app.load_path_for_test(doc.clone());
+    let mut harness = harness_for(app);
+    harness.run();
+    drain_worker(&mut harness);
+    harness.run();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW);
+    let exit = harness.get_by_label_contains("Verificar otro archivo");
+    let rect = exit.rect();
+    assert!(
+        rect.max.y <= screen.max.y && rect.min.y >= screen.min.y,
+        "the way out is inside the window: {rect:?} not within {screen:?}"
+    );
+    exit.click();
+    harness.run();
+    assert!(
+        matches!(harness.state().screen_ref_for_test(), Screen::Idle),
+        "the button inside the verdict area still goes home"
     );
 
     std::fs::remove_dir_all(dir).ok();

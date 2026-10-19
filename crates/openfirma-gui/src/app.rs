@@ -1635,9 +1635,17 @@ impl App {
             );
             ui.add_space(6.0);
         }
+        let mut go_idle = false;
         egui::ScrollArea::vertical()
             .id_salt("verdicts")
-            .auto_shrink([false, false])
+            // 06-N-9: the notes and the way out are laid out INSIDE this area
+            // and the area shrinks to its content when the content fits, so
+            // the exit is on screen with a short verdict and reachable by
+            // scrolling with a long one. Before, `auto_shrink([false, false])`
+            // made the area consume every remaining pixel of the window and
+            // pushed the button below the bottom edge — 5 px of it showed,
+            // whatever the window size.
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 for (i, line) in verdicts.lines.iter().enumerate() {
                     let open = details_open.get(i).copied().unwrap_or(false);
@@ -1681,12 +1689,22 @@ impl App {
                         });
                     }
                 }
+                for n in &verdicts.notes {
+                    let n = n.clone();
+                    ui.weak(n);
+                }
+                if !verdicts.notes.is_empty() {
+                    ui.add_space(6.0);
+                }
+                // The click is recorded here and acted on OUTSIDE the closure:
+                // a `put_back!` in this position would return from the closure,
+                // not from this function, and the screen would be swapped back
+                // at the end of it (the shape 06-N-6 found in the picker).
+                if ui.button(tr.verify_another.clone()).clicked() {
+                    go_idle = true;
+                }
             });
-        for n in &verdicts.notes {
-            let n = n.clone();
-            ui.weak(n);
-        }
-        if ui.button(tr.verify_another.clone()).clicked() {
+        if go_idle {
             put_back!(Screen::Idle);
         }
         put_back!(taken);
