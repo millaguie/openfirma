@@ -239,6 +239,11 @@ fn opening_a_store_parks_the_picker_and_replaces_its_own_line() {
     std::fs::create_dir_all(&dir).unwrap();
     let d = doc(&dir);
     let mut app = App::default();
+    // The sentence below is the Spanish one, and `$LANG` belongs to whoever
+    // runs cargo — the macOS CI runners answer `LANG=en_US`, which is exactly
+    // how this test failed there and nowhere else. Same pin `fixture_app`
+    // makes in tests/ui.rs.
+    app.set_locale_for_test(openfirma_gui::strings::Tr::es());
     // The starter parks the picker (production reaches it from the form; this
     // asserts the screen the job hands back to).
     app.set_screen_for_test(Screen::OpeningStore {
