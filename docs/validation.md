@@ -620,6 +620,26 @@ checkout does not turn tests red on an expiry that means nothing), an OCSP
 responder delegate with the OCSPSigning EKU, and one real OCSP response for
 the RSA signing cert produced fully offline.
 
+Three rules the fixtures learned the hard way, because a fixture that only runs on
+the newest tool on the shelf reports nothing:
+
+- **No test mints with `openssl x509 -req -not_before`/`-not_after`.** Those
+  options exist only from OpenSSL 3.2, and the Linux CI legs run 3.0.13, so a
+  fixture built that way is green on a current workstation and red on every leg
+  (`427dc90` remakes the two that were). "Out of date" is written as `-days` plus
+  the instant the caller asks about: `chain_certificates`, `pades_verify` and
+  `--at` all take that instant, and *out of date at an instant* is what the rule
+  actually judges, so nothing about the finding is lost.
+- **openssl stamps the current time and cannot be talked out of it.** A seal dated
+  in the past is therefore built with openfirma's own CMS writer
+  (`content_type = id-ct-TSTInfo`, RFC 3161 2.2), as `archived_revocation_time.rs`
+  does; and because GeneralizedTime and UTCTime carry whole seconds, sealed and
+  signing-time instants must be whole seconds too, or the assertions come out
+  about a codec rather than about the rule.
+- **Minted certificates take `-CAserial` into the test's own scratch directory.**
+  The default writes `testdata/certs/ca.srl`, which the suite's parallel test
+  binaries race.
+
 ## Real certificates
 
 Layer 4 needs a certificate from a trusted provider to get a "firma válida"
