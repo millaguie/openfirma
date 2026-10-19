@@ -193,8 +193,17 @@ impl Drop for Module {
 /// nothing waits on this lock but another keystore operation of the same
 /// process.
 /// One registry entry: the module path it was loaded from, how it was
-/// initialized, and the live handle.
-type RegistryEntry = (PathBuf, InitShape, Arc<Module>);
+/// initialized, with which library parameters, and the live handle. The
+/// parameters are part of the identity, not decoration (round 2, 04-N2):
+/// NSS's softokn3 reads its `configDir` once per process, so handing a second
+/// store the FIRST one's handle makes it list the first database's
+/// certificates under the second one's origin.
+struct RegistryEntry {
+    path: PathBuf,
+    shape: InitShape,
+    library_parameters: Option<String>,
+    module: Arc<Module>,
+}
 
 static MODULES: OnceLock<Mutex<Vec<RegistryEntry>>> = OnceLock::new();
 
@@ -578,25 +587,46 @@ fn process_module(
     let mut reg = registry()
         .lock()
         .map_err(|_| Error::Keystore("the module registry was poisoned".into()))?;
-    if let Some((_, shape, module)) = reg.iter().find(|(p, _, _)| p == path) {
+    if let Some(entry) = reg.iter().find(|e| e.path == path) {
         // Already loaded by an earlier store in this process — Cryptoki's
         // one-initialization-per-library rule makes the *library* the unit of
         // sharing, not the (path, shape) pair. Asking for it under a different
         // init shape afterwards is a programming error: the first caller's
         // C_Initialize already decided how this library was configured.
-        if *shape != init {
+        if entry.shape != init {
             return Err(Error::Keystore(format!(
                 "{} is already initialized in this process as {} and cannot be \
                  reopened as {}",
                 path.display(),
-                shape.name(),
+                entry.shape.name(),
                 init.name()
             )));
         }
-        return Ok(module.clone());
+        // Same library, different database (round 2, 04-N2): NSS reads its
+        // `configDir` out of C_Initialize's arguments once per process, and
+        // Cryptoki has no second initialize — so reusing this handle would
+        // answer with the FIRST database's certificates, labelled as the
+        // second one's. Refuse by name instead of lying about the origin.
+        if entry.library_parameters.as_deref() != library_parameters {
+            let name = |p: Option<&str>| p.unwrap_or("no library parameters").to_string();
+            return Err(Error::Keystore(format!(
+                "{} is already open in this process as {}; a PKCS#11 library is \
+                 initialized once per process, so {} cannot be opened in the \
+                 same run. Close and reopen openfirma to use the other one.",
+                path.display(),
+                name(entry.library_parameters.as_deref()),
+                name(library_parameters)
+            )));
+        }
+        return Ok(entry.module.clone());
     }
     let module = Arc::new(load_and_init(path, init, library_parameters)?);
-    reg.push((path.to_path_buf(), init, module.clone()));
+    reg.push(RegistryEntry {
+        path: path.to_path_buf(),
+        shape: init,
+        library_parameters: library_parameters.map(str::to_owned),
+        module: module.clone(),
+    });
     Ok(module)
 }
 

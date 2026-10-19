@@ -272,6 +272,58 @@ fn nss_db_lists_signs_and_still_explains_a_bogus_database() {
     );
 }
 
+#[test]
+fn a_second_nss_database_in_one_process_is_refused_by_name() {
+    // Round 2, 04-N2: softokn3 reads its `configDir` out of C_Initialize once
+    // per process, and Cryptoki has no second initialize for the same library.
+    // Before this was checked, opening a second NSS database in the same run
+    // handed it the FIRST one's handle, and it listed the first database's
+    // certificates under the second one's origin — a certificate attributed to
+    // the wrong store (and, in the window, rows whose origin was a lie).
+    let Some((module, db)) = nss_env() else {
+        require_or_skip(
+            "no NSS test material: set OPENFIRMA_TEST_NSS_DB (and the module if not \
+             /usr/lib) from tools/setup-test-keystores.sh",
+        );
+        return;
+    };
+    // Whichever test ran first, the fixture database is the one this process
+    // initialized softokn3 with: every NSS test here opens it before anything
+    // else, and opening it again is the reuse path.
+    let _fixture =
+        Pkcs11Store::open_nss(&module, &db, None, Some(String::new())).expect("the fixture DB");
+
+    // A copy of it, in a directory of its own: same certificates, different
+    // `configDir`. It must be refused, and the refusal must name both.
+    let dir = std::env::temp_dir().join(format!("openfirma-nss-second-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = Path::new(db.strip_prefix("sql:").unwrap_or(&db));
+    for entry in std::fs::read_dir(source).unwrap().flatten() {
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+        }
+    }
+    let other = format!("sql:{}", dir.display());
+    let err = Pkcs11Store::open_nss(&module, &other, None, Some(String::new()))
+        .err()
+        .expect("a second NSS database cannot be opened in the same process")
+        .to_string();
+    assert!(
+        err.contains("already open in this process"),
+        "the refusal must say why one library cannot hold two databases: {err}"
+    );
+    assert!(
+        err.contains(&dir.display().to_string()),
+        "the refusal must name the database that cannot be opened: {err}"
+    );
+    // And the fixture is still the one this process can answer with.
+    let again = Pkcs11Store::open_nss(&module, &db, None, Some(String::new()))
+        .expect("the fixture database is still the open one");
+    assert_eq!(again.token_label(), "NSS Certificate DB");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------------------
 // module loading and table validation (no token material needed)
 
