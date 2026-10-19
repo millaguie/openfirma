@@ -1299,3 +1299,144 @@ fn dat_param(bytes: &[u8]) -> String {
         .replace('/', "%2F")
         .replace('=', "%3D")
 }
+
+/// Finding 04-N3: `afirma-serve` read the consent flag and ignored the config
+/// file's own `allow_unattended`, which is the reverse of what the ADR, the
+/// help text and its own refusal all said — the recommended fix did not work
+/// and a bare flag opened a headless signer.
+///
+/// All four combinations go through the binary. `--issue-token` makes the
+/// endpoint start, print a token, probe itself and exit, so "it started" is a
+/// real statement about a running endpoint and not a reading of the source.
+#[test]
+fn serve_takes_its_standing_consent_from_the_config_not_from_the_flag() {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace("::", "_");
+    let root = std::env::temp_dir().join(format!("openfirma-{}-{test}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let p12 = root.join("clave.p12");
+    if !Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/certs/signer-rsa.p12"
+    ))
+    .is_file()
+    {
+        if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+            panic!("OPENFIRMA_REQUIRE_TESTS is set and testdata/certs/signer-rsa.p12 is missing");
+        }
+        eprintln!("skipped: the test PKI is absent, run tools/gen-testcert.sh");
+        return;
+    }
+    std::fs::copy(
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/certs/signer-rsa.p12"
+        )),
+        &p12,
+    )
+    .unwrap();
+    let pw = root.join("pw.txt");
+    std::fs::write(&pw, b"openfirma\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // A config with the standing opt-in, and one without it.
+    let with_optin = root.join("con-optin.toml");
+    std::fs::write(
+        &with_optin,
+        format!(
+            "p12 = \"{}\"\npassword_file = \"{}\"\nallow_unattended = true\n",
+            p12.display(),
+            pw.display()
+        ),
+    )
+    .unwrap();
+    let without = root.join("sin-optin.toml");
+    std::fs::write(
+        &without,
+        format!(
+            "p12 = \"{}\"\npassword_file = \"{}\"\n",
+            p12.display(),
+            pw.display()
+        ),
+    )
+    .unwrap();
+    // The config names where the signing key lives, so B-2's private-mode rule
+    // covers it too — a 0644 config is refused before it is read, which is how
+    // the first draft of this test failed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for cfg in [&with_optin, &without] {
+            std::fs::set_permissions(cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    let serve = |config: &Path, flag: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openfirma"));
+        cmd.args([
+            "afirma-serve",
+            "--config",
+            config.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1:0",
+            "--issue-token",
+        ]);
+        if flag {
+            cmd.arg("--allow-unattended");
+        }
+        cmd.output().expect("the binary must run")
+    };
+
+    // (a) The file's opt-in, no flag: the case the report found refusing.
+    let out = serve(&with_optin, false);
+    let started = out.status.success();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        started && text.contains("token: "),
+        "a config key with allow_unattended = true must start the endpoint \
+         without any flag: {}\n{}",
+        text,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (b) The flag alone, no file opt-in: the ADR's rule, and the report's
+    // other half — a bare flag used to open the endpoint.
+    let out = serve(&without, true);
+    assert!(
+        !out.status.success(),
+        "a bare --allow-unattended must not stand in for the file's opt-in: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("allow_unattended = true"),
+        "the refusal must name the config option: {stderr}"
+    );
+
+    // (c) Neither: refused, and the flag is what the refusal tells an argv key
+    // to pass (this one is a config key, so it names the file instead).
+    let out = serve(&without, false);
+    assert!(!out.status.success(), "no opt-in anywhere must not start");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("allow_unattended"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (d) Both: it starts (the file is enough; the flag is not a poison).
+    let out = serve(&with_optin, true);
+    assert!(
+        out.status.success(),
+        "both opt-ins must start the endpoint: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

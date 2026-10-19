@@ -1626,37 +1626,47 @@ fn main() -> Result<()> {
                 .parse()
                 .with_context(|| format!("--bind {bind:?} is not an address like 127.0.0.1:0"))?;
             // Same two homes as `afirma-uri`: argv first, then the config file.
-            // A-3: which home decided also decides whether quiet signing is
-            // allowed — argv keys need this invocation's --allow-unattended,
-            // config keys carry their standing opt-in in the file itself.
-            let allow = allow_unattended;
-            let (container, password) = match p12 {
+            // A-3, and 04-N3: whichever home decided also decides whose consent
+            // this endpoint already has. An argv key answers to THIS
+            // invocation's --allow-unattended; a config key answers to the
+            // file's own standing `allow_unattended = true`, and the flag does
+            // NOT stand in for it — a headless service outlives whoever typed
+            // the flag. That is what the ADR, this command's help and the
+            // refusal below have always said; the code asked for the flag in
+            // both cases, so the very fix those texts recommend
+            // (`allow_unattended = true` in the file) refused, while a bare
+            // --allow-unattended opened the endpoint.
+            let (container, password, standing) = match p12 {
                 Some(container) => (
                     container,
                     p12_password(password, password_file)?.context(
                         "--p12 needs its password: --password-file or OPENFIRMA_PASSWORD",
                     )?,
+                    allow_unattended,
                 ),
                 None => {
                     let config = browser_key_config(config.as_deref())?;
-                    // A-3: the endpoint is a headless signer by construction —
-                    // it answers every token-bearing request, and AutoFirma's
-                    // equivalent flow always has its dialog + PIN in between.
-                    // So the endpoint accepts only keys whose owner opted them
-                    // in IN THE CONFIG FILE; --allow-unattended cannot stand in
-                    // for a missing file-level opt-in here (a standing service
-                    // outlives whoever typed the flag).
+                    let opted_in = config.as_ref().is_some_and(|c| c.allow_unattended);
                     match config.and_then(|c| c.p12.zip(c.password_file)) {
-                        Some((container, password_file)) if allow => (
-                            container,
-                            p12_password(None, Some(password_file))?
-                                .context("the browser config names a p12 but no password_file")?,
-                        ),
-                        Some(_) => anyhow::bail!(
-                            "the browser config's key has no allow_unattended = true, and \
-                             an endpoint signs every token-bearing request without asking: \
-                             add the opt-in to the config file if its owner means it"
-                        ),
+                        Some((container, password_file)) => {
+                            if !opted_in {
+                                anyhow::bail!(
+                                    "the browser config's key has no allow_unattended = true, \
+                                     and an endpoint signs every token-bearing request without \
+                                     asking: a standing service cannot borrow the authority of a \
+                                     flag typed once (that is what --allow-unattended is for: \
+                                     the argv key of one invocation). Add the opt-in to the \
+                                     config file if that is what the key's owner decided."
+                                );
+                            }
+                            (
+                                container,
+                                p12_password(None, Some(password_file))?.context(
+                                    "the browser config names a p12 but no password_file",
+                                )?,
+                                true,
+                            )
+                        }
                         None => anyhow::bail!(
                             "--p12 names the key the endpoint signs with, or write the \
                              browser config (`afirma-uri --register`) that names it for \
@@ -1665,17 +1675,16 @@ fn main() -> Result<()> {
                     }
                 }
             };
-            if !allow {
+            if !standing {
                 // A-3: an endpoint answers whatever loopback request holds a
                 // token; AutoFirma puts a dialog in front of every one of them.
                 // Without the owner's opt-in there is no dialog here, so there
                 // is no endpoint either — refusing now beats signing quietly
-                // later. The config path keeps working when it carries its
-                // own decision; `allow` already folded that in.
+                // later. The config path kept working when its file carried its
+                // own decision; `standing` is that decision, or this flag.
                 anyhow::bail!(
                     "an endpoint over {} would sign browser calls without asking anybody: \
-                     pass --allow-unattended, or let the key come from a browser config \
-                     with allow_unattended = true — only if that is what the key's owner \
+                     pass --allow-unattended — only if that is what the key's owner \
                      decided; see docs/adr/0005-browser-protocol.md",
                     container.display()
                 );
