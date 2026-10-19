@@ -11,6 +11,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# The token default is read; only `publish` needs to write, and it says so on
+# itself (round two's N-5: the whole workflow used to carry contents: write, which
+# the build legs — the ones that compile code from a push and run scripts out of
+# the repository — never needed).
+permissions:
+  contents: read
+
 jobs:
   build:
     name: build ${{ matrix.target }}
@@ -61,7 +68,10 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # No rust-cache here on purpose (round two's N-5): a release artifact should
+      # come from the lockfile in this checkout, not from whatever object cache a
+      # previous dispatch left under the same key. The CI legs keep their caches;
+      # publishing is where byte-for-byte reproducibility starts counting.
 
       - name: platform packages
         if: matrix.setup
@@ -80,10 +90,10 @@ jobs:
       # ever needs it, and openfirma-gui's own bin has required-features.
       - name: build every member without the GUI (non-GUI targets)
         if: ${{ !matrix.gui }}
-        run: cargo build --release --workspace --exclude openfirma-gui --target ${{ matrix.target }}
+        run: cargo build --release --locked --workspace --exclude openfirma-gui --target ${{ matrix.target }}
 
       - name: build CLI
-        run: cargo build --release --target ${{ matrix.target }} --bin openfirma
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin openfirma
 
       # The window ships where its toolkit builds (gui: true above): the
       # runner's native targets. The cross compilations — x86_64 binaries
@@ -94,7 +104,7 @@ jobs:
       # artifacts hold the GUI.
       - name: build GUI
         if: matrix.gui
-        run: cargo build --release --target ${{ matrix.target }} -p openfirma-gui --bin openfirma-gui
+        run: cargo build --release --locked --target ${{ matrix.target }} -p openfirma-gui --bin openfirma-gui
 
       # Third-party licence report: MIT/Apache/BSD/ISC/Zlib/OFL all require
       # their notices to travel with the binaries, so `cargo about` renders
@@ -163,9 +173,36 @@ jobs:
             *.sha256
           if-no-files-found: error
 
+  # A tag publishes only over a green suite of ITS OWN commit (round two's N-5:
+  # publish used to depend on the build legs alone, so CI being red at tag time
+  # was nobody's problem). This is not the authoritative gate — ci.yml on main
+  # stays that, with the crosscheck tools and the keystores installed and
+  # OPENFIRMA_REQUIRE_TESTS turning any skip into a failure. What this job adds
+  # is the ordering: nothing reaches the release page while the same commit's
+  # tests fail. It generates the test PKI and runs without REQUIRE_TESTS, so a
+  # missing SoftHSM or xmlsec1 skips here instead of failing; that is stated
+  # rather than papered over, because "the tag's tests were red" is the failure
+  # this job exists to catch and nothing else.
+  test:
+    name: test ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      # eframe links the X11/xkb client libraries at check time on Linux, or the
+      # workspace test build dies in the sys crates (the same list ci.yml's lint
+      # and legs install).
+      - run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev
+      - run: bash tools/gen-testcert.sh
+      - run: cargo test --workspace --locked
+
   publish:
-    needs: build
+    needs: [build, test]
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -181,6 +218,7 @@ jobs:
         # the `gui: true` entries, nothing else. (H-21, review 07: these notes
         # once claimed aarch64 Windows carried the window and called the arm64
         # Linux runner "cross"; both were false.)
+        #
         run: |
           {
             echo ""
