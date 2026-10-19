@@ -72,21 +72,35 @@ fn desktop_entry_usable(binary: &Path) -> Result<(), String> {
 /// Exec="/opt/AutoFirma/AutoFirma" afirma-uri %u
 /// ```
 ///
-/// and openfirma reproduces it exactly: the binary path in double quotes
-/// escaped as a G_TOKEN_STRING (backslashes and `"` doubled — what GNOME's
-/// GKeyFile unescapes back into the original path), the marker argument
-/// `afirma-uri` next, and `%u` OUTSIDE any quotes so the browser substitutes
-/// the URI itself. An earlier revision put `"%u"` in quotes with `\s`-escaped
-/// paths; Chrome under X11 hands the handler a leading double quote then, and
-/// every real sede call died on "URI does not start with afirma://" while the
-/// registration looked healthy (that is what A-1 observed).
+/// and openfirma reproduces it exactly: the binary path in double quotes, the
+/// marker argument `afirma-uri` next, and `%u` OUTSIDE any quotes so the browser
+/// substitutes the URI itself. An earlier revision put `"%u"` in quotes with
+/// `\s`-escaped paths; Chrome under X11 hands the handler a leading double quote
+/// then, and every real sede call died on "URI does not start with afirma://"
+/// while the registration looked healthy (that is what A-1 observed).
+///
+/// The quoting is TWO escaping layers, and finding 04-N10 is what happens when
+/// they are treated as one. The FILE is a GLib key file, whose escapes are `\\`
+/// (and `\n`/`\t`/`\r`/`\s`): a backslash before a quote is not one of them, so
+/// glib refuses the whole file and `gio launch` answers "Unable to load
+/// application information" — while `desktop-file-validate` sees nothing wrong.
+/// The VALUE is a desktop-entry `Exec` line, parsed shell-like: inside double
+/// quotes a backslash escapes `"` and `\` and is literal before anything else.
+/// So a quote in the path has to reach glib's value as `\"`, which in the file
+/// is `\\"`; both layers are applied in that order below, and the integration
+/// test hands the result to `gio` to see the program actually start.
 pub fn linux_desktop_entry(binary: &Path) -> Result<String, String> {
     desktop_entry_usable(binary)?;
-    let escaped = binary
+    // Layer 1: the quoted argument as the Exec parser wants it.
+    let argument = binary
         .display()
         .to_string()
         .replace('\\', r"\\")
-        .replace('"', "\\\"");
+        .replace('"', r#"\""#);
+    // Layer 2: those backslashes as the key file wants them. Every backslash
+    // the first layer wrote is doubled here, which is also why the key file's
+    // other escapes are unreachable from a path.
+    let escaped = argument.replace('\\', r"\\");
     Ok(format!(
         "[Desktop Entry]\n\
          Version=1.0\n\
@@ -916,6 +930,15 @@ mod tests {
             "/home/Ana María/bin/openfirma",
             "/opt/Local Tools/openfirma",
             r"C:\Archivos\openfirma",
+            // 04-N10: a quote in the path is what the old one-layer escaping
+            // could not write, and a backslash NEXT TO one is the case where
+            // the two layers have to be told apart (the quote needs an Exec
+            // escape inside a key-file escape; the backslash needs two of
+            // each).
+            "/home/los \"jefes\"/bin/openfirma",
+            r"/home/back\slash\bin/openfirma",
+            r"/home/two\\backslashes\bin/openfirma",
+            r#"/home/a\"b/bin/openfirma"#,
         ] {
             let entry = linux_desktop_entry(Path::new(path))
                 .unwrap_or_else(|e| panic!("{path} debe generar un entry válido: {e}"));
@@ -941,22 +964,56 @@ mod tests {
                 !quoted_path.contains("%u"),
                 "%u no puede caer dentro de la comilla de la ruta: {exec}"
             );
-            // G_TOKEN_STRING unescaping (what GKeyFile does): `\\` → `\`,
-            // `\"` → `"`, everything else literal. Round-tripping must give
-            // the original path back, spaces included.
-            let mut restored = String::new();
-            let mut chars = quoted_path.chars();
-            while let Some(c) = chars.next() {
-                if c == '\\' {
-                    match chars.next() {
-                        Some(n) => restored.push(n),
-                        None => panic!("escape suelto en {exec}"),
+            // And the two layers undone, in the order a desktop reads them,
+            // must give the original path back byte for byte — spaces, quotes
+            // and backslashes included (04-N10).
+            //
+            // Layer 1, glib reading the FILE: `\\` → `\`; every other escape
+            // glib knows (`\n`, `\t`, `\r`, `\s`) is unreachable here because
+            // layer 2 doubles every backslash this text has.
+            fn key_file_unescape(text: &str) -> String {
+                let mut out = String::new();
+                let mut it = text.chars();
+                while let Some(c) = it.next() {
+                    if c == '\\' {
+                        match it.next() {
+                            Some(n) => out.push(n),
+                            None => panic!("escape suelto al final de {text}"),
+                        }
+                    } else {
+                        out.push(c);
                     }
-                } else {
-                    restored.push(c);
                 }
+                out
             }
-            assert_eq!(restored, path, "{exec}");
+            // Layer 2, the desktop entry's Exec parser reading a QUOTED
+            // argument, which is shell-like: a backslash escapes `"` and `\`,
+            // and before anything else it stays a literal backslash
+            // (g_shell_parse_argv's rule inside double quotes).
+            fn exec_unescape_in_quotes(text: &str) -> String {
+                let mut out = String::new();
+                let mut it = text.chars();
+                while let Some(c) = it.next() {
+                    if c != '\\' {
+                        out.push(c);
+                        continue;
+                    }
+                    match it.next() {
+                        Some(n @ ('"' | '\\')) => out.push(n),
+                        Some(n) => {
+                            out.push('\\');
+                            out.push(n);
+                        }
+                        None => panic!("escape suelto al final de {text}"),
+                    }
+                }
+                out
+            }
+            assert_eq!(
+                exec_unescape_in_quotes(&key_file_unescape(quoted_path)),
+                path,
+                "el Exec escrito es {exec}"
+            );
         }
     }
 

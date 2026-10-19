@@ -315,9 +315,12 @@ jobs:
       # gnutls-bin joins for p11tool, the one tool that can clear CKA_PRIVATE:
       # the "key WITHOUT a login" token that review 04, N6's test needs is built
       # with it, and without the package that test would skip on every runner.
+      # libglib2.0-bin carries `gio`: the browser tests hand the desktop entry
+      # --register writes to the parser that actually refused it (finding
+      # 04-N10), and desktop-file-validate is not that parser.
       - name: install PKCS#11 test modules and crosscheck tools (linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc libnss3 gnutls-bin qpdf poppler-utils xmlsec1
+        run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc libnss3 gnutls-bin libglib2.0-bin qpdf poppler-utils xmlsec1
 
       # The crosscheck pair on macOS (H-1): qpdf and pdfsig (poppler) have no
       # base-system equivalent there, and require_or_skip now fails the suite
