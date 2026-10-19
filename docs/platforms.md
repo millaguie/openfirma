@@ -16,7 +16,7 @@ in format code, ever.
 | Capability | Windows | macOS | Linux | Rust approach |
 |---|---|---|---|---|
 | System certificate store | CAPI/CNG via hand-written FFI (`windows.rs`) | refused until testable (`macos.rs`, see ADR-0004) | none canonical, use PKCS#11 + NSS | one `SystemStore` trait per `cfg(target_os)` backend |
-| Non exportable keys, sign with OS key | NCrypt / CAPI CSP | `SecKeyCreateSignature` | PKCS#11 | platform bindings |
+| Non exportable keys, sign with OS key | CAPI CSP (`CryptSignHash`, PKCS#1 v1.5); a CNG-only key is refused by name — no NCrypt signer yet | `SecKeyCreateSignature` | PKCS#11 | platform bindings |
 | PKCS#11 tokens | vendor DLL | vendor dylib | `pkcs11-module` via p11-kit | openfirma-keystore loads the module at runtime with `libloading` (hand-written Cryptoki types, no bindings crate). The musl static release binary cannot `dlopen`, so that artifact is PKCS#12-only; use the glibc build for `--store pkcs11:`/`nss`. **Windows: compiled and linted, never run against a real module** — CI provisions no SoftHSM there, so the tested module path is Linux |
 | Smartcards, DNIe | WinSCard | WinSCard equivalent (PCSC.framework) | pcsclite | `pcsc` crate, one API on all three |
 | Firefox / NSS store | cert9.db | cert9.db | cert9.db | open softokn3 through PKCS#11 (loaded with `libloading`), no sqlite needed |

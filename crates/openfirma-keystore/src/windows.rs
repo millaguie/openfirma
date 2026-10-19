@@ -274,6 +274,12 @@ const CRYPT_ACQUIRE_SILENT_FLAG: u32 = 0x0000_0040;
 const CERT_NCRYPT_KEY_SPEC: u32 = 0xFFFF_FFFF;
 /// `HP_HASHVAL`: read the hash value back out of a hash object.
 const HP_HASHVAL: u32 = 0x0002;
+/// `NTE_BAD_ALGID`: the CSP was asked for a digest it does not implement.
+/// `CryptCreateHash` answers this for SHA-256 on a `PROV_RSA_FULL` provider —
+/// the provider Windows assigns to a double-clicked `.pfx` — and the code says
+/// so out loud instead of re-opening the key container as `PROV_RSA_AES`
+/// (review 04, N10: see `capi_sign_prehash`).
+const NTE_BAD_ALGID: i32 = 0x8009_0008u32 as i32;
 /// The CNG algorithm ids for the plain-SHA hash objects that carry a caller-
 /// computed digest into CryptSignHash (CAPI has no "digest already" id, so we
 /// create an empty hash object, set its value with HP_HASHVAL and sign it).
@@ -593,6 +599,30 @@ unsafe extern "system" {
 fn capi_sign_prehash(prov: usize, spec: u32, alg: DigestAlg, prehash: &[u8]) -> Result<Vec<u8>> {
     let mut hash = 0usize;
     if unsafe { CryptCreateHash(prov, calg_for(alg), 0, 0, &mut hash) } == 0 {
+        // NTE_BAD_ALGID is a CSP that cannot hash this digest at all, and the
+        // classic case is SHA-256 on a `PROV_RSA_FULL` provider ("Microsoft
+        // Enhanced Cryptographic Provider v1.0") — which is exactly where
+        // Windows puts the key of a double-clicked `.pfx`. .NET and SunMSCAPI
+        // get past it by re-opening the same key container as `PROV_RSA_AES`.
+        // openfirma does not, deliberately (review 04, N10): the retry would be
+        // Windows-only code that cannot be built or run on this project's
+        // development machine, and a wrong provider or container pick does not
+        // fail loudly — it signs with whatever key it finds, which is worse
+        // than an error the user can act on. So the failure names its cause
+        // here, and the limitation is declared in README and docs/platforms.md.
+        let code = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_default();
+        if code == NTE_BAD_ALGID {
+            return Err(Error::Keystore(format!(
+                "this certificate's CSP has no {} digest to sign (Win32 error {:#010x}, \
+                 NTE_BAD_ALGID): a legacy PROV_RSA_FULL provider, where Windows puts a \
+                 double-clicked .pfx, cannot compute SHA-2. Re-import the key into a \
+                 PROV_RSA_AES provider, or sign through the card's PKCS#11 interface",
+                alg.name(),
+                code as u32
+            )));
+        }
         return Err(last_error("CryptCreateHash"));
     }
     // HP_HASHVAL carries the digest into the object. The pointer is read-only
