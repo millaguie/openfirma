@@ -82,6 +82,7 @@ fn cms_verdicts(
         Ok(reports) => Ok(VerdictList {
             lines: reports.iter().map(|r| valid_line(r, tr)).collect(),
             notes: Vec::new(),
+            document: None,
         }),
         Err(Error::Verification(msg)) => {
             // Not a CMS at all is a verdict about the FILE, not about each
@@ -103,6 +104,7 @@ fn cms_verdicts(
             Ok(VerdictList {
                 lines,
                 notes: Vec::new(),
+                document: None,
             })
         }
         Err(e) => Err(e),
@@ -232,8 +234,22 @@ fn pdf_verdicts(
             }
             let mut list = VerdictList {
                 lines: Vec::new(),
+                // 06-N-3: everything under `other_notes` is a failure the
+                // library could NOT attribute to one signature (the
+                // certification gate, a document time-stamp, the /DSS), so it
+                // is the DOCUMENT that failed. It says so in front, in plain
+                // language, and no line below may then read "Firma válida":
+                // `pades_verify` returns Err for these files and the CLI exits
+                // 1, while the window painted every individually sound
+                // signature green over a document that is not valid.
+                document: if other_notes.is_empty() {
+                    None
+                } else {
+                    Some(document_reason(&other_notes, tr))
+                },
                 notes: other_notes,
             };
+            let document_failed = list.document.is_some();
             for (i, line) in lines.into_iter().enumerate() {
                 match line {
                     Some(l) => list.lines.push(l),
@@ -241,6 +257,9 @@ fn pdf_verdicts(
                         // This signature's part passed; say so from its own
                         // report rather than from the document's silence.
                         match verify_one_pdf_signature(bytes, i, opts) {
+                            Ok(r) if document_failed => {
+                                list.lines.push(sound_line_on_a_failed_document(&r, tr))
+                            }
                             Ok(r) => list.lines.push(valid_line(&r, tr)),
                             Err(e) => list.lines.push(unknown_line(
                                 verdict_about_file(&e.to_string(), tr),
@@ -428,7 +447,11 @@ fn pdf_list_from_report(report: &openfirma_pades::DocumentReport, tr: &Tr) -> Ve
             ));
         }
     }
-    VerdictList { lines, notes }
+    VerdictList {
+        lines,
+        notes,
+        document: None,
+    }
 }
 
 /// The green line of a signature every check passed.
@@ -442,6 +465,36 @@ fn valid_line(r: &VerifyReport, tr: &Tr) -> VerdictLine {
         trust_anchor: Some(r.trust_anchor.clone()),
         technical: technical_of(r),
     }
+}
+
+/// The line of a signature whose OWN checks passed while the document as a
+/// whole failed (06-N-3). Everything the verifier proved about this signer is
+/// kept — name, time, chain, the technical block — and the status is amber
+/// with the one qualifier that is true: the signature is sound, the document
+/// is not. Green here would undo the refusal the CLI exits 1 for, and it is
+/// exactly what a person reads as "todo bien".
+fn sound_line_on_a_failed_document(r: &VerifyReport, tr: &Tr) -> VerdictLine {
+    let mut line = valid_line(r, tr);
+    line.status = crate::wizard::VerdictStatus::Unknown;
+    line.why_not = Some(tr.verdict_document_signature_alone.clone());
+    line
+}
+
+/// Which sentence a document-level refusal earns: the layer the library named,
+/// said in the interface language. Only the layers this project can name are
+/// mapped; a refusal nobody recognised keeps `plain_reason`'s honest "Motivo:
+/// <the library's first clause>", and the library's whole sentence is in the
+/// notes either way.
+fn document_reason(chunks: &[String], tr: &Tr) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.contains("/DocMDP") {
+            parts.push(tr.reason_document_certified.clone());
+        } else {
+            parts.push(plain_reason(chunk, tr));
+        }
+    }
+    parts.join(" ")
 }
 
 /// The red line of one failing signer: plain reason in front, the library's
@@ -481,6 +534,7 @@ fn one_unknown(why: String, technical: String) -> VerdictList {
             technical: vec![technical],
         }],
         notes: Vec::new(),
+        document: None,
     }
 }
 

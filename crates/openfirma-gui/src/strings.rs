@@ -69,6 +69,15 @@ pub struct Tr {
     pub verdict_invalid: String,
     pub verdict_unknown: String,
     pub verdict_unsigned: String,
+    /// 06-N-3: the headline of a failure that belongs to the DOCUMENT and to
+    /// no single signature. No line under it may read "Firma válida".
+    pub verdict_document_invalid: String,
+    /// What a signature line may say at most once that headline stands: its
+    /// own checks passed, the document did not.
+    pub verdict_document_signature_alone: String,
+    /// The certification refusal of the document, in plain language (the
+    /// library's own sentence rides behind the notes).
+    pub reason_document_certified: String,
     /// A drop refused while a finished signature still stands unacknowledged
     /// on the Done screen (M-8's never-lose rule in its drop form).
     pub drop_while_done: String,
@@ -220,6 +229,14 @@ impl Tr {
             verdict_invalid: "La firma NO es válida".into(),
             verdict_unknown: "No se puede confirmar la validez de esta firma".into(),
             verdict_unsigned: "Este archivo no tiene ninguna firma".into(),
+            verdict_document_invalid: "El documento NO se puede dar por válido".into(),
+            verdict_document_signature_alone: "la firma en sí es correcta, pero el documento NO"
+                .into(),
+            reason_document_certified:
+                "está certificado con la restricción «no se permiten cambios» (/Perms /DocMDP \
+                 /P 1) y hay firmas o cambios posteriores a esa certificación: ningún lector \
+                 conforme da por buena una certificación rota"
+                    .into(),
             drop_while_done: "Termina primero con la firma que tienes en pantalla: guarda o \
                               descarta su resultado antes de abrir otro archivo."
                 .into(),
@@ -357,6 +374,15 @@ impl Tr {
             verdict_invalid: "The signature is NOT valid".into(),
             verdict_unknown: "The signature's validity cannot be confirmed".into(),
             verdict_unsigned: "This file carries no signature".into(),
+            verdict_document_invalid: "The document cannot be held valid".into(),
+            verdict_document_signature_alone: "the signature itself is sound, but the document \
+                                              is NOT"
+                .into(),
+            reason_document_certified:
+                "it is certified with «no changes permitted» (/Perms /DocMDP /P 1) and carries \
+                 signatures or changes after that certification: no conforming reader holds a \
+                 broken certification sound"
+                    .into(),
             drop_while_done: "Finish with the signature on screen first: save or discard its \
                               result before opening another file."
                 .into(),
@@ -492,6 +518,9 @@ mod tests {
                 &tr.verdict_invalid,
                 &tr.verdict_unknown,
                 &tr.verdict_unsigned,
+                &tr.verdict_document_invalid,
+                &tr.verdict_document_signature_alone,
+                &tr.reason_document_certified,
                 &tr.signer_line,
                 &tr.signed_at_line,
                 &tr.declared_time_note,

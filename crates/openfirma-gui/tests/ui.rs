@@ -584,6 +584,48 @@ fn the_windows_own_csig_verifies_against_its_original_and_asks_when_it_is_gone()
 }
 
 #[test]
+fn a_document_that_fails_as_a_whole_is_never_a_valid_signature() {
+    // 06-N-3, through the window and its real worker. On a PDF certified with
+    // `/Perms /DocMDP` `/P 1` and then signed anyway, `pades_verify` answers
+    // Err about the DOCUMENT — its sentence carries no per-signature label —
+    // while each signature holds over the bytes it covers. The window
+    // re-verified the signatures one by one, found them sound, and painted
+    // "Firma válida" over a file `openfirma verify` exits 1 for, with the
+    // library's own English sentence pushed off the bottom edge. What the
+    // screen must say instead: the document's refusal first, in Spanish, and
+    // not one green line under it.
+    let Some(pdf) = certified_then_signed_pdf() else {
+        eprintln!("SKIP: the test PKI is absent, run tools/gen-testcert.sh");
+        return;
+    };
+    let dir = temp_doc("document-failure");
+    let doc = dir.join("certificado.pdf");
+    std::fs::write(&doc, &pdf).unwrap();
+
+    let mut app = fixture_app(Some(testdata().join("certs/chain.crt")));
+    app.load_path_for_test(doc.clone());
+    let mut harness = harness_for(app);
+    harness.run(); // the anchor question fires and the fixture answers it
+    drain_worker(&mut harness);
+    harness.run();
+    assert!(
+        matches!(
+            harness.state().screen_ref_for_test(),
+            Screen::Verified { .. }
+        ),
+        "a verdict, never an error screen: the library refused the document"
+    );
+    harness.get_by_label_contains("El documento NO se puede dar por válido");
+    harness.get_by_label_contains("la firma en sí es correcta, pero el documento NO");
+    assert!(
+        harness.query_by_label_contains("Firma válida").is_none(),
+        "no line may read as valid while the document as a whole is refused"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn verdict_details_stay_open_across_frames_and_say_hiding() {
     // M-3, pinned: the old details checkbox reset itself every frame, so no
     // technical block was ever readable. The toggle is screen state now — one
@@ -602,6 +644,7 @@ fn verdict_details_stay_open_across_frames_and_say_hiding() {
                 technical: vec!["messageDigest check failed: digest-xyz".into()],
             }],
             notes: Vec::new(),
+            document: None,
         },
         details_open: vec![false],
     });
@@ -1055,4 +1098,76 @@ fn verify_after_gui_sign(signed: &Path) {
     };
     let document = openfirma_pades::pades_verify(&bytes, &opts).expect("the GUI's output verifies");
     assert_eq!(document.signatures.len(), 1);
+}
+
+/// A one-page PDF whose catalog is exactly `catalog`, closed by an honest
+/// classic cross-reference table: the smallest document the certification
+/// gate can walk a `/Prev` chain on. Built here, never committed as a binary.
+fn one_page_pdf(catalog: &str) -> Vec<u8> {
+    let bodies = [
+        catalog,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>",
+    ];
+    let mut out = Vec::from(&b"%PDF-1.4\n"[..]);
+    let mut offsets = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref_at = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for o in &offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// 06-N-3's file: a PDF certified with `/Perms /DocMDP` `/P 1` ("no changes
+/// permitted") that then received a signature, built with the library's own
+/// signer the way the pades suite builds it. `pades_verify` refuses the
+/// DOCUMENT — the certification is broken by what followed it — while the
+/// signature is sound over its own bytes. That is the file `openfirma verify`
+/// exits 1 for, and the one the window painted "Firma válida" over.
+fn certified_then_signed_pdf() -> Option<Vec<u8>> {
+    use openfirma_core::cert::CertificateHandle;
+    use openfirma_core::signer::SoftwareSigner;
+    let certs = testdata().join("certs");
+    let (Ok(cert), Ok(key)) = (
+        std::fs::read_to_string(certs.join("signer-rsa.crt")),
+        std::fs::read_to_string(certs.join("signer-rsa.key")),
+    ) else {
+        return None;
+    };
+    let signer = SoftwareSigner::from_pkcs8_pem(&cert, &key).expect("the test PKI is unusable");
+    let chain: Vec<CertificateHandle> = ["intermediate.crt", "ca.crt"]
+        .iter()
+        .map(|c| {
+            CertificateHandle::from_pem(&std::fs::read_to_string(certs.join(c)).unwrap())
+                .expect("the test PKI is incomplete")
+        })
+        .collect();
+    let doc = one_page_pdf(
+        "<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP << /TransformParams \
+         << /P 1 >> >> >> >>",
+    );
+    let opts = openfirma_pades::PadesOptions {
+        // The certification is the fixture's premise: openfirma signs a
+        // certified document only when told to, exactly as AutoFirma asks.
+        allow_signing_certified: true,
+        ..openfirma_pades::PadesOptions::default()
+    };
+    Some(
+        openfirma_pades::pades_sign(&doc, &signer.with_chain(chain), &opts)
+            .expect("the fixture signs"),
+    )
 }

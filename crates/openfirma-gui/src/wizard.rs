@@ -256,6 +256,15 @@ pub struct VerdictList {
     /// Document-level notes that are not a signature verdict (unsigned doc,
     /// validation data present…) as plain sentences.
     pub notes: Vec<String>,
+    /// The DOCUMENT's own refusal, when the verifier answered `Err` for a
+    /// reason that belongs to no single signature (06-N-3): a certification
+    /// broken by what was signed after it, a document time-stamp followed by
+    /// changes, unreadable validation data. It is the screen's first sentence
+    /// — in the interface language, in red — and while it stands no line may
+    /// read "Firma válida", however sound a signature is over its own bytes:
+    /// the CLI already refuses these files with rc=1, and the window painted
+    /// the same bytes green.
+    pub document: Option<String>,
 }
 
 impl core::fmt::Debug for VerdictList {

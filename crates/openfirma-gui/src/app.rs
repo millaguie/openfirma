@@ -1620,6 +1620,21 @@ impl App {
         if verdicts.lines.is_empty() {
             ui.label(tr.verdict_unsigned.clone());
         }
+        // 06-N-3: when the verifier refused the DOCUMENT — a failure it could
+        // not pin on one signature — that refusal is the screen's first
+        // sentence, in this language, in red. No line under it may read
+        // "Firma válida": the library returned Err for this file and the CLI
+        // exits 1, so a green line here would be the project's exact false
+        // success, over a document every conforming reader flags.
+        if let Some(reason) = &verdicts.document {
+            let sentence = format!("{} — {reason}", tr.verdict_document_invalid);
+            ui.label(
+                RichText::new(sentence)
+                    .color(ui.visuals().error_fg_color)
+                    .strong(),
+            );
+            ui.add_space(6.0);
+        }
         egui::ScrollArea::vertical()
             .id_salt("verdicts")
             .auto_shrink([false, false])
