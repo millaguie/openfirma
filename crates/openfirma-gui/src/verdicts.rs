@@ -409,13 +409,8 @@ fn pdf_list_from_report(report: &openfirma_pades::DocumentReport, tr: &Tr) -> Ve
             .iter()
             .filter(|t| t.verified())
             .count();
-        if verified == total {
-            notes.push(format!(
-                "El documento lleva {total} sello(s) de tiempo de documento (nivel B-LTA): la \
-                 firma de la autoridad de sellado de cada uno se ha verificado, y cada sello \
-                 certifica todos los bytes anteriores al momento del sellado."
-            ));
-        } else if verified == 0 {
+        let total = total.to_string();
+        if verified == 0 {
             // A seal whose TSA signature did not verify is not a B-LTA level:
             // saying it were would be the exact false green this project bans
             // (review A2). Say what was seen, not what a level would claim.
@@ -423,17 +418,17 @@ fn pdf_list_from_report(report: &openfirma_pades::DocumentReport, tr: &Tr) -> Ve
                 .document_timestamps
                 .iter()
                 .find_map(|t| t.problem.clone())
-                .unwrap_or_else(|| "no se pudo comprobar".into());
-            notes.push(format!(
-                "El documento lleva {total} sello(s) de tiempo de documento, pero la firma de \
-                 su autoridad de sellado NO se ha podido verificar ({why}). NO se afirma el \
-                 nivel B-LTA: un sello sin verificar no certifica nada."
+                .unwrap_or_else(|| tr.note_unchecked_reason.clone());
+            notes.push(Tr::fill(
+                &tr.note_lta_none,
+                &[("total", &total), ("why", &why)],
             ));
+        } else if verified == report.document_timestamps.len() {
+            notes.push(Tr::fill(&tr.note_lta_all, &[("total", &total)]));
         } else {
-            notes.push(format!(
-                "El documento lleva {total} sello(s) de tiempo de documento, de los que \
-                 {verified} tienen la firma de su autoridad verificada. NO se afirma el nivel \
-                 B-LTA mientras alguno quede sin verificar."
+            notes.push(Tr::fill(
+                &tr.note_lta_some,
+                &[("total", &total), ("verified", &verified.to_string())],
             ));
         }
     }
@@ -444,28 +439,33 @@ fn pdf_list_from_report(report: &openfirma_pades::DocumentReport, tr: &Tr) -> Ve
         // counted as unchecked instead (06-C-1), and the sentence says so
         // rather than moving the number silently.
         let checked = dss.ocsps + dss.crls.len();
-        notes.push(format!(
-            "El documento guarda datos de validación ({} certificados, {} CRLs, {} respuestas \
-             OCSP). {checked} dato(s) se han comprobado (legibles, y cada uno firmado por la \
-             autoridad que lo emite){}",
-            dss.certificates,
-            dss.crls.len(),
-            dss.ocsps,
-            if dss.unchecked == 0 {
-                ".".to_string()
-            } else {
-                format!(
-                    "; {} NO se han podido comprobar, porque los emitió una autoridad que no \
-                     está entre las configuradas.",
-                    dss.unchecked
-                )
-            }
+        notes.push(Tr::fill(
+            &tr.note_dss_checked,
+            &[
+                ("certs", &dss.certificates.to_string()),
+                ("crls", &dss.crls.len().to_string()),
+                ("ocsps", &dss.ocsps.to_string()),
+                ("checked", &checked.to_string()),
+                (
+                    "unchecked",
+                    &if dss.unchecked == 0 {
+                        ".".to_string()
+                    } else {
+                        Tr::fill(
+                            &tr.note_dss_unchecked,
+                            &[("unchecked", &dss.unchecked.to_string())],
+                        )
+                    },
+                ),
+            ],
         ));
         for chain in &dss.chains {
-            notes.push(format!(
-                "La cadena de la firma {} se reconstruye solo con los datos del documento: {}.",
-                chain.signature,
-                chain.subjects.join(" -> ")
+            notes.push(Tr::fill(
+                &tr.note_dss_chain,
+                &[
+                    ("n", &chain.signature.to_string()),
+                    ("chain", &chain.subjects.join(" -> ")),
+                ],
             ));
         }
     }

@@ -114,7 +114,7 @@ cargo run -- sign -i doc.pdf -o doc.lt.pdf --format pades-b-lt \
 cargo run -- verify -i doc.csig --content doc.txt --trust testdata/certs/ca.crt
 cargo run -- verify -i doc.signed.pdf --trust testdata/certs/ca.crt
 cargo test                       # includes the OpenSSL crosschecks
-cargo run -p openfirma-gui       # the window (Spanish UI; docs/adr/0006-gui-toolkit.md)
+cargo run -p openfirma-gui       # the window (Spanish and English; docs/adr/0006-gui-toolkit.md)
 ```
 
 The GUI needs no flags: drop the document, pick the certificate, sign — the

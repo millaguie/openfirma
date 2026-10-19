@@ -112,16 +112,19 @@ rfd = "0.16"
 # `accesskit`: the platform accessibility tree (a screen reader must be able
 # to read this window — finding A-2). It was a production gap before: only
 # the dev-dependency egui_kittest pulled it in, so tests exercised an a11y
-# layer the shipped binary never built. The `clipboard` feature is NOT turned
-# on deliberately: its Linux half needs `smithay-clipboard`, which is not in
-# the vendored offline registry (it would break `cargo --offline` and CI),
-# while this app copies through rfd/std::process instead (see app.rs).
+# layer the shipped binary never built. `clipboard` is ON (review 06, A-2):
+# without it egui's copy command only moved text inside the process, so the
+# Done screen's "Copiar ruta" button copied nothing a user could paste. Its
+# Linux half is `arboard` + `smithay-clipboard`, both in the registry and both
+# pure Rust (no C beyond what the window stack already links); the earlier
+# comment here claimed they were absent, which was simply wrong.
 eframe = { version = "0.37", default-features = false, features = [
     "glow",
     "x11",
     "wayland",
     "default_fonts",
     "accesskit",
+    "clipboard",
 ] }
 egui = "0.37"
 # The windowless UI test harness of egui (ADR-0006): it drives the widget tree

@@ -660,6 +660,72 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
 }
 
 #[test]
+fn adding_a_keystore_shows_a_spinner_and_the_drop_waits_for_it() {
+    // 06-N-10 through the real widgets and the real worker. Answering the
+    // add-keystore form used to load a module and log in INSIDE the frame — a
+    // card that takes seconds froze the window on a painted button — and a
+    // drop arriving meanwhile replaced the very screen the job was going to
+    // answer into. Now: the picker parks behind a spinner, a drop while it
+    // opens is refused out loud, and the picker comes back with the store's
+    // own line under the store's own name.
+    let dir = temp_doc("store-open");
+    let doc = dir.join("doc.pdf");
+    let other = dir.join("otro.pdf");
+    let inputs = testdata().join("inputs/simple.pdf");
+    if require(inputs.is_file(), "testdata/inputs/simple.pdf").is_none() {
+        return;
+    }
+    std::fs::copy(&inputs, &doc).unwrap();
+    std::fs::copy(&inputs, &other).unwrap();
+
+    let mut app = fixture_app(None);
+    app.load_path_for_test(doc.clone());
+    let mut harness = harness_for(app);
+    harness.run();
+    harness
+        .get_by_label("Otro almacén (escribe su ruta o nombre)…")
+        .click();
+    harness.run();
+    // A module that does not exist: the failure is the store's own, answered
+    // as fast as an OS can say "no such file", and nothing about it depends on
+    // a card being in a reader.
+    harness
+        .state_mut()
+        .set_descriptor_for_test("pkcs11:/no/existe/modulo.so");
+    harness.get_by_label("Abrir").click();
+    harness.step(); // a spinner repaints forever: never `run`, one step
+    assert!(
+        matches!(
+            harness.state().screen_ref_for_test(),
+            Screen::OpeningStore { .. }
+        ),
+        "the open runs off the UI thread: the picker is parked, not blocked"
+    );
+
+    // A drop while the store opens: refused out loud (the one thing at a time
+    // rule covers drops), and the parked picker is exactly where it was.
+    harness.state_mut().load_path_from_cli(other.clone());
+    assert!(matches!(
+        harness.state().screen_ref_for_test(),
+        Screen::OpeningStore { .. }
+    ));
+
+    drain_worker(&mut harness);
+    harness.run();
+    harness.get_by_label_contains("Termina primero la operación");
+    assert!(
+        matches!(harness.state().screen_ref_for_test(), Screen::Picked { .. }),
+        "the picker comes back, with the document it held"
+    );
+    harness.get_by_label_contains("no se ha podido abrir el almacén");
+    assert!(
+        harness.state().pending_note_for_test().is_some(),
+        "and it still says the drop was refused while it worked"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn no_configured_authority_is_an_amber_verdict_never_a_green_one() {
     // 06-C-1, through the window and its real worker. On a machine with no
     // authority configured, dropping a signed PDF used to open a file dialog

@@ -12,10 +12,26 @@ use openfirma_core::Result;
 
 /// The unsigned-attribute timestamp provider for one URL, with the GUI's
 /// https refusal text. Plain http only — see `openfirma_cades::tsa`.
-pub fn provider(url: &str) -> Result<openfirma_cades::TimestampFn> {
-    openfirma_cades::tsa::provider(url, HTTPS_REFUSAL, |source, _token| {
-        warn_if_token_unverified(source);
+pub fn provider(
+    url: &str,
+    unchecked: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<openfirma_cades::TimestampFn> {
+    let unchecked = std::sync::Arc::clone(unchecked);
+    openfirma_cades::tsa::provider(url, HTTPS_REFUSAL, move |source, _token| {
+        note_token_seen(&unchecked, source);
     })
+}
+
+/// What happens for every token this window embeds: it can prove WHAT it
+/// covers and never WHO made it (M-11). The flag carries that fact back to the
+/// screen the citizen is looking at — the Done screen turns it into the
+/// sentence that says a stamp nobody verified proves the time only if you
+/// trust its issuer; the stderr line is for whoever started the window from a
+/// terminal. Split out so both halves of the piece are testable: that the
+/// callback fires is `openfirma_cades::tsa::provider`'s own tested rule.
+fn note_token_seen(unchecked: &std::sync::Arc<std::sync::atomic::AtomicBool>, source: &str) {
+    unchecked.store(true, std::sync::atomic::Ordering::SeqCst);
+    warn_if_token_unverified(source);
 }
 
 /// The message the window's own TSA field shows when someone types an https
@@ -41,6 +57,10 @@ fn warn_if_token_unverified(source: &str) {
 
 #[cfg(test)]
 mod tests {
+    fn unchecked_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
     /// The GUI and the CLI must refuse the same https url for the same reason
     /// (one rule, two frontends): the text is the window's, the decision is
     /// the crate's.
@@ -48,7 +68,7 @@ mod tests {
     fn an_https_tsa_url_is_refused_before_anything_connects() {
         // unwrap_err() would need the provider closure to be Debug; match
         // keeps the assertion about the MESSAGE, which is what matters here.
-        let err = match super::provider("https://tsa.example/tsa") {
+        let err = match super::provider("https://tsa.example/tsa", &unchecked_flag()) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("an https TSA url must be refused"),
         };
@@ -57,6 +77,21 @@ mod tests {
 
     #[test]
     fn a_plain_http_url_builds_a_provider() {
-        assert!(super::provider("http://127.0.0.1:1/tsa").is_ok());
+        assert!(super::provider("http://127.0.0.1:1/tsa", &unchecked_flag()).is_ok());
+    }
+
+    /// 06-N-11 (review M-11): the flag the Done screen reads is set by the one
+    /// function every embedded token goes through. Without this, a signature
+    /// carrying a stamp nobody verified looked exactly like one whose stamp
+    /// was checked.
+    #[test]
+    fn a_token_that_was_only_imprint_checked_raises_the_flag() {
+        let seen = unchecked_flag();
+        assert!(!seen.load(std::sync::atomic::Ordering::SeqCst));
+        super::note_token_seen(&seen, "the TSA at http://tsa.example/tsa");
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "the Done screen has to be told"
+        );
     }
 }

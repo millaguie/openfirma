@@ -39,6 +39,11 @@ pub struct Tr {
     pub store_dnie: String,
     pub store_opensc: String,
     pub store_fnmt: String,
+    /// 06-N-11: a Firefox/Chromium profile's NSS database is named by what it
+    /// IS. It used to borrow the "type its path" instruction as its label, so
+    /// the picker offered links all reading "another keystore" instead of the
+    /// browser they open.
+    pub store_firefox: String,
     /// Per-row badges under the certificate name (A-7).
     pub cert_issuer_line: String,
     pub cert_valid_until_line: String,
@@ -64,6 +69,9 @@ pub struct Tr {
     pub sign_another: String,
     /// Shown while the background thread signs (A-1): what it is waiting for.
     pub signing_in_progress: String,
+    /// 06-N-10: opening a keystore (module load + login) runs on the worker,
+    /// so the window says what it is waiting for instead of freezing.
+    pub opening_store: String,
     // --- verify -----------------------------------------------------------
     pub verdict_valid: String,
     pub verdict_invalid: String,
@@ -152,12 +160,39 @@ pub struct Tr {
     pub add_store_help: String,
     /// Folder-reveal failed (its own sentence; the OS error rides behind it).
     pub fail_open_folder: String,
-    /// Copying the path to the clipboard failed (no clipboard tool answered).
-    pub fail_copy_path: String,
     /// Saving to a chosen name failed (its own sentence).
     pub fail_save_as: String,
     /// A keystore with no signable certificate (catalog error line tail).
     pub store_no_private_key: String,
+    /// 06-N-10: the lead of a picker line about a store that refused to open.
+    /// Spanish, like every other sentence the window authors; the store's own
+    /// reason (often the library's English) rides after it, never instead.
+    pub store_open_failed: String,
+    // --- verdict notes (M-6/N-11): sentences about a whole document, with
+    //     named holes ({total}, {chain}) instead of `format!` placeholders, so
+    //     a translation can never break the build and a hole left unfilled is
+    //     visible on screen rather than a panic. `Tr::fill` is the one filler.
+    /// Every document time-stamp verified.
+    pub note_lta_all: String,
+    /// No document time-stamp verified: no B-LTA claim.
+    pub note_lta_none: String,
+    /// Some document time-stamps verified: no B-LTA claim.
+    pub note_lta_some: String,
+    /// The `/DSS` the document carries, everything checked.
+    pub note_dss_checked: String,
+    /// Tail of the same sentence when some archived datum could not be checked
+    /// (06-C-1: no authority configured).
+    pub note_dss_unchecked: String,
+    /// One rebuilt chain, from the archived data alone.
+    pub note_dss_chain: String,
+    /// The reason shown when nothing said why a token could not be checked.
+    pub note_unchecked_reason: String,
+    /// 06-N-11: the Done screen now names its lines — which one is the
+    /// DOCUMENT and which is the file this run wrote.
+    pub output_line: String,
+    /// Closing while a keystore opens (its own sentence: nothing is being
+    /// signed yet).
+    pub close_opening_store: String,
 }
 
 impl Tr {
@@ -207,6 +242,7 @@ impl Tr {
             store_dnie: "DNI electrónico".into(),
             store_opensc: "Tarjeta criptográfica (OpenSC)".into(),
             store_fnmt: "Certificado de la FNMT (AC CFv3)".into(),
+            store_firefox: "Firefox".into(),
             cert_issuer_line: "Emitido por".into(),
             cert_valid_until_line: "Válido hasta".into(),
             cert_expired: "caducado".into(),
@@ -228,6 +264,9 @@ impl Tr {
             copy_path: "Copiar ruta".into(),
             sign_another: "Firmar otro documento".into(),
             signing_in_progress: "Firmando. Si usas una tarjeta, tenla a mano…".into(),
+            opening_store: "Abriendo el almacén de certificados. Si usas una tarjeta, tenla a \
+                            mano…"
+                .into(),
             verdict_valid: "Firma válida".into(),
             verdict_invalid: "La firma NO es válida".into(),
             verdict_unknown: "No se puede confirmar la validez de esta firma".into(),
@@ -320,9 +359,39 @@ impl Tr {
                  base de Firefox/Chromium), o los almacenes del sistema."
                     .into(),
             fail_open_folder: "No se pudo abrir la carpeta:".into(),
-            fail_copy_path: "No se pudo copiar la ruta al portapapeles:".into(),
             fail_save_as: "No se pudo guardar:".into(),
             store_no_private_key: "no contiene ningún certificado con clave privada".into(),
+            store_open_failed: "no se ha podido abrir el almacén".into(),
+            note_lta_all: "El documento lleva {total} sello(s) de tiempo de documento (nivel \
+                           B-LTA): la firma de la autoridad de sellado de cada uno se ha \
+                           verificado, y cada sello certifica todos los bytes anteriores al \
+                           momento del sellado."
+                .into(),
+            note_lta_none: "El documento lleva {total} sello(s) de tiempo de documento, pero la \
+                            firma de su autoridad de sellado NO se ha podido verificar ({why}). \
+                            NO se afirma el nivel B-LTA: un sello sin verificar no certifica \
+                            nada."
+                .into(),
+            note_lta_some: "El documento lleva {total} sello(s) de tiempo de documento, de los \
+                            que {verified} tienen la firma de su autoridad verificada. NO se \
+                            afirma el nivel B-LTA mientras alguno quede sin verificar."
+                .into(),
+            note_dss_checked: "El documento guarda datos de validación ({certs} certificados, \
+                               {crls} CRLs, {ocsps} respuestas OCSP). {checked} dato(s) se han \
+                               comprobado (legibles, y cada uno firmado por la autoridad que lo \
+                               emite){unchecked}"
+                .into(),
+            note_dss_unchecked: "; {unchecked} NO se han podido comprobar, porque los emitió una \
+                                 autoridad que no está entre las configuradas."
+                .into(),
+            note_dss_chain: "La cadena de la firma {n} se reconstruye solo con los datos del \
+                             documento: {chain}."
+                .into(),
+            note_unchecked_reason: "no se pudo comprobar".into(),
+            output_line: "Fichero firmado".into(),
+            close_opening_store: "El almacén de certificados se está abriendo todavía. ¿Quieres \
+                                  cancelarlo y cerrar?"
+                .into(),
         }
     }
 
@@ -352,6 +421,7 @@ impl Tr {
             store_dnie: "Electronic ID card (DNIe)".into(),
             store_opensc: "Smart card (OpenSC)".into(),
             store_fnmt: "FNMT certificate (AC CFv3)".into(),
+            store_firefox: "Firefox".into(),
             cert_issuer_line: "Issued by".into(),
             cert_valid_until_line: "Valid until".into(),
             cert_expired: "expired".into(),
@@ -373,6 +443,8 @@ impl Tr {
             copy_path: "Copy path".into(),
             sign_another: "Sign another document".into(),
             signing_in_progress: "Signing. If you use a card, have it ready…".into(),
+            opening_store: "Opening the certificate store. If you use a card, have it ready…"
+                .into(),
             verdict_valid: "Signature is valid".into(),
             verdict_invalid: "The signature is NOT valid".into(),
             verdict_unknown: "The signature's validity cannot be confirmed".into(),
@@ -457,10 +529,51 @@ impl Tr {
                  Firefox/Chromium database), or the system keystores."
                     .into(),
             fail_open_folder: "The folder could not be opened:".into(),
-            fail_copy_path: "The path could not be copied to the clipboard:".into(),
             fail_save_as: "Could not save:".into(),
             store_no_private_key: "contains no certificate with a private key".into(),
+            store_open_failed: "the store could not be opened".into(),
+            note_lta_all: "The document carries {total} document time-stamp(s) (level B-LTA): \
+                           the sealing authority's signature was verified for each one, and \
+                           each stamp covers every byte before the moment it was made."
+                .into(),
+            note_lta_none: "The document carries {total} document time-stamp(s), but the \
+                            sealing authority's signature could NOT be verified ({why}). Level \
+                            B-LTA is NOT claimed: an unverified stamp certifies nothing."
+                .into(),
+            note_lta_some: "The document carries {total} document time-stamp(s), of which \
+                            {verified} have their authority's signature verified. Level B-LTA \
+                            is NOT claimed while any is left unverified."
+                .into(),
+            note_dss_checked: "The document carries validation data ({certs} certificates, \
+                               {crls} CRLs, {ocsps} OCSP responses). {checked} datum(a) were \
+                               checked (readable, and each one signed by the authority that \
+                               issued it){unchecked}"
+                .into(),
+            note_dss_unchecked: "; {unchecked} could NOT be checked, because the authority that \
+                                 issued them is not among the configured ones."
+                .into(),
+            note_dss_chain: "The chain of signature {n} rebuilds from the document's own data \
+                             alone: {chain}."
+                .into(),
+            note_unchecked_reason: "it could not be checked".into(),
+            output_line: "Signed file".into(),
+            close_opening_store: "The certificate store is still opening. Cancel it and close?"
+                .into(),
         }
+    }
+
+    /// Fill a table sentence's named holes (`{total}`, `{chain}`). The table
+    /// holds sentences with named holes rather than `format!` templates: a
+    /// translation can never break the build with a stray brace, and a hole
+    /// left unfilled stays visible on screen (`{total}`) instead of panicking.
+    /// `tests::every_hole_of_every_note_gets_filled` holds the other side —
+    /// each sentence is filled with exactly the holes it declares.
+    pub fn fill(template: &str, holes: &[(&str, &str)]) -> String {
+        let mut out = template.to_string();
+        for (name, value) in holes {
+            out = out.replace(&format!("{{{name}}}"), value);
+        }
+        out
     }
 }
 
@@ -500,6 +613,7 @@ mod tests {
                 &tr.store_dnie,
                 &tr.store_opensc,
                 &tr.store_fnmt,
+                &tr.store_firefox,
                 &tr.cert_issuer_line,
                 &tr.cert_valid_until_line,
                 &tr.cert_expired,
@@ -518,6 +632,7 @@ mod tests {
                 &tr.save_as,
                 &tr.sign_another,
                 &tr.signing_in_progress,
+                &tr.opening_store,
                 &tr.verdict_valid,
                 &tr.verdict_invalid,
                 &tr.verdict_unknown,
@@ -563,9 +678,18 @@ mod tests {
                 &tr.add_store_cancel,
                 &tr.add_store_help,
                 &tr.fail_open_folder,
-                &tr.fail_copy_path,
                 &tr.fail_save_as,
                 &tr.store_no_private_key,
+                &tr.store_open_failed,
+                &tr.note_lta_all,
+                &tr.note_lta_none,
+                &tr.note_lta_some,
+                &tr.note_dss_checked,
+                &tr.note_dss_unchecked,
+                &tr.note_dss_chain,
+                &tr.note_unchecked_reason,
+                &tr.output_line,
+                &tr.close_opening_store,
             ];
             for f in fields {
                 assert!(!f.trim().is_empty(), "{lang} has an empty string");
@@ -616,5 +740,123 @@ mod tests {
             crate::verdicts::signer_display("OU=cosas,C=ES").as_deref(),
             None,
         );
+    }
+
+    /// A-7/M-6: the table is the ONE place the window's sentences live, and a
+    /// field nobody reads is a sentence the window promises and never says.
+    /// Review 06 found ten of them — three hardcoded in the add-keystore form
+    /// while the table held their translations, two failures spelled out in
+    /// the Done screen, and five with no reader at all. This walks the crate's
+    /// own sources (`src/` minus this file, plus `tests/`) and fails on any
+    /// field name that is read nowhere else.
+    #[test]
+    fn every_string_in_the_table_is_used_by_the_window() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut used = String::new();
+        for dir in [root.join("src"), root.join("tests")] {
+            for entry in std::fs::read_dir(&dir).expect("the crate's own sources") {
+                let path = entry.expect("a source entry").path();
+                let is_strings = path.file_name().is_some_and(|n| n == "strings.rs");
+                let is_rust = path.extension().is_some_and(|e| e == "rs");
+                if is_strings || !is_rust {
+                    continue;
+                }
+                used.push_str(&std::fs::read_to_string(&path).expect("readable source"));
+            }
+        }
+        let table = std::fs::read_to_string(root.join("src/strings.rs")).expect("the table");
+        let mut fields = 0;
+        for line in table.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("pub ") else {
+                continue;
+            };
+            let Some(name) = rest.strip_suffix(": String,") else {
+                continue;
+            };
+            if name.contains(' ') {
+                continue;
+            }
+            fields += 1;
+            // `.field` and not a bare substring: a mention of the name in a
+            // comment is not a reader, and the window reads through `tr.`.
+            assert!(
+                used.contains(&format!(".{name}")),
+                "Tr::{name} is declared and read nowhere (A-7)"
+            );
+        }
+        assert!(fields > 80, "the scanner found only {fields} fields");
+    }
+
+    /// M-6/N-11: the verdict NOTES were hardcoded Spanish inside `verdicts.rs`
+    /// even in an English window. They are table sentences now, and this holds
+    /// it: every note ships in both languages, the English one is not the
+    /// Spanish one, and the declared holes are the ones filled — nothing on
+    /// screen is left looking like `{total}`.
+    #[test]
+    fn every_document_note_is_written_in_both_languages() {
+        let es = Tr::es();
+        let en = Tr::en();
+        let notes: [(&str, &str, &str, &[&str]); 5] = [
+            (
+                "note_lta_all",
+                &es.note_lta_all,
+                &en.note_lta_all,
+                &["total"],
+            ),
+            (
+                "note_lta_none",
+                &es.note_lta_none,
+                &en.note_lta_none,
+                &["total", "why"],
+            ),
+            (
+                "note_lta_some",
+                &es.note_lta_some,
+                &en.note_lta_some,
+                &["total", "verified"],
+            ),
+            (
+                "note_dss_checked",
+                &es.note_dss_checked,
+                &en.note_dss_checked,
+                &["certs", "crls", "ocsps", "checked", "unchecked"],
+            ),
+            (
+                "note_dss_chain",
+                &es.note_dss_chain,
+                &en.note_dss_chain,
+                &["n", "chain"],
+            ),
+        ];
+        for (name, es_sentence, en_sentence, holes) in notes {
+            assert_ne!(
+                es_sentence, en_sentence,
+                "{name}: the English sentence is the Spanish one"
+            );
+            for (locale, text) in [("es", es_sentence), ("en", en_sentence)] {
+                let with: Vec<(&str, &str)> = holes.iter().map(|h| (*h, "7")).collect();
+                let filled = Tr::fill(text, &with);
+                assert!(
+                    !filled.contains('{'),
+                    "{name}/{locale}: a hole is left unfilled: {filled}"
+                );
+                assert!(
+                    filled.contains('7'),
+                    "{name}/{locale}: the sentence has no hole to fill"
+                );
+            }
+            // The English column is English. A Spanish sentence pasted there
+            // is exactly the defect this test exists for.
+            for marker in ["El documento", "La cadena", "no se pudo", "de los que"] {
+                assert!(
+                    !en_sentence.contains(marker),
+                    "{name}: the English note says {marker:?}"
+                );
+            }
+        }
+        // The tail rides inside the DSS sentence and is a note of its own.
+        assert!(es.note_dss_unchecked.contains("{unchecked}"));
+        assert!(en.note_dss_unchecked.contains("{unchecked}"));
+        assert_ne!(es.note_dss_unchecked, en.note_dss_unchecked);
     }
 }

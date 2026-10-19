@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openfirma_gui::app::App;
-use openfirma_gui::wizard::{CertCatalog, CertificateChoice, KeySource, Screen, SignJob};
+use openfirma_gui::wizard::{
+    CertCatalog, CertificateChoice, ErrorReport, KeySource, OpenStoreOutcome, Screen, SignJob,
+    SignOutcome,
+};
 
 fn doc(dir: &Path) -> PathBuf {
     let d = dir.join("job-one.pdf");
@@ -26,6 +29,7 @@ fn which(screen: &openfirma_gui::wizard::Screen) -> &'static str {
         S::Idle => "Idle",
         S::Picked { .. } => "Picked",
         S::Signing { .. } => "Signing",
+        S::OpeningStore { .. } => "OpeningStore",
         S::Done { .. } => "Done",
         S::Verified { .. } => "Verified",
         S::NeedsContent { .. } => "NeedsContent",
@@ -206,5 +210,185 @@ fn pin_backed_rows_survive_from_document_to_document() {
             which(other)
         ),
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A picker with no rows and no errors, ready to have a store open folded in.
+fn empty_picker(path: &Path) -> Screen {
+    picker(path)
+}
+
+fn failure(which: &str) -> OpenStoreOutcome {
+    OpenStoreOutcome::Failed {
+        descriptor: which.to_string(),
+        report: ErrorReport {
+            plain: "keystore refused".into(),
+            technical: "PKCS#11: no token present".into(),
+        },
+    }
+}
+
+#[test]
+fn opening_a_store_parks_the_picker_and_replaces_its_own_line() {
+    // 06-N-10, the state half: opening a keystore ran inside the frame and
+    // every failed click pushed ANOTHER identical red line, so the fifth click
+    // landed on a different button than the first (the review's
+    // `26b-other.png`). The park is the job's; the line is per store.
+    let dir = std::env::temp_dir().join(format!("openfirma-store-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = doc(&dir);
+    let mut app = App::default();
+    // The starter parks the picker (production reaches it from the form; this
+    // asserts the screen the job hands back to).
+    app.set_screen_for_test(Screen::OpeningStore {
+        back: Box::new(empty_picker(&d)),
+    });
+
+    let dead = "pkcs11:/no/existe/modulo.so";
+    app.deliver_store_outcome_for_test(failure(dead));
+    let lines = |app: &App| match app.screen_ref_for_test() {
+        Screen::Picked { catalog, .. } => catalog.errors.clone(),
+        other => panic!("the picker must come back, got {}", which(other)),
+    };
+    let once = lines(&app);
+    assert_eq!(once.len(), 1, "one store, one line: {once:?}");
+    assert!(once[0].starts_with(dead), "{once:?}");
+    assert!(
+        once[0].contains("no se ha podido abrir el almacén"),
+        "the line leads in Spanish (06-N-10): {once:?}"
+    );
+
+    // The same dead store clicked five times: still exactly one line, and not
+    // five.
+    for _ in 0..4 {
+        let back = app.take_screen_for_test();
+        app.set_screen_for_test(Screen::OpeningStore {
+            back: Box::new(back),
+        });
+        app.deliver_store_outcome_for_test(failure(dead));
+    }
+    let lines_after = lines(&app);
+    assert_eq!(
+        lines_after.len(),
+        1,
+        "five clicks, one line: {lines_after:?}"
+    );
+
+    // A second store's line does not touch the first's, and a store that
+    // opens carrying no signable certificate says so in its own line.
+    let other = "nss";
+    {
+        let back = app.take_screen_for_test();
+        app.set_screen_for_test(Screen::OpeningStore {
+            back: Box::new(back),
+        });
+        app.deliver_store_outcome_for_test(failure(other));
+    }
+    let two = lines(&app);
+    assert_eq!(two.len(), 2, "one line per store: {two:?}");
+    {
+        let back = app.take_screen_for_test();
+        app.set_screen_for_test(Screen::OpeningStore {
+            back: Box::new(back),
+        });
+        app.deliver_store_outcome_for_test(OpenStoreOutcome::Opened {
+            descriptor: dead.to_string(),
+            entries: Vec::new(),
+            pin: None,
+        });
+    }
+    let after_open = lines(&app);
+    assert_eq!(
+        after_open.len(),
+        2,
+        "the dead store's line was replaced, not added to: {after_open:?}"
+    );
+    assert!(
+        after_open
+            .iter()
+            .any(|l| l.contains(dead)
+                && l.contains("no contiene ningún certificado con clave privada")),
+        "{after_open:?}"
+    );
+    assert!(
+        after_open.iter().any(|l| l.starts_with(other)),
+        "the other store's line is untouched: {after_open:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_worker_that_dies_leaves_a_sentence_not_a_spinner() {
+    // 06-N-11: a thread that vanished (a panic, an OS refusal) used to read as
+    // "not yet" forever, so the window spun on a job nobody was running. The
+    // park comes back and the window says what happened.
+    let dir = std::env::temp_dir().join(format!("openfirma-dead-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = doc(&dir);
+    let mut app = App::default();
+    app.set_locale_for_test(openfirma_gui::strings::Tr::es());
+    app.set_screen_for_test(Screen::Signing {
+        back: Box::new(picker(&d)),
+    });
+    app.kill_worker_for_test();
+    assert!(app.worker_running_for_test());
+    app.poll_worker_for_test();
+    assert!(
+        !app.worker_running_for_test(),
+        "the dead slot is released: it is not a job"
+    );
+    match app.screen_ref_for_test() {
+        Screen::Picked { .. } => {}
+        other => panic!("the park must come back, got {}", which(other)),
+    }
+    assert_eq!(
+        app.pending_note_for_test(),
+        Some(openfirma_gui::strings::Tr::es().fail_worker_died)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_time_stamp_nobody_checked_is_said_on_the_done_screen() {
+    // Review M-11: every token this window embeds is accepted on its imprint
+    // alone — nothing here knows which TSA to trust — and that fact lived only
+    // on the stderr of whoever started the window from a terminal. A green
+    // "Firma guardada" that silently carried an unchecked stamp is the same
+    // class of false comfort the verify side refuses.
+    let dir = std::env::temp_dir().join(format!("openfirma-tsa-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = doc(&dir);
+    let done = |checked: bool| SignOutcome::Done {
+        signature: b"%PDF-1.4 firmado".to_vec(),
+        output: d.with_extension("signed.pdf"),
+        format_label: "PAdES-B-B".into(),
+        signer_display: "ANA".into(),
+        tsa_token_unchecked: checked,
+    };
+
+    let mut app = App::default();
+    app.set_locale_for_test(openfirma_gui::strings::Tr::es());
+    app.set_screen_for_test(Screen::Signing {
+        back: Box::new(picker(&d)),
+    });
+    app.deliver_sign_outcome_for_test(done(true));
+    assert!(
+        matches!(app.screen_ref_for_test(), Screen::Done { .. }),
+        "an unchecked stamp never turns a signature into a failure"
+    );
+    assert_eq!(
+        app.pending_note_for_test(),
+        Some(openfirma_gui::strings::Tr::es().fail_tsa_unverified)
+    );
+
+    // No stamp, no note: the sentence is about the stamp, not about signing.
+    let mut app = App::default();
+    app.set_locale_for_test(openfirma_gui::strings::Tr::es());
+    app.set_screen_for_test(Screen::Signing {
+        back: Box::new(picker(&d)),
+    });
+    app.deliver_sign_outcome_for_test(done(false));
+    assert!(matches!(app.screen_ref_for_test(), Screen::Done { .. }));
+    assert_eq!(app.pending_note_for_test(), None);
     std::fs::remove_dir_all(&dir).ok();
 }

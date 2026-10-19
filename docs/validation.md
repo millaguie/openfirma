@@ -455,11 +455,13 @@ wording, a real certificate that never enters the repository.
       lines and the error sentences. AccessKit is on for eframe exactly for
       this; kittest asserts the tree exists but only a real reader says
       whether it reads well.
-- [ ] clipboard (A-4): the Done screen's copy-path button and any "copy" text
-      land in the system clipboard through egui's own OutputCommand (the
-      `accesskit` feature without `clipboard`: the Linux half of that feature
-      needs smithay-clipboard, absent from the offline registry, so the copy
-      goes through the context). Paste into a text editor to confirm.
+- [ ] clipboard (A-4): the Done screen's copy-path button lands in the SYSTEM
+      clipboard — eframe's `clipboard` feature is ON (arboard, plus
+      smithay-clipboard on Linux; both in the registry and both pure Rust), so
+      egui's copy command reaches the platform. Paste into a text editor to
+      confirm: before that feature was on, the text only moved inside the
+      process and the button was a no-op a user could not tell apart from a
+      working one.
 - [ ] the terminal password prompt (B-6): in a real terminal, `openfirma sign
       … --p12 f.p12` with nothing in the environment asks on stderr and hides
       the typing (check by pressing keys: nothing shows); typing into `cat`

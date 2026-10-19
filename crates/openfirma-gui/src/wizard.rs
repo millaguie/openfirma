@@ -318,6 +318,12 @@ pub enum SignOutcome {
         output: PathBuf,
         format_label: String,
         signer_display: String,
+        /// 06-N-11 (review M-11): at least one time-stamp token was embedded
+        /// WITHOUT its own signature being checked. This window has no TSA
+        /// authority to check one against, so it says on screen what the
+        /// terminal-only warning used to say alone: the stamp proves the time
+        /// only if you trust who issued it.
+        tsa_token_unchecked: bool,
     },
     /// A refusal worth a red line ("the password was wrong" is a retry
     /// reason, not a journey back to the drop zone): the Picked screen stays,
@@ -402,6 +408,15 @@ pub enum Screen {
         /// ever lost to a click.
         back: Box<Screen>,
     },
+    /// A keystore is opening on the worker thread (06-N-10: loading a PKCS#11
+    /// module and logging in is exactly the work A-1 put off the UI thread,
+    /// and it used to run inside the frame — a card that takes seconds to
+    /// answer froze the window). Same park shape as `Signing`, different
+    /// sentence: the picker is untouched behind it.
+    OpeningStore {
+        /// The Picked screen parked while the store opens.
+        back: Box<Screen>,
+    },
     /// A signature is finished and held. This state cannot be left through
     /// the window's close button without an explicit decision; the bytes live
     /// here until they are saved for real or discarded on purpose.
@@ -450,6 +465,7 @@ impl Screen {
     pub fn signing_back(&self) -> Option<&Screen> {
         match self {
             Screen::Signing { back } => Some(back),
+            Screen::OpeningStore { back } => Some(back),
             _ => None,
         }
     }
@@ -465,7 +481,7 @@ impl Screen {
     /// had no password yet is dropped.
     pub fn restore(&self) -> Screen {
         match self {
-            Screen::Idle | Screen::Signing { .. } => Screen::Idle,
+            Screen::Idle | Screen::Signing { .. } | Screen::OpeningStore { .. } => Screen::Idle,
             Screen::Picked {
                 path,
                 content,
@@ -613,6 +629,26 @@ pub fn parse_descriptor(text: &str) -> Result<StoreSpec, String> {
 pub enum WorkerReply {
     Sign(SignOutcome),
     Verify(Result<VerifiedAnswer, ErrorReport>),
+    /// 06-N-10: an opened keystore, or the reason it refused, plus the PIN
+    /// that worked so the cache keeps a PIN the store accepted.
+    Store(OpenStoreOutcome),
+}
+
+/// What opening a keystore on the worker produced. The descriptor rides with
+/// both arms: a failure is one line under that store's name in the picker,
+/// never a screen of its own.
+pub enum OpenStoreOutcome {
+    /// The entries to add, and the PIN to remember — `Some` only when the
+    /// store accepted it (a wrong PIN is never cached).
+    Opened {
+        descriptor: String,
+        entries: Vec<crate::keystore_io::StoreEntry>,
+        pin: Option<Zeroizing<String>>,
+    },
+    Failed {
+        descriptor: String,
+        report: ErrorReport,
+    },
 }
 
 /// What the verify worker computed for the window. `Debug` is a sentence,

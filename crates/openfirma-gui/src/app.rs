@@ -31,9 +31,9 @@ use crate::keystore_io;
 use crate::signing;
 use crate::strings::Tr;
 use crate::wizard::{
-    CertCatalog, CertificateChoice, CloseDecision, ErrorReport, KeySource, LoadJob, PinCache,
-    Screen, SignJob, SignOutcome, VerdictLine, VerdictStatus, WorkerReply, close_decision,
-    display_name, effective_formats, output_path, tsa_available,
+    CertCatalog, CertificateChoice, CloseDecision, ErrorReport, KeySource, LoadJob,
+    OpenStoreOutcome, PinCache, Screen, SignJob, SignOutcome, VerdictLine, VerdictStatus,
+    WorkerReply, close_decision, display_name, effective_formats, output_path, tsa_available,
 };
 use openfirma_core::workflow::{Format, StoreSpec};
 
@@ -453,11 +453,65 @@ impl App {
         self.worker_rx = Some(rx);
     }
 
+    /// 06-N-10: opening a keystore is loading a module and logging in — the
+    /// slowest thing the picker does, and it used to run inside the frame.
+    /// What the store needs (its descriptor and the typed PIN) is read HERE,
+    /// on the UI thread, and moves to the worker; the picker is parked
+    /// untouched and comes back with the answer, rows and all.
+    fn start_store_open(&mut self, descriptor: String) {
+        debug_assert!(
+            self.worker_rx.is_none(),
+            "two jobs must never share the one slot (A-1)"
+        );
+        if self.worker_rx.is_some() {
+            return; // one job in flight: the second click has nowhere to go
+        }
+        // The cache's PIN if this store opened before, else what is typed
+        // now. The typed field is cleared when the job starts, exactly as it
+        // was when the open ran inline.
+        let pin = self.pins.get(&descriptor).or_else(|| {
+            let typed = self.pin_input.lock().ok().map(|p| p.to_string())?;
+            (!typed.is_empty()).then(|| Zeroizing::new(typed))
+        });
+        if let Ok(mut g) = self.pin_input.lock() {
+            *g = Zeroizing::new(String::new());
+        }
+        let tr = self.tr.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = descriptor.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(WorkerReply::Store(run_open_store_job(&d, pin, &tr)));
+        });
+        self.worker_rx = Some(rx);
+        let back = Box::new(std::mem::replace(&mut self.screen, Screen::Idle));
+        self.screen = Screen::OpeningStore { back };
+    }
+
     /// Drain the worker without blocking: at most one answer per frame, and
     /// never while a UI closure borrows the screen (this runs between panels).
     fn poll_worker(&mut self) {
         let Some(rx) = &self.worker_rx else { return };
-        let Ok(reply) = rx.try_recv() else { return };
+        let outcome = rx.try_recv();
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The thread went away without an answer (a panic, or the OS
+                // refusing the spawn). The old `let Ok(..) else { return }`
+                // treated that exactly like "not yet" and left the window
+                // spinning forever; the park is put back and the window says
+                // what happened (review 06, M-11's family: a worker that dies
+                // is not a job that is still running).
+                self.worker_rx = None;
+                let back = match std::mem::replace(&mut self.screen, Screen::Idle) {
+                    Screen::Signing { back } | Screen::OpeningStore { back } => *back,
+                    other => other,
+                };
+                self.pending_note = Some(self.tr.fail_worker_died.clone());
+                self.screen = back;
+                return;
+            }
+        };
         self.worker_rx = None;
         match reply {
             WorkerReply::Sign(SignOutcome::Done {
@@ -465,6 +519,7 @@ impl App {
                 output,
                 format_label,
                 signer_display,
+                tsa_token_unchecked,
             }) => {
                 // The Picked screen was parked at start_sign; the Done screen
                 // never needs it again (the bytes are its own now).
@@ -491,6 +546,9 @@ impl App {
                     signer_display,
                     saved: true,
                 };
+                if tsa_token_unchecked {
+                    self.pending_note = Some(self.tr.fail_tsa_unverified.clone());
+                }
             }
             WorkerReply::Sign(SignOutcome::Retryable { reason }) => {
                 let back = match std::mem::replace(&mut self.screen, Screen::Idle) {
@@ -547,7 +605,57 @@ impl App {
                     back: None,
                 }
             }
+            WorkerReply::Store(outcome) => self.store_opened(outcome),
         }
+    }
+
+    /// Put the picker back and fold in what opening a store produced
+    /// (06-N-10). The screen the job parked IS the Picked screen it started
+    /// from, so nothing the user built is lost. A failure becomes ONE line
+    /// under that store's name and replaces whatever that store said before:
+    /// clicking a dead card five times used to stack five identical red
+    /// sentences and push the catalogue off the screen.
+    fn store_opened(&mut self, outcome: OpenStoreOutcome) {
+        let mut back = match std::mem::replace(&mut self.screen, Screen::Idle) {
+            Screen::OpeningStore { back } => *back,
+            other => other,
+        };
+        let tr = &self.tr;
+        if let Screen::Picked { catalog, .. } = &mut back {
+            match outcome {
+                OpenStoreOutcome::Opened {
+                    descriptor,
+                    entries,
+                    pin,
+                } => {
+                    let found = entries.len();
+                    catalog
+                        .entries
+                        .extend(entries.into_iter().map(certificate_choice));
+                    if found == 0 {
+                        let line = format!("{descriptor}: {}", tr.store_no_private_key);
+                        replace_store_line(catalog, &descriptor, line);
+                    } else {
+                        // A store that now yields rows is not the one the
+                        // previous line was about.
+                        catalog
+                            .errors
+                            .retain(|e| !e.starts_with(&format!("{descriptor}: ")));
+                    }
+                    if let Some(pin) = pin {
+                        self.pins.put(&descriptor, pin);
+                    }
+                }
+                OpenStoreOutcome::Failed { descriptor, report } => {
+                    let line = format!("{descriptor}: {} ({})", tr.store_open_failed, report.plain);
+                    replace_store_line(catalog, &descriptor, line);
+                }
+            }
+        }
+        // A screen that is not the picker means the window moved on while the
+        // card was answering; its own state is what the user is looking at and
+        // is put back untouched (a drop during a job is refused at the door).
+        self.screen = back;
     }
 
     // -------------------------------------------------------------------- idle
@@ -694,6 +802,12 @@ impl App {
         self.pending_note.clone()
     }
 
+    /// Stand in for what typing into the add-keystore field holds between
+    /// frames (the same shape as `force_password_for_test`).
+    pub fn set_descriptor_for_test(&mut self, descriptor: &str) {
+        self.descriptor_input = descriptor.to_string();
+    }
+
     /// Stand in for what typing into the password widget holds between frames.
     pub fn force_password_for_test(&mut self, p: String) {
         if let Ok(mut guard) = self.password_input.lock() {
@@ -781,6 +895,15 @@ impl App {
         self.worker_rx.is_some()
     }
 
+    /// A worker thread that went away without answering (06-N-11): the sender
+    /// is dropped at once, so the next poll sees `Disconnected` — the case the
+    /// old `let Ok(..) else { return }` treated exactly like "not yet".
+    pub fn kill_worker_for_test(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerReply>();
+        drop(tx);
+        self.worker_rx = Some(rx);
+    }
+
     /// Drain the worker without blocking (A-1's production poll, reached
     /// directly because kittest owns no winit event loop; this is the same
     /// method `eframe::App::ui` calls every frame, never a lookalike).
@@ -823,6 +946,7 @@ impl App {
                 output,
                 format_label,
                 signer_display,
+                tsa_token_unchecked,
             }) => {
                 // The park always exists here: start_sign replaced the picker
                 // with Signing and nothing else ever moves that screen while a
@@ -850,6 +974,9 @@ impl App {
                     signer_display,
                     saved: true,
                 };
+                if tsa_token_unchecked {
+                    self.pending_note = Some(self.tr.fail_tsa_unverified.clone());
+                }
             }
             WorkerReply::Sign(SignOutcome::Retryable { reason }) => {
                 let back = match std::mem::replace(&mut self.screen, Screen::Idle) {
@@ -900,7 +1027,15 @@ impl App {
                     back: None,
                 }
             }
+            WorkerReply::Store(outcome) => self.store_opened(outcome),
         }
+    }
+
+    /// The keystore-open half of the same seam (06-N-10): tests park an
+    /// `OpeningStore` screen by hand (the real starter spawns a thread) and
+    /// deliver the outcome the worker would have sent.
+    pub fn deliver_store_outcome_for_test(&mut self, outcome: OpenStoreOutcome) {
+        self.inject_reply_for_test(WorkerReply::Store(outcome));
     }
 
     /// Move the screen out so a test can inspect and mutate it, leaving Idle;
@@ -946,6 +1081,12 @@ impl App {
             Format::Xml => tr.detected_xml.clone(),
             Format::Data => tr.detected_data.clone(),
         });
+        // A refusal that names the whole attempt rather than one row (a drop
+        // during a job, an authority that could not be read) is said here, in
+        // the warning colour, where the citizen is looking.
+        if let Some(note) = self.pending_note.clone() {
+            ui.colored_label(ui.visuals().warn_fg_color, note);
+        }
         ui.add_space(10.0);
 
         // The certificate picker is the heart of this screen: format and
@@ -997,11 +1138,9 @@ impl App {
                             "dnie" => tr.store_dnie.clone(),
                             "opensc" => tr.store_opensc.clone(),
                             "fnmt" => tr.store_fnmt.clone(),
-                            "firefox" | "nssdb" => format!(
-                                "{} ({}",
-                                tr.open_keystore.trim_end_matches('…'),
-                                descriptor
-                            ),
+                            "firefox" | "nssdb" => {
+                                format!("{} ({})", tr.store_firefox, descriptor)
+                            }
                             _ => descriptor.clone(),
                         };
                         if ui.link(label).clicked() {
@@ -1265,10 +1404,7 @@ impl App {
         let mut open_it = false;
         let mut cancel = false;
         ui.group(|ui| {
-            ui.weak(
-                "Escribe el descriptor del almacén: pkcs11:/ruta/modulo.so[:token], \
-                 nss (la base de Firefox/Chromium), o los almacenes del sistema.",
-            );
+            ui.weak(tr.add_store_help.clone());
             let mut d = std::mem::take(&mut self.descriptor_input);
             let mut p = String::new();
             App::mirror_secret(&self.pin_input, &mut p);
@@ -1283,10 +1419,10 @@ impl App {
                     .hint_text(tr.keystore_pin.clone()),
             );
             App::sync_secret(&self.pin_input, &p);
-            if ui.button("Abrir").clicked() {
+            if ui.button(tr.add_store_open.clone()).clicked() {
                 open_it = true;
             }
-            if ui.button("Cancelar").clicked() {
+            if ui.button(tr.add_store_cancel.clone()).clicked() {
                 cancel = true;
             }
             self.descriptor_input = d;
@@ -1313,6 +1449,14 @@ impl App {
         // second thread ever existing.
         ui.spinner();
         ui.label(tr.signing_in_progress.clone());
+    }
+
+    /// 06-N-10: the store-open job's spinner. Same park shape as signing, its
+    /// own sentence — a card that takes ten seconds to answer now shows what
+    /// the window is waiting for instead of freezing on a painted button.
+    fn render_opening_store(&mut self, ui: &mut Ui) {
+        ui.spinner();
+        ui.label(self.tr.opening_store.clone());
     }
 
     /// Ask "this name already exists" once per attempt: save dialog answers,
@@ -1481,19 +1625,28 @@ impl App {
         // mark carries "this is good" and the heading stays readable on both
         // themes (the old arithmetic on Color32 did not compile against 0.37).
         ui.label(RichText::new(format!("{} ✓", tr.signed_ok)).heading());
-        ui.label(format!(
-            "{} · {} · «{}»",
-            display_name(path),
-            format_label,
-            signer_display,
-        ));
+        // 06-N-11 (M-11): what the signature does NOT prove (an unchecked
+        // time-stamp token) is said here, in the warning colour, not only on
+        // the terminal this window was started from.
+        if let Some(note) = self.pending_note.clone() {
+            ui.colored_label(ui.visuals().warn_fg_color, note);
+        }
+        ui.label(format!("{} · {}", display_name(path), format_label));
+        ui.label(format!("{}: «{}»", tr.signer_line, signer_display));
+        // 06-N-11: the two paths on this screen are DISTINCT things and each
+        // one now says which it is. The heading names the document that was
+        // signed; this line names the file this run wrote, and it is the one
+        // the buttons below act on.
         let out_text = output.display().to_string();
+        ui.label(format!("{}:", tr.output_line));
         ui.label(RichText::new(out_text).monospace());
         // A-2: the path a user needs in a terminal is ONE click from their
-        // clipboard. egui's copy command goes through egui-winit to arboard —
-        // no xclip spawned per press, and the accesskit tree reports the
-        // button like any other (the feature story is pinned in the workspace
-        // Cargo.toml; a headless test asserts the command leaves the frame).
+        // clipboard. egui's copy command goes through egui-winit to arboard,
+        // which is why the workspace turns eframe's `clipboard` feature ON
+        // (without it the text only moved inside the process). The copy is
+        // fire-and-forget: the platform reports no failure back, so no
+        // sentence claims one, and the accesskit tree reports the button like
+        // any other.
         if ui.button(tr.copy_path.clone()).clicked() {
             let text = output.display().to_string();
             ui.ctx().copy_text(text);
@@ -1523,7 +1676,7 @@ impl App {
             // trust decision to whatever program answers, while this screen's
             // ✓ already shows openfirma's own verdict.
             if let Err(e) = open_in_file_manager(&dir) {
-                folder_error = Some(format!("No se pudo abrir la carpeta: {e}"));
+                folder_error = Some(format!("{} {e}", self.tr.fail_open_folder));
             }
         }
 
@@ -1545,7 +1698,7 @@ impl App {
                 match copied {
                     Ok(()) => *output = dest,
                     Err(e) => {
-                        let note = format!("No se pudo guardar: {e}");
+                        let note = format!("{} {e}", self.tr.fail_save_as);
                         put_back!(Screen::Failed {
                             error: ErrorReport {
                                 plain: note,
@@ -1788,71 +1941,6 @@ impl App {
         }
         put_back!(taken);
     }
-
-    // ------------------------------------------------------------- keystores
-
-    /// Open a keystore descriptor and merge its signable certificates into
-    /// the catalog (the CLI's `keystores list` rule: one store failing never
-    /// hides another's listing, and it never aborts what is already open).
-    /// The PIN comes from the session cache when this card was opened before
-    /// (A-6); the typed field is a fresh card only. A slow reader freezes no
-    /// frame — but opening a dialog answer must show its errors immediately,
-    /// so this stays on the UI thread by decision: a file-dialog answer is
-    /// already a round trip a user expects to wait for, and egui keeps the
-    /// spinner-free error path instant. What froze the review's window was
-    /// per-signature card work and TSAs; those are the worker's (A-1).
-    fn open_descriptor(&mut self, descriptor: &str) {
-        let outcome = (|| -> openfirma_core::Result<Vec<keystore_io::StoreEntry>> {
-            let spec = StoreSpec::parse(descriptor).map_err(openfirma_core::Error::Keystore)?;
-            let pin = self.pins.get(descriptor).or_else(|| {
-                let typed = self.pin_input.lock().ok().map(|p| p.to_string())?;
-                (!typed.is_empty()).then(|| Zeroizing::new(typed))
-            });
-            let store = keystore_io::open_store(&spec, pin.clone())?;
-            if let Some(pin) = pin {
-                self.pins.put(descriptor, pin);
-            }
-            keystore_io::store_entries(&store, descriptor)
-        })();
-        match outcome {
-            Ok(list) => {
-                if let Screen::Picked { catalog, .. } = &mut self.screen {
-                    for e in list {
-                        catalog.entries.push(certificate_choice(e));
-                    }
-                    if catalog.entries.is_empty() {
-                        catalog.errors.push(format!(
-                            "{descriptor}: no contiene ningún certificado con clave privada"
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                let report = errors::report(&e, &self.tr);
-                // A keystore that refused to open never hides the picker: its
-                // reason rides in the catalog's error list. Only a failure
-                // outside any picker becomes the screen itself.
-                if let Screen::Picked { catalog, .. } = &mut self.screen {
-                    catalog
-                        .errors
-                        .push(format!("{descriptor}: {}", report.plain));
-                } else {
-                    let back = match std::mem::replace(&mut self.screen, Screen::Idle) {
-                        s @ (Screen::Picked { .. } | Screen::Done { .. }) => Some(Box::new(s)),
-                        _ => None,
-                    };
-                    self.screen = Screen::Failed {
-                        error: report,
-                        back,
-                    };
-                }
-            }
-        }
-        // The typed PIN leaves the widget now; the cache owns its zeroizing.
-        if let Ok(mut g) = self.pin_input.lock() {
-            *g = Zeroizing::new(String::new());
-        }
-    }
 }
 
 /// The stable widget id of the .p12 password field: hashed from a fixed salt,
@@ -1947,6 +2035,11 @@ enum Loaded {
 
 impl App {
     fn load_path_with_intent(&mut self, path: PathBuf, verify_intent: bool) {
+        // A new file is a new question: what the previous loop left on screen
+        // (an authority that could not be read, a drop refused while a job
+        // ran) stops being true here. The sentences THIS load produces are set
+        // below it.
+        self.pending_note = None;
         // B-3: arriving through "Verificar una firma", an unsigned document is
         // answered, not swallowed by the sign flow — the two verbs finally do
         // different things with the same dialog.
@@ -1965,6 +2058,16 @@ impl App {
     fn load_dropped(&mut self, path: PathBuf) {
         if self.screen.is_done() {
             self.pending_note = Some(self.tr.drop_while_done.clone());
+            return;
+        }
+        // A-1's one-job rule covers drops too (06-N-10): a drop while a
+        // signature, a verification or a keystore open is in flight would
+        // replace the screen that job parked — the picker with its catalogue,
+        // its PIN-backed rows and the bytes it holds — and the answer would
+        // land on a screen the job never started from. Refused out loud; the
+        // job's own answer arrives where it was always going.
+        if self.worker_rx.is_some() {
+            self.pending_note = Some(self.tr.drop_while_working.clone());
             return;
         }
         self.load_path_with_intent(path, false);
@@ -2093,6 +2196,7 @@ impl eframe::App for App {
             Screen::Idle => self.render_idle(ui),
             Screen::Picked { .. } => self.render_picked(ui),
             Screen::Signing { .. } => self.render_signing(ui),
+            Screen::OpeningStore { .. } => self.render_opening_store(ui),
             Screen::Done { .. } => self.render_done(ui),
             Screen::Verified { .. } => self.render_verified(ui),
             Screen::NeedsContent { .. } => self.render_needs_content(ui),
@@ -2100,7 +2204,7 @@ impl eframe::App for App {
         });
         while let Some(action) = self.deferred.pop() {
             match action {
-                Deferred::OpenStore(d) => self.open_descriptor(&d),
+                Deferred::OpenStore(d) => self.start_store_open(d),
                 Deferred::AskContent(sig_path) => {
                     let title = self.tr.dialog_content_for_detached.clone();
                     match (self.open_file(&title), std::fs::read(&sig_path)) {
@@ -2145,7 +2249,16 @@ impl eframe::App for App {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(&ctx, |ui| {
                     let msg = match which {
-                        Some(CloseDecision::WarnBusy) => tr.close_signing.clone(),
+                        // 06-N-11: a busy close said "the signature is still
+                        // being made" for a verify and a keystore open too.
+                        // What is running is read from the screen (the state
+                        // each job parks) and from the worker slot; every
+                        // answer is a true sentence.
+                        Some(CloseDecision::WarnBusy) => match self.screen {
+                            Screen::Signing { .. } => tr.close_signing.clone(),
+                            Screen::OpeningStore { .. } => tr.close_opening_store.clone(),
+                            _ => tr.close_verifying.clone(),
+                        },
                         _ => tr.close_unsaved.clone(),
                     };
                     ui.label(msg);
@@ -2267,11 +2380,14 @@ fn run_sign_job(job: SignJob, tr: &Tr) -> SignOutcome {
     } = job;
     let display = key.display().to_string();
     let _ = &path; // the Done screen reads its path from the parked back screen
+    // 06-N-11 (M-11): whether a time-stamp token went in without its own
+    // signature being checked. The callback sets it; the Done screen says it.
+    let tsa_unchecked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let result: openfirma_core::Result<Vec<u8>> = (|| {
         let timestamp = if tsa_url.trim().is_empty() {
             None
         } else {
-            Some(crate::tsa::provider(tsa_url.trim())?)
+            Some(crate::tsa::provider(tsa_url.trim(), &tsa_unchecked)?)
         };
         let signer = key.signer()?;
         signing::execute(
@@ -2308,6 +2424,7 @@ fn run_sign_job(job: SignJob, tr: &Tr) -> SignOutcome {
                 output: out,
                 format_label: signing::format_label(&chosen_format).to_string(),
                 signer_display: display,
+                tsa_token_unchecked: tsa_unchecked.load(std::sync::atomic::Ordering::SeqCst),
             }
         }
         Err(e) => {
@@ -2339,6 +2456,49 @@ fn run_verify_job(job: LoadJob, tr: &Tr) -> Result<crate::wizard::VerifiedAnswer
         Ok(verdicts) => Ok(crate::wizard::VerifiedAnswer { path, verdicts }),
         Err(e) => Err(errors::report(&e, tr)),
     }
+}
+
+/// The store-open worker's whole run (06-N-10): parse the descriptor, open
+/// the store with the PIN it was handed — the module load and the login are
+/// exactly the work that must not run inside a frame — and list what it holds
+/// that can sign. Nothing here touches the screen: the outcome travels back
+/// to the UI thread, and a failure becomes ONE line under the store's name
+/// rather than a screen of its own.
+///
+/// The PIN rides in and out: `Some` on success is a PIN the store ACCEPTED and
+/// therefore the only one worth caching (a refused one is never written to the
+/// cache, the same rule the inline version had).
+fn run_open_store_job(
+    descriptor: &str,
+    pin: Option<Zeroizing<String>>,
+    tr: &Tr,
+) -> OpenStoreOutcome {
+    let opened = (|| -> openfirma_core::Result<Vec<keystore_io::StoreEntry>> {
+        let spec = StoreSpec::parse(descriptor).map_err(openfirma_core::Error::Keystore)?;
+        let store = keystore_io::open_store(&spec, pin.clone())?;
+        keystore_io::store_entries(&store, descriptor)
+    })();
+    match opened {
+        Ok(entries) => OpenStoreOutcome::Opened {
+            descriptor: descriptor.to_string(),
+            entries,
+            pin,
+        },
+        Err(e) => OpenStoreOutcome::Failed {
+            descriptor: descriptor.to_string(),
+            report: errors::report(&e, tr),
+        },
+    }
+}
+
+/// One picker line per store: the new sentence about `descriptor` REPLACES
+/// whatever that store said before (06-N-10 — repeated clicks on a card that
+/// cannot open stacked identical red lines until the catalogue was pushed off
+/// the screen). Other stores' lines are untouched.
+fn replace_store_line(catalog: &mut CertCatalog, descriptor: &str, line: String) {
+    let prefix = format!("{descriptor}: ");
+    catalog.errors.retain(|e| !e.starts_with(&prefix));
+    catalog.errors.push(line);
 }
 
 impl CertificateChoice {
