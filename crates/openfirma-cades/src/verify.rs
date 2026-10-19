@@ -760,18 +760,26 @@ fn verify_signer_info(
                     let bound = crate::tsp::token_imprint(token)
                         .and_then(|(alg, hash)| {
                             // The token imprints the DIGEST of this signature's
-                            // value under its own algorithm; hashing here is
-                            // what the signing side did (`signed_data::sign`
-                            // hands the provider `&signature_value`), and what
-                            // AutoFirma's CMSTimestamper.java:227 does too.
-                            if alg == si.digest_alg && hash == alg.digest(&signature_value_digest) {
+                            // value under the algorithm the TOKEN names. That is
+                            // the algorithm the requester chose and the signing
+                            // side used (`signed_data::sign` hands the provider
+                            // `&signature_value`, and AutoFirma's
+                            // CMSTimestamper.java:227 hashes the same bytes); it
+                            // is NOT required to be the algorithm the signature
+                            // itself digests under. It used to be, and every
+                            // AutoFirma stamp read as unverified because
+                            // `TsaParams.java:24` asks every TSA for a SHA-512
+                            // imprint while the signature is usually SHA-256 —
+                            // openssl verified the same token and openfirma did
+                            // not (round two, N7).
+                            if hash == alg.digest(&signature_value_digest) {
                                 Ok(())
                             } else {
                                 Err(Error::Other(format!(
                                     "the token's messageImprint is not the {} of this \
                                      signature value: it time-stamps a different signature \
                                      and says nothing about this one",
-                                    si.digest_alg.name()
+                                    alg.name()
                                 )))
                             }
                         })

@@ -57,6 +57,13 @@ fn run(args: &[&str]) -> (bool, String) {
 /// `/etc/ssl/openssl.cnf` points `ts -reply` at `/etc/ssl/tsaserial`, which no
 /// unprivileged process can write. The same recipe as adversarial-wave1.rs.
 fn tsa_cnf(name: &str) -> PathBuf {
+    tsa_cnf_with(name, "sha256")
+}
+
+/// The same, naming which imprint digests the responder will answer. A test
+/// that wants a token whose imprint algorithm differs from the signature's
+/// needs a responder that accepts the one the query asks for.
+fn tsa_cnf_with(name: &str, digests: &str) -> PathBuf {
     let test = std::thread::current()
         .name()
         .unwrap_or("main")
@@ -68,7 +75,7 @@ fn tsa_cnf(name: &str) -> PathBuf {
     std::fs::write(
         &cnf,
         format!(
-            "[tsa]\ndefault_tsa = tsa_config1\n[tsa_config1]\nserial = {}\ncrypto_device = builtin\ndefault_policy = 1.2.3.4.1\ndigests = sha256\naccuracy = secs:1\nordering = no\ntsa_name = no\ness_cert_id_chain = no\ness_cert_id_alg = sha256\nsigner_digest = sha256\n",
+            "[tsa]\ndefault_tsa = tsa_config1\n[tsa_config1]\nserial = {}\ncrypto_device = builtin\ndefault_policy = 1.2.3.4.1\ndigests = {digests}\naccuracy = secs:1\nordering = no\ntsa_name = no\ness_cert_id_chain = no\ness_cert_id_alg = sha256\nsigner_digest = sha256\n",
             dir.join("tsaserial").display()
         ),
     )
@@ -394,5 +401,173 @@ fn verify_reports_a_genuine_b_t_signature_as_timestamped() {
     assert!(
         report.timestamp.gen_time().is_some(),
         "a verified token must expose the genTime the B-T level asserts"
+    );
+}
+
+/// The shape every AutoFirma B-T signature has, and the one this verifier used
+/// to refuse. The requester chooses the imprint's algorithm; AutoFirma chooses
+/// SHA-512 for every TSA (`TsaParams.java:24`) whatever the signature digests
+/// under, while the TSA signs its own SignedData under SHA-256. openssl's
+/// `ts -verify` calls that token OK; openfirma answered "the token's SignerInfo
+/// digests under SHA-256 but its messageImprint says SHA-512" — and reported a
+/// valid stamp as unverified (round two, N7). Refusing too eagerly is the safe
+/// direction for a verdict, but it is still a citizen's document that no
+/// validator can time-stamp-verify and this program cannot either.
+///
+/// The second half of the test is the reason the algorithm equality is safe to
+/// drop: the binding is the imprint's VALUE under the token's own algorithm, so
+/// a token lifted from another signature is still refused, and refused by name.
+#[test]
+fn a_token_imprinting_under_another_algorithm_than_the_signature_is_still_verified() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    if !certs_dir().join("tsa.crt").exists() {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    }
+    let Some(signer) = load_signer(
+        "signer-rsa.crt",
+        "signer-rsa.key",
+        &["intermediate.crt", "ca.crt"],
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+
+    let sig_value: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let token: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let tsr_path: Arc<Mutex<PathBuf>> = Arc::new(Mutex::new(PathBuf::new()));
+    let (grab_value, grab_token, grab_path) = (sig_value.clone(), token.clone(), tsr_path.clone());
+
+    let provider: openfirma_cades::TimestampFn = Arc::new(move |sig, digest| {
+        // `digest` is what the signature digests under (SHA-256 by default).
+        // The query asks for SHA-512 instead, which is what AutoFirma does.
+        let _ = digest;
+        let query = tsp::request(DigestAlg::Sha512, sig, 0x51f1_51f1)?;
+        let q = write_tmp("bt-512.tsq", &query);
+        let r = write_tmp("bt-512.tsr", b"");
+        let dir = certs_dir();
+        let (ok, text) = run(&[
+            "ts",
+            "-reply",
+            "-config",
+            tsa_cnf_with("bt-512", "sha512,sha256").to_str().unwrap(),
+            "-queryfile",
+            q.to_str().unwrap(),
+            "-out",
+            r.to_str().unwrap(),
+            "-signer",
+            dir.join("tsa.crt").to_str().unwrap(),
+            "-inkey",
+            dir.join("tsa.key").to_str().unwrap(),
+            "-chain",
+            dir.join("chain.crt").to_str().unwrap(),
+        ]);
+        assert!(ok, "openssl ts -reply failed:\n{text}");
+        let response = std::fs::read(&r).expect("the TSA wrote no response");
+        let t = tsp::token_from_response(&response, DigestAlg::Sha512, sig, Some(&query))?;
+        *grab_value.lock().unwrap() = sig.to_vec();
+        *grab_token.lock().unwrap() = t.clone();
+        *grab_path.lock().unwrap() = r;
+        Ok(vec![tsp::unsigned_attribute(&t)?])
+    });
+
+    let signature = sign(
+        CONTENT,
+        &signer,
+        &CadesOptions {
+            timestamp: Some(provider),
+            ..CadesOptions::default()
+        },
+    )
+    .expect("signing with a SHA-512-imprint token failed");
+
+    // the mismatch is real in what was produced, not assumed
+    let imprint = tsp::token_imprint(&token.lock().unwrap().clone()).expect("the token parses");
+    assert_eq!(
+        imprint.0,
+        DigestAlg::Sha512,
+        "the test stopped producing the shape it is about"
+    );
+
+    let dir = certs_dir();
+    let ca = {
+        let pem = std::fs::read_to_string(dir.join("ca.crt")).unwrap();
+        CertificateHandle::from_pem(&pem).unwrap()
+    };
+    let reports = openfirma_cades::verify::verify(
+        &signature,
+        Some(CONTENT),
+        &openfirma_cades::verify::VerifyOptions {
+            trust_anchors: vec![ca.clone()],
+            ..Default::default()
+        },
+    )
+    .expect("the verifier must accept a signature it just produced");
+    let report = reports.first().expect("one report for one signer");
+    assert_eq!(
+        report.digest,
+        DigestAlg::Sha256,
+        "the signature itself is not the SHA-256 one this test pairs with a SHA-512 imprint"
+    );
+    assert!(
+        report.timestamp.verified(),
+        "a stamp whose imprint algorithm merely differs from the signature's was \
+         refused: {:?}",
+        report.timestamp.problem()
+    );
+    assert!(report.timestamp.gen_time().is_some());
+
+    // openssl, the independent implementation, agrees on the same token
+    let value = write_tmp("bt-512-sigvalue.bin", &sig_value.lock().unwrap());
+    let (ok, text) = run(&[
+        "ts",
+        "-verify",
+        "-data",
+        value.to_str().unwrap(),
+        "-in",
+        tsr_path.lock().unwrap().to_str().unwrap(),
+        "-CAfile",
+        dir.join("ca.crt").to_str().unwrap(),
+        "-untrusted",
+        dir.join("intermediate.crt").to_str().unwrap(),
+    ]);
+    assert!(ok, "openssl ts -verify rejected the token:\n{text}");
+
+    // and the binding holds without the algorithm equality: a TSA that hands
+    // back the FIRST signature's token for a second signature's value is
+    // refused, naming the token's own algorithm
+    let stolen = token.lock().unwrap().clone();
+    let liar: openfirma_cades::TimestampFn =
+        Arc::new(move |_sig, _digest| Ok(vec![tsp::unsigned_attribute(&stolen)?]));
+    let other = sign(
+        b"a different document entirely\n",
+        &signer,
+        &CadesOptions {
+            timestamp: Some(liar),
+            ..CadesOptions::default()
+        },
+    )
+    .expect("signing with a borrowed token failed");
+    let reports = openfirma_cades::verify::verify(
+        &other,
+        Some(b"a different document entirely\n"),
+        &openfirma_cades::verify::VerifyOptions {
+            trust_anchors: vec![ca],
+            ..Default::default()
+        },
+    )
+    .expect("the signature itself must still verify");
+    let report = reports.first().expect("one report");
+    assert!(
+        !report.timestamp.verified(),
+        "a token lifted from another signature's value was accepted"
+    );
+    let problem = report.timestamp.problem().unwrap_or_default();
+    assert!(
+        problem.contains("SHA-512") && problem.contains("different signature"),
+        "the refusal must name the token's algorithm and what it means: {problem}"
     );
 }

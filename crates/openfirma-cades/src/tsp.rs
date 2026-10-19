@@ -423,7 +423,10 @@ pub fn verify_token_signature(
     let (sid_tag, sid_value) = (v.tag, v.content);
     let mut dai = f.sequence("the SignerInfo.digestAlgorithm")?;
     let digest_oid = parse_dotted_oid(&dai.oid("the SignerInfo.digestAlgorithm")?.to_string())?;
-    let digest = DigestAlg::from_oid(&digest_oid).map_err(|_| {
+    // Read to refuse a token digesting under an algorithm this code cannot
+    // compute; the CMS verifier in step (5) digests under it for real. It is
+    // kept separate from the imprint's algorithm on purpose — see step (7).
+    let _digest = DigestAlg::from_oid(&digest_oid).map_err(|_| {
         Error::Other(format!(
             "the token's SignerInfo digests under {digest_oid}, which this code does not know"
         ))
@@ -467,23 +470,22 @@ pub fn verify_token_signature(
     })?;
     crate::verify::check_certificate_rules(tsa_cert, crate::verify::CertRole::TimeStamping)?;
 
-    // (7) the digest algorithm of the SignerInfo is the one the TSTInfo's
-    // messageImprint hashes under: two names for one operation, they may not
-    // disagree.
-    let imprint_digest =
+    // (7) the messageImprint must hash under an algorithm this code can
+    // compute. It is deliberately NOT required to be the algorithm the
+    // SignerInfo digests under: RFC 3161 never asks for that, and the two
+    // disagree in the wild — AutoFirma asks every TSA for a SHA-512 imprint
+    // (`TsaParams.java:24`) while plenty of TSAs sign their own SignedData
+    // under SHA-256, and openssl's `ts -verify` accepts exactly that token.
+    // Requiring equality reported every AutoFirma B-T stamp as unverified
+    // (round two, N7). What binds a token to one signature is the imprint's
+    // VALUE under its own algorithm, which `crate::verify` checks.
+    let _imprint_digest =
         DigestAlg::from_oid(&parse_dotted_oid(&tst.imprint_alg)?).map_err(|_| {
             Error::Other(format!(
                 "the token imprints under {}, which this code does not know",
                 tst.imprint_alg
             ))
         })?;
-    if imprint_digest != digest {
-        return Err(Error::Other(format!(
-            "the token's SignerInfo digests under {} but its messageImprint says {}",
-            digest.name(),
-            imprint_digest.name()
-        )));
-    }
 
     Ok(TokenStatus {
         gen_time: tst.gen_time,
@@ -495,8 +497,10 @@ pub fn verify_token_signature(
 /// bytes matter to the verdict beyond what the messageDigest binds.
 struct TstInfo {
     gen_time: SystemTime,
-    /// The OID of `messageImprint.hashAlgorithm`, cross-checked against the
-    /// SignerInfo's digestAlgorithm.
+    /// The OID of `messageImprint.hashAlgorithm`, refused when this code cannot
+    /// compute it. Deliberately not compared with the SignerInfo's
+    /// digestAlgorithm: RFC 3161 lets the requester choose the imprint's
+    /// algorithm, and AutoFirma chooses one the TSA usually does not sign under.
     imprint_alg: String,
 }
 
