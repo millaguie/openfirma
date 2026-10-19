@@ -174,22 +174,151 @@ fn applications_dir_in(xdg: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Pa
 }
 
 /// Whether an AutoFirma installation is present whose `afirma://` registration
-/// `--register` would replace: the two places the reference packages live
-/// (the Unix package's `/opt/AutoFirma` and the JNLP installer's per-user
-/// directory — the same pair `~/.config/autofirma.last` tracks). Finding A-2:
-/// a scheme has exactly ONE default handler, so takeover must be visible.
+/// `--register` would replace — the places the reference packages really
+/// install into, not the two this function first knew (finding 04-N1).
 pub fn detect_autofirma_install() -> Vec<PathBuf> {
+    autofirma_paths(
+        &|p| p.is_dir() || p.is_file(),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+        std::env::var_os("XDG_DATA_DIRS").as_deref(),
+    )
+}
+
+/// The same list with the filesystem and the two environment inputs injected,
+/// so what "an AutoFirma is here" means is testable without root and without
+/// racing another test over `HOME`.
+fn autofirma_paths(
+    exists: &dyn Fn(&Path) -> bool,
+    home: Option<&Path>,
+    data_dirs: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    if Path::new("/opt/AutoFirma").is_dir() {
-        found.push(PathBuf::from("/opt/AutoFirma"));
+    // The Unix packages. `afirma-simple`'s .deb installs the application under
+    // `/usr/lib/Autofirma`; the .rpm uses `%{_libdir}/autofirma`, which on the
+    // 64-bit targets this project ships is `/usr/lib64/autofirma`.
+    // `/opt/AutoFirma` is the JNLP-era layout an earlier revision knew alone —
+    // it stays, and it is not the one the packages use.
+    for dir in [
+        "/opt/AutoFirma",
+        "/usr/lib/Autofirma",
+        "/usr/lib64/autofirma",
+    ] {
+        if exists(Path::new(dir)) {
+            found.push(PathBuf::from(dir));
+        }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let per_user = PathBuf::from(home).join(".local/share/autofirma");
-        if per_user.is_dir() {
+    // The per-user JNLP installer.
+    if let Some(home) = home {
+        let per_user = home.join(".local/share/autofirma");
+        if exists(&per_user) {
             found.push(per_user);
         }
     }
+    // And the launcher the OS actually reads, wherever XDG says applications
+    // live (`/usr/local/share:/usr/share` when unset): the .deb ships
+    // `afirma.desktop` and the .rpm `autofirma.desktop`, and seeing that file
+    // is seeing the registration itself.
+    let dirs = data_dirs
+        .map(|v| v.to_owned())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    for root in std::env::split_paths(&dirs) {
+        // XDG requires absolute entries; a relative one is not a data root.
+        if !root.is_absolute() {
+            continue;
+        }
+        for name in ["afirma.desktop", "autofirma.desktop"] {
+            let entry = root.join("applications").join(name);
+            if exists(&entry) {
+                found.push(entry);
+            }
+        }
+    }
     found
+}
+
+/// What stands between this install and `afirma://` (finding 04-N1): the
+/// handler the OS would launch right now, and the AutoFirma leftovers a
+/// package leaves on disk.
+///
+/// The handler is the authority and the evidence is the second opinion. A path
+/// list alone is a guess about where a package wrote its files — it missed the
+/// .deb's `/usr/lib/Autofirma` entirely, and no list can see a registration
+/// whose `.desktop` openfirma never predicted. What `xdg-mime query default
+/// x-scheme-handler/afirma` answers is precisely the thing being replaced.
+pub struct SchemeHolder {
+    pub current_handler: Option<String>,
+    pub autofirma: Vec<PathBuf>,
+}
+
+impl SchemeHolder {
+    /// Whether `--register` would take the scheme from somebody else. Our own
+    /// entry re-registering itself is not a takeover.
+    pub fn blocks_registration(&self) -> bool {
+        match &self.current_handler {
+            // Linux's answer is exact: anything that is not our file.
+            Some(handler) => handler != DESKTOP_FILE,
+            // No answer at all (no xdg-mime, or nothing registered): the
+            // installations on disk are all there is to go on.
+            None => !self.autofirma.is_empty(),
+        }
+    }
+
+    /// The one sentence naming what is in the way, shared by the refusal and
+    /// the acknowledgement so a reader cannot see two different stories.
+    fn what(&self) -> String {
+        let mut what = Vec::new();
+        if let Some(handler) = self
+            .current_handler
+            .as_deref()
+            .filter(|h| *h != DESKTOP_FILE)
+        {
+            what.push(format!("el handler por defecto ahora mismo es {handler}"));
+        }
+        if !self.autofirma.is_empty() {
+            what.push(format!(
+                "se ven restos de una instalacion de AutoFirma en {}",
+                self.autofirma
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        what.join("; ")
+    }
+
+    /// What `--register` refuses with, naming the way past it.
+    pub fn refusal(&self) -> String {
+        format!(
+            "afirma:// ya lo atiende otro programa ({}): el esquema admite un solo handler \
+             por defecto, y registrar openfirma le sustituye — sus archivos siguen en disco, \
+             pero dejan de recibir las llamadas, y en una sede el usuario firma con lo que el \
+             escritorio lance. Repite con --acknowledge-autofirma para asumirlo, o desinstala \
+             primero AutoFirma. En Linux, `xdg-mime query default x-scheme-handler/afirma` \
+             responde quien es.",
+            self.what()
+        )
+    }
+
+    /// What an acknowledging `--register` prints: what is being taken, and how
+    /// to give it back.
+    pub fn acknowledgement(&self) -> String {
+        format!(
+            "AVISO: se sustituye la registracion de afirma:// ({}) para dejarsela a \
+             openfirma; se puede revertir con `openfirma afirma-uri --unregister` (devuelve \
+             el esquema a quien lo tuviera) y volviendo a ejecutar el configurador de \
+             AutoFirma",
+            self.what()
+        )
+    }
+}
+
+/// The live snapshot: the handler answering now, and the installations on disk.
+pub fn scheme_holder() -> SchemeHolder {
+    SchemeHolder {
+        current_handler: get_current_handler(),
+        autofirma: detect_autofirma_install(),
+    }
 }
 
 /// Which handler the OS would launch for an `afirma:` URI right now (Linux:
@@ -756,10 +885,114 @@ mod tests {
         for p in detect_autofirma_install() {
             let text = p.display().to_string();
             assert!(
-                text.contains("AutoFirma") || text.ends_with(".local/share/autofirma"),
+                text.ends_with(".local/share/autofirma")
+                    || [
+                        "/opt/AutoFirma",
+                        "/usr/lib/Autofirma",
+                        "/usr/lib64/autofirma"
+                    ]
+                    .contains(&text.as_str())
+                    || text.ends_with("/applications/afirma.desktop")
+                    || text.ends_with("/applications/autofirma.desktop"),
                 "deteccion fuera de los directorios registrados: {text}"
             );
         }
+    }
+
+    /// Finding 04-N1: the evidence list is the layouts the packages really
+    /// install, asked through an injected filesystem so no root is needed.
+    #[test]
+    fn autofirma_evidence_covers_the_layouts_the_packages_install() {
+        let deb = |p: &Path| {
+            matches!(
+                p.to_str().unwrap_or_default(),
+                "/usr/lib/Autofirma"
+                    | "/usr/share/applications/afirma.desktop"
+                    | "/home/ana/.local/share/autofirma"
+            )
+        };
+        assert_eq!(
+            autofirma_paths(&deb, Some(Path::new("/home/ana")), None),
+            vec![
+                PathBuf::from("/usr/lib/Autofirma"),
+                PathBuf::from("/home/ana/.local/share/autofirma"),
+                PathBuf::from("/usr/share/applications/afirma.desktop"),
+            ],
+            "the .deb's own layout — the one the round-two report found invisible"
+        );
+
+        // The .rpm's: `%{_libdir}/autofirma` plus a launcher reached through
+        // XDG_DATA_DIRS instead of the default `/usr/local/share:/usr/share`.
+        let rpm = |p: &Path| {
+            matches!(
+                p.to_str().unwrap_or_default(),
+                "/usr/lib64/autofirma" | "/opt/xdg/share/applications/autofirma.desktop"
+            )
+        };
+        assert_eq!(
+            autofirma_paths(&rpm, None, Some("/opt/xdg/share".as_ref())),
+            vec![
+                PathBuf::from("/usr/lib64/autofirma"),
+                PathBuf::from("/opt/xdg/share/applications/autofirma.desktop"),
+            ]
+        );
+
+        // A relative XDG entry is not a data root (the XDG rule), and nothing
+        // present means nothing reported.
+        let relative = |p: &Path| p.ends_with("applications/afirma.desktop");
+        assert!(autofirma_paths(&relative, None, Some("relative/share".as_ref())).is_empty());
+        let nothing = |_p: &Path| false;
+        assert!(autofirma_paths(&nothing, None, None).is_empty());
+    }
+
+    /// Finding 04-N1: what decides a takeover is the handler answering NOW.
+    /// The reported defect was a handler that was AutoFirma's while the path
+    /// detection found nothing at all, and `--register` went ahead (exit 0).
+    #[test]
+    fn the_handler_answering_now_is_what_decides_the_takeover() {
+        let ours = SchemeHolder {
+            current_handler: Some(DESKTOP_FILE.to_string()),
+            autofirma: Vec::new(),
+        };
+        assert!(
+            !ours.blocks_registration(),
+            "re-registering our own entry is not a takeover"
+        );
+
+        let theirs = SchemeHolder {
+            current_handler: Some("afirma.desktop".to_string()),
+            autofirma: Vec::new(),
+        };
+        assert!(
+            theirs.blocks_registration(),
+            "the official launcher is the handler: this is the exact case that \
+             used to register silently"
+        );
+        let refusal = theirs.refusal();
+        assert!(refusal.contains("afirma.desktop"), "{refusal}");
+        assert!(refusal.contains("--acknowledge-autofirma"), "{refusal}");
+
+        // No handler, no evidence: nothing to ask about (a fresh machine).
+        let clean = SchemeHolder {
+            current_handler: None,
+            autofirma: Vec::new(),
+        };
+        assert!(!clean.blocks_registration());
+
+        // No answer from the OS, but an installation on disk: still not
+        // silent, and both sentences name what they found and the way back.
+        let on_disk = SchemeHolder {
+            current_handler: None,
+            autofirma: vec![PathBuf::from("/usr/lib/Autofirma")],
+        };
+        assert!(on_disk.blocks_registration());
+        assert!(on_disk.refusal().contains("/usr/lib/Autofirma"));
+        let acknowledged = on_disk.acknowledgement();
+        assert!(
+            acknowledged.contains("/usr/lib/Autofirma"),
+            "{acknowledged}"
+        );
+        assert!(acknowledged.contains("--unregister"), "{acknowledged}");
     }
 
     #[test]

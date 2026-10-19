@@ -1816,34 +1816,16 @@ fn register_scheme(
          process from a path already, so this failure means the OS lied about argv0)",
     )?;
     #[cfg(not(target_os = "windows"))]
-    let _ = &exe; // A-2: a scheme has exactly ONE default handler. Detect what stands in
-    // the way BEFORE writing anything and require the acknowledgement — the
-    // same decision AutoFirma's configurator dialog makes visible.
-    let detected = openfirma_browser::scheme::detect_autofirma_install();
-    if !detected.is_empty() && !acknowledges_autofirma {
-        anyhow::bail!(
-            "hay un AutoFirma instalado ({}): el esquema afirma:// solo admite un handler \
-             por defecto, y registrar openfirma le sustituye (sus archivos siguen en disco \
-             pero dejen de recibir las llamadas). Repite con --acknowledge-autofirma para \
-             asumirlo, o desinstala primero AutoFirma.",
-            detected
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    if !detected.is_empty() {
-        println!(
-            "AVISO: se sustituye la registracion de AutoFirma ({}) para afirma://; \
-             se puede revertir con `openfirma afirma-uri --unregister` y volviendo a \
-             ejecutar el configurador de AutoFirma",
-            detected
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    let _ = &exe; // A-2: a scheme has exactly ONE default handler. What stands in the
+    // way is decided BEFORE writing anything and never silently: 04-N1 — the
+    // handler the OS would launch right now (the thing actually being
+    // replaced) plus the AutoFirma leftovers on disk, where an earlier
+    // revision guessed from two paths the official packages do not use.
+    if let Some(warning) = registration_verdict(
+        &openfirma_browser::scheme::scheme_holder(),
+        acknowledges_autofirma,
+    )? {
+        println!("{warning}");
     }
     #[cfg(target_os = "linux")]
     {
@@ -1875,6 +1857,15 @@ fn register_scheme(
         println!(
             "then double-click it (or `regedit /I`) and accept the UAC prompt: \
                   a signing client never edits HKCR by itself"
+        );
+        // 04-N1: on this platform the takeover check above has nothing to ask —
+        // `current_handler` is Linux's `xdg-mime` answer and the read of
+        // `HKCR\afirma` a Windows one would need is not implemented (no runner
+        // here exercises a real registry, and openfirma never writes it). What
+        // it can do is tell the person importing the .reg how to look.
+        println!(
+            "antes de importarlo, mira quien atiende ahora afirma://: `reg query HKCR\\afirma \
+             /ve` muestra la clave de AutoFirma si esta ahi, y este .reg la sobrescribe"
         );
     }
     #[cfg(target_os = "macos")]
@@ -1935,6 +1926,25 @@ fn register_scheme(
         }
     }
     Ok(())
+}
+
+/// What `--register` does about whoever holds `afirma://` right now (finding
+/// 04-N1): nothing when the scheme is free or already ours, a refusal naming
+/// the way past it when somebody else answers, and the takeover warning once
+/// that refusal has been acknowledged. Pure, so the decision is testable
+/// without a desktop: the snapshot comes from `scheme_holder`, and the caller
+/// runs this BEFORE it writes anything.
+fn registration_verdict(
+    holder: &openfirma_browser::scheme::SchemeHolder,
+    acknowledged: bool,
+) -> Result<Option<String>> {
+    if !holder.blocks_registration() {
+        return Ok(None);
+    }
+    if !acknowledged {
+        anyhow::bail!("{}", holder.refusal());
+    }
+    Ok(Some(holder.acknowledgement()))
 }
 
 /// The key half of a registration, validated and rendered but not yet written
@@ -3649,6 +3659,43 @@ mod tests {
     }
 
     #[test]
+    fn register_refuses_a_scheme_an_installed_autofirma_holds() {
+        // 04-N1, the reported case end to end minus the desktop: the handler
+        // answering now is the official launcher while the path detection
+        // finds nothing (it looked at `/opt/AutoFirma` only), which is how
+        // `--register` used to take afirma:// with exit 0 and no warning.
+        use openfirma_browser::scheme::{DESKTOP_FILE, SchemeHolder};
+        let theirs = SchemeHolder {
+            current_handler: Some("afirma.desktop".to_string()),
+            autofirma: Vec::new(),
+        };
+        let err = registration_verdict(&theirs, false)
+            .expect_err("an unacknowledged takeover must refuse")
+            .to_string();
+        assert!(err.contains("--acknowledge-autofirma"), "{err}");
+        assert!(err.contains("afirma.desktop"), "{err}");
+        let warning = registration_verdict(&theirs, true)
+            .expect("acknowledging is not an error")
+            .expect("and it prints what is being taken");
+        assert!(warning.contains("--unregister"), "{warning}");
+
+        // Our own entry: re-registering is not a takeover, and nothing is
+        // printed for it.
+        let ours = SchemeHolder {
+            current_handler: Some(DESKTOP_FILE.to_string()),
+            autofirma: Vec::new(),
+        };
+        assert!(registration_verdict(&ours, false).unwrap().is_none());
+
+        // Nothing registered anywhere: quiet, too.
+        let free = SchemeHolder {
+            current_handler: None,
+            autofirma: Vec::new(),
+        };
+        assert!(registration_verdict(&free, false).unwrap().is_none());
+    }
+
+    #[test]
     fn a_register_that_cannot_finish_writes_nothing_at_all() {
         // 04-N4: the checks ran after the writes. With a password file others
         // can read, `--register` wrote the .desktop entry and ran `xdg-mime
@@ -3779,7 +3826,12 @@ mod tests {
         let _xdg_guard = lock_quiet(&XDG_MIME_OVERRIDE);
         unsafe { std::env::set_var("OPENFIRMA_ASSUME_XDG_MIME", "1") };
         let wrote = with_home(&dir, || {
-            register_scheme(Some(p12.clone()), Some(pw.clone()), Some(&cfg), false, true)
+            // Acknowledging, because 04-N1 makes the takeover check real: a
+            // developer machine with AutoFirma on it must say so out loud, and
+            // this test is about the config round trip, not about that
+            // verdict (which has its own test). On CI, with no AutoFirma
+            // anywhere, the flag changes nothing.
+            register_scheme(Some(p12.clone()), Some(pw.clone()), Some(&cfg), true, true)
         });
         wrote.expect("a --register with a real key must write its config");
 
