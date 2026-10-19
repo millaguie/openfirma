@@ -1089,17 +1089,38 @@ fn digest_name(text: &str) -> Option<DigestAlg> {
 fn sign_from_uri(uri: &AfirmaUri, signer: &dyn Signer) -> Result<BrowserResult, BrowserError> {
     // The gates (operation, storage route, properties) ran in `execute_gate`
     // before the key was touched; see findings A-4 and M-5.
-    let content = uri.data.as_deref().ok_or_else(|| {
+    let content = match uri.data.as_deref() {
+        Some(data) if !data.is_empty() => data,
         // AutoFirma's own name for a sign call carrying no data: 600100 /
         // SAF_03 (ErrorCode.Request.DATA_NOT_FOUND). A pre-4.1 caller reads
         // "SAF_03: Error en los parametros de entrada" — the exact text the
         // recorded ERRORS table answers for that shape.
-        BrowserError::with_wire(
-            WireError::DATA_NOT_FOUND,
-            "missing-data",
-            "a sign call arrived without a dat payload",
-        )
-    })?;
+        //
+        // 04-N9: `dat=` and no `dat` at all are one refusal, not two. An empty
+        // value decodes to zero bytes, which every frontend below will happily
+        // sign: the result is a structurally valid signature over nothing, and
+        // it opens in a viewer as a document the user never signed. A page that
+        // sent `dat=` meant a payload it failed to attach; the honest answer is
+        // the one its own protocol has for a missing one. Nothing legitimately
+        // wants the empty document signed through this door — a caller that
+        // really has zero bytes to sign is signing a file, and says so.
+        Some(_) => {
+            return Err(BrowserError::with_wire(
+                WireError::DATA_NOT_FOUND,
+                "empty-data",
+                "a sign call arrived with an EMPTY dat payload (`dat=`): the zero-byte \
+                 document is not what its sender meant, and signing it would answer with \
+                 a signature over nothing",
+            ));
+        }
+        None => {
+            return Err(BrowserError::with_wire(
+                WireError::DATA_NOT_FOUND,
+                "missing-data",
+                "a sign call arrived without a dat payload",
+            ));
+        }
+    };
     // AutoFirma requires both parameters (setSignParameters throws on each
     // miss), so the refusal here is its own behaviour, not ours.
     let format_text = uri.format.as_deref().ok_or_else(|| {
