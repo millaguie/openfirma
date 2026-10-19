@@ -22,10 +22,16 @@ CERTS="testdata/certs"
 P12="$CERTS/signer-rsa.p12"
 PASS="openfirma"
 OUT="${GOLDEN_DIR:-testdata/golden}"
+# The CLI under test: where cargo put it. Hardcoding "$OF_BIN"
+# (round two's N-6) made the script lie on any machine that sets CARGO_TARGET_DIR,
+# comparing a stale binary against the jar while reporting MATCH. OPENFIRMA_BIN
+# overrides; cargo metadata is the truth when the env vars differ.
+OF_BIN="${OPENFIRMA_BIN:-${CARGO_TARGET_DIR:-$ROOT/target}/debug/openfirma}"
 DRIVER="target/golden-driver"
 INPUTS="testdata/inputs"
 
 [ -f "$P12" ] || { echo "run tools/gen-testcert.sh first" >&2; exit 1; }
+[ -x "$OF_BIN" ] || { echo "no CLI at $OF_BIN, build it (cargo build) or set OPENFIRMA_BIN" >&2; exit 1; }
 [ -f "$JAR" ] || { echo "no autofirma.jar at $JAR, run tools/fetch-autofirma.sh" >&2; exit 1; }
 
 mkdir -p "$OUT" "$DRIVER"
@@ -84,7 +90,7 @@ run_case() {
   java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
     "$CERTS/$base.p12" "$PASS" "$input" "$af" SHA256withRSA "$@" >/dev/null 2>&1
 
-  ./target/debug/openfirma inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
+  "$OF_BIN" inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
 
   # The contentHint description comes from AutoFirma's jmimemagic database,
   # which we do not ship, so it is read back from its own output instead of
@@ -114,12 +120,12 @@ run_case() {
   # --force: this script owns $ours (the corpus is regenerated per run, see
   # docs/validation.md), and the CLI refuses to replace an existing output of
   # another run without being told the overwrite is meant (review 06, A-3).
-  ./target/debug/openfirma sign -i "$input" -o "$ours" --force \
+  "$OF_BIN" sign -i "$input" -o "$ours" --force \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
     "${of[@]}" >/dev/null
 
-  ./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
+  "$OF_BIN" inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
 
   if diff -u "$OUT/$name.autofirma.dump" "$OUT/$name.openfirma.dump" >"$OUT/$name.diff"; then
     rm -f "$OUT/$name.diff"
@@ -164,7 +170,7 @@ run_alg_case() {
     "${af_params[@]+"${af_params[@]}"}" >/dev/null 2>&1 \
     || { echo "SKIP   $name (AutoFirma refused to sign it)"; return 0; }
 
-  ./target/debug/openfirma inspect -i "$af" | normalize >"$dump"
+  "$OF_BIN" inspect -i "$af" | normalize >"$dump"
 
   local hint of=(--digest "$(echo "$sha" | tr 'A-Z' 'a-z')")
   hint="$(awk '
@@ -198,12 +204,12 @@ run_alg_case() {
   # --force: this script owns $ours (the corpus is regenerated per run, see
   # docs/validation.md), and the CLI refuses to replace an existing output of
   # another run without being told the overwrite is meant (review 06, A-3).
-  ./target/debug/openfirma sign -i "$input" -o "$ours" --force \
+  "$OF_BIN" sign -i "$input" -o "$ours" --force \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
     "${of[@]}" >/dev/null; echo "ALG-CASE $name flags: ${of[*]}" >&2
 
-  ./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
+  "$OF_BIN" inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
 
   if diff -u "$dump" "$OUT/$name.openfirma.dump" >"$OUT/$name.diff"; then
     rm -f "$OUT/$name.diff"
@@ -237,17 +243,17 @@ if [ -f "$CERTS/signer-ec.p12" ]; then
   # the test EC certificate is P-256, so the digest both sides use is SHA-256
   java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
     "$CERTS/signer-ec.p12" "$PASS" "$INPUTS/simple.txt" "$af" SHA256withECDSA >/dev/null 2>&1
-  ./target/debug/openfirma inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
+  "$OF_BIN" inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
   hint="$(awk '
     /OID 1\.2\.840\.113549\.1\.9\.16\.2\.4$/ { found = 1; next }
     found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
     found && /OID /        { exit }
   ' "$OUT/$name.autofirma.dump")"
-  ./target/debug/openfirma sign --force -i "$INPUTS/simple.txt" -o "$ours" \
+  "$OF_BIN" sign --force -i "$INPUTS/simple.txt" -o "$ours" \
     --cert "$CERTS/signer-ec.crt" --key "$CERTS/signer-ec.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
     --digest sha256 ${hint:+--content-hint "$hint"} >/dev/null
-  ./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
+  "$OF_BIN" inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
   if diff -u "$OUT/$name.autofirma.dump" "$OUT/$name.openfirma.dump" >"$OUT/$name.diff"; then
     rm -f "$OUT/$name.diff"
     echo "MATCH  $name"
@@ -288,20 +294,20 @@ if [ -f "$CERTS/signer-policy.p12" ]; then
     policyIdentifier=2.16.724.1.3.1.1.2.1.9 \
     policyIdentifierHash=AQI= policyIdentifierHashAlgorithm=SHA-256 \
     commitmentTypeIndications=1 commitmentTypeIndication0Identifier=5 >/dev/null 2>&1
-  ./target/debug/openfirma inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
+  "$OF_BIN" inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
   hint="$(awk '
     /OID 1\.2\.840\.113549\.1\.9\.16\.2\.4$/ { found = 1; next }
     found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
     found && /OID /        { exit }
   ' "$OUT/$name.autofirma.dump")"
-  ./target/debug/openfirma sign --force -i "$INPUTS/simple.txt" -o "$ours" \
+  "$OF_BIN" sign --force -i "$INPUTS/simple.txt" -o "$ours" \
     --cert "$CERTS/signer-policy.crt" --key "$CERTS/signer-policy.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
     ${hint:+--content-hint "$hint"} \
     --signature-policy 2.16.724.1.3.1.1.2.1.9 \
     --signature-policy-hash 0102 \
     --commitment-type 1.2.840.113549.1.9.16.6.5 >/dev/null
-  ./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
+  "$OF_BIN" inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
   if diff -u "$OUT/$name.autofirma.dump" "$OUT/$name.openfirma.dump" >"$OUT/$name.diff"; then
     rm -f "$OUT/$name.diff"
     echo "MATCH  $name"
@@ -325,18 +331,18 @@ af="$OUT/$name.autofirma.csig"; ours="$OUT/$name.openfirma.csig"
 java -Djava.awt.headless=true -cp "$JAR:$DRIVER" AutofirmaGolden \
   "$CERTS/signer-rsa.p12" "$PASS" "$INPUTS/simple.txt" "$af" SHA256withRSA \
   includeMimeTypeAttribute=true mimeType=text/plain >/dev/null 2>&1
-./target/debug/openfirma inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
+"$OF_BIN" inspect -i "$af" | normalize >"$OUT/$name.autofirma.dump"
 hint="$(awk '
   /OID 1\.2\.840\.113549\.1\.9\.16\.2\.4$/ { found = 1; next }
   found && /UTF8String / { sub(/^ *UTF8String "/, ""); sub(/".*$/, ""); print; exit }
   found && /OID /        { exit }
 ' "$OUT/$name.autofirma.dump")"
-./target/debug/openfirma sign --force -i "$INPUTS/simple.txt" -o "$ours" \
+"$OF_BIN" sign --force -i "$INPUTS/simple.txt" -o "$ours" \
   --cert "$CERTS/signer-rsa.crt" --key "$CERTS/signer-rsa.key" \
   --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" \
   ${hint:+--content-hint "$hint"} \
   --mime-type text/plain >/dev/null
-./target/debug/openfirma inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
+"$OF_BIN" inspect -i "$ours" | normalize >"$OUT/$name.openfirma.dump"
 if diff -u "$OUT/$name.autofirma.dump" "$OUT/$name.openfirma.dump" >"$OUT/$name.diff"; then
   rm -f "$OUT/$name.diff"
   echo "MATCH  $name"
@@ -372,13 +378,13 @@ run_pades_case() {
     "$CERTS/$base.p12" "$PASS" "$input" "$af" SHA256withRSA >/dev/null 2>&1 \
     || { echo "SKIP   $name (AutoFirma refused to sign it)"; return 0; }
 
-  ./target/debug/openfirma sign --force -i "$input" -o "$ours" --format pades-b-b \
+  "$OF_BIN" sign --force -i "$input" -o "$ours" --format pades-b-b \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" >/dev/null
 
-  python3 tools/golden/pdf-normalize.py "$af" --inspect ./target/debug/openfirma \
+  python3 tools/golden/pdf-normalize.py "$af" --inspect "$OF_BIN" \
     | normalize_pades >"$OUT/$name.autofirma.pades.dump"
-  python3 tools/golden/pdf-normalize.py "$ours" --inspect ./target/debug/openfirma \
+  python3 tools/golden/pdf-normalize.py "$ours" --inspect "$OF_BIN" \
     | normalize_pades >"$OUT/$name.openfirma.pades.dump"
 
   # both sides must pass their own integrity check, or a MATCH is meaningless
@@ -422,7 +428,7 @@ run_xades_case() {
     format=XAdES\ Enveloped profile=baseline >/dev/null 2>&1 \
     || { echo "SKIP   $name (AutoFirma refused to sign it)"; return 0; }
 
-  ./target/debug/openfirma sign --force -i "$input" -o "$ours" --format xades-b-b \
+  "$OF_BIN" sign --force -i "$input" -o "$ours" --format xades-b-b \
     --cert "$CERTS/$base.crt" --key "$CERTS/$base.key" \
     --chain "$CERTS/intermediate.crt" --chain "$CERTS/ca.crt" >/dev/null
 
