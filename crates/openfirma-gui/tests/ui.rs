@@ -564,6 +564,50 @@ fn the_pickers_back_button_leaves_the_picker() {
 }
 
 #[test]
+fn the_advanced_options_open_when_the_header_is_clicked() {
+    // 06-N-7: `.open(Some(adv_open))` forced the header's state every frame and
+    // `*advanced = adv_open` wrote back the value it had just read, so the
+    // click was never seen: the TSA field, the digest choice, the format list
+    // and the PDF reason were unreachable from the window, which ADR-0006
+    // point 7 describes as existing.
+    let Some(()) = require(
+        testdata().join("inputs/simple.pdf").is_file(),
+        "testdata/inputs/simple.pdf",
+    ) else {
+        return;
+    };
+    let mut app = fixture_app(None);
+    app.load_path_for_test(testdata().join("inputs/simple.pdf"));
+    let mut harness = harness_for(app);
+    harness.run();
+    harness.get_by_label_contains("Opciones avanzadas");
+    assert!(
+        harness
+            .query_by_label_contains("Algoritmo de resumen")
+            .is_none(),
+        "closed means closed: the panel is not rendered yet"
+    );
+    harness.get_by_label_contains("Opciones avanzadas").click();
+    harness.run();
+    // The panel is open, its options are on screen, and its label says where
+    // the next click goes.
+    harness.get_by_label_contains("Algoritmo de resumen");
+    harness.get_by_label_contains("Motivo de la firma");
+    harness.get_by_label_contains("Ocultar opciones avanzadas");
+    // And it closes again — the state is the screen's, not a frame's.
+    harness
+        .get_by_label_contains("Ocultar opciones avanzadas")
+        .click();
+    harness.run();
+    harness.get_by_label_contains("Opciones avanzadas");
+    assert!(
+        harness
+            .query_by_label_contains("Algoritmo de resumen")
+            .is_none()
+    );
+}
+
+#[test]
 fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     // The verify deviation from AutoFirma, pinned through the window: the
     // *document itself* (not an exported .csig) gets verdicts. Built end to

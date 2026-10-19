@@ -1133,21 +1133,26 @@ impl App {
         // a level with the CLI's honest pointer to the terminal
         // (docs/adr/0006-gui-toolkit.md).
         ui.add_space(6.0);
-        let adv_open = *advanced;
-        egui::CollapsingHeader::new(if *advanced {
+        let header = egui::CollapsingHeader::new(if *advanced {
             tr.advanced_hide.clone()
         } else {
             tr.advanced_show.clone()
         })
         .id_salt("advanced")
-        .open(Some(adv_open))
+        .open(Some(*advanced))
         .show(ui, |ui| {
             if tsa_available(chosen_format) {
-                ui.weak(tr.adv_tsa.clone());
-                ui.add_sized(
+                // 06-N-7's other half: kittest's accessibility check refused the
+                // panel the moment it could open — the TSA field had no name a
+                // screen reader could read, only a hint that vanishes on the
+                // first keystroke. The sentence above it is its label now, the
+                // same shape the password field uses.
+                let label = ui.weak(tr.adv_tsa.clone());
+                let field = ui.add_sized(
                     [(ui.available_width() - 60.0).min(460.0), 26.0],
                     egui::TextEdit::singleline(tsa_url).hint_text("http://tsa.ejemplo/tsa"),
                 );
+                field.labelled_by(label.id);
             }
             ui.weak(tr.adv_digest.clone());
             ui.horizontal(|ui| {
@@ -1173,14 +1178,23 @@ impl App {
                 }
             }
             if format == Format::Pdf {
-                ui.weak(tr.adv_reason.clone());
-                ui.add_sized(
+                let label = ui.weak(tr.adv_reason.clone());
+                let field = ui.add_sized(
                     [(ui.available_width() - 60.0).min(460.0), 26.0],
                     egui::TextEdit::singleline(reason),
                 );
+                field.labelled_by(label.id);
             }
         });
-        *advanced = adv_open;
+        // 06-N-7: the header's own click decides the state. `open(Some(x))`
+        // alone forces the state every frame, so the click was read by egui and
+        // thrown away, and writing `*advanced` back into what had just been
+        // read from it changed nothing: TSA, digest, format and the PDF reason
+        // were unreachable in the window. Now the header reports the click and
+        // the screen's own flag flips, which is also what the label follows.
+        if header.header_response.clicked() {
+            *advanced = !*advanced;
+        }
 
         // The one button that decides everything.
         ui.add_space(14.0);
