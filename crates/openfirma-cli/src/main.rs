@@ -1795,6 +1795,17 @@ fn register_scheme(
             ),
         }
     }
+    // 04-N4: the key half of the registration is validated and rendered HERE,
+    // before the exe is resolved and before the first byte is written. The old
+    // order wrote the .desktop entry and took the scheme, and only then read
+    // the password file's mode — leaving the machine registered against a
+    // handler that cannot open its key.
+    let pending = prepare_browser_config(
+        p12.as_deref(),
+        password_file.as_deref(),
+        &config,
+        allow_unattended,
+    )?;
     // The registration needs openfirma's own absolute path: the Linux desktop
     // entry gets it inside linux_install_and_register, Windows writes it into
     // the .reg below. (A former `let _exe` here looked like the shared value
@@ -1888,59 +1899,26 @@ fn register_scheme(
         );
     }
 
-    if p12.is_some() || password_file.is_some() {
-        let container = p12.context(
-            "--register writes a p12 into the handler config; --password-file without \
-             --p12 would write half a key pair",
-        )?;
-        let pw_file = password_file.context(
-            "--register needs --password-file next to --p12 (the file whose first line \
-             is its password): the config never stores a password itself, and argv has \
-             no flag for one on purpose",
-        )?;
-        if !container.is_file() {
-            anyhow::bail!(
-                "--p12 {} is not a file this user can sign with now; --register refuses \
-                 to write a handler config pointing at a key that does not exist yet",
-                container.display()
-            );
-        }
-        if !pw_file.is_file() {
-            anyhow::bail!(
-                "--password-file {} is not a file; the handler would open every browser \
-                 call against a password that cannot be read",
-                pw_file.display()
-            );
-        }
-        // B-2: the config names (and the password file IS) signing-key
-        // material — same private-mode rule on both, before anything reads
-        // them.
-        openfirma_browser::scheme::check_private(&pw_file).map_err(anyhow::Error::msg)?;
-        let contents = openfirma_browser::scheme::BrowserConfig {
-            p12: Some(container.clone()),
-            password_file: Some(pw_file.clone()),
-            allow_unattended,
-        }
-        .to_toml();
-        if let Some(dir) = config.parent() {
+    if let Some(pending) = pending {
+        if let Some(dir) = pending.path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        std::fs::write(&config, contents.clone())
-            .with_context(|| format!("writing {}", config.display()))?;
+        std::fs::write(&pending.path, &pending.contents)
+            .with_context(|| format!("writing {}", pending.path.display()))?;
         // The file names where the signing key lives: private from its first
         // write (B-2 — an earlier revision wrote it with the process umask,
         // and a shared home read 0644).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("protecting {}", config.display()))?;
+            std::fs::set_permissions(&pending.path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("protecting {}", pending.path.display()))?;
         }
-        println!("wrote {}", config.display());
+        println!("wrote {}", pending.path.display());
         println!(
             "the handler signs with {} (password: first line of {})",
-            container.display(),
-            pw_file.display()
+            pending.container.display(),
+            pending.password_file.display()
         );
         if allow_unattended {
             eprintln!(
@@ -1952,11 +1930,78 @@ fn register_scheme(
                 "sin allow_unattended, cada llamada del navegador debe confirmarse o \
                  rechazarse (A-3); para firmar sin prompt escribe allow_unattended = true \
                  en {}",
-                config.display()
+                pending.path.display()
             );
         }
     }
     Ok(())
+}
+
+/// The key half of a registration, validated and rendered but not yet written
+/// (finding 04-N4). `--register` used to write the `.desktop` entry and take
+/// the scheme for openfirma BEFORE discovering that the password file it was
+/// told to name is readable by others, or that the `.p12` is not a file — it
+/// had already replaced the handler when it refused, the worst of the two
+/// states: registered, and dead on every browser call. Every check that can
+/// refuse now runs here, before the first write of any kind.
+struct PendingConfig {
+    path: PathBuf,
+    contents: String,
+    container: PathBuf,
+    password_file: PathBuf,
+}
+
+fn prepare_browser_config(
+    p12: Option<&Path>,
+    password_file: Option<&Path>,
+    config: &Path,
+    allow_unattended: bool,
+) -> Result<Option<PendingConfig>> {
+    if p12.is_none() && password_file.is_none() {
+        return Ok(None);
+    }
+    let container = p12
+        .context(
+            "--register writes a p12 into the handler config; --password-file without \
+             --p12 would write half a key pair",
+        )?
+        .to_path_buf();
+    let pw_file = password_file
+        .context(
+            "--register needs --password-file next to --p12 (the file whose first line \
+             is its password): the config never stores a password itself, and argv has \
+             no flag for one on purpose",
+        )?
+        .to_path_buf();
+    if !container.is_file() {
+        anyhow::bail!(
+            "--p12 {} is not a file this user can sign with now; --register refuses \
+             to write a handler config pointing at a key that does not exist yet",
+            container.display()
+        );
+    }
+    if !pw_file.is_file() {
+        anyhow::bail!(
+            "--password-file {} is not a file; the handler would open every browser \
+             call against a password that cannot be read",
+            pw_file.display()
+        );
+    }
+    // B-2: the config names (and the password file IS) signing-key material —
+    // same private-mode rule on both, before anything reads them.
+    openfirma_browser::scheme::check_private(&pw_file).map_err(anyhow::Error::msg)?;
+    let contents = openfirma_browser::scheme::BrowserConfig {
+        p12: Some(container.clone()),
+        password_file: Some(pw_file.clone()),
+        allow_unattended,
+    }
+    .to_toml();
+    Ok(Some(PendingConfig {
+        path: config.to_path_buf(),
+        contents,
+        container,
+        password_file: pw_file,
+    }))
 }
 
 /// `afirma-uri --unregister`: remove only what openfirma wrote (its desktop
@@ -3601,6 +3646,93 @@ mod tests {
             "{err}"
         );
         std::fs::remove_file(&pw).ok();
+    }
+
+    #[test]
+    fn a_register_that_cannot_finish_writes_nothing_at_all() {
+        // 04-N4: the checks ran after the writes. With a password file others
+        // can read, `--register` wrote the .desktop entry and ran `xdg-mime
+        // default` — taking afirma:// for openfirma — and refused only then,
+        // leaving a registered handler that cannot open its key. The refusal
+        // has to arrive before the machine is touched, and "nothing was
+        // written" is what this test looks at, not the sentence.
+        let _home_guard = lock_quiet(&HOME_LOCK);
+        #[cfg(target_os = "linux")]
+        let _xdg_guard = lock_quiet(&XDG_MIME_OVERRIDE);
+        unsafe { std::env::set_var("OPENFIRMA_ASSUME_XDG_MIME", "1") };
+        let dir =
+            std::env::temp_dir().join(format!("openfirma-register-order-{}", std::process::id()));
+        let apps = dir.join(".local/share/applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        let desktop = apps.join("openfirma-afirma.desktop");
+        let _ = std::fs::remove_file(&desktop);
+        let cfg = dir.join("browser.toml");
+        let _ = std::fs::remove_file(&cfg);
+        let p12 = dir.join("clave.p12");
+        std::fs::write(&p12, b"a file, but not a container -- never opened here").unwrap();
+
+        // (a) A password file anyone can read: B-2's rule refuses it. (The
+        // round-two report reproduced exactly this pair and the .desktop entry
+        // was on disk afterwards, registered.)
+        let loose = dir.join("pw-loose.txt");
+        std::fs::write(&loose, b"secreto\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let err = with_home(&dir, || {
+            register_scheme(
+                Some(p12.clone()),
+                Some(loose.clone()),
+                Some(&cfg),
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+        });
+        assert!(err.contains("legible por otros"), "{err}");
+        assert!(
+            !desktop.exists(),
+            "--register took the scheme before refusing: {}",
+            desktop.display()
+        );
+        assert!(
+            !cfg.exists(),
+            "--register wrote the handler config before refusing: {}",
+            cfg.display()
+        );
+
+        // (b) A .p12 that is not there at all: the other named refusal, and
+        // the same absence.
+        let pw = dir.join("pw.txt");
+        std::fs::write(&pw, b"secreto\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let err = with_home(&dir, || {
+            register_scheme(
+                Some(dir.join("no-existe.p12")),
+                Some(pw.clone()),
+                Some(&cfg),
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+        });
+        assert!(err.contains("is not a file"), "{err}");
+        assert!(
+            !desktop.exists(),
+            "--register took the scheme before refusing"
+        );
+        assert!(
+            !cfg.exists(),
+            "--register wrote the handler config before refusing"
+        );
     }
 
     #[test]
