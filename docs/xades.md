@@ -260,7 +260,17 @@ set by `docs/pades.md` and `docs/adr/0003`.
    provider rejects SunEC keys (`No installed provider supports this key`) —
    so there is no golden for it; the EC path is crosschecked with `xmlsec1`
    instead.
-6. **Not implemented** (out of scope, one reason each): enveloping, internally
+6. **A root element that is itself a `ds:Signature`.** Refused; AutoFirma signs
+   it. The data reference's filter is `not(ancestor-or-self::ds:Signature)`, so when
+   the root is the signature the filter removes the very element the reference
+   points at and the digest covers nothing. Measured with
+   `tools/golden/AutofirmaGolden` on `<ds:Signature><ds:SignedInfo/></ds:Signature>`:
+   AutoFirma accepts the input and writes 7 723 bytes, its own validator then
+   answers `UNKOWN_ERROR` over what it wrote, and `xmlsec1 verify` answers `ERROR`.
+   Emitting a signature that nobody — including the tool that emitted it — can
+   validate is the failure this project refuses rather than reproduces, so the
+   answer is an error naming the element and what to sign instead.
+7. **Not implemented** (out of scope, one reason each): enveloping, internally
    detached and externally detached shapes (the enveloped golden covers the
    XML document case, and non-XML input is refused with an error pointing to
    CAdES); the advanced profile's `SigningCertificate` v1 + signed KeyInfo
