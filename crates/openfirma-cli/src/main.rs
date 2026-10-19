@@ -1523,7 +1523,13 @@ fn main() -> Result<()> {
                         Some((container, password_file)) => {
                             allow |= config.as_ref().is_some_and(|c| c.allow_unattended);
                             eprintln!(
-                                "signing with the browser config's key: {}",
+                                // "using", not "signing": this line is printed
+                                // before the consent gate decides, so a refusal
+                                // (04-N8's `consent-required`, or a key that
+                                // cannot be opened) would otherwise arrive right
+                                // after a line announcing a signature that is
+                                // not going to happen.
+                                "using the browser config's key: {}",
                                 container.display()
                             );
                             (

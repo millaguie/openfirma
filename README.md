@@ -74,9 +74,14 @@ The window (`openfirma-gui`) signs and verifies through the same library
 calls this CLI makes — everything it does is also possible from here, and the
 decisions (detection, output naming, descriptor parsing, trust anchors) are
 one implementation both frontends call, not two that can drift. Not started
-yet: FacturaE. The browser protocol works on its own
-pages and test sedes; against a *real* sede it still lacks the TLS leg — see
-docs/adr/0005-browser-protocol.md and the table row below.
+yet: FacturaE. The browser protocol — `afirma://` parsing, dispatch, the wire
+forms a sede's page parses, and the loopback endpoint — works end to end
+against a client that speaks what the recorded pages send. **No real sede works
+today, and no page of ours exists**: nothing here serves HTML, the endpoint
+hands its one token to whatever started it (a shell with `curl`, or a test in
+`crates/openfirma-browser/tests/`), and a real sede's page speaks `wss://` to a
+port it chooses itself with an `idsession` it mints, which is not implemented —
+see docs/adr/0005-browser-protocol.md and the table row below.
 
 | Component | Status |
 |---|---|
@@ -92,7 +97,7 @@ docs/adr/0005-browser-protocol.md and the table row below.
 | Keystores: Windows cert store, macOS keychain | Windows compiles on CI and is untested at runtime: it lists the certificates whose private key CAPI can acquire, signs through the store's own context with a legacy CSP (PKCS#1 v1.5), and **refuses by name** a key that lives only in the CNG store (the NCrypt signer does not exist yet) and one whose provider is CNG-only; a legacy CSP that cannot produce SHA-256 (a `PROV_RSA_FULL` provider — the usual destination of a double-clicked `.pfx`) fails with its Win32 error instead of being re-opened through `PROV_RSA_AES`, see the note in `crates/openfirma-keystore/src/windows.rs`. macOS refuses both listing and signing until it can be tested, see docs/adr/0004-system-keystores.md |
 | XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
 | XAdES B-T and above, FacturaE, enveloping/detached shapes | not started |
-| Browser integration (`afirma://` parsing, dispatch, loopback endpoint) | works end to end against a fake sede (openssl crosschecks the signature it produces); wire forms — the URL-safe base64 payload, the `:=` error envelope with AutoFirma's Spanish catalogue and SAF pairings — pinned against recorded autoscript.js predicates (tests/autoscript_wire.rs); precalculatedHashAlgorithm signs the sede's imprint verbatim, proven against openssl (tests/prehash_golden.rs); plain HTTP transport: real sedes need wss, refused rather than faked, see docs/adr/0005-browser-protocol.md |
+| Browser integration (`afirma://` parsing, dispatch, loopback endpoint) | works end to end against a fake sede (openssl crosschecks the signature it produces); wire forms — the URL-safe base64 payload, the `:=` error envelope with AutoFirma's Spanish catalogue and SAF pairings — pinned against recorded autoscript.js predicates (tests/autoscript_wire.rs); precalculatedHashAlgorithm signs the sede's imprint verbatim, proven against openssl (tests/prehash_golden.rs). **A browser cannot reach it yet**: the transport is plain HTTP on loopback and the one-shot token goes to whoever started the endpoint, while a real sede's page opens `wss://127.0.0.1:<port>` on a port IT chose with an `idsession` it minted, and the flows need `afirma://websocket`/`afirma://service` and the `echo=`/`getresult` messages — none of that is implemented, and it is refused by name rather than faked, see docs/adr/0005-browser-protocol.md |
 | GUI (`openfirma-gui`, egui/eframe): sign, verify, keystores, .p12 | works: the same library calls as the CLI (docs/adr/0006-gui-toolkit.md); windowless kittest tests drive the real App, including an end-to-end sign-then-verify; real-display checks live in docs/validation.md's manual checklist |
 
 ## Quick start
@@ -170,17 +175,28 @@ A sede's browser call answers through the same signing code. The scheme and
 the loopback endpoint's rules are docs/adr/0005-browser-protocol.md; at install
 time you register the scheme once, naming the key the handler signs with (it
 writes only your own files — the `.desktop` entry plus a browser config under
-`$XDG_CONFIG_HOME/openfirma/browser.toml` that stores paths, never a password),
-then pages hand URIs to the endpoint:
+`$XDG_CONFIG_HOME/openfirma/browser.toml` that stores paths, never a password):
 
 ```
 cargo run -- afirma-uri --register \
     --p12 certificado.p12 --password-file pw.txt   # registration + handler config
 cargo run -- afirma-serve \
-    --p12 certificado.p12 --password-file pw.txt   # prints its port and one token
+    --p12 certificado.p12 --password-file pw.txt --allow-unattended
+    # prints its port and one token; without the opt-in it refuses to start
 cargo run -- afirma-uri "afirma://sign?op=sign&format=CAdES&algorithm=SHA256&dat=…" \
     --p12 certificado.p12 --password-file pw.txt -o result.txt   # what the OS handler runs
 ```
+
+Two things this cannot tell you by omission. **Registering takes the scheme
+from AutoFirma** where AutoFirma is installed: `--register` refuses unless
+`--acknowledge-autofirma` says you know that, because two handlers cannot both
+own `afirma://` — and from that moment a sede's page starts openfirma, whose
+answer for a key that did not opt in is a refusal (`allow_unattended = true` in
+the config is the standing consent; a config key without it is asked on a
+terminal and refused when there is none, and the desktop is notified on Linux).
+And **nothing here serves a page or speaks a real sede's transport**: the
+endpoint answers the recorded wire to whoever holds the token it printed, which
+is `curl` or a test, not a browser; see docs/adr/0005-browser-protocol.md.
 
 `tools/fetch-autofirma.sh` downloads the official AutoFirma so its output can
 be diffed against ours, see `docs/validation.md`.

@@ -1326,6 +1326,120 @@ fn dat_param(bytes: &[u8]) -> String {
         .replace('=', "%3D")
 }
 
+/// Finding 04-N11: the README's `afirma-serve` line was a command that exits 1.
+/// It read
+/// ```text
+/// cargo run -- afirma-serve --p12 certificado.p12 --password-file pw.txt
+/// ```
+/// and the endpoint's own consent rule refuses an argv key that did not pass
+/// `--allow-unattended`, so the first step of the README's browser path was a
+/// refusal. Two halves are pinned here, and the first reads the file: the
+/// documented command must carry the opt-in that makes itself start (editing it
+/// away turns this red), and the behaviour behind it must be what the line
+/// claims — with the opt-in the endpoint starts and prints its token, without
+/// it the same argv key is refused and the refusal names the flag.
+#[test]
+fn the_readmes_serve_command_is_one_that_starts() {
+    let readme = std::fs::read_to_string(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../README.md"
+    )))
+    .expect("README.md must be there");
+    // The command wraps over two lines in the file, so the block is read to its
+    // end (a line not ending in a shell continuation) rather than one line.
+    let lines: Vec<&str> = readme.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.contains("cargo run -- afirma-serve"))
+        .expect("the README documents afirma-serve");
+    let mut command = String::new();
+    for line in &lines[start..] {
+        command.push_str(line);
+        command.push(' ');
+        if !line.trim_end().ends_with('\\') {
+            break;
+        }
+    }
+    assert!(
+        command.contains("--allow-unattended"),
+        "the documented afirma-serve command must carry the opt-in that lets it \
+         start at all; as written the first step of the browser path exits 1 \
+         (04-N11): {command}"
+    );
+
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace("::", "_");
+    let root = std::env::temp_dir().join(format!("openfirma-{}-{test}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let pki = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/certs/signer-rsa.p12"
+    ));
+    if !pki.is_file() {
+        if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+            panic!("OPENFIRMA_REQUIRE_TESTS is set and testdata/certs/signer-rsa.p12 is missing");
+        }
+        eprintln!("skipped: the test PKI is absent, run tools/gen-testcert.sh");
+        return;
+    }
+    let p12 = root.join("certificado.p12");
+    std::fs::copy(pki, &p12).unwrap();
+    let pw = root.join("pw.txt");
+    std::fs::write(&pw, b"openfirma\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let serve = |flag: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openfirma"));
+        cmd.args([
+            "afirma-serve",
+            "--p12",
+            p12.to_str().unwrap(),
+            "--password-file",
+            pw.to_str().unwrap(),
+            "--bind",
+            "127.0.0.1:0",
+            "--issue-token",
+        ]);
+        if flag {
+            cmd.arg("--allow-unattended");
+        }
+        cmd.output().expect("the binary must run")
+    };
+
+    // What the README's line does once it carries the flag: starts, and the
+    // port and token it prints are those of a real endpoint (`--issue-token`
+    // probes itself before exiting).
+    let out = serve(true);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("token: "),
+        "the documented command must start: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the half that makes the flag necessary rather than decorative: the
+    // same command without it is exactly the refusal the report measured.
+    let out = serve(false);
+    assert!(
+        !out.status.success(),
+        "an argv key without the opt-in must not open a headless signer: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--allow-unattended"),
+        "the refusal must name the flag the README now shows: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Finding 04-N3: `afirma-serve` read the consent flag and ignored the config
 /// file's own `allow_unattended`, which is the reverse of what the ADR, the
 /// help text and its own refusal all said — the recommended fix did not work
