@@ -475,6 +475,66 @@ fn a_wrong_password_stays_on_the_picker_with_its_rows_and_a_sentence() {
 }
 
 #[test]
+fn a_wrong_password_returns_to_the_picker_with_its_document_and_a_sentence() {
+    // 06-N-5, through the button a person presses and the REAL worker.
+    // `render_picked` had swapped the Picked screen into a local and left
+    // `Idle` where it had been, so `start_sign` parked the drop zone as the
+    // screen a retry comes back to: a wrong password restored it, and the
+    // document, the chosen certificate and the typed field went with it —
+    // without a sentence saying what had happened. The test the area had
+    // built a `Screen::Signing { back: Picked }` by hand and delivered the
+    // outcome through a test door, which is why it never saw this.
+    let p12 = testdata().join("certs/signer-rsa.p12");
+    let dir = temp_doc("wrong-password");
+    let doc = dir.join("nota.txt");
+    if require(p12.is_file(), "the test PKI").is_none() {
+        return;
+    }
+    std::fs::write(&doc, b"contenido de la nota\n").unwrap();
+
+    let app = fixture_app(Some(doc.clone()));
+    let mut harness = harness_for(app);
+    harness.run();
+    harness
+        .query_all_by_label_contains("Examinar")
+        .next()
+        .unwrap()
+        .click();
+    harness.run();
+    harness.state_mut().dialogs_for_test().fixture_open = Some(p12.clone());
+    harness
+        .get_by_label_contains("Abrir un archivo de certificado")
+        .click();
+    harness.run();
+    harness
+        .state_mut()
+        .force_password_for_test("equivocada".into());
+    harness.run();
+    harness.get_by_label("Firmar").click();
+    harness.step(); // the spinner screen, as the happy path does
+    drain_worker(&mut harness);
+    harness.run();
+
+    assert!(
+        matches!(harness.state().screen_ref_for_test(), Screen::Picked { .. }),
+        "a wrong password comes back to the picker, not to the drop zone"
+    );
+    // The document is the same one, its row is still there, and the sentence
+    // is under the field. The drop zone's own heading must be gone: that is
+    // the screen the citizen was thrown to.
+    harness.get_by_label_contains("nota.txt");
+    harness.get_by_label_contains("Contraseña incorrecta");
+    assert!(
+        harness
+            .query_by_label_contains("Arrastra aquí el documento")
+            .is_none(),
+        "the drop zone is not where a retry lands"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     // The verify deviation from AutoFirma, pinned through the window: the
     // *document itself* (not an exported .csig) gets verdicts. Built end to

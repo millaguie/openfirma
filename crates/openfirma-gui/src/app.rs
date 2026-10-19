@@ -1243,7 +1243,7 @@ impl App {
         // remembered copy goes too (M-8). The thunk holds its own Zeroizing.
         App::forget_secret(ui, p12_password_id(), &self.password_input);
         let out = output_path(format, &path_copy);
-        self.start_sign(SignJob {
+        let job = SignJob {
             key,
             chosen_format,
             digest: digest_copy,
@@ -1252,7 +1252,17 @@ impl App {
             content: content_copy,
             path: path_copy,
             out,
-        });
+        };
+        // 06-N-5: the Picked screen goes back on `self.screen` before the
+        // worker parks it. `render_picked` swapped it into a local and left
+        // `Idle` in its place, so `start_sign` parked the drop zone as the
+        // screen to come back to: a wrong password restored it, and the
+        // document, the chosen certificate and the typed field were gone with
+        // no sentence saying why. `sign_to`, the other door into the worker,
+        // hands its screen over the same way.
+        self.scratch = taken;
+        std::mem::swap(&mut self.screen, &mut self.scratch);
+        self.start_sign(job);
     }
 
     fn render_add_store(&mut self, ui: &mut Ui, catalog: &mut CertCatalog) {
