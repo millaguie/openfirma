@@ -50,29 +50,15 @@ pub fn report(err: &Error, tr: &Tr) -> crate::wizard::ErrorReport {
         Error::Other(m) if m.contains("no trust anchors") => tr.fail_no_anchors_internal.clone(),
         Error::Other(_) => technical.clone(),
         // Parser chatter is for the details control only.
-        Error::Der(e) => plain_error(
-            "El archivo no tiene el formato esperado",
-            &technical,
-            Some(&e.to_string()),
-        ),
-        Error::Spki(e) => plain_error(
-            "La clave pública del certificado no se entiende",
-            &technical,
-            Some(&e.to_string()),
-        ),
+        Error::Der(e) => plain_error(&tr.fail_bad_format, &technical, Some(&e.to_string())),
+        Error::Spki(e) => plain_error(&tr.fail_bad_public_key, &technical, Some(&e.to_string())),
         Error::UnsupportedDigest(_)
         | Error::UnsupportedKeyAlgorithm(_)
         | Error::UnsupportedCombination { .. } => technical.clone(),
-        Error::PrehashLength { .. } => plain_error(
-            "El repositorio devolvió una firma de tamaño inesperado; inténtalo de nuevo.",
-            &technical,
-            None,
-        ),
-        Error::Signing(m) => {
-            plain_error("El dispositivo o archivo de clave no pudo firmar", m, None)
-        }
-        Error::Pdf(m) => plain_error("El PDF no se puede procesar", m, None),
-        Error::Xml(m) => plain_error("El XML no se puede procesar", m, None),
+        Error::PrehashLength { .. } => plain_error(&tr.fail_bad_signature, &technical, None),
+        Error::Signing(m) => plain_error(&tr.fail_key_cannot_sign, m, None),
+        Error::Pdf(m) => plain_error(&tr.fail_pdf, m, None),
+        Error::Xml(m) => plain_error(&tr.fail_xml, m, None),
         Error::NoCertificate => technical.clone(),
     };
     crate::wizard::ErrorReport { plain, technical }
@@ -98,7 +84,7 @@ pub fn is_wrong_password(report: &crate::wizard::ErrorReport) -> bool {
     t.contains("integrity check failed") || t.contains("wrong password")
 }
 
-/// A Spanish wrapper that always says what to try next when the cause leaves
+/// The window's wrapper that always says what to try next when the cause leaves
 /// a way out. `cause`, when short enough, is woven into the sentence so one
 /// line answers "what happened" and "what now".
 fn plain_error(head: &str, technical: &str, _hint: Option<&str>) -> String {
@@ -142,6 +128,51 @@ mod tests {
         let r = report(&e, &Tr::es());
         assert!(!r.plain.contains("der"), "{}", r.plain);
         assert!(r.plain.starts_with("El archivo"), "{}", r.plain);
+    }
+
+    /// M-6/A-5: the failures this window authors itself are sentences of the
+    /// TABLE, in both languages. They used to be Spanish literals here, so an
+    /// English window refused a broken PDF with "El PDF no se puede procesar"
+    /// in the middle of its own English. Each class is walked, because the
+    /// classes leave by different arms.
+    #[test]
+    fn the_failures_the_window_authors_follow_the_language() {
+        let cases: Vec<Error> = vec![
+            Error::Der(der::Error::new(
+                der::ErrorKind::Incomplete {
+                    expected_len: der::Length::new(64),
+                    actual_len: der::Length::new(3),
+                },
+                der::Length::new(0),
+            )),
+            Error::Pdf("expected an object".into()),
+            Error::Xml("expected an element".into()),
+            Error::Signing("the card removed itself".into()),
+            Error::PrehashLength {
+                alg: "SHA-256",
+                expected: 32,
+                got: 4,
+            },
+        ];
+        for e in cases {
+            let es = report(&e, &Tr::es());
+            let en = report(&e, &Tr::en());
+            assert_ne!(es.plain, en.plain, "{:?} is the same sentence", e);
+            for spanish in ["El ", "La ", "No se ", "no se ", "puede "] {
+                assert!(
+                    !en.plain.starts_with(spanish),
+                    "{:?} says {spanish:?} in an English window: {}",
+                    e,
+                    en.plain
+                );
+            }
+            // The English sentence is English all the way through: the head
+            // comes from the table, and the cause after it is the library's
+            // own technical English in both languages (named in M-6).
+        }
+        // The public-key class is unreachable without a real malformed SPKI,
+        // so its head is asserted directly rather than through a fake error.
+        assert!(!Tr::en().fail_bad_public_key.contains("clave"));
     }
 
     #[test]

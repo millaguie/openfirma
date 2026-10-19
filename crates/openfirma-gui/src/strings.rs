@@ -162,6 +162,15 @@ pub struct Tr {
     pub fail_open_folder: String,
     /// Saving to a chosen name failed (its own sentence).
     pub fail_save_as: String,
+    /// The head of a failure sentence this window authors itself, for the
+    /// parser/format classes the library reports in its own words (M-6: the
+    /// window's language is the interface language, in BOTH of them).
+    pub fail_bad_format: String,
+    pub fail_bad_public_key: String,
+    pub fail_bad_signature: String,
+    pub fail_key_cannot_sign: String,
+    pub fail_pdf: String,
+    pub fail_xml: String,
     /// A keystore with no signable certificate (catalog error line tail).
     pub store_no_private_key: String,
     /// 06-N-10: the lead of a picker line about a store that refused to open.
@@ -360,6 +369,13 @@ impl Tr {
                     .into(),
             fail_open_folder: "No se pudo abrir la carpeta:".into(),
             fail_save_as: "No se pudo guardar:".into(),
+            fail_bad_format: "El archivo no tiene el formato esperado".into(),
+            fail_bad_public_key: "La clave pública del certificado no se entiende".into(),
+            fail_bad_signature:
+                "El repositorio devolvió una firma de tamaño inesperado; inténtalo de nuevo.".into(),
+            fail_key_cannot_sign: "El dispositivo o archivo de clave no pudo firmar".into(),
+            fail_pdf: "El PDF no se puede procesar".into(),
+            fail_xml: "El XML no se puede procesar".into(),
             store_no_private_key: "no contiene ningún certificado con clave privada".into(),
             store_open_failed: "no se ha podido abrir el almacén".into(),
             note_lta_all: "El documento lleva {total} sello(s) de tiempo de documento (nivel \
@@ -530,6 +546,13 @@ impl Tr {
                     .into(),
             fail_open_folder: "The folder could not be opened:".into(),
             fail_save_as: "Could not save:".into(),
+            fail_bad_format: "The file is not in the expected format".into(),
+            fail_bad_public_key: "The certificate's public key cannot be read".into(),
+            fail_bad_signature: "The store returned a signature of an unexpected size; try again."
+                .into(),
+            fail_key_cannot_sign: "The key device or file could not sign".into(),
+            fail_pdf: "The PDF cannot be processed".into(),
+            fail_xml: "The XML cannot be processed".into(),
             store_no_private_key: "contains no certificate with a private key".into(),
             store_open_failed: "the store could not be opened".into(),
             note_lta_all: "The document carries {total} document time-stamp(s) (level B-LTA): \
@@ -675,6 +698,12 @@ impl Tr {
             &self.add_store_help,
             &self.fail_open_folder,
             &self.fail_save_as,
+            &self.fail_bad_format,
+            &self.fail_bad_public_key,
+            &self.fail_bad_signature,
+            &self.fail_key_cannot_sign,
+            &self.fail_pdf,
+            &self.fail_xml,
             &self.store_no_private_key,
             &self.store_open_failed,
             &self.note_lta_all,
