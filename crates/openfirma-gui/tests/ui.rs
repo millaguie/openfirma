@@ -727,12 +727,24 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     // The verify starts a worker (A-1); kittest has no frame loop to drain it,
     // so the test answers through the app's own transition.
     let mut harness = harness_for(app);
-    // A spinner never settles: one frame, not `run()`.
+    // A spinner never settles: one frame, not `run()`. Whether that one frame
+    // still shows the park is the machine's business — the verification runs on
+    // a real worker thread, and this frame drains its answer if it has already
+    // landed. On both macOS runners it consistently has, which is what this
+    // test used to fail on; the park itself is asserted above, before any frame
+    // is drawn, where no thread can race it. Here the window has to be the
+    // parked spinner or the verdict that replaced it — never the drop zone.
     harness.step();
-    harness.get_by_label_contains("Comprobando la firma");
-    harness
-        .state_mut()
-        .deliver_verify_answer_for_test(Ok(answer));
+    match harness.state().screen_ref_for_test() {
+        Screen::Verifying { .. } => {
+            harness.get_by_label_contains("Comprobando la firma");
+            harness
+                .state_mut()
+                .deliver_verify_answer_for_test(Ok(answer));
+        }
+        Screen::Verified { .. } => {}
+        _ => panic!("a verification left neither the park nor a verdict"),
+    }
     harness.run();
     // A-5/M-2: a verdict that reads as a sentence and names the signer by
     // name — never a DN, never DER in front.
