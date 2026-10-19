@@ -2777,6 +2777,10 @@ fn a_hybrid_reference_revision_is_read_from_its_stream() {
 // ---------------------------------------------------------------------------
 // Round 7, H1 and H2: the appearance set had no provenance.
 
+/// The reservation width every real-CMS pass in this file shares: what the crate's
+/// own writer reserves.
+const RESERVED: usize = openfirma_pades::sign::DEFAULT_CONTENTS_RESERVED;
+
 /// The signature dictionary of a hand-written pass, with `/Contents` reserved as
 /// wide as this crate's writer reserves it and the `/ByteRange` numbers at their
 /// reserved width, so patching and signing move no byte.
@@ -2986,7 +2990,6 @@ fn a_second_signers_chain_does_not_license_the_slot_the_first_widgets_ap_named()
 /// nothing else, and neither verdict is an artefact of my hand-written signature.
 #[test]
 fn a_second_signer_cannot_write_into_the_first_signers_box_even_with_real_cms() {
-    const RESERVED: usize = openfirma_pades::sign::DEFAULT_CONTENTS_RESERVED;
     let Some(signer) = signer() else {
         require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
         return;
@@ -3282,5 +3285,230 @@ fn a_chain_deeper_than_the_walk_is_refused_by_a_message_that_owns_the_bound() {
             .iter()
             .map(|(object, change)| (object.num, change.allowed()))
             .collect::<Vec<_>>()
+    );
+}
+
+/// The same revision writer with a GENERATION per piece: `904 1 obj` plus the
+/// matching `00001 n` xref entry. This is the shape round 7's B-2 turned on the
+/// provenance guard — the covered bytes promise `/G 904 0 R`, a later section
+/// defines the object at generation 1 — and no other writer in this file spells
+/// it, because honest writers never leave generation 0.
+fn append_pieces_gen(pdf: &[u8], objects: &[(u32, u16, Vec<u8>)]) -> Vec<u8> {
+    let mut out = pdf.to_vec();
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let mut offsets: Vec<(u32, u16, usize)> = Vec::new();
+    for (num, generation, body) in objects {
+        offsets.push((*num, *generation, out.len()));
+        out.extend_from_slice(format!("{num} {generation} obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_at = out.len();
+    let mut xref = String::from("xref\n");
+    for (num, generation, at) in &offsets {
+        // one subsection per object: a generation belongs to the entry, and no
+        // reader is expected to guess where runs of equal generations begin
+        xref.push_str(&format!("{num} 1\n{at:010} {generation:05} n \n"));
+    }
+    let size = offsets
+        .iter()
+        .map(|(num, _, _)| num + 1)
+        .max()
+        .unwrap_or(0)
+        .max(declared_size(pdf));
+    out.extend_from_slice(xref.as_bytes());
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Prev {} >>\nstartxref\n{xref_at}\n%%EOF\n",
+            last_xref(pdf)
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// The form of `form_with_xobject` that names its nested XObject at a NON-ZERO
+/// generation: this is what the reviewer's PoC does — the chain and the promised
+/// slot spelled `904 1 R`, so every set keyed on the reference as written matches,
+/// and only a set asking about NUMBERS can still refuse.
+fn form_with_xobject_gen(named: u32, generation: u16, text: &str) -> Vec<u8> {
+    format!(
+        "<< /Type /XObject /Subtype /Form /FormType 1 /BBox [ 0 0 300 200 ] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /G {named} {generation} R >> >> \
+         /Length {} >>\nstream\n{text}\nendstream",
+        text.len()
+    )
+    .into_bytes()
+}
+
+/// Round 7's B-2, the generation dodge of the provenance guard: the covered widget
+/// promises `/AP << /N 900 0 R >>`, the second pass writes its legitimate chain AND
+/// the ink at `900 1 obj` with a generation-1 xref entry. The promise is spelled
+/// `0 R`; nothing else moves. A guard keyed on `(number, generation)` sees a brand
+/// new object and licenses it — while Ghostscript, which resolves by number, draws
+/// the ink inside the first signature's rectangle, and poppler shrugs. `verify` said
+/// OK over that document with two signatures; the reviewer's artifacts
+/// (`p5-gen1-pass.pdf`, generation 1, and `p5-gen2-pass.pdf`, generation 7) are what
+/// measured it here before this test existed. A promise is a NUMBER: which
+/// generation an xref entry carries is the writer's choice.
+#[test]
+fn filling_a_promised_slot_at_another_generation_is_still_filling_it() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let Some(plain) = signed_over_a_dangling_widget(900) else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+
+    for generation in [1u16, 7] {
+        let widget = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature2) /P 3 0 R \
+                        /Rect [ 50 400 350 600 ] /F 132 /V 301 0 R /AP << /N 302 0 R >> >>"
+            .to_vec();
+        let mut attacked = append_pieces_gen(
+            &plain,
+            &[
+                (300, 0, widget),
+                // REAL CMS (see `sign_the_pass`): with `padded_signature`'s fake
+                // /Contents the second signature fails its OWN crypto and this
+                // expect_err passes for the wrong reason — which is precisely how
+                // this test sat green over a reverted guard until it was fixed.
+                (301, 0, real_signature_body(RESERVED)),
+                (302, 0, form_with_xobject_gen(900, generation, "q Q")),
+                (
+                    900,
+                    generation,
+                    appearance_body(b"BT /F1 18 Tf 10 100 Td (PAGUESE 9999 EUR) Tj ET"),
+                ),
+            ],
+        );
+        sign_the_pass(&mut attacked, &signer, RESERVED);
+
+        let text = pades_verify(&attacked, &anchors())
+            .expect_err(&format!(
+                "the slot stays promised at generation {generation}: Ghostscript resolves \
+                 it and draws the second pass's ink inside the first signature's box"
+            ))
+            .to_string();
+        assert!(
+            text.contains("900"),
+            "and the refusal names the object, whatever generation its entry carries: {text}"
+        );
+    }
+}
+
+/// The font rule was written with its own provenance check (round 3b), and B-2
+/// turns on it the same way it turns on the slot rule: a second signer's pass — real
+/// CMS, its own widget, the remapping `/F2` font the covered page had named as
+/// `97 0 R` written at `97 1 obj` — licenses itself the font because the guard asked
+/// `(num, gen)` of a promise that is only ever about the NUMBER. Then every glyph
+/// the first signature signed renders one letter shifted inside the second
+/// signer's document. The control shows the same second signature licensing a font
+/// nobody had promised (98 at generation 0) and verifying: so the refusal below is
+/// about the promise, not about my hand-written pass failing something of its own.
+#[test]
+fn a_remapping_font_written_at_another_generation_is_still_the_promised_font() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // the covered page dangles /F2 in slot 97 — the round-3b fixture's own shape
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R /F2 97 0 R >> >> /Contents 4 0 R >>";
+    let headline = b"BT /F2 24 Tf 72 640 Td (PAGO UN CERO CERO) Tj ET";
+    let plain = pades_sign(
+        &append_two(INPUT, &[(3, page.as_slice()), (4, &stream_body(headline))]),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing a page whose /F2 slot is still empty");
+    pades_verify(&plain, &anchors()).expect("an empty /F2 slot is not an attack");
+
+    // every capital one letter up: A -> B, P -> Q, ... (the round-3b re-mapping)
+    let differences = (65..90)
+        .map(|code| format!("{code} /{}", char::from(code as u8 + 1)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remapper = || {
+        format!(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding \
+             /Differences [ {differences} ] >> >>"
+        )
+    };
+    let widget = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature2) /P 3 0 R \
+                    /Rect [ 50 400 350 600 ] /F 132 /V 301 0 R /AP << /N 302 0 R >> >>"
+        .to_vec();
+
+    // the attack: the promised slot's font, arrived at generation 1
+    let mut attacked = append_pieces_gen(
+        &plain,
+        &[
+            (300, 0, widget.clone()),
+            (301, 0, real_signature_body(RESERVED)),
+            (302, 0, appearance_body(b"q Q")),
+            (97, 1, remapper().into_bytes()),
+        ],
+    );
+    sign_the_pass(&mut attacked, &signer, RESERVED);
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("the page promised /F2 at number 97; generation is not a second promise")
+        .to_string();
+    assert!(
+        text.contains("97"),
+        "the refusal names the font by its number: {text}"
+    );
+
+    // control: an un-promised font of the same shape verifies with both signatures,
+    // so the half above refused the NUMBER and nothing about this pass's plumbing
+    let mut control = append_pieces_gen(
+        &plain,
+        &[
+            (300, 0, widget),
+            (301, 0, real_signature_body(RESERVED)),
+            (302, 0, appearance_body(b"q Q")),
+            (98, 0, remapper().into_bytes()),
+        ],
+    );
+    sign_the_pass(&mut control, &signer, RESERVED);
+    let report = pades_verify(&control, &anchors())
+        .expect("a font nobody promised is the second pass's own plumbing");
+    assert_eq!(report.signatures.len(), 2, "both signatures read");
+}
+
+/// The other direction of the same arithmetic, pinned so nobody "fixes" the
+/// generation problem by loosening what a covered object IS: a pass that re-publishes
+/// the signed page's CONTENT under another generation reads, per object number, as the
+/// old bytes vanishing and unknown ones arriving. Both halves refuse — the covered
+/// object was taken away from readers, and the arrival is content no whitelist carries
+/// — and this test says so in one file rather than leaving it to be rediscovered as a
+/// hole. (It also pins that the DELETION rule of round two's N-1 decides by number:
+/// walking the final state alone saw neither half.)
+#[test]
+fn re_publishing_a_signed_object_under_another_generation_refuses_on_both_halves() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let headline = b"BT /F1 24 Tf 72 700 Td (PAGO UN CERO UNO) Tj ET";
+    let plain = pades_sign(
+        &append_two(INPUT, &[(4, &stream_body(headline))]),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing");
+    pades_verify(&plain, &anchors()).expect("the document verifies before the pass");
+
+    let swapped = stream_body(b"BT /F1 24 Tf 72 700 Td (PAGUESE 9999 EUR) Tj ET");
+    let attacked = append_pieces_gen(&plain, &[(4, 1, swapped)]);
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("the signed content left and something else arrived; neither is an archive")
+        .to_string();
+    assert!(
+        text.contains('4'),
+        "both verdicts speak about object 4: {text}"
     );
 }

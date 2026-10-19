@@ -682,14 +682,24 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
     // signatures verified, and `pdftotext` returned the text (`e2e.pdf` in the round-7
     // report). The deep variant reached the same number from the covered form's own
     // `/Resources`, one hop away from bytes the signature did attest.
-    let covered_named: BTreeSet<ObjRef> = {
-        let mut out: BTreeSet<ObjRef> = referrers
+    // Keyed by NUMBER, deliberately (round 7's B-2). A reference reads
+    // `904 0 R` and a cross-reference entry can define that object at generation
+    // 1: poppler then refuses to resolve it while Ghostscript — the engine of
+    // every print dialog — resolves by number and draws what the second pass
+    // wrote. Licensing the gen-1 write because the promise was spelled `0 R`
+    // would license ink that half of the readers show inside the first
+    // signature's rectangle. The same argument moved the `/Font` rule below: a
+    // promised NUMBER is not anybody's slot, in whichever generation the pass
+    // chooses to land it. Honest writers never notice: they promise and write
+    // the same generation, which is 0.
+    let covered_named: BTreeSet<u32> = {
+        let mut out: BTreeSet<u32> = referrers
             .iter()
             .filter(|(_, namers)| namers.iter().any(|namer| !changed(redefined, *namer)))
-            .map(|(object, _)| *object)
+            .map(|(object, _)| object.num)
             .collect();
         for change in redefined {
-            out.extend(refs_in(&change.before));
+            out.extend(refs_in(&change.before).into_iter().map(|r| r.num));
         }
         out
     };
@@ -738,8 +748,8 @@ struct Gate<'a> {
     /// refusal over one of them has to say it came from the bound.
     stopped_short: &'a BTreeSet<ObjRef>,
     /// Numbers the covered bytes already named, so a pass may not write one of
-    /// them and call the result its own plumbing.
-    covered_named: &'a BTreeSet<ObjRef>,
+    /// them — in any generation — and call the result its own plumbing.
+    covered_named: &'a BTreeSet<u32>,
     fonts: &'a BTreeSet<ObjRef>,
     transport: &'a BTreeSet<ObjRef>,
 }
@@ -1029,7 +1039,7 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
             // A number the covered bytes named is not a slot: the earlier signature
             // attested a hole there, and filling it shows the reader bytes that
             // signature never covered, inside whatever rectangle pointed at it.
-            && !covered_named.contains(object)
+            && !covered_named.contains(&object.num)
         {
             return Change::SignaturePlumbing(*object);
         }
@@ -1519,12 +1529,20 @@ fn plumbing_fonts(
         }
         // the state the judged signature was made over: a body that changed kept
         // its earlier shape in `before`, a body that did not is still its own.
+        // Promised by NUMBER (round 7's B-2 asked why this one and the appearance
+        // slot ask the same question twice): the reference spells a generation, an
+        // xref entry can land the font at another one, and Ghostscript resolves by
+        // number — the glyph table that re-maps signed text would draw even where
+        // poppler shrugs.
         let named_by_the_covered_bytes = referrers
-            .get(object)
-            .is_some_and(|from| from.iter().any(|namer| !changed(redefined, *namer)))
-            || redefined
-                .iter()
-                .any(|change| refs_in(&change.before).contains(object));
+            .iter()
+            .filter(|(referenced, _)| referenced.num == object.num)
+            .any(|(_, from)| from.iter().any(|namer| !changed(redefined, *namer)))
+            || redefined.iter().any(|change| {
+                refs_in(&change.before)
+                    .into_iter()
+                    .any(|r| r.num == object.num)
+            });
         if named_by_the_covered_bytes {
             continue;
         }
