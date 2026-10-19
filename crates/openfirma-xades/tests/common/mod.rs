@@ -95,7 +95,10 @@ pub fn write_tmp(name: &str, bytes: &[u8]) -> PathBuf {
         .join("openfirma-xades-crosscheck")
         .join(target);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(name);
+    // The pid keeps two concurrent runs of the same binary from writing one
+    // another's file over: the name is per *target*, so a green run and a broken
+    // one could otherwise read each other's output and agree with the wrong file.
+    let path = dir.join(format!("{name}-{}", std::process::id()));
     std::fs::write(&path, bytes).unwrap();
     path
 }

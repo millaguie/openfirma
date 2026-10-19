@@ -479,9 +479,11 @@ fn splice_into_document(input: &[u8], doc: &xml::Document, signature: &[u8]) -> 
     // comments are not written. Measured against AutoFirma (`docs/xades.md`),
     // and not only for fidelity — the data reference is the root subtree, so a
     // PI kept here would sit inside a signed file covered by no digest. The
-    // prolog/epilog vectors still exist on the parsed document (the encoding
-    // check reads them); they just have no part in the output. DTDs cannot be
-    // here at all: the reader refuses them.
+    // prolog/epilog vectors still exist on the parsed document and the
+    // canonicalizer writes them for a whole-document pass; the encoding rule
+    // reads the declaration plus the whole input's bytes, not these vectors, and
+    // here they have no part in the output. DTDs cannot be here at all: the
+    // reader refuses them.
     let root = &doc.root;
     if root.self_closing {
         // <root attrs/> becomes <root attrs><ds:Signature .../></root>: the

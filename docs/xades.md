@@ -50,8 +50,11 @@ element**. Serialization of the output, measured:
   agrees, and every validator recomputes exactly that, so a document-level
   sibling is never in the bytes a digest covers — keeping one would put an
   unprotected node inside a signed file. The reader still parses prolog and
-  epilog nodes (the encoding check reads them) and the input keeps them; the
-  output does not, and the CLI says nothing about it, as AutoFirma says nothing.
+  epilog nodes and keeps them on the document — a whole-document canonicalization
+  pass writes them, and what guards their bytes on the way in is the check that
+  the *whole input* is UTF-8, not anything that reads the declaration — and the
+  input keeps them; the output does not, and the CLI says nothing about it, as
+  AutoFirma says nothing.
   An earlier version of this section claimed the opposite — that the data
   transform "canonicalizes the document *including its prolog PIs*", following
   the C-1 follow-up — and the code did that, which made every PI-carrying input
