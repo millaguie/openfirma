@@ -2773,3 +2773,514 @@ fn a_hybrid_reference_revision_is_read_from_its_stream() {
     );
     pades_verify(&out, &anchors()).expect("an unchanged hybrid revision is not a modification");
 }
+
+// ---------------------------------------------------------------------------
+// Round 7, H1 and H2: the appearance set had no provenance.
+
+/// The signature dictionary of a hand-written pass, with `/Contents` reserved as
+/// wide as this crate's writer reserves it and the `/ByteRange` numbers at their
+/// reserved width, so patching and signing move no byte.
+fn real_signature_body(reserved: usize) -> Vec<u8> {
+    format!(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached \
+         /ByteRange [ 0 {PAD} {PAD} {PAD} ] /Contents <{}> >>",
+        "0".repeat(reserved * 2)
+    )
+    .into_bytes()
+}
+
+/// Sign a hand-written pass FOR REAL: point `/ByteRange` at the two ranges a
+/// detached signature covers, sign those bytes with the CMS shape this crate's own
+/// writer builds, and zero-pad the hex into the reserved hole.
+///
+/// The padding is what the writer does and what readers accept, and the reason this
+/// exists at all is that a fake `/Contents` (see [`padded_signature`]) makes the
+/// second signature fail its OWN crypto: the document never reaches the question
+/// this section is about, and a test over it would pass for the wrong reason.
+fn sign_the_pass(pass: &mut [u8], signer: &SoftwareSigner, reserved: usize) {
+    let marker = b"/Contents ".as_slice();
+    // The hole a PAdES `/ByteRange` describes is the `/Contents` VALUE, `<` and `>`
+    // included — which is what this crate's verifier asks for, and what the writer's
+    // own reservation produces: the first range ends at the `<`, the second starts
+    // after the `>`.
+    let value_at = pass
+        .windows(marker.len())
+        .rposition(|w| w == marker)
+        .expect("the signature's /Contents")
+        + marker.len();
+    let hex_at = value_at + 1;
+    let hex_end = hex_at + reserved * 2;
+    let after = hex_end + 1; // past the closing >
+    let patched = format!(
+        "[ 0 {value_at:010} {after:010} {:010} ]",
+        pass.len() - after
+    );
+    let range_at = pass
+        .windows(b"/ByteRange [ ".len())
+        .rposition(|w| w == b"/ByteRange [ ")
+        .expect("the signature's /ByteRange")
+        + b"/ByteRange ".len();
+    assert_eq!(
+        pass[range_at..range_at + patched.len()],
+        *b"[ 0 0000000000 0000000000 0000000000 ]".as_slice(),
+        "the placeholder has to be replaced by something the same width"
+    );
+    pass[range_at..range_at + patched.len()].copy_from_slice(patched.as_bytes());
+
+    let mut covered = pass[..value_at].to_vec();
+    covered.extend_from_slice(&pass[after..]);
+    let cms = openfirma_cades::sign(
+        &covered,
+        signer,
+        &openfirma_cades::CadesOptions {
+            encapsulate_content: false,
+            signing_certificate_v2: true,
+            include_issuer_serial: true,
+            ..Default::default()
+        },
+    )
+    .expect("a real CMS over the pass's own bytes");
+    let mut hex = cms
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert!(
+        hex.len() <= reserved * 2,
+        "the CMS needs {} hex digits and the hole holds {}",
+        hex.len(),
+        reserved * 2
+    );
+    hex.push_str(&"0".repeat(reserved * 2 - hex.len()));
+    pass[hex_at..hex_end].copy_from_slice(hex.as_bytes());
+}
+
+/// A form XObject with the `/Resources /XObject` entry a chain hop needs, `/Length`
+/// computed because a wrong one is a different object.
+fn form_with_xobject(named: u32, text: &str) -> Vec<u8> {
+    format!(
+        "<< /Type /XObject /Subtype /Form /FormType 1 /BBox [ 0 0 300 200 ] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /G {named} 0 R >> >> \
+         /Length {} >>\nstream\n{text}\nendstream",
+        text.len()
+    )
+    .into_bytes()
+}
+
+/// A page whose only annotation is a signature widget still waiting for its
+/// appearance in slot `slot` — the object does not exist, so the rectangle the
+/// signature attests is an empty box.
+fn page_and_dangling_widget(slot: u32, vref: u32) -> Vec<u8> {
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R \
+                 /Annots [ 100 0 R ] >>";
+    let widget = format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /P 3 0 R \
+         /Rect [ 50 50 350 250 ] /F 132 /AP << /N {slot} 0 R >> /V {vref} 0 R >>"
+    );
+    append_two(INPUT, &[(3, page.as_slice()), (100, widget.as_bytes())])
+}
+
+/// Sign the same shape twice, the way `an_appearance_the_covered_widget_was_still_
+/// waiting_for` does, so the widget's `/V` carries a real signature number rather
+/// than a made-up one.
+fn signed_over_a_dangling_widget(slot: u32) -> Option<Vec<u8>> {
+    let signer = signer()?;
+    let probe = pades_sign(
+        &page_and_dangling_widget(slot, 9999),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing");
+    let signature = object_with(&probe, b"/Type /Sig");
+    let signed = pades_sign(
+        &page_and_dangling_widget(slot, signature),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing with the widget pointing at its own signature");
+    pades_verify(&signed, &anchors()).expect("an empty appearance slot is not an attack");
+    Some(signed)
+}
+
+/// Round 7's H1, at the gate. `appearances` answers WHO WROTE an object and nothing
+/// about who was PROMISED it, so a second signer's own legitimate chain — widget,
+/// `/AP /N`, and the `/Resources /XObject` of that appearance, every one of them
+/// written by that signer and covered by its signature — reached the slot the FIRST
+/// signer's covered widget named. The ink went into the first signature's rectangle,
+/// which had attested an empty box, and nothing in the set said where the number had
+/// come from.
+#[test]
+fn a_second_signers_chain_does_not_license_the_slot_the_first_widgets_ap_named() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(plain) = signed_over_a_dangling_widget(900) else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let coverage_end = coverage_end_of(&plain);
+
+    let widget = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature2) /P 3 0 R \
+                    /Rect [ 50 400 350 600 ] /F 132 /V 301 0 R /AP << /N 302 0 R >> >>"
+        .to_vec();
+    let mut pass = append_pieces(
+        &plain,
+        &[
+            (300, widget),
+            (301, padded_signature()),
+            (302, form_with_xobject(900, "q Q")),
+            (
+                900,
+                appearance_body(b"BT /F1 18 Tf 10 100 Td (PAGUESE 9999 EUR) Tj ET"),
+            ),
+        ],
+    );
+    patch_byte_range(&mut pass);
+
+    let revs = revisions(&pass).expect("the pass parses");
+    let redefined = redefinitions_after(&pass, &revs, coverage_end).expect("redefinitions");
+    let verdicts = classify(&pass, &redefined).expect("classify");
+
+    let (_, change) = verdicts
+        .iter()
+        .find(|(object, _)| object.num == 900)
+        .expect("the slot is judged");
+    assert!(
+        matches!(change, Change::NotAllowed { .. }),
+        "a number the covered bytes named is not a place another pass writes its \
+         appearance: {change:?}"
+    );
+
+    // The guard is about the SLOT, not about the pass that came calling: everything
+    // this pass wrote for its own signature is still what it is. Without that half
+    // the fix would be a refusal of second signatures, which is not the finding.
+    for num in [300, 302] {
+        let (_, change) = verdicts
+            .iter()
+            .find(|(object, _)| object.num == num)
+            .unwrap_or_else(|| panic!("object {num} is judged"));
+        assert!(
+            matches!(change, Change::SignaturePlumbing(_)),
+            "the attacker's own appearance plumbing is still plumbing: {change:?}"
+        );
+    }
+    assert!(
+        verdicts
+            .iter()
+            .any(|(object, change)| object.num == 301 && matches!(change, Change::NewSignature(_))),
+        "and its signature is still a new signature: {:?}",
+        verdicts
+            .iter()
+            .map(|(object, change)| (object.num, std::mem::discriminant(change)))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The same shape end to end, with a second signature whose CMS is real: before the
+/// provenance guard `openfirma verify` answered OK over this document with two
+/// signatures and the text of `PAGUESE 9999 EUR` rendered inside the first
+/// signature's box.
+///
+/// The control is the point of the test as much as the attack: the same pass, the
+/// same real CMS, its chain ending in an object nobody promised it — and that
+/// document verifies. So the difference between the two verdicts is the slot and
+/// nothing else, and neither verdict is an artefact of my hand-written signature.
+#[test]
+fn a_second_signer_cannot_write_into_the_first_signers_box_even_with_real_cms() {
+    const RESERVED: usize = openfirma_pades::sign::DEFAULT_CONTENTS_RESERVED;
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let Some(plain) = signed_over_a_dangling_widget(900) else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+
+    let widget = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature2) /P 3 0 R \
+                    /Rect [ 50 400 350 600 ] /F 132 /V 301 0 R /AP << /N 302 0 R >> >>"
+        .to_vec();
+
+    // the attack: its appearance's /Resources names the number the covered widget
+    // was waiting for, and the pass writes the ink there
+    let attacked = {
+        let mut pass = append_pieces(
+            &plain,
+            &[
+                (300, widget.clone()),
+                (301, real_signature_body(RESERVED)),
+                (302, form_with_xobject(900, "q Q")),
+                (
+                    900,
+                    appearance_body(b"BT /F1 18 Tf 10 100 Td (PAGUESE 9999 EUR) Tj ET"),
+                ),
+            ],
+        );
+        sign_the_pass(&mut pass, &signer, RESERVED);
+        pass
+    };
+    let error = pades_verify(&attacked, &anchors())
+        .expect_err("ink inside the first signature's rectangle is refused");
+    assert!(
+        error.to_string().contains("900 0 R"),
+        "and it names the slot the ink went into: {error}"
+    );
+
+    // the control: identical pass, identical real CMS, its chain ends in an object
+    // of its own — both signatures verify, which is what makes the half above a
+    // verdict about the slot rather than about my hand-written container
+    let control = {
+        let mut pass = append_pieces(
+            &plain,
+            &[
+                (300, widget),
+                (301, real_signature_body(RESERVED)),
+                (302, form_with_xobject(303, "q Q")),
+                (
+                    303,
+                    appearance_body(b"BT /F1 18 Tf 10 100 Td (FIRMADO POR MI) Tj ET"),
+                ),
+            ],
+        );
+        sign_the_pass(&mut pass, &signer, RESERVED);
+        pass
+    };
+    let report = pades_verify(&control, &anchors())
+        .expect("a second signature over its own appearance verifies with real crypto");
+    assert_eq!(report.signatures.len(), 2, "and both signatures are read");
+}
+
+/// Round 7's H2, the same hole one hop from bytes the signature DID attest: the
+/// covered widget's appearance exists, its `/Resources` names a form that is there
+/// and a slot that is not, and the second pass fills the slot from its own chain.
+/// Every hop of that chain is written and covered by the second pass, so every check
+/// the chain walk makes is satisfied — what is missing is that the number was already
+/// promised by covered bytes.
+#[test]
+fn a_hop_from_a_covered_form_does_not_license_the_slot_that_form_left_dangling() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // rev1: widget 100 -> /AP/N 702 (exists), whose /Resources is 700 and names
+    // /Pre 701 (exists) and /G 904 (does not). 702 invokes both.
+    let widget = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /P 3 0 R \
+                    /Rect [ 50 50 350 250 ] /F 132 /AP << /N 702 0 R >>"
+        .to_vec();
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R \
+                 /Annots [ 100 0 R ] >>";
+    let crafted = |vref: u32| {
+        let with_widget = format!("{} /V {vref} 0 R >>", String::from_utf8_lossy(&widget));
+        append_two(
+            INPUT,
+            &[
+                (3, page.as_slice()),
+                (100, with_widget.as_bytes()),
+                (
+                    700,
+                    b"<< /Font << /F1 5 0 R >> /XObject << /Pre 701 0 R /G 904 0 R >> >>",
+                ),
+                (701, appearance_body(b"q Q").as_slice()),
+                (
+                    702,
+                    b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [ 0 0 300 200 ] \
+                      /Resources 700 0 R /Length 13 >>\nstream\n/Pre Do /G Do\nendstream",
+                ),
+            ],
+        )
+    };
+    let probe = pades_sign(&crafted(9999), &signer, &PadesOptions::default()).expect("signing");
+    let signature = object_with(&probe, b"/Type /Sig");
+    let plain =
+        pades_sign(&crafted(signature), &signer, &PadesOptions::default()).expect("signing");
+    pades_verify(&plain, &anchors()).expect("the dangling /G slot is not an attack yet");
+    let coverage_end = coverage_end_of(&plain);
+
+    // pass 2: its own signature and appearance, whose /Resources names the SAME
+    // number the covered form names, and writes the ink into it
+    let second_widget = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature2) /P 3 0 R \
+                           /Rect [ 50 400 350 600 ] /F 132 /V 301 0 R /AP << /N 302 0 R >> >>"
+        .to_vec();
+    let mut pass = append_pieces(
+        &plain,
+        &[
+            (300, second_widget),
+            (301, padded_signature()),
+            (302, form_with_xobject(904, "q Q")),
+            (
+                904,
+                appearance_body(b"BT /F1 18 Tf 10 100 Td (PAGUESE 9999 EUR) Tj ET"),
+            ),
+        ],
+    );
+    patch_byte_range(&mut pass);
+
+    let revs = revisions(&pass).expect("the pass parses");
+    let redefined = redefinitions_after(&pass, &revs, coverage_end).expect("redefinitions");
+    let verdicts = classify(&pass, &redefined).expect("classify");
+    let (_, change) = verdicts
+        .iter()
+        .find(|(object, _)| object.num == 904)
+        .expect("the slot is judged");
+    assert!(
+        matches!(change, Change::NotAllowed { .. }),
+        "a slot a covered form named is not the second pass's to fill: {change:?}"
+    );
+}
+
+/// The other half of the guard, and the shape that needs it. The namer of the slot is
+/// an object the second pass REWROTE, so "somebody who left it alone points there" is
+/// no longer true of the final state: the page's `/Resources` lives in its own object
+/// (600), which the pass re-serialises the way iText re-serialises everything it
+/// touches — same entries, same values, different spaces. Object 905 is named only by
+/// that rewritten dictionary, so only what the object's EARLIER body named can see the
+/// promise the covered bytes made, and that is the second half of the set.
+#[test]
+fn a_rewritten_namer_cannot_open_the_slot_its_earlier_body_promised() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    // rev1: the page reaches its resources through an object of their own, which
+    // names /XObject /G 905; 905 does not exist, so the `/G Do` in the content draws
+    // nothing where the signature said something would be.
+    let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+                 /Resources 600 0 R /Contents 4 0 R >>";
+    let resources = b"<< /Font << /F1 5 0 R >> /XObject << /G 905 0 R >> >>";
+    let crafted = append_two(
+        INPUT,
+        &[
+            (3, page.as_slice()),
+            (600, resources.as_slice()),
+            (
+                4,
+                stream_body(b"BT /F1 24 Tf 72 700 Td (PAGO UN CERO UNO) Tj ET\n/G Do").as_slice(),
+            ),
+        ],
+    );
+    let plain = pades_sign(&crafted, &signer, &PadesOptions::default())
+        .expect("signing a page whose /G slot is still empty");
+    pades_verify(&plain, &anchors()).expect("an empty /G slot is not an attack");
+    let coverage_end = coverage_end_of(&plain);
+
+    // pass 2: its own signature and appearance, the resources dictionary written
+    // without the spaces the covered bytes carried, and the ink in the slot those
+    // covered resources promised.
+    let second_widget = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature2) /P 3 0 R \
+                           /Rect [ 50 400 350 600 ] /F 132 /V 301 0 R /AP << /N 302 0 R >> >>"
+        .to_vec();
+    let reserialized = b"<</Font<</F1 5 0 R>>/XObject<</G 905 0 R>>>>";
+    let mut pass = append_pieces(
+        &plain,
+        &[
+            (300, second_widget),
+            (301, padded_signature()),
+            (302, form_with_xobject(905, "q Q")),
+            (600, reserialized.to_vec()),
+            (
+                905,
+                appearance_body(b"BT /F1 18 Tf 10 100 Td (PAGUESE 9999 EUR) Tj ET"),
+            ),
+        ],
+    );
+    patch_byte_range(&mut pass);
+
+    let revs = revisions(&pass).expect("the pass parses");
+    let redefined = redefinitions_after(&pass, &revs, coverage_end).expect("redefinitions");
+    // the re-serialisation itself is nothing happening, which is why this fixture
+    // isolates the half it isolates: the namer is on the changed side of the gate
+    let resources_change = redefined
+        .iter()
+        .find(|change| change.object.num == 600)
+        .expect("the resources dictionary is a redefinition");
+    assert!(
+        resources_change.before != resources_change.after,
+        "the fixture really respells the dictionary it judges"
+    );
+    let verdicts = classify(&pass, &redefined).expect("classify");
+    let (_, change) = verdicts
+        .iter()
+        .find(|(object, _)| object.num == 905)
+        .expect("the slot is judged");
+    assert!(
+        matches!(change, Change::NotAllowed { .. }),
+        "what the covered resources promised is not the second pass\'s to fill, even \
+         though the dictionary that promised it was rewritten: {change:?}"
+    );
+}
+
+/// The bound fails closed, and this pins what it says when it does. A second pass
+/// whose chain is deeper than the walk follows is refused — that is the right
+/// direction, the walk refuses rather than licenses what it could not read — but a
+/// refusal that describes the object as if the gate had read it tells the person
+/// nothing about what happened, and round 7 named that as the usability half of the
+/// finding. So the message has to own the bound.
+#[test]
+fn a_chain_deeper_than_the_walk_is_refused_by_a_message_that_owns_the_bound() {
+    use openfirma_pades::revisions::{Change, classify, redefinitions_after, revisions};
+
+    let Some(plain) = signed_over_a_dangling_widget(900) else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let coverage_end = coverage_end_of(&plain);
+
+    // a legitimate chain of its own — every object this pass wrote, none of them a
+    // slot anybody had promised — nested sixty-six deep
+    let widget = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature2) /P 3 0 R \
+                    /Rect [ 50 400 350 600 ] /F 132 /V 301 0 R /AP << /N 400 0 R >> >>"
+        .to_vec();
+    let mut pieces: Vec<(u32, Vec<u8>)> = vec![(300, widget), (301, padded_signature())];
+    for number in 400..466 {
+        pieces.push((number, form_with_xobject(number + 1, "q Q")));
+    }
+    let mut pass = append_pieces(&plain, &pieces);
+    patch_byte_range(&mut pass);
+
+    let revs = revisions(&pass).expect("the pass parses");
+    let redefined = redefinitions_after(&pass, &revs, coverage_end).expect("redefinitions");
+    let verdicts = classify(&pass, &redefined).expect("classify");
+
+    let refused: Vec<(u32, String)> = verdicts
+        .iter()
+        .filter_map(|(object, change)| match change {
+            Change::NotAllowed { detail, .. } => Some((object.num, detail.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !refused.is_empty(),
+        "the walk stops somewhere, and what it stops before is refused"
+    );
+    let (number, detail) = &refused[0];
+    assert!(
+        (400..=466).contains(number),
+        "only the chain is past the bound: {refused:?}"
+    );
+    assert!(
+        detail.contains("deeper than the 64 objects"),
+        "the refusal says the bound stopped the walk: {detail}"
+    );
+    assert!(
+        !detail.contains("readers render"),
+        "and does not blame the bytes for what arithmetic did: {detail}"
+    );
+
+    // and the walk did license what it reached, so this is a bound and not a blanket
+    // refusal of deep chains: the top of the chain is plumbing
+    assert!(
+        verdicts
+            .iter()
+            .any(|(object, change)| object.num == 400
+                && matches!(change, Change::SignaturePlumbing(_))),
+        "the head of the chain is licensed: {:?}",
+        verdicts
+            .iter()
+            .map(|(object, change)| (object.num, change.allowed()))
+            .collect::<Vec<_>>()
+    );
+}

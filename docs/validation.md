@@ -312,7 +312,20 @@ unjudged. The walk is bounded and fails closed, and its safety does not weaken
 per hop: a hop is reached only when the pass that wrote it is the pass of the
 signature that owns the widget, and the licensing branch still asks that it be
 brand new, so a hop that rewrote a covered object is refused however it was
-reached. One widening is bookkeeping rather than rendering: a writer of the same
+reached. Reaching it is only half the question, and round 7's H1 and H2 are the
+other half: the set answers who WROTE an object and says nothing about who was
+PROMISED it, so a second signer's own legitimate chain (widget, appearance, the
+`/Resources /XObject` of that appearance, every one written and covered by that
+signer) reached the `/AP /N` slot the FIRST signer's covered widget had named and
+that did not exist when it signed, and the ink drawn there appeared inside the first
+signature's rectangle with both signatures verifying (measured end to end with a
+real CMS: `verify` answered OK and `pdftotext` returned the new text). A brand-new
+appearance is therefore licensed only when it is not somebody's promised slot: no
+namer the pass left alone points at it, and no rewritten object's EARLIER body did
+either. The bound keeps the same manners for the same reason: an appearance past the
+64 objects the walk follows is refused, and the refusal says the bound stopped the
+walk rather than describing bytes it never read (the reference tool's own chains
+measure three objects deep). One widening is bookkeeping rather than rendering: a writer of the same
 lineage re-stamps its own mark — iText records the version that last wrote a
 document as a non-standard `/ITXT` entry and re-serializes the dictionary around
 entries it did not change (measured: co-signing a document this crate signed

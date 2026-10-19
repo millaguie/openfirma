@@ -637,6 +637,7 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
     // name to license an appearance of its own (round 3).
     let mut attested: BTreeSet<ObjRef> = BTreeSet::new();
     let mut appearances: BTreeSet<ObjRef> = BTreeSet::new();
+    let mut stopped_short: BTreeSet<ObjRef> = BTreeSet::new();
     for (object, body) in &final_state {
         let attesting = attesting_signature(pdf, &locations, &final_state, object);
         if attesting.is_none() && !is_signature_field(pdf, &locations, &final_state, object) {
@@ -657,17 +658,41 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
         // are addressed only through the container (round 4, A-7).
         if let Some(appearance) = widget_appearance(&final_state, body) {
             if let Some(signature) = attesting {
-                appearances.extend(appearance_chain(
-                    &locations,
-                    &final_state,
-                    &revs,
-                    signature,
-                    appearance,
-                ));
+                let (chain, short) =
+                    appearance_chain(&locations, &final_state, &revs, signature, appearance);
+                appearances.extend(chain);
+                stopped_short.extend(short);
             }
         }
     }
 
+    // Every number the bytes being judged already pointed at: a namer that this
+    // pass left alone still points there, and the body a namer had BEFORE this pass
+    // pointed there when the signature was made. Those numbers are not places a
+    // later revision may write, because writing one fills a hole the covered bytes
+    // promised rather than adding a thing nobody had seen — the rule `/Font` has
+    // (round 3b) and the rule the appearance set lacked.
+    //
+    // Round 7's H1 and H2 are the same hole read twice. `appearances` answers who
+    // WROTE an object, and nothing about who was promised it, so a second signer's
+    // own legitimate chain — widget, `/AP /N`, `/Resources /XObject`, all written by
+    // that signer, every hop attested — reached object 900 that the FIRST signer's
+    // covered widget had named and that did not exist when it signed. The ink the
+    // second pass wrote there drew inside the first signature's rectangle, both
+    // signatures verified, and `pdftotext` returned the text (`e2e.pdf` in the round-7
+    // report). The deep variant reached the same number from the covered form's own
+    // `/Resources`, one hop away from bytes the signature did attest.
+    let covered_named: BTreeSet<ObjRef> = {
+        let mut out: BTreeSet<ObjRef> = referrers
+            .iter()
+            .filter(|(_, namers)| namers.iter().any(|namer| !changed(redefined, *namer)))
+            .map(|(object, _)| *object)
+            .collect();
+        for change in redefined {
+            out.extend(refs_in(&change.before));
+        }
+        out
+    };
     let fonts = plumbing_fonts(&locations, &final_state, &referrers, &revs, redefined);
     let transport = transport_containers(redefined, &locations, &referrers);
 
@@ -683,6 +708,8 @@ pub fn classify(pdf: &[u8], redefined: &[Redefinition]) -> Result<Vec<(ObjRef, C
                     root: trailer.root,
                     validation_data: &validation_data,
                     appearances: &appearances,
+                    stopped_short: &stopped_short,
+                    covered_named: &covered_named,
                     fonts: &fonts,
                     transport: &transport,
                 },
@@ -707,6 +734,12 @@ struct Gate<'a> {
     root: ObjRef,
     validation_data: &'a BTreeSet<ObjRef>,
     appearances: &'a BTreeSet<ObjRef>,
+    /// Chain members the walk never reached because of [`CHAIN_WALK_LIMIT`]: a
+    /// refusal over one of them has to say it came from the bound.
+    stopped_short: &'a BTreeSet<ObjRef>,
+    /// Numbers the covered bytes already named, so a pass may not write one of
+    /// them and call the result its own plumbing.
+    covered_named: &'a BTreeSet<ObjRef>,
     fonts: &'a BTreeSet<ObjRef>,
     transport: &'a BTreeSet<ObjRef>,
 }
@@ -718,6 +751,8 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     let root = gate.root;
     let validation_data = gate.validation_data;
     let appearances = gate.appearances;
+    let stopped_short = gate.stopped_short;
+    let covered_named = gate.covered_named;
     let fonts = gate.fonts;
     let transport = gate.transport;
     let brand_new = older.is_empty();
@@ -989,9 +1024,27 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
         if is_type(newer, "/XObject")
             && pdf::get(newer, "/Subtype").is_some_and(|t| pdf::trim_ws(t) == b"/Form")
             && appearances.contains(object)
+            // …and it is plumbing OF THE PASS THAT WROTE IT, which is the half the
+            // chain walk establishes, and the half that says nothing about the slot.
+            // A number the covered bytes named is not a slot: the earlier signature
+            // attested a hole there, and filling it shows the reader bytes that
+            // signature never covered, inside whatever rectangle pointed at it.
+            && !covered_named.contains(object)
         {
             return Change::SignaturePlumbing(*object);
         }
+    }
+    if stopped_short.contains(object) {
+        // The walk stopped for arithmetic, not for anything it read in this object,
+        // and a refusal that hides that reads as a judgement about the bytes.
+        return Change::NotAllowed {
+            object: *object,
+            detail: format!(
+                "its appearance chain is deeper than the {CHAIN_WALK_LIMIT} objects this \
+                 gate follows, so the walk stopped before it and nothing is left that \
+                 could license it: the refusal is the bound, not a reading of these bytes"
+            ),
+        };
     }
     Change::NotAllowed {
         object: *object,
@@ -1571,29 +1624,51 @@ fn carries_attested_signature_value(
 /// a byte that signature attests, which is the argument the direct `/AP /N` has
 /// rested on since round 3.
 ///
+/// How far the appearance walk follows one signature's chain. See
+/// [`appearance_chain`] for what the reference tool's own chains measure.
+const CHAIN_WALK_LIMIT: usize = 64;
+
 /// Only `/Resources` the form carries itself is followed. A form's inherited
 /// resources are the PAGE's, whose objects are covered bytes `same_pass` refuses
 /// anyway — following them could only re-name what the document already had,
 /// never license what this pass wrote — so leaving them out loses nothing and
 /// keeps the walk to what the pass itself built.
 ///
+/// Returns what the walk licensed and what it left unlicensed BECAUSE of the bound:
+/// the second set exists so that a refusal over one of those objects can say that
+/// the bound stopped the walk, rather than describing the object as if the gate had
+/// read it and disapproved.
+///
 /// The walk is bounded, and the bound fails closed: what it leaves unlicensed is
-/// refused, not licensed.
+/// refused, not licensed. 64 is not a guess about a hostile document but about an
+/// honest one, so it is worth saying what the honest one measures: the reference
+/// tool's deepest appearance chain is THREE objects (`/AP /N` and the two forms it
+/// draws through, read off AutoFirma 1.9.1's own twice-signed two-field output after
+/// flattening its object streams — every widget in it, both fields). Twenty-one
+/// times the tool's own depth is headroom for a document that nests its signature
+/// graphic; a document that needs more is a document this gate refuses and says so.
 fn appearance_chain(
     locations: &BTreeMap<ObjRef, Location>,
     final_state: &BTreeMap<ObjRef, Vec<u8>>,
     revs: &[Revision],
     signature: ObjRef,
     root: ObjRef,
-) -> BTreeSet<ObjRef> {
-    const CHAIN_LIMIT: usize = 64;
+) -> (BTreeSet<ObjRef>, BTreeSet<ObjRef>) {
     let mut licensed: BTreeSet<ObjRef> = BTreeSet::new();
+    let mut stopped_short = BTreeSet::new();
     if !same_pass(locations, revs, signature, root) {
-        return licensed;
+        return (licensed, stopped_short);
     }
     let mut queue = vec![root];
     while let Some(object) = queue.pop() {
-        if licensed.contains(&object) || licensed.len() >= CHAIN_LIMIT {
+        if licensed.contains(&object) {
+            continue;
+        }
+        if licensed.len() >= CHAIN_WALK_LIMIT {
+            // named by a chain this walk refused to follow further. Remembered,
+            // because a refusal that does not say it came from a bound reads like
+            // an accusation about the bytes.
+            stopped_short.insert(object);
             continue;
         }
         licensed.insert(object);
@@ -1606,7 +1681,7 @@ fn appearance_chain(
             }
         }
     }
-    licensed
+    (licensed, stopped_short)
 }
 
 /// The `/XObject` entries of a form XObject's own `/Resources`: the objects its
