@@ -16,6 +16,21 @@ fn write_tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     path
 }
 
+/// The config a `--register` run leaves behind, built with the SAME writer the
+/// installer uses, not by hand: a hand made `p12 = "C:\Users\...\clave.p12"` is
+/// not a value at all on Windows — the backslashes are escape sequences — so a
+/// test that formatted one itself failed on the Windows runners for a reason
+/// that had nothing to do with the rule it was checking (CI run 39202830689).
+/// `to_toml` doubles them.
+fn browser_config(p12: &Path, pw: &Path, allow_unattended: bool) -> String {
+    openfirma_browser::scheme::BrowserConfig {
+        p12: Some(p12.to_path_buf()),
+        password_file: Some(pw.to_path_buf()),
+        allow_unattended,
+    }
+    .to_toml()
+}
+
 /// `-i f.pdf -o f.pdf` replaces the only copy of the document the user named,
 /// and the guard against that typo runs before anything is read or signed, so
 /// this needs no certificate material to fail in exactly the right way.
@@ -1220,10 +1235,21 @@ fn register_stores_paths_the_handler_can_find_from_any_directory() {
         !text.contains("\"claves/clave.p12\"") && !text.contains("\"claves/pw.txt\""),
         "the config must not store the relative paths it was given: {text}"
     );
-    let canonical = std::fs::canonicalize(&p12).unwrap();
-    assert!(
-        text.contains(&canonical.display().to_string()),
-        "the config must name the key the handler will find: {text}"
+    // The stored path must name THE SAME FILE the relative one did, from any
+    // working directory. Compared as identities (both sides canonicalized),
+    // never as substrings: on Windows `canonicalize` answers a `\\?\` verbatim
+    // path and the config holds the doubled-backslash form of a plain one, so a
+    // textual comparison would pin this test to POSIX separators. The handler
+    // in the next step proves the behavioural half anyway.
+    let stored = openfirma_browser::scheme::BrowserConfig::load(&cfg)
+        .expect("the config --register wrote must parse back")
+        .expect("it exists");
+    let identity = |p: &Path| std::fs::canonicalize(p).expect("a file the test created");
+    assert_eq!(
+        identity(&stored.p12.expect("the config names the key")),
+        identity(&p12),
+        "the config must name the key the handler will find, whatever its own \
+         working directory is: {text}"
     );
 
     // The handler the desktop starts: another working directory, no --p12 at
@@ -1348,25 +1374,9 @@ fn serve_takes_its_standing_consent_from_the_config_not_from_the_flag() {
 
     // A config with the standing opt-in, and one without it.
     let with_optin = root.join("con-optin.toml");
-    std::fs::write(
-        &with_optin,
-        format!(
-            "p12 = \"{}\"\npassword_file = \"{}\"\nallow_unattended = true\n",
-            p12.display(),
-            pw.display()
-        ),
-    )
-    .unwrap();
+    std::fs::write(&with_optin, browser_config(&p12, &pw, true)).unwrap();
     let without = root.join("sin-optin.toml");
-    std::fs::write(
-        &without,
-        format!(
-            "p12 = \"{}\"\npassword_file = \"{}\"\n",
-            p12.display(),
-            pw.display()
-        ),
-    )
-    .unwrap();
+    std::fs::write(&without, browser_config(&p12, &pw, false)).unwrap();
     // The config names where the signing key lives, so B-2's private-mode rule
     // covers it too — a 0644 config is refused before it is read, which is how
     // the first draft of this test failed.
@@ -1482,15 +1492,7 @@ fn a_consent_refusal_is_a_cancellation_and_tells_the_desktop() {
     // The key is never opened (the refusal comes first) but it has to BE a key
     // the config could name: the config is read before the call is made.
     let cfg = root.join("clave.toml");
-    std::fs::write(
-        &cfg,
-        format!(
-            "p12 = \"{}\"\npassword_file = \"{}\"\n",
-            p12.display(),
-            pw.display()
-        ),
-    )
-    .unwrap();
+    std::fs::write(&cfg, browser_config(&p12, &pw, false)).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
