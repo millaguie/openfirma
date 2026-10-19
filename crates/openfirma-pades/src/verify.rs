@@ -190,12 +190,17 @@ pub fn verify(pdf: &[u8], opts: &VerifyOptions) -> Result<DocumentReport> {
                 } else {
                     // the same sentence the time-stamp gate uses: the attack
                     // IS a following revision that no archive may append, and
-                    // naming it is what tells the user which layer refused
-                    for p in problems {
-                        failures.push(format!(
-                            "{label} was followed by changes no archive may append: {p}"
-                        ));
-                    }
+                    // naming it is what tells the user which layer refused.
+                    // One sentence per signature, the changes listed inside it:
+                    // repeating the label per change (round two's 02-N-4) made a
+                    // document with two unclassified changes read as two
+                    // refusals, and a reader counted signatures that were not
+                    // there — the two changes here were `/Info` and the XMP
+                    // packet of one signing pass.
+                    failures.push(format!(
+                        "{label} was followed by changes no archive may append: {}",
+                        problems.join("; ")
+                    ));
                 }
             }
             Err(e) => failures.push(format!("{label}: {}", unwrap(&e))),
@@ -219,14 +224,16 @@ pub fn verify(pdf: &[u8], opts: &VerifyOptions) -> Result<DocumentReport> {
             // it is only admissible if it is validation data or plumbing —
             // otherwise B-LTA would certify documents whose pages were swapped
             // after the stamp.
-            let mut problems = revision_gate_problems(pdf, t.byte_range)?;
-            for p in problems.drain(..) {
+            let problems = revision_gate_problems(pdf, t.byte_range)?;
+            if !problems.is_empty() {
+                // one sentence per time-stamp, as above
                 failures.push(format!(
                     "document time-stamp {} (object {} {}) was followed by changes no \
-                     archive may append: {p}",
+                     archive may append: {}",
                     i + 1,
                     t.object.num,
-                    t.object.generation
+                    t.object.generation,
+                    problems.join("; ")
                 ));
             }
             if problems.is_empty() {

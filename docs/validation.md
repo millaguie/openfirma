@@ -321,12 +321,29 @@ turned the covered `/Pages` node into
 32000 and nothing renders differently, and the rule is deliberately narrow: a
 bare dictionary (never a stream, whose data a reader also takes), its entries
 pairwise identical in order and spelling, exactly one entry added and its key
-`/ITXT`. Anything else stays refused, which is where the declared residual of
-this gate sits: a NESTED value respelled inside a rewritten object — iText
-re-serializing a page's `/Resources` as well as growing its `/Annots` when it
-appends an annotation of its own — is still the incremental saving attack, and
-closing it means deciding an appended revision by what a reader RESOLVES rather
-than by object bytes. A second declared residual is the fill's: taking up a field
+`/ITXT`. Bookkeeping of the same kind is a pass refreshing its DATES, and this one
+the reference tool does on every second signature: saving a document again rewrites
+the document properties dictionary and, when the producer wrote one, the XMP packet,
+moving `/ModDate`, `xmp:ModifyDate` and `xmp:MetadataDate` and nothing else
+(measured with AutoFirma 1.9.1 signing a Ghostscript-produced PDF twice — same
+object numbers, packet length unchanged, `/Producer` byte for byte intact). Both are
+licensed when ONLY dates moved: every key the covered revision had is still there
+with the same value bytes, the values that did move are still dates, and for the
+packet every byte outside `xmp:CreateDate`, `xmp:ModifyDate` and `xmp:MetadataDate`
+is identical. A property that moved alongside them — including a property whose
+value happens to look exactly like a date under a key that is not one of the two —
+a key invented or dropped, an element added to the packet, or a date element
+holding text that is not a date, stays refused. Anything else stays refused too,
+which is where the declared residual of this gate sits: a NESTED value respelled
+inside a rewritten object — iText re-serializing a page's `/Resources` as well as
+growing its `/Annots` when it appends an annotation of its own — is still the
+incremental saving attack, and closing it means deciding an appended revision by
+what a reader RESOLVES rather than by object bytes. That residual is what refuses
+the reference tool co-signing one of our INVISIBLE signatures today: its widget is
+attested and the rule agrees, the respelled page around it is what the gate cannot
+read, and the refusal says exactly that rather than blaming the widget (pinned as
+that shape in `crates/openfirma-pades/tests/autofirma_cosign.rs`). A second declared
+residual is the fill's: taking up a field
 the signed bytes left empty repaints the appearance they carried, which is what
 filling a form field is and what AutoFirma 1.9.1 itself does on a pre-drawn form.
 An object a pass packed into an object stream — the

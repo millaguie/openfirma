@@ -294,6 +294,16 @@ pub enum Change {
     /// the document renders differently because of it. See
     /// `adds_only_the_itxt_mark`.
     Bookkeeping(ObjRef),
+    /// A date a later signing pass refreshed: the document properties dictionary
+    /// or the XMP packet, rewritten so that only its date fields moved and every
+    /// other byte — every key, and every value a reader lists — is what the
+    /// signature covered. Measured with AutoFirma 1.9.1 signing a Ghostscript PDF
+    /// twice, which is what a citizen's twice-signed document is: the second pass
+    /// left `/Producer` intact and moved `/ModDate` one second, and inside the
+    /// `/Type /Metadata` packet it moved `xmp:ModifyDate` and `xmp:MetadataDate`
+    /// the same second, changing nothing else in the file. Refusing that refused
+    /// the second signature of the tool this project reproduces (round two, 02-N-4).
+    DateStamp(ObjRef),
     /// The transport a revision writes its objects through: an object stream,
     /// or the cross-reference stream that indexes them. Neither carries
     /// anything a reader renders — the objects INSIDE an object stream are
@@ -333,6 +343,11 @@ impl std::fmt::Display for Change {
                     "object {o} is a dictionary a writer re-stamped with its own marker"
                 )
             }
+            Change::DateStamp(o) => write!(
+                f,
+                "object {o} is a date a later signing pass refreshed: the object kept every \
+                 key and every value a reader lists, only /ModDate or the XMP dates differ"
+            ),
             Change::Transport(o) => {
                 write!(
                     f,
@@ -851,6 +866,30 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     if !brand_new && only_date_keys(newer) && older_keys_are_dates(older) {
         return Change::SignaturePlumbing(*object);
     }
+    // The shape real writers actually produce: a REWRITE of `/Info`, or of the XMP
+    // packet, in which ONLY dates moved. The rule above licenses pure timestamp
+    // dictionaries, and that is not what a signing library writes — its `/Info`
+    // carries the producer and the title alongside the dates, so the test has to be
+    // which VALUES differ, not which KEYS exist. Measured with AutoFirma 1.9.1
+    // signing a Ghostscript-written PDF twice (`docs/pades.md` keeps the recipe):
+    // the second pass rewrote `/Info` with `/Producer` byte for byte intact and
+    // `/ModDate` one second later, and rewrote the metadata packet keeping its
+    // length and moving only `xmp:ModifyDate` and `xmp:MetadataDate`. Both sides
+    // were the SAME object number, so no fresh-dictionary rule ever saw them, and
+    // the refusal the person got read as tampering on a document the reference tool
+    // had just produced.
+    //
+    // The safety is the shape, read on both sides: every key the earlier revision
+    // had is still there with the same value bytes except `/ModDate` and
+    // `/CreationDate`, whose new values must still be dates, and for the packet
+    // every byte outside the three `xmp:` date elements is identical — which also
+    // means no element was added and none removed. A `/Title` that moved, an XMP
+    // element that appeared, a packet re-serialised with different text, a key
+    // invented: all still refused, and `after_signature_dates.rs` pins each of
+    // those refusals next to the two acceptances.
+    if !brand_new && (dates_only_moved(older, newer) || xmp_dates_only_moved(older, newer)) {
+        return Change::DateStamp(*object);
+    }
     // Pages: /Annots may only grow, and only with widgets of real signatures.
     // The two sides may spell their references differently (an archiving pass
     // copying the page dictionary writes it with its own padding), so compari-
@@ -864,9 +903,31 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
             && grew
                 .iter()
                 .all(|a| carries_attested_signature_value(pdf, locations, final_state, a))
-            && other_keys_equal(older, newer, b"/Annots")
         {
-            return Change::SignaturePlumbing(*object);
+            if other_keys_equal(older, newer, b"/Annots") {
+                return Change::SignaturePlumbing(*object);
+            }
+            // Every widget it gained is attested, and something ELSE on the page
+            // moved. Split from the refusal above because those are different facts
+            // to tell: blaming the widget when the widget is fine is how a person
+            // ends up re-signing a document that nothing tampered with. Measured
+            // with AutoFirma 1.9.1 co-signing a document this crate signed (round
+            // two, 02-N-4): the page came back RE-SERIALISED,
+            // `/Resources << /Font << /F1 4 0 R >> >>` written as
+            // `/Resources<</Font<</F1 4 0 R>>>>` — same meaning, different bytes —
+            // and this gate compares bytes on purpose, because the byte comparison
+            // is what stops a re-pointed /Contents hiding a shadow. That is the
+            // named residual R4-C2 keeps in docs/pades.md, and the honest thing to
+            // say here is that the gate cannot see the difference.
+            return Change::NotAllowed {
+                object: *object,
+                detail: "the page's annotations grew only with widgets a signature \
+                         attests, but another key of the page holds different bytes than \
+                         the ones the signature covered: a writer re-serialised the page \
+                         (same meaning, different bytes) or something in it really did \
+                         change, and this gate reads bytes"
+                    .into(),
+            };
         }
     }
     // A signature field itself, or any dictionary (widget or plain AcroForm
@@ -1007,6 +1068,174 @@ fn only_date_keys(body: &[u8]) -> bool {
 /// object did not exist then — that case is `brand_new`, handled by its own rule.
 fn older_keys_are_dates(older: &[u8]) -> bool {
     !older.is_empty() && only_date_keys(older)
+}
+
+/// The keys of a document properties dictionary whose value a signing pass may
+/// move. ISO 32000-1 14.3.3 keeps the two; the XMP side of the same habit is
+/// [`XMP_DATE_ELEMENTS`].
+const PDF_DATE_KEYS: &[&[u8]] = &[b"/ModDate", b"/CreationDate"];
+
+/// The `xmp:` elements a pass refreshes when it touches the packet: the schema's
+/// creation, modification and metadata dates. Namespaced exactly as the packets in
+/// the field spell them — a packet that writes these dates under a prefix this does
+/// not list stays refused, which is the direction this gate refuses in.
+const XMP_DATE_ELEMENTS: &[&[u8]] = &[b"xmp:CreateDate", b"xmp:ModifyDate", b"xmp:MetadataDate"];
+
+/// Whether `newer` is `older` with every key kept and only the values of
+/// [`PDF_DATE_KEYS`] moved, the new values still dates.
+///
+/// Unlike [`adds_only_the_itxt_mark`] this reads the dictionary unordered: a writer
+/// that re-serialises `/Info` in its own order changes no value, and a properties
+/// dictionary is shown field by field, never as bytes. What is NOT relaxed is
+/// coverage: a key that disappeared or appeared fails the rule, and a value that is
+/// not a date fails it whatever key carries it.
+fn dates_only_moved(older: &[u8], newer: &[u8]) -> bool {
+    if !is_bare_dictionary(older) || !is_bare_dictionary(newer) {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (pdf::items(older), pdf::items(newer)) else {
+        return false;
+    };
+    let mut moved = false;
+    for (ka, va) in &a {
+        let name = &older[ka.clone()];
+        let Some((_, vb)) = b.iter().find(|(kb, _)| &newer[kb.clone()] == name) else {
+            // a key the covered revision had is gone: that is a property taken away
+            // from every reader, not a date refreshed
+            return false;
+        };
+        let (before, after) = (&older[va.clone()], &newer[vb.clone()]);
+        if before == after {
+            continue;
+        }
+        if !PDF_DATE_KEYS.contains(&name) || !is_pdf_date(before) || !is_pdf_date(after) {
+            return false;
+        }
+        moved = true;
+    }
+    b.iter()
+        .all(|(kb, _)| a.iter().any(|(ka, _)| older[ka.clone()] == newer[kb.clone()]))
+        // and something DID move: identical bytes never reach this function
+        && moved
+}
+
+/// A PDF date string (ISO 32000-1 7.9.4): `(D:YYYYMMDDHHmmSS…)`, or the same
+/// without the `D:` prefix, in either string form. Checked for SHAPE rather than
+/// calendar sense, because what the rule needs is that the bytes are a date and not
+/// a sentence somebody routed through a date key. A literal string carrying an
+/// escape is not read as a date at all: the writers that produce these values do not
+/// escape inside them, so the escaping means something else is in there.
+fn is_pdf_date(value: &[u8]) -> bool {
+    let text = pdf::trim_ws(value);
+    let inner = match (text.first(), text.last()) {
+        (Some(b'('), Some(b')')) | (Some(b'<'), Some(b'>')) => &text[1..text.len() - 1],
+        _ => return false,
+    };
+    if inner.contains(&b'\\') {
+        return false;
+    }
+    let body = inner.strip_prefix(b"D:".as_slice()).unwrap_or(inner);
+    body.len() >= 4
+        && body[..4].iter().all(|b| b.is_ascii_digit())
+        && body[4..].iter().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9' | b'.' | b'+' | b'-' | b'\'' | b'T' | b't' | b'Z' | b'z' | b' '
+            )
+        })
+}
+
+/// The dictionary and the payload of a body [`rendered_body`] built for a stream:
+/// what came before the `\nstream\n` marker the helper itself inserted, and what it
+/// carried. Anything else is `None`.
+///
+/// The marker is the only way to tell a stream's payload from its content here, and
+/// it is why this exists: the old `describe_change` looked for the six bytes `stream`
+/// ANYWHERE in the body, so a metadata packet that mentioned the word was described
+/// as page content (round two, 02-N-4).
+fn stream_parts(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = pdf::dict_end(body, 0).ok()?;
+    let marker = b"\nstream\n".as_slice();
+    let rest = body.get(end..)?;
+    if !rest.starts_with(marker) {
+        return None;
+    }
+    Some((&body[..end], &rest[marker.len()..]))
+}
+
+/// Whether `newer` is the same `/Type /Metadata` packet with only its dates
+/// refreshed. The dictionary may differ in `/Length` alone, since a date can be a
+/// byte wider than the one it replaces; outside that, the two payloads have to be
+/// byte for byte identical once their date elements are masked — which is also what
+/// proves no element was added, none removed, and none of the rest rewritten.
+fn xmp_dates_only_moved(older: &[u8], newer: &[u8]) -> bool {
+    let (Some((dict_a, body_a)), Some((dict_b, body_b))) =
+        (stream_parts(older), stream_parts(newer))
+    else {
+        return false;
+    };
+    if pdf::get(dict_a, "/Type").is_none_or(|t| pdf::trim_ws(t) != b"/Metadata") {
+        return false;
+    }
+    if !keys_equal_except(dict_a, dict_b, &[b"/Length"]) {
+        return false;
+    }
+    match (mask_xmp_dates(body_a), mask_xmp_dates(body_b)) {
+        (Some(a), Some(b)) => a == b,
+        // an element whose text is not a date is content wearing a date's name
+        _ => false,
+    }
+}
+
+/// The packet with the text of each [`XMP_DATE_ELEMENTS`] element replaced by one
+/// marker character, or `None` when any such element's text is not a date.
+///
+/// Elements are matched as `<name>` and `</name>` exactly: an element carrying
+/// attributes is not the shape any signing pass writes for these three, and reading
+/// it anyway would mean deciding where its text starts by guesswork.
+fn mask_xmp_dates(packet: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(packet.len());
+    let mut i = 0usize;
+    'scan: while i < packet.len() {
+        for name in XMP_DATE_ELEMENTS {
+            let open = [&b"<"[..], *name, b">"].concat();
+            if !packet[i..].starts_with(&open) {
+                continue;
+            }
+            let close = [&b"</"[..], *name, b">"].concat();
+            let text_at = i + open.len();
+            let rel = packet[text_at..]
+                .windows(close.len())
+                .position(|w| w == close)?;
+            if !is_xmp_date(&packet[text_at..text_at + rel]) {
+                return None;
+            }
+            out.extend_from_slice(&open);
+            out.push(b'@');
+            out.extend_from_slice(&close);
+            i = text_at + rel + close.len();
+            continue 'scan;
+        }
+        out.push(packet[i]);
+        i += 1;
+    }
+    Some(out)
+}
+
+/// An XMP Date value: at least four digits up front, and after them only the
+/// characters that format uses. Shape-checked for the same reason [`is_pdf_date`]
+/// is, and with the same consequence — a value that is a sentence is refused rather
+/// than licensed.
+fn is_xmp_date(text: &[u8]) -> bool {
+    let text = pdf::trim_ws(text);
+    text.len() >= 4
+        && text[..4].iter().all(|b| b.is_ascii_digit())
+        && text.iter().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9' | b'-' | b'+' | b':' | b'T' | b'Z' | b'z' | b'.' | b' '
+            )
+        })
 }
 
 pub(crate) fn is_type(body: &[u8], name: &str) -> bool {
@@ -1970,6 +2199,16 @@ fn find_stream_marker(body: &[u8]) -> Option<usize> {
 }
 
 /// How to describe a redefinition the whitelist does not cover.
+///
+/// Round two's 02-N-4 was about these sentences. They asserted what readers DO —
+/// "readers render its bytes (page content, XObjects, embedded files)" — without
+/// looking at which object had been rewritten, and the claim was false for exactly
+/// the shape that reached them: the XMP metadata packet, which nothing renders, on a
+/// document the reference tool itself had produced. What is actually known here is
+/// the object's SHAPE and that no rule licenses the change, so that is what is said,
+/// in the words a person would use for the object. The framing that these are
+/// changes a later pass may not append belongs to the caller, which names the
+/// signature they follow.
 fn describe_change(body: &[u8]) -> String {
     if body == UNREADABLE {
         "the new bytes of this object cannot be read: no signature attests what \
@@ -1980,12 +2219,29 @@ fn describe_change(body: &[u8]) -> String {
          reused with another generation, so every reader resolves the reference \
          to nothing); what it rendered is not in the document any more"
             .into()
-    } else if body.windows(6).any(|w| w == b"stream") {
-        "a stream object was rewritten after the signature; readers render its \
-         bytes (page content, XObjects, embedded files)"
+    } else if let Some((dict, _)) = stream_parts(body) {
+        if pdf::get(dict, "/Type").is_some_and(|t| pdf::trim_ws(t) == b"/Metadata") {
+            // named for what it is, because the old sentence was not: an XMP packet
+            // carries dates, a producer and a conformance claim, and no reader draws
+            // it. What makes this a refusal is that the change is not the dates a
+            // signing pass refreshes, not a story about pixels.
+            "the XMP metadata packet (/Metadata) was rewritten after the signature, and the \
+             rewrite is not the dates every signing pass refreshes"
+                .into()
+        } else {
+            "a stream object was rewritten after the signature, and a stream carries the \
+             bytes a document shows or keeps (page content, an appearance, an embedded \
+             file): no later pass may replace one"
+                .into()
+        }
+    } else if is_document_properties(body) {
+        "the document properties dictionary (/Info) was rewritten after the signature, and \
+         the rewrite moves more than its dates"
             .into()
     } else if pdf::get(body, "/Annots").is_some() {
-        "an annotations array (or the page owning it) was rewritten".into()
+        "an annotations array (or the page owning it) was rewritten: a widget a later pass \
+         adds has to carry a signature value that the earlier signature's own bytes attest"
+            .into()
     } else if pdf::get(body, "/Kids").is_some() || pdf::get(body, "/MediaBox").is_some() {
         "a page tree node or a page was rewritten".into()
     } else if pdf::get(body, "/V").is_some() && pdf::get(body, "/FT").is_some() {
@@ -1995,4 +2251,28 @@ fn describe_change(body: &[u8]) -> String {
     } else {
         "an object outside the archive whitelist was rewritten".into()
     }
+}
+
+/// Whether a bare dictionary looks like the document properties dictionary the
+/// trailer names `/Info`: no `/Type` of its own, and at least one of the properties
+/// a reader lists in a document's properties dialog. This only ever NAMES a refusal
+/// — the whitelist decides either way — so a false positive costs one accurate
+/// sentence and a false none; a stream's dictionary is excluded by
+/// [`is_bare_dictionary`], and `/Info` has no `/Type` (ISO 32000-1 14.3.3).
+fn is_document_properties(body: &[u8]) -> bool {
+    if !is_bare_dictionary(body) || pdf::get(body, "/Type").is_some() {
+        return false;
+    }
+    [
+        "/Producer",
+        "/Title",
+        "/Author",
+        "/Subject",
+        "/Keywords",
+        "/Creator",
+        "/ModDate",
+        "/CreationDate",
+    ]
+    .iter()
+    .any(|key| pdf::get(body, key).is_some())
 }

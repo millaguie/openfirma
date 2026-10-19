@@ -66,3 +66,84 @@ pub fn test_signer() -> Option<openfirma_core::signer::SoftwareSigner> {
         .collect();
     Some(signer.with_chain(chain))
 }
+
+// ---------------------------------------------------------------------------
+// The document round two's 02-N-4 was measured on: what a producer hands a signing
+// tool, and therefore the shape a SECOND signature has to live with.
+
+/// The XMP packet `gs` writes into `/Metadata`: three `xmp:` dates and nothing a
+/// signing pass has a reason to touch.
+pub const XMP_PACKET: &str = r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999-02-22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:CreateDate>2026-10-19T10:11:06+02:00</xmp:CreateDate>
+   <xmp:ModifyDate>2026-10-19T10:11:07+02:00</xmp:ModifyDate>
+   <xmp:MetadataDate>2026-10-19T10:11:07+02:00</xmp:MetadataDate>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+/// The same packet one second later, the way AutoFirma 1.9.1 leaves it on its second
+/// pass: two elements differ, every other byte — the packet's length included — is
+/// what the first revision carried.
+pub const XMP_PACKET_LATER: &str = r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999-02-22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:CreateDate>2026-10-19T10:11:06+02:00</xmp:CreateDate>
+   <xmp:ModifyDate>2026-10-19T10:11:08+02:00</xmp:ModifyDate>
+   <xmp:MetadataDate>2026-10-19T10:11:08+02:00</xmp:MetadataDate>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+/// `/Info` as the producer writes it, with the `/Producer` a signing pass leaves
+/// alone. The `/Author` is a key that is not one of the two dates and carries a
+/// well-formed PDF date as its value: the shape that only the key-name guard on the
+/// date rule can refuse.
+pub const INFO_BODY: &str = "<< /Producer (GPL Ghostscript 10.08.0) \
+     /Author (D:20261019101107+02'00') \
+     /CreationDate (D:20261019101106+02'00') /ModDate (D:20261019101107+02'00') >>";
+
+/// The same dictionary the way iText writes it — no spaces — with `/ModDate` one
+/// second later, `/Producer` and `/Author` byte for byte intact.
+pub const INFO_BODY_LATER: &str = "<</Producer(GPL Ghostscript 10.08.0)\
+     /Author(D:20261019101107+02'00')\
+     /CreationDate(D:20261019101106+02'00')/ModDate(D:20261019101108+02'00')>>";
+
+/// The object numbers `xmp_document` writes, so a test can name what it rewrites.
+pub const METADATA_OBJ: u32 = 4;
+pub const CONTENT_OBJ: u32 = 6;
+pub const INFO_OBJ: u32 = 7;
+
+/// A one-page document whose catalog names an XMP `/Metadata` stream and whose
+/// trailer names an `/Info` dictionary, both dated `XMP_PACKET` / `INFO_BODY`. This
+/// is the input `gs` hands a signing tool, and the reason the revision gate has to
+/// understand a date refresh: refusing it refused the reference tool's own second
+/// signature (round two, 02-N-4).
+pub fn xmp_document() -> Vec<u8> {
+    let metadata = format!(
+        "<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n{}\nendstream",
+        XMP_PACKET.len(),
+        XMP_PACKET
+    );
+    let content = format!(
+        "<< /Length {} >>\nstream\n{}\nendstream",
+        b"BT /F1 24 Tf 72 700 Td (PAGO UN CERO UNO) Tj ET".len(),
+        "BT /F1 24 Tf 72 700 Td (PAGO UN CERO UNO) Tj ET"
+    );
+    let bodies: &[&str] = &[
+        "<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 6 0 R \
+         /Resources << /Font << /F1 5 0 R >> >> >>",
+        &metadata,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        &content,
+        INFO_BODY,
+    ];
+    build_pdf(bodies, "/Size 8 /Root 1 0 R /Info 7 0 R")
+}

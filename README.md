@@ -68,6 +68,18 @@ Very early, phase 1. What works today:
   `sign --allow-weak-algorithms`, or `AlgorithmPolicy` for library callers. It is
   the in-repo verifier, not a substitute for VALIDe or the ETSI validators, see
   `docs/validation.md`.
+- **What `openfirma verify` refuses in a document AutoFirma signed.** Every revision after a
+  signature is judged, and only the changes a signed document may receive are accepted: more
+  signatures, document time-stamps, validation data, the plumbing a signature field needs, and
+  the dates a signing pass refreshes (`/ModDate` in the document properties, `xmp:ModifyDate`
+  and `xmp:MetadataDate` in the XMP packet). Anything else the later revision changed is
+  refused, and the message names the object and the change instead of accusing anyone. One
+  everyday shape is still refused today: AutoFirma signing a document openfirma signed with an
+  *invisible* signature. AutoFirma rewrites the page it puts its box on, this verifier compares
+  bytes, and so it cannot see that nothing a reader is told has changed — the declared residual
+  in `docs/validation.md`, pinned in its own test. What does verify, measured against
+  AutoFirma 1.9.1's own output: the tool signing a document twice, filling a form box over our
+  signature, and its documents carrying XMP and document properties.
 - CLI: `openfirma sign`, `openfirma verify`, `openfirma inspect` (dumping any
   DER signature as a normalized tree for diffing), and `openfirma keystores
   list`, which lists what a PKCS#11 token or NSS database holds.
