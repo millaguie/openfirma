@@ -213,17 +213,27 @@ set by `docs/pades.md` and `docs/adr/0003`.
    serialization differences, so no digest can diverge. One measured edge:
    AutoFirma normalizes the declaration (see above), and we emit the same
    normalized declaration rather than the input's.
-3. **Input encoding.** UTF-8 only. Input that does not decode as UTF-8 is
-   refused with an error naming the cause; AutoFirma would transcode through
-   its serializer. A declaration whose `encoding` names anything other than
-   UTF-8 (or its registered alias `utf8`, or US-ASCII) is refused too, naming
-   what it declared and the `iconv` to run: signing bytes while a validator
-   re-reads them through the declared encoding signs different text than what
-   gets verified. Same for a version other than 1.0, whitespace in front of
-   the declaration, and namespace declarations that XML itself forbids
-   (duplicate prefixes on one element, `xmlns:p=""`): every validator's parser
-   (libxml2) refuses those documents, so signing them would ship bytes nobody
-   can even re-open.
+3. **Input encoding.** UTF-8 only, and the two ways a file can say otherwise
+   are refused in two places. Bytes that do not decode as UTF-8 are refused by
+   the reader, naming the cause; AutoFirma would transcode through its
+   serializer. A declaration whose `encoding` names anything other than UTF-8
+   (or its registered alias `utf8`, or US-ASCII) is refused too, naming what it
+   declared and the `iconv` to run: signing bytes while a validator re-reads
+   them through the declared encoding signs different text than what gets
+   verified. A document written in UTF-16 never reaches that reader: the
+   detector reads UTF-8, so a UTF-16 `<` is `<` `NUL` and the answer for those
+   bytes is `Data` — deliberately, because a detached CAdES over the file as it
+   stands is a signature it *can* make, and calling them `Xml` would trade a
+   working option for a guaranteed error. Asking for an XML shape over them is
+   therefore refused by the shared format gate, and that sentence names the
+   encoding, the `iconv` and the conversion-free alternative; round two's N-6 is
+   why it is that specific — until then it said "this file holds plain data"
+   about a `factura.xml` the person could see was XML, while this section
+   claimed the encoding was named. Same for a version other than 1.0,
+   whitespace in front of the declaration, and namespace declarations that XML
+   itself forbids (duplicate prefixes on one element, `xmlns:p=""`): every
+   validator's parser (libxml2) refuses those documents, so signing them would
+   ship bytes nobody can even re-open.
 4. **DTD and entities.** Refused: a DOCTYPE is rejected before parsing (XXE
    safety, and no golden input has one) and any entity reference beyond the
    five predefined ones is an error. The error says to sign the expanded

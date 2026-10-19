@@ -232,6 +232,23 @@ pub fn execute_request(
     // sentence, not a shape complaint (finding M-4).
     let allowed = detected.supported_formats();
     if !allowed.contains(&req.format) && all_formats().contains(&req.format) {
+        // Round two, N-6: a UTF-16 XML is XML to the person holding the file,
+        // and `Format::detect` calls it Data because Data is the only shape it
+        // can honestly sign — a detached CAdES over the bytes as they stand.
+        // Answering "it holds plain data" to someone who asked for XAdES over
+        // `factura.xml` sent them looking for a fault in their document; the
+        // cause is the encoding, and the way out is the same `iconv` the
+        // reader's Latin-1 refusal prints.
+        if detected == Format::Data && openfirma_core::workflow::is_utf16_xml(content) {
+            return Err(Error::Other(format!(
+                "{} is asked for over a document that is XML written in UTF-16. openfirma \
+                 signs XML it can read as UTF-8, so convert it first: iconv -f UTF-16 -t \
+                 UTF-8 in.xml > out.xml (and update its encoding declaration). Signing the \
+                 bytes as they stand is possible and needs no conversion, but it is a \
+                 detached CAdES (cades-b-b), not an XML signature.",
+                req.format
+            )));
+        }
         return Err(Error::Other(format!(
             "{} is not a format this file can be signed as (it holds {}).",
             req.format,
@@ -508,6 +525,47 @@ mod tests {
         let mut req = SignRequest::new("pades-b-b", DigestAlg::Sha256).from_window();
         let err = execute_request(&mut req, Format::Data, b"hello", signer).unwrap_err();
         assert!(err.to_string().contains("plain data"), "{err}");
+    }
+
+    /// Round two, N-6: the same gate, over the file shape it described wrongly.
+    /// A `factura.xml` saved as UTF-16 detects as Data (the XML reader speaks
+    /// UTF-8), so asking for XAdES answered "it holds plain data" — a sentence
+    /// about a document the person can see is XML, with no hint of the encoding
+    /// or of the way out, while `docs/xades.md` §3 promised the encoding is
+    /// named. Both halves belong in the refusal: what the file actually is, and
+    /// that it can still be signed as it stands.
+    #[test]
+    fn xml_in_utf16_is_refused_naming_the_encoding_and_the_way_out() {
+        let utf16: Vec<u8> = "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-16\"?><facturae/>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            Format::detect(&utf16),
+            Format::Data,
+            "the premise of the finding: the detector cannot call these Xml"
+        );
+        let mut req = SignRequest::new("xades-b-b", DigestAlg::Sha256).from_window();
+        let err = execute_request(&mut req, Format::Data, &utf16, &Mock).unwrap_err();
+        let said = err.to_string();
+        for needed in ["UTF-16", "iconv", "cades-b-b"] {
+            assert!(said.contains(needed), "{said} never mentions {needed}");
+        }
+        assert!(
+            !said.contains("plain data"),
+            "the sentence N-6 was about is back: {said}"
+        );
+        // A plain text file still gets the generic sentence: this recognizes one
+        // byte shape, it does not soften any other refusal.
+        let mut req = SignRequest::new("xades-b-b", DigestAlg::Sha256).from_window();
+        let err =
+            execute_request(&mut req, Format::Data, b"contrato en texto plano", &Mock).unwrap_err();
+        assert!(err.to_string().contains("plain data"), "{err}");
+        // Neither refusal reached a signer: `Mock` panics the moment the
+        // dispatcher asks who signs, so had the gate let a request through this
+        // test would have aborted rather than got to assert. That the offer the
+        // sentence makes is real — a detached CAdES over bytes as they stand —
+        // is what `crates/openfirma-cli/tests/cli.rs` produces for `cades-b-b`.
     }
 
     #[test]

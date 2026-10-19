@@ -105,12 +105,26 @@ impl Format {
     /// still readable — encryption in the PDF spec hides content, not the
     /// header) still detects as Pdf; refusing it is the signer's job when it
     /// cannot open it, not the detector's.
+    ///
+    /// A UTF-16 document is `Data` here on purpose, and round two's N-6 is the
+    /// reason that is written down: what the XML reader speaks is UTF-8, so an
+    /// XML file in UTF-16 cannot be signed as XAdES — but it CAN be signed as
+    /// the detached CAdES these bytes mean, and calling it `Xml` would take
+    /// that away and leave the person with a guaranteed error.
+    /// [`is_utf16_xml`] exists so the refusal of an XML shape over such a file
+    /// can name the encoding instead of saying "plain data".
     pub fn detect(bytes: &[u8]) -> Format {
         if bytes.starts_with(b"%PDF-") {
             return Format::Pdf;
         }
         let mut rest = bytes;
-        // A UTF-8 or UTF-16 BOM before the XML declaration is legal and common.
+        // The UTF-8 mark is the one that matters: after it the bytes are still
+        // UTF-8 and the checks below read them. The UTF-16 marks are skipped so
+        // the same shape is looked at either way (round two, N-6 measured that
+        // it changes nothing: a UTF-16 `<` is `<` `NUL`, so neither check can
+        // fire and the answer is Data with or without the mark) — they are kept
+        // because a mark is not content, not because they make UTF-16 detect
+        // as XML.
         for bom in [&b"\xef\xbb\xbf"[..], b"\xff\xfe", b"\xfe\xff"] {
             if rest.starts_with(bom) {
                 rest = &rest[bom.len()..];
@@ -124,6 +138,50 @@ impl Format {
         } else {
             Format::Data
         }
+    }
+}
+
+/// Whether `bytes` are XML written in UTF-16: a byte-order mark, or the byte
+/// shape of a `<` opening markup with the other half of each character NUL.
+///
+/// This is not a detection rule — [`Format::detect`] answers Data for these
+/// files and the CAdES path keeps signing them — it is what a refusal deserves
+/// to say (round two, N-6). Asking for `xades-b-b` over a UTF-16 `factura.xml`
+/// used to answer "this file holds plain data", while `docs/xades.md` §3
+/// promised that input which is not UTF-8 is refused naming the cause. The
+/// cause here is the encoding, and the way out is the same `iconv` the Latin-1
+/// refusal prints.
+pub fn is_utf16_xml(bytes: &[u8]) -> bool {
+    let (body, big) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (rest, false),
+        [0xFE, 0xFF, rest @ ..] => (rest, true),
+        // no mark: only a `<` sitting in one of the two halves is a candidate
+        [b'<', 0, ..] => (bytes, false),
+        [0, b'<', ..] => (bytes, true),
+        _ => return false,
+    };
+    let unit = |i: usize| -> Option<u16> {
+        let (a, b) = (*body.get(i)?, *body.get(i + 1)?);
+        Some(if big {
+            (u16::from(a) << 8) | u16::from(b)
+        } else {
+            (u16::from(b) << 8) | u16::from(a)
+        })
+    };
+    // leading whitespace, two bytes at a time, in the endianness chosen above
+    let mut i = 0usize;
+    while matches!(unit(i), Some(0x20 | 0x09 | 0x0D | 0x0A)) {
+        i += 2;
+    }
+    // the first character must open markup, with the same ASCII-only bias
+    // `looks_like_markup` carries: an accented name-start character is not
+    // something this function claims to recognize
+    match (unit(i), unit(i + 2)) {
+        (Some(0x3C), Some(second)) if second < 0x80 => {
+            let c = second as u8 as char;
+            c.is_ascii_alphabetic() || matches!(second, 0x21 | 0x3F | 0x2F)
+        }
+        _ => false,
     }
 }
 
@@ -988,6 +1046,79 @@ mod tests {
         assert_eq!(Format::detect(b"<3 and falling\n"), Format::Data);
         assert_eq!(Format::detect(b""), Format::Data);
         assert_eq!(Format::detect(b"contrato en texto plano"), Format::Data);
+        // Round two, N-6, pinned: a UTF-16 XML detects as Data, with a mark or
+        // without one. That is the deliberate choice, not an oversight — the
+        // bytes can be signed as the detached CAdES they mean, and answering
+        // Xml would take that away and promise an XAdES that cannot be made.
+        // `is_utf16_xml` below is what lets the refusal say so.
+        assert_eq!(
+            Format::detect(&utf16("<?xml version=\"1.0\"?><a/>", false)),
+            Format::Data
+        );
+        assert_eq!(
+            Format::detect(&utf16("<?xml version=\"1.0\"?><a/>", true)),
+            Format::Data
+        );
+    }
+
+    /// One document in either endianness, optionally with its byte-order mark.
+    fn utf16(text: &str, big: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if big {
+            out.extend_from_slice(b"\xfe\xff");
+        } else {
+            out.extend_from_slice(b"\xff\xfe");
+        }
+        for unit in text.encode_utf16() {
+            let pair = if big {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            };
+            out.extend_from_slice(&pair);
+        }
+        out
+    }
+
+    /// The sentence a refusal is built from (round two, N-6): these files ARE
+    /// XML to whoever has them open, and `Format::detect` calls them Data, so
+    /// without this the answer to "sign this factura.xml as XAdES" was "it
+    /// holds plain data" while `docs/xades.md` §3 promised the encoding was
+    /// named. Recognizing them is a byte shape, not a decoder, so the rule
+    /// stays as narrow as the claim: markup that opens, in either endianness,
+    /// with or without a mark — and nothing else.
+    #[test]
+    fn xml_written_in_utf16_is_recognized_as_such() {
+        let doc = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><facturae/>";
+        for big in [false, true] {
+            assert!(
+                is_utf16_xml(&utf16(doc, big)),
+                "UTF-16{} with a mark",
+                if big { "BE" } else { "LE" }
+            );
+            // and the same bytes without the mark: the NUL in the other half of
+            // each character is the shape, not the mark
+            assert!(
+                is_utf16_xml(&utf16(doc, big)[2..]),
+                "UTF-16{} without a mark",
+                if big { "BE" } else { "LE" }
+            );
+        }
+        // a root element with no declaration, and a comment: both open markup
+        assert!(is_utf16_xml(&utf16("<root>x</root>", false)));
+        assert!(is_utf16_xml(&utf16("<!-- hi --><root/>", false)));
+        // leading whitespace, two bytes at a time, does not hide it
+        assert!(is_utf16_xml(&utf16("  \n<root/>", false)));
+
+        // what it must NOT claim: UTF-16 text that is not markup, an angle
+        // bracket that opens nothing (the same rule `looks_like_markup` has),
+        // plain UTF-8 XML, and bytes too short to say anything.
+        assert!(!is_utf16_xml(&utf16("contrato en texto plano", false)));
+        assert!(!is_utf16_xml(&utf16("<3 and falling", false)));
+        assert!(!is_utf16_xml(b"<?xml version=\"1.0\"?><a/>"));
+        assert!(!is_utf16_xml(b""));
+        assert!(!is_utf16_xml(b"\xff\xfe<\x00"));
+        assert!(!is_utf16_xml(b"<"));
     }
 
     #[test]
