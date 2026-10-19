@@ -1105,11 +1105,20 @@ impl App {
         // M-4: the "back" button the review counted as absent — leaving does
         // not cost the document a second trip through a file dialog.
         ui.add_space(6.0);
+        let mut go_back = false;
         ui.horizontal(|ui| {
+            // 06-N-6: the click is recorded here and acted on OUTSIDE the
+            // closure. `put_back!` in this position returned from the closure,
+            // not from this function, and the `put_back!(taken)` at the end
+            // swapped the Picked screen straight back in: the button did
+            // nothing at all.
             if ui.button(tr.back_button.clone()).clicked() {
-                put_back!(Screen::Idle);
+                go_back = true;
             }
         });
+        if go_back {
+            put_back!(Screen::Idle);
+        }
 
         if self.show_add_store {
             self.render_add_store(ui, catalog);

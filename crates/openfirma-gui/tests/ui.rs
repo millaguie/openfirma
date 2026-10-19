@@ -535,6 +535,35 @@ fn a_wrong_password_returns_to_the_picker_with_its_document_and_a_sentence() {
 }
 
 #[test]
+fn the_pickers_back_button_leaves_the_picker() {
+    // 06-N-6: the button was painted, clickable and inert — `put_back!` inside
+    // the `ui.horizontal` closure returned from the closure, and the call at
+    // the end of the frame put the Picked screen straight back. A citizen who
+    // picked the wrong `.p12` had no way back except dragging another file or
+    // closing the window.
+    let Some(()) = require(
+        testdata().join("inputs/simple.pdf").is_file(),
+        "testdata/inputs/simple.pdf",
+    ) else {
+        return;
+    };
+    let mut app = fixture_app(None);
+    app.load_path_for_test(testdata().join("inputs/simple.pdf"));
+    let mut harness = harness_for(app);
+    harness.run();
+    harness.get_by_label_contains("Es un PDF");
+    harness
+        .get_by_label_contains("Elegir otro documento")
+        .click();
+    harness.run();
+    assert!(
+        matches!(harness.state().screen_ref_for_test(), Screen::Idle),
+        "the back button leaves the picker"
+    );
+    harness.get_by_label_contains("Arrastra aquí el documento");
+}
+
+#[test]
 fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     // The verify deviation from AutoFirma, pinned through the window: the
     // *document itself* (not an exported .csig) gets verdicts. Built end to
