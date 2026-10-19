@@ -380,10 +380,20 @@ impl SystemStore for WindowsStore {
                     let _ = freed; // neither API reports much on a close path
                 }
             }
+            // Round 2, 04-N3: the listings showed this certificate's subject CN
+            // as its name while `label` stayed empty, so `--store-alias '<CN>'`
+            // — and every alias `autofirma listaliases` printed — matched
+            // nothing, on a store that is the only one Windows users have.
+            // Windows' own `friendlyName` would be a better name where a user
+            // set one; reading it needs `CertGetCertificateContextProperty` with
+            // `CERT_FRIENDLY_NAME_PROP_ID`, which is Windows-only FFI that
+            // cannot be built or run on this project's development machine, so
+            // it is declared here rather than guessed at. The CN comes from the
+            // DER that was parsed two lines up.
+            let label = cert.subject_cn();
             out.push(StoreCertificate {
                 cert,
-                label: None, // the friendly name needs cryptui-style property
-                // reads; subject CN is what users actually compare here.
+                label,
                 key_handle: KeyHandle::WindowsStoreIndex(out.len()),
                 // No equivalent of CKA_ALWAYS_AUTHENTICATE in the CryptoAPI
                 // store index we read; A6 will revisit this with the NCrypt

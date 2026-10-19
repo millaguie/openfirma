@@ -680,6 +680,26 @@ fn open_store(spec: &StoreSpec, pin: Option<Zeroizing<String>>) -> Result<DynSto
     Ok(openfirma_keystore::open_store(spec, pin)?)
 }
 
+/// The name a keystore entry is offered under and answers to: the store's own
+/// label when it has one, the subject CN when it does not. This is the name
+/// `keystores list` and `autofirma listaliases` print, so it is the name
+/// `--store-alias`/`-alias` has to accept — round 2's 04-N3: the match used to
+/// be against `label` alone, so on a store whose entries carry no label (a
+/// PKCS#11 object without `CKA_LABEL`, and every certificate the Windows store
+/// lists) the refusal read
+///
+///     no keystore entry labeled 'PEREZ GARCIA, ANA'; entries present: …
+///       PEREZ GARCIA, ANA
+///
+/// — the name it had just offered. `<no CN>` is what a certificate without a
+/// CN is listed as, and matching it literally is harmless: it is copyable.
+fn entry_name(entry: &openfirma_keystore::StoreCertificate) -> String {
+    entry
+        .label
+        .clone()
+        .unwrap_or_else(|| entry.cert.subject_cn().unwrap_or_else(|| "<no CN>".into()))
+}
+
 /// Picks the signing certificate of a keystore for `sign --store`: by label
 /// when `--store-alias` gave one, otherwise requiring exactly one signer. An
 /// ambiguous pick is refused with the labels on offer — guessing which
@@ -715,12 +735,11 @@ fn store_signer(store: DynStore, alias: Option<&str>) -> Result<Box<dyn Signer +
     let chosen = match alias {
         Some(want) => all
             .iter()
-            .find(|c| c.label.as_deref() == Some(want))
+            .find(|c| entry_name(c) == want)
             .with_context(|| {
                 let mut msg = format!("no keystore entry labeled '{want}'; entries present:");
                 for c in &pool {
-                    let cn = c.cert.subject_cn().unwrap_or_else(|| "<no CN>".into());
-                    msg.push_str(&format!("\n  {}", c.label.as_deref().unwrap_or(&cn)));
+                    msg.push_str(&format!("\n  {}", entry_name(c)));
                 }
                 msg
             })?
@@ -732,8 +751,7 @@ fn store_signer(store: DynStore, alias: Option<&str>) -> Result<Box<dyn Signer +
                               --store-alias:",
             );
             for c in &pool {
-                let cn = c.cert.subject_cn().unwrap_or_else(|| "<no CN>".into());
-                msg.push_str(&format!("\n  {}", c.label.as_deref().unwrap_or(&cn)));
+                msg.push_str(&format!("\n  {}", entry_name(c)));
             }
             anyhow::bail!("{msg}")
         }
@@ -3341,6 +3359,56 @@ mod tests {
     }
 
     use std::time::SystemTime;
+
+    #[test]
+    fn an_unlabeled_store_is_still_reachable_by_the_name_it_prints() {
+        // 04-N3, on the same code path the Windows store takes: entries with
+        // `label: None` (the Windows store filled none, and neither does a
+        // PKCS#11 object without CKA_LABEL). `store_signer` compared `label`
+        // alone while both listings print the subject CN, so the refusal named
+        // the entry it had just offered and the compat layer's `-alias <CN>`
+        // — fed straight from `listaliases` — could never work.
+        use openfirma_keystore::{KeyHandle, StoreCertificate};
+        let entry = |cn: &str| StoreCertificate {
+            cert: openfirma_core::filter::shape_cert(
+                // RFC 4514: the comma inside the value is escaped on the way in
+                // and comes back unescaped from subject_cn().
+                &format!("CN={}", cn.replace(',', "\\,")),
+                "CN=AC FNMT Usuarios,O=FNMT,C=ES",
+                std::time::Duration::from_secs(3600),
+                Some((true, true)),
+            ),
+            label: None,
+            key_handle: KeyHandle::Pkcs11Id(vec![1]),
+            always_authenticate: false,
+            chain: Vec::new(),
+        };
+        let mk = || {
+            Arc::new(FixedStore(vec![
+                entry("LOPEZ MARTIN, JUAN"),
+                entry("PEREZ GARCIA, ANA"),
+            ])) as DynStore
+        };
+        // Two signers and no alias: refused, with both printed names on offer.
+        let err = store_signer(mk(), None)
+            .map(|_| ())
+            .expect_err("two signers need an alias")
+            .to_string();
+        assert!(err.contains("PEREZ GARCIA, ANA"), "{err}");
+        assert!(err.contains("LOPEZ MARTIN, JUAN"), "{err}");
+        // The name the listing printed is the name that selects.
+        let picked = store_signer(mk(), Some("PEREZ GARCIA, ANA")).expect("the CN selects");
+        assert_eq!(
+            picked.certificate().subject_cn().as_deref(),
+            Some("PEREZ GARCIA, ANA")
+        );
+        // And a name nothing carries is refused with the same list.
+        let err = store_signer(mk(), Some("NADIE NADIE"))
+            .map(|_| ())
+            .expect_err("no such entry")
+            .to_string();
+        assert!(err.contains("PEREZ GARCIA, ANA"), "{err}");
+    }
 
     /// Temp file named after the running test, because cargo runs the tests
     /// of one binary in parallel threads.
