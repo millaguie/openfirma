@@ -224,9 +224,11 @@ struct VerifyArgs {
     input: PathBuf,
 
     /// The signed content, for a detached CAdES signature. Not needed for an
-    /// encapsulated one, where the content travels inside the signature and
-    /// this flag is ignored, and ignored for a PDF, where each signature
-    /// covers the bytes its own /ByteRange names.
+    /// encapsulated one, where the content travels inside the signature; if it
+    /// is given anyway it is compared with the encapsulated bytes, and a
+    /// difference refuses the signature instead of either side winning quietly.
+    /// Ignored for a PDF, where each signature covers the bytes its own
+    /// /ByteRange names.
     #[arg(long)]
     content: Option<PathBuf>,
 
@@ -440,9 +442,13 @@ struct SignArgs {
     /// A TimeStampResp file, as `openssl ts -reply` writes one, to embed as
     /// the B-T token instead of asking a TSA live. The token imprints the
     /// signature value, which for RSA PKCS#1 v1.5 is deterministic, so the flow
-    /// is: sign once, stamp the signature value, sign again with this flag.
-    /// ECDSA signatures are randomised, so for those use --tsa. The imprint is
-    /// checked against the signature value and a mismatch is an error.
+    /// is: sign once, stamp the signature value, sign again with this flag. Both
+    /// passes need --no-signing-time: signingTime is a *signed* attribute kept to
+    /// whole seconds, so two passes agree only when they land inside the same
+    /// second. Measured: the same command twice within a second writes identical
+    /// bytes, and with a pause across the boundary the two files differ — a race,
+    /// not a recipe. ECDSA signatures are randomised, so for those use --tsa. The
+    /// imprint is checked against the signature value and a mismatch is an error.
     #[arg(long)]
     timestamp_token: Option<PathBuf>,
 
@@ -1083,6 +1089,23 @@ fn main() -> Result<()> {
                 })?);
             }
 
+            // Read before the flags move into the provider: the summary line has
+            // to tell the truth about what the command just wrote.
+            let stamp_note = match (&tsa, &timestamp_token) {
+                (Some(url), _) => Some(format!("+ time-stamp token from {url}")),
+                (None, Some(file)) => Some(format!("+ time-stamp token from {}", file.display())),
+                (None, None) => None,
+            };
+            // Not "CAdES-B-T": the level is what a verifier decides later, and all
+            // this command has done is attach a token whose imprint matches (whether
+            // the TSA's own signature was checkable is stderr's business, and it
+            // says so). The line used to print the bare format label over a
+            // signature that carried a stamp, which read as if none had been asked
+            // for.
+            let stamp_note = match stamp_note {
+                Some(what) => format!(", {what}"),
+                None => String::new(),
+            };
             let stamp = timestamp_provider(tsa, timestamp_token, validation_certs.clone())?;
             let mut request =
                 openfirma_browser::signing::SignRequest::new(format.flag_value(), digest_alg);
@@ -1163,7 +1186,7 @@ fn main() -> Result<()> {
                 .subject_cn()
                 .unwrap_or_else(|| "<no CN>".into());
             println!(
-                "signed {} -> {} ({} bytes, {}, {})",
+                "signed {} -> {} ({} bytes, {}{stamp_note}, {})",
                 input.display(),
                 output.display(),
                 signature.len(),

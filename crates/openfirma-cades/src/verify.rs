@@ -22,7 +22,8 @@
 //!   value, under its own certificate and chain (RFC 5652 6).
 //!
 //! What is *not* checked, because it is layer 3/4 territory in
-//! docs/validation.md: revocation (CRL/OCSP) and certificate policies. Chain construction itself follows RFC 5280: an
+//! docs/validation.md: revocation (CRL/OCSP) and certificate policies. Chain
+//! construction itself follows RFC 5280: an
 //! issuer is only ever accepted when `basicConstraints` says `cA = TRUE`, its
 //! `keyUsage` (when present) allows `keyCertSign`, its `pathLenConstraint`
 //! still leaves room, and no critical extension escapes interpretation — nor a
@@ -462,9 +463,13 @@ fn unsigned_values<'a>(content: &'a [u8], wanted: ObjectIdentifier) -> Result<Ve
 /// Verifies every `SignerInfo` of a CMS `SignedData`.
 ///
 /// `content` is the external content of a detached signature. When the
-/// signature encapsulates its content, the encapsulated bytes are verified and
-/// `content` is ignored; when it is detached and `content` is `None`,
-/// verification fails on the `messageDigest` check.
+/// signature encapsulates its content the encapsulated bytes are what gets
+/// verified, and a `content` supplied as well has to *be* those bytes: the two
+/// are compared and a difference refuses the signature rather than one of them
+/// quietly winning (round one"s A1 — the flag used to be ignored here, which
+/// let a verifier report a signature valid against a document nobody signed).
+/// When it is detached and `content` is `None`, verification fails on the
+/// `messageDigest` check.
 ///
 /// `Ok` holds one [`VerifyReport`] per signer and only happens when all of
 /// them pass. A failure names the signer (when there is more than one) and
@@ -1412,7 +1417,10 @@ pub fn check_certificate_rules(cert: &CertificateHandle, role: CertRole) -> Resu
                     return Err(fail(
                         CHECK_CERTIFICATE_CHAIN,
                         format!(
-                            "the TSA certificate \"{}\" carries its extendedKeyUsage                              non-critical; RFC 3161 2.3 requires a time-stamp authority's to                              be marked critical, and a non-critical one is a statement                              verifiers are allowed to ignore",
+                            "the TSA certificate \"{}\" carries its extendedKeyUsage \
+                             non-critical; RFC 3161 2.3 requires a time-stamp authority's to \
+                             be marked critical, and a non-critical one is a statement \
+                             verifiers are allowed to ignore",
                             subject(cert)
                         ),
                     ));

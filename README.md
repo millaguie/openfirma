@@ -62,10 +62,12 @@ Very early, phase 1. What works today:
   each link's signature and every validity date checked at a validation time
   of your choice. RSA and ECDSA P-256/P-384/P-521, and SKI-based signer
   identifiers (SignerInfo version 3). The default `AlgorithmPolicy` is the
-  ETSI TS 119 312 conservative one: SHA-1 signature digests and RSA keys
-  below 2048 bits are refused unless the caller opts out explicitly. It is
-  the in-repo verifier, not a substitute for VALIDe or the ETSI validators,
-  see `docs/validation.md`.
+  ETSI TS 119 312 conservative one: SHA-1 signature digests and RSA keys below
+  2048 bits are refused, and `verify` has no switch to accept them — a signature
+  that weak is refused, full stop. Opting out is a *signing* decision:
+  `sign --allow-weak-algorithms`, or `AlgorithmPolicy` for library callers. It is
+  the in-repo verifier, not a substitute for VALIDe or the ETSI validators, see
+  `docs/validation.md`.
 - CLI: `openfirma sign`, `openfirma verify`, `openfirma inspect` (dumping any
   DER signature as a normalized tree for diffing), and `openfirma keystores
   list`, which lists what a PKCS#11 token or NSS database holds.
