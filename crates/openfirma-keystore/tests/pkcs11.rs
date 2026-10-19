@@ -197,6 +197,59 @@ fn softhsm_lists_pairs_and_signs_both_keys() {
     );
 }
 
+/// Round 2, 04-N6. SoftHSM's own refusal for a wrong PIN advertises the token's
+/// remaining tries, so an empty `C_Login` is not a no-op there: it is a real
+/// failed attempt. A key the token lets us use without a login (OpenSC serves
+/// many cards that way) must therefore sign without one. Before the fix this
+/// failed with CKR_PIN_INCORRECT, because `sign_prehash` always logged in and
+/// with no PIN it sent the empty string.
+#[test]
+fn a_key_visible_without_a_login_signs_without_spending_a_pin_try() {
+    let Some((module, _)) = softhsm_env() else {
+        require_or_skip(
+            "no SoftHSM test material: set OPENFIRMA_TEST_PKCS11_MODULE and SOFTHSM2_CONF \
+             from tools/setup-test-keystores.sh",
+        );
+        return;
+    };
+    // The token with a CKA_PRIVATE=false key needs p11tool to build (see the
+    // setup script); where that is missing the label is not there at all, which
+    // is a skip and never a pass.
+    let Some(store) = Pkcs11Store::open(&module, Some("openfirma publica"), None)
+        .ok()
+        .filter(|s| s.token_label() == "openfirma publica")
+    else {
+        require_or_skip(
+            "no public-key token: tools/setup-test-keystores.sh builds it when p11tool \
+             (gnutls-bin) is installed",
+        );
+        return;
+    };
+    let certs = store
+        .certificates()
+        .expect("a key visible without a login lists without a PIN");
+    assert_eq!(
+        certs.len(),
+        1,
+        "the public-key token holds one signer: {certs:?}"
+    );
+    // The bite: this only succeeds if no empty C_Login ran first, and this
+    // token's PIN is not empty.
+    check_signature(&store, &certs[0]);
+
+    // And nothing above left the fixture unusable: it still opens with its own
+    // PIN (a token whose tries a stray login had exhausted would not). Named
+    // limit: whether an attempt was spent is not read back here — the bite is
+    // that the anonymous signature succeeds at all, which it cannot do while an
+    // empty C_Login runs first, and the second half of the fix (what a token
+    // that *does* demand a PIN gets told) has no live shape on SoftHSM: a key
+    // that is visible without a login cannot carry CKA_ALWAYS_AUTHENTICATE
+    // there, so it is pinned by the unit test below instead.
+    let with_pin = Pkcs11Store::open(&module, Some("openfirma publica"), Some("12345678".into()))
+        .expect("the fixture still opens with its PIN");
+    assert_eq!(with_pin.token_label(), "openfirma publica");
+}
+
 // ---------------------------------------------------------------------------
 // NSS shared database (libsoftokn3)
 

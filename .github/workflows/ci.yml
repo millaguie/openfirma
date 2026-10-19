@@ -312,10 +312,12 @@ jobs:
       # skip by design. qpdf/poppler/xmlsec join the install: the crosscheck
       # tools are CI dependencies now (their absence fails the suite through
       # require_or_skip instead of silently skipping it — review 07, H-1).
-      # Installed before the PKI step so its failure is visible on its own.
+      # gnutls-bin joins for p11tool, the one tool that can clear CKA_PRIVATE:
+      # the "key WITHOUT a login" token that review 04, N6's test needs is built
+      # with it, and without the package that test would skip on every runner.
       - name: install PKCS#11 test modules and crosscheck tools (linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc libnss3 qpdf poppler-utils xmlsec1
+        run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc libnss3 gnutls-bin qpdf poppler-utils xmlsec1
 
       # The crosscheck pair on macOS (H-1): qpdf and pdfsig (poppler) have no
       # base-system equivalent there, and require_or_skip now fails the suite

@@ -490,7 +490,16 @@ impl SystemStore for Pkcs11Store {
             }
         };
         let session = Session::open(&self.module, self.slot)?;
-        self.login(&session)?;
+        // Round 2, 04-N6: with no PIN there is nothing to log in with, and
+        // every empty `C_Login` is a real failed try on a token that counts
+        // them (a DNIe locks after three). A key the token lets us use without
+        // a login — OpenSC serves many cards that way, and SoftHSM honours a
+        // `CKA_PRIVATE=false` key — signs without ever asking. A key that does
+        // need the login gets `needs_a_pin` from the sign itself, which is the
+        // actionable answer instead of a spent try.
+        if self.pin.is_some() {
+            self.login(&session)?;
+        }
         sign_with_key(&session, self, &id, alg, prehash)
     }
 }
@@ -1182,11 +1191,14 @@ fn pkcs11_sign(
     data: &[u8],
 ) -> Result<Vec<u8>> {
     let advertised = read_ck_bool(session, key_object, CKA_ALWAYS_AUTHENTICATE)?.unwrap_or(false);
-    if advertised {
+    let have_pin = store.pin.is_some();
+    let outcome = if advertised {
         init_sign(session, mechanism, key_object)?;
-        store.login_as(session, CKU_CONTEXT_SPECIFIC)?;
+        if have_pin {
+            store.login_as(session, CKU_CONTEXT_SPECIFIC)?;
+        }
         let signed = sign_finish(session, mechanism, data);
-        if matches!(&signed, Err(err) if is_operation_uninitialised(err)) {
+        if have_pin && matches!(&signed, Err(err) if is_operation_uninitialised(err)) {
             // The login tore the operation down (SoftHSM's logout-first
             // C_Login). It stands on the session; rebuild and sign without a
             // second login attempt.
@@ -1200,6 +1212,11 @@ fn pkcs11_sign(
             sign_finish(session, mechanism, data)
         };
         if matches!(&signed, Err(err) if is_user_not_logged_in(err)) {
+            if !have_pin {
+                // Nothing to pay the login with (04-N6): say what the token
+                // wants instead of logging in with an empty PIN.
+                return Err(needs_a_pin(&store.token_label));
+            }
             // Enforced without advertising: pay the context login now and run
             // a fresh operation — the spec order, arrived at late.
             store.login_as(session, CKU_CONTEXT_SPECIFIC)?;
@@ -1212,7 +1229,40 @@ fn pkcs11_sign(
             return retry;
         }
         signed
-    }
+    };
+    // The sign ran without a PIN. A CKR_USER_NOT_LOGGED_IN that reaches here
+    // (the probe's `per_signature_refusal`, or a module that answers at
+    // C_SignInit) means this token wants one, and the refusal's wording about
+    // a PIN that was already accepted would be a lie: say the true thing.
+    without_a_pin(&store.token_label, outcome, have_pin)
+}
+
+/// The one message for "this token wants a PIN and none was given" (round 2,
+/// 04-N6). Without a PIN there is nothing to log in with, and the empty login
+/// the old code sent is a real failed try on a token that counts them (a DNIe
+/// locks after three), so openfirma asks for the PIN rather than guessing it.
+fn needs_a_pin(token_label: &str) -> Error {
+    Error::Keystore(format!(
+        "token '{token_label}' needs a PIN to use this key and none was given: pass \
+         --pin-env VAR with the environment variable holding its PIN (a token that \
+         truly needs none is spelled with the :: marker, e.g. \
+         --store pkcs11:/path/to/module.so::)"
+    ))
+}
+
+/// The mapping the sign path applies to its own failure when no PIN was given:
+/// CKR_USER_NOT_LOGGED_IN becomes `needs_a_pin`, everything else stands. Kept
+/// apart from the sign flow because the live half has no shape on SoftHSM — a
+/// key visible without a login cannot carry CKA_ALWAYS_AUTHENTICATE there — so
+/// this is what the unit test pins.
+fn without_a_pin(token_label: &str, outcome: Result<Vec<u8>>, have_pin: bool) -> Result<Vec<u8>> {
+    outcome.map_err(|e| {
+        if !have_pin && is_user_not_logged_in(&e) {
+            needs_a_pin(token_label)
+        } else {
+            e
+        }
+    })
 }
 
 /// `CKR_USER_NOT_LOGGED_IN` surfaced as a keystore error — the one return that
@@ -1519,5 +1569,58 @@ mod tests {
         // 0x105 is CKA_DECRYPT — the value this crate shipped by mistake,
         // which made every private key look always-authenticate.
         assert_eq!(CKA_ALWAYS_AUTHENTICATE, 0x0202);
+    }
+
+    #[test]
+    fn without_a_pin_says_the_token_wants_one() {
+        // Round 2, 04-N6. What a token answers when it wants a PIN nobody
+        // gave: CKR_USER_NOT_LOGGED_IN, in either of the two shapes the sign
+        // path can meet it — the raw return, or the per-signature refusal
+        // `sign_finish` builds for an advertised key. Neither may reach the
+        // user as it stands: the refusal talks about consent being denied to
+        // someone who never typed a PIN, and the raw return's own hint points
+        // at --pin-env only by luck of wording.
+        for shape in [
+            Error::Keystore(format!(
+                "C_Sign failed: {}",
+                describe(CKR_USER_NOT_LOGGED_IN)
+            )),
+            per_signature_refusal(CKR_USER_NOT_LOGGED_IN),
+        ] {
+            let mapped = without_a_pin("DNIe", Err(shape), false)
+                .expect_err("a token that wants a PIN cannot sign without one")
+                .to_string();
+            assert!(mapped.contains("needs a PIN"), "{mapped}");
+            assert!(mapped.contains("DNIe"), "the token is named: {mapped}");
+            assert!(mapped.contains("--pin-env"), "{mapped}");
+            // The lie this replaces: a PIN that was never given cannot have
+            // been refused, and consent was not what failed.
+            assert!(!mapped.contains("CKA_ALWAYS_AUTHENTICATE"), "{mapped}");
+            assert!(!mapped.contains("consent"), "{mapped}");
+        }
+        // With a PIN the caller did give, the per-signature refusal stands as
+        // written: there the answer really is about consent.
+        let kept = without_a_pin(
+            "DNIe",
+            Err(per_signature_refusal(CKR_USER_NOT_LOGGED_IN)),
+            true,
+        )
+        .expect_err("still an error")
+        .to_string();
+        assert!(kept.contains("CKA_ALWAYS_AUTHENTICATE"), "{kept}");
+        // And an unrelated failure is never relabelled.
+        let other = without_a_pin(
+            "DNIe",
+            Err(Error::Keystore("C_Sign failed: something else".into())),
+            false,
+        )
+        .expect_err("still an error")
+        .to_string();
+        assert_eq!(other, "keystore: C_Sign failed: something else");
+        // Success stays success.
+        assert_eq!(
+            without_a_pin("DNIe", Ok(vec![1, 2]), false).unwrap(),
+            vec![1, 2]
+        );
     }
 }

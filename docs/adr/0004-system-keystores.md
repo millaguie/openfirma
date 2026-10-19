@@ -102,7 +102,10 @@ pub trait SystemStore {
   and an empty PIN sent on such a guess spends one of the three tries a DNIe
   counts before locking (measured on SoftHSM; finding M2). The `::` marker —
   not the absence of a variable — is what spells "this keystore has no
-  password". Login happens at open
+  password". With neither a PIN nor the marker no login is attempted at all
+  (review 04, N6): a token that lets its key be used without one signs, and a
+  token that turns out to need one is told so by name rather than sent an
+  empty PIN as a guess. When a PIN was given, the login happens at open
   time so a wrong PIN fails while the reader is still in hand; token flags
   (`CKF_USER_PIN_COUNT_LOW`/`FINAL_TRY`/`LOCKED`) are read before wording the
   error so "last try" is said before the lock, not after.

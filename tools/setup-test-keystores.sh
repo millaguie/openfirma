@@ -6,6 +6,8 @@
 # Everything lives under $TESTDIR (default /tmp/opencode/keystores) so a reboot
 # or cleanup wipes it; rerun this script to rebuild. Tests skip when material
 # is absent. Requires: softhsm2-util, pkcs11-tool (opensc), pk12util, openssl.
+# p11tool (gnutls-bin) is optional: it builds the second token whose key is
+# visible without a login, and without it the test that needs that token skips.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 TESTDIR="${OPENFIRMA_KEYSTORE_TESTDIR:-/tmp/opencode/keystores}"
@@ -75,6 +77,32 @@ pkcs11-tool --module "$P11" --login --pin "$PIN" \
   --write-object "$TESTDIR/dnie/marta.pk8" --type privkey \
   --id 0e --label "DNIE sign key" >/dev/null
 
+# A second token whose private key is visible WITHOUT a login — the shape
+# OpenSC serves on many cards, and the one review 04, N6 measured: listing
+# works with no PIN at all, so the signature path must not answer with an
+# empty `C_Login` (which SoftHSM counts as a real wrong-PIN try). `CKA_PRIVATE`
+# is cleared by GnuTLS's p11tool (`--no-mark-private`); pkcs11-tool has no flag
+# for it, so where p11tool is missing the whole token is skipped and the no-PIN
+# test in tests/pkcs11.rs skips with it rather than passing vacuously.
+if command -v p11tool >/dev/null; then
+  softhsm2-util --init-token --free --label "openfirma publica" \
+    --pin "$PIN" --so-pin "$PIN" >/dev/null
+  p11tool --provider "$P11" --login --set-pin="$PIN" \
+    --write "pkcs11:token=openfirma%20publica" \
+    --load-privkey "$CERTS/signer-rsa.key" --label "openfirma publica key" \
+    --id 0f --no-mark-private >/dev/null
+  pkcs11-tool --module "$P11" --login --pin "$PIN" \
+    --token-label "openfirma publica" \
+    --write-object "$CERTS/signer-rsa.crt.der" --type cert --id 0f \
+    --label "openfirma publica" >/dev/null
+  # Named limit: a key that is visible without a login AND still demands one
+  # (CKA_ALWAYS_AUTHENTICATE) cannot be built here — SoftHSM refuses that
+  # attribute together with CKA_PRIVATE=false (measured: p11tool's
+  # `--no-mark-private --mark-always-authenticate` fails at C_CreateObject for
+  # RSA and EC alike). So the live half covers "signs without a login"; the
+  # "token wants a PIN and none was given" answer is unit-tested instead.
+fi
+
 # NSS shared DB (empty password) with the same signers as PKCS#12.
 rm -f "$TESTDIR/nssdb"/*
 for who in rsa ec; do
@@ -90,4 +118,9 @@ done
 
 echo "PKCS#11 module: $P11"
 echo "SOFTHSM2_CONF=$SOFTHSM2_CONF (token label 'openfirma test', PIN $PIN)"
+if command -v p11tool >/dev/null; then
+  echo "second token 'openfirma publica' (PIN $PIN, key visible without a login)"
+else
+  echo "no p11tool (gnutls-bin): the 'openfirma publica' token was NOT built, and the no-PIN test skips"
+fi
 echo "NSS DB: sql:$TESTDIR/nssdb (empty password)"

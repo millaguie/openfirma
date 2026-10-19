@@ -313,11 +313,14 @@ struct SignArgs {
     store: Option<String>,
 
     /// Environment variable holding the PIN of the --store keystore (its PKCS#11
-    /// user PIN, or the NSS database password; an unset variable means an empty
-    /// one). Like every secret here it must not appear on the command line:
-    /// export the variable, point this flag at its name. With no value after a
-    /// token label — `...module.so:My Token:` — nothing is looked up and the
-    /// token's own no-password login is attempted.
+    /// user PIN, or the NSS database password). Like every secret here it must
+    /// not appear on the command line: export the variable, point this flag at
+    /// its name. A variable that is not set is refused before anything opens —
+    /// a typo in the name must not spend a real token's lockout tries. A
+    /// keystore that genuinely needs no PIN (a passwordless token, an NSS
+    /// shared database) is spelled by the descriptor itself, with the trailing
+    /// `::`. With neither, openfirma signs without ever calling C_Login, and
+    /// asks for a PIN only if the token turns out to require one.
     #[arg(long)]
     pin_env: Option<String>,
 
