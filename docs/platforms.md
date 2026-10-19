@@ -31,9 +31,10 @@ in format code, ever.
 
 - **Apple Silicon and x64**: build universal binary with `cargo lipo` or ship
   two artifacts like AutoFirma does.
-- **macOS notarization** is mandatory for the wss localhost service to start
-  without Gatekeeper blocking, and for the trust store modification to prompt
-  properly. Needs a Developer ID.
+- **macOS notarization** would be mandatory if the wss localhost service ever
+  lands — Gatekeeper blocks it otherwise, and the trust-store modification has
+  to prompt properly — which is one of the four pieces openfirma does not
+  implement (ADR-0005's honest gap). Needs a Developer ID.
 - **Windows 32 bit**: AutoFirma still ships it. Decide early whether we drop it,
   because it constrains the Rust target to `i686-pc-windows-msvc` and some
   crates do not build there.

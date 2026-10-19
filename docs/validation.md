@@ -165,7 +165,13 @@ The protocol parsing itself (`crates/openfirma-browser/tests/uri_parse.rs`)
 works from recorded `afirma://` URIs with the AutoFirma source line each form
 comes from, and the attack surface has tests that assert refusal *by named
 reason*: cross-site Origin, rebound Host, GET-as-CSRF, token replay, chunked
-and oversized bodies (`crates/openfirma-browser/tests/fake_sede.rs`). The
+and oversized bodies (`crates/openfirma-browser/tests/fake_sede.rs`). Round two
+added the head parser's own cases to that list — two `Content-Length` fields
+(400, `duplicate-content-length`), a version this endpoint does not implement
+(505, `unsupported-http-version`), an IPv6 loopback bind refused by name, and,
+the other way round, a `Host` whose spelling differs only in case *accepted*,
+because a host name is case-insensitive and refusing it refused something
+legal. The
 threat model and why the transport is plain HTTP on loopback rather than the
 TLS WebSocket AutoFirma's configurator sets up (a generated `CN=Autofirma ROOT`
 CA whose certificate it installs into the browser's own store) is
@@ -413,14 +419,20 @@ and docs/adr/0004-system-keystores.md).
 The last step is the sedes electrónicas themselves: submit a real trámite with a
 document signed by openfirma. That is the only proof of protocol layer
 compatibility, and it is done by hand, tracked in `docs/validation-log.md`.
-For the browser path this step has an extra gap today: real sedes open a
-`wss://127.0.0.1:<port>` socket (docs/adr/0005-browser-protocol.md), and the
-openfirma endpoint speaks plain HTTP on loopback until a pure-Rust TLS stack
-exists, so an end-to-end trámite through a real sede's autoscript is not yet
-possible; what *is* proven is every layer under it — URI parsing from recorded
-URIs, dispatch, wire response shapes, and the endpoint's refusals.
+For the browser path that step is out of reach today, and not for one reason:
+a real sede's page opens an SSL WebSocket (`wss://127.0.0.1:<port>`) on one of
+the ports *it* chose, authenticates every message with the `idsession` *it*
+minted, and speaks `afirma://websocket` / `afirma://service` with the
+`echo=`/`getresult` messages in the flows that need a server in the middle —
+none of which openfirma implements, which the README's browser row and
+docs/adr/0005-browser-protocol.md both say plainly. There is no page of ours
+either: nothing here serves HTML, and the endpoint's one-shot token goes to
+whatever started it. What *is* proven is every layer under the sede: URI
+parsing from recorded URIs, dispatch, the wire response shapes, the
+cryptographic output verified by an independent implementation, and the
+endpoint's refusals.
 
-One more limit on the same path, from round two's 04-N8: a refusal for want of
+One more limit on the same path, from round two's `05-N8`: a refusal for want of
 consent reaches the person at the desktop through `notify-send` on Linux only
 (looked up on PATH, its output swallowed, any failure ignored). macOS's
 `osascript -e 'display notification …'` and Windows's toast have no

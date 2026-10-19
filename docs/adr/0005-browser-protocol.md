@@ -210,13 +210,19 @@ is a channel THIS project's callers speak — `fake_sede`, the crosscheck tools,
 and `afirma-serve --issue-token` plus curl as the README shows — and no shipped
 page builds that request. Said plainly: with `--register` run on a machine that
 has AutoFirma installed, a real sede's page gets no answer from openfirma at
-all; the scheme handler is what a person or a script invokes. Making wss work
-requires (a) serving TLS with the CA AutoFirma's configurator generates —
-`CN=Autofirma ROOT`, plus a `127.0.0.1` leaf (see M-7 below: NOT "silent
-self-signed acceptance", Firefox gets the cert imported by the configurator),
-and (b) shipping that CA into each browser's trust store, which is exactly the
-installer behavior this project has not yet reviewed for its own security
-properties. ADR-0005 therefore keeps the endpoint on plain TCP + one-shot
+all; the scheme handler is what a person or a script invokes. Making a real
+sede work is not one missing piece but four: (a) TLS, served with the CA
+AutoFirma's configurator generates — `CN=Autofirma ROOT`, plus a `127.0.0.1`
+leaf (see M-7 below: NOT "silent self-signed acceptance", Firefox gets the cert
+imported by the configurator) — and (b) shipping that CA into each browser's
+trust store, which is exactly the installer behavior this project has not yet
+reviewed for its own security properties; (c) the operations themselves,
+`afirma://websocket` v4 and `afirma://service`, which the page drives with the
+ports IT chose and the `idsession` IT minted (ours accepts a URI the caller
+constructs, not a page's handshake); and (d) the messages those flows carry,
+`echo=` and `getresult`, which is how a page learns anything at all — the
+current endpoint's only answer to a page-shaped request is a refusal. ADR-0005
+therefore keeps the endpoint on plain TCP + one-shot
 token, refuses nothing the plain channel can honestly answer, and names the wss
 gap openly: a real sede that demands wss gets no answer from openfirma until an
 ADR amends this section with a reviewed TLS design. This is a recorded
