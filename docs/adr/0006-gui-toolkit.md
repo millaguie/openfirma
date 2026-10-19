@@ -108,7 +108,8 @@ open-folder link. Verify is **drop, read** — one file, plain-language lines.
    window holds an unsaved result or a signing in flight, `close_decision`
    says Warn; the close request answers itself with `CancelClose` and a two-
    button guard (Seguir trabajando / Cerrar sin guardar), so no OS gesture
-   closes over a result nobody saw. The first write is synced before ✓ shows,
+   closes over a result nobody saw. The first write is synced before the signed
+   screen shows,
    Save-As replaces the path only after its own sync, and every failure is a
    plain sentence with "Ver detalles técnicos" behind it — never a DER dump
    in front, never a spinner without an owner.

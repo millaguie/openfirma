@@ -433,7 +433,8 @@ wording, a real certificate that never enters the repository.
       three platforms, and cancels cleanly (drop zone stays where it was).
 - [ ] ".p12" button → picker → password field → Firmar; a wrong password is
       one plain sentence plus details, never a dialog storm; the right one
-      writes `documento.signed.pdf` next to the original before ✓ appears.
+      writes `documento.signed.pdf` next to the original before the signed
+      screen appears.
 - [ ] keystores: open a DNIe/OpenSC token by descriptor + PIN (or SoftHSM via
       `pkcs11:/usr/lib/softhsm/libsofthsm2.so:openfirma test`, PIN 12345678);
       its row needs no password to sign; a wrong PIN says so on the picker.
@@ -450,6 +451,12 @@ wording, a real certificate that never enters the repository.
       exists, the failure is a red sentence on the screen.
 - [ ] CLI parity spot-check: every action above reproduces with the
       equivalent `openfirma sign/verify` line from the README.
+- [ ] contrast (M-7): on a real screen, in both themes, the notes ("the issuer
+      was not checked", "no certificate was found") and the red/amber sentences
+      of a failed verdict must be comfortably readable. The colours are picked
+      to clear WCAG AA 4.5:1 on every surface the window paints on and the
+      crate's own test recomputes the ratios; what only a person can judge is
+      whether they LOOK right.
 - [ ] screen reader (A-2): with Orca (or NVDA under Windows) running, the
       window's texts arrive as ACCESSIBLE TEXT — labels, buttons, the verdict
       lines and the error sentences. AccessKit is on for eframe exactly for

@@ -665,14 +665,14 @@ impl App {
         if let Some(note) = self.pending_note.clone() {
             // M-7: the theme's own warning colour — the hand-picked amber was
             // 3.7:1 on the dark background the app inherits from the desktop.
-            ui.colored_label(ui.visuals().warn_fg_color, note);
+            ui.colored_label(palette(ui).warn, note);
         }
         let mut open_dialog = false;
         let hovering = !ui.ctx().input(|i| i.raw.hovered_files.is_empty());
         ui.vertical_centered(|ui| {
             ui.add_space(36.0);
             ui.label(RichText::new(tr.drop_here.clone()).heading());
-            ui.weak(tr.drop_hint.clone());
+            ui.colored_label(palette(ui).note, tr.drop_hint.clone());
             ui.add_space(20.0);
             // The drop zone doubles as the file button: egui's drag-and-drop
             // fires for the whole window (read_dropped_file), and this frame
@@ -1085,7 +1085,7 @@ impl App {
         // during a job, an authority that could not be read) is said here, in
         // the warning colour, where the citizen is looking.
         if let Some(note) = self.pending_note.clone() {
-            ui.colored_label(ui.visuals().warn_fg_color, note);
+            ui.colored_label(palette(ui).warn, note);
         }
         ui.add_space(10.0);
 
@@ -1095,7 +1095,7 @@ impl App {
         ui.label(RichText::new(tr.choose_certificate.clone()).strong());
         for e in catalog.errors.iter() {
             let e = e.clone();
-            ui.colored_label(ui.visuals().error_fg_color, e);
+            ui.colored_label(palette(ui).alert, e);
         }
 
         egui::ScrollArea::vertical()
@@ -1205,7 +1205,7 @@ impl App {
             App::sync_secret(&self.password_input, &mirror);
             let _ = resp;
             if *password_error {
-                ui.colored_label(ui.visuals().error_fg_color, tr.password_wrong.clone());
+                ui.colored_label(palette(ui).alert, tr.password_wrong.clone());
             }
             if *selected != Some(i) {
                 *selected = Some(i);
@@ -1257,14 +1257,14 @@ impl App {
                 // screen reader could read, only a hint that vanishes on the
                 // first keystroke. The sentence above it is its label now, the
                 // same shape the password field uses.
-                let label = ui.weak(tr.adv_tsa.clone());
+                let label = ui.colored_label(palette(ui).note, tr.adv_tsa.clone());
                 let field = ui.add_sized(
                     [(ui.available_width() - 60.0).min(460.0), 26.0],
                     egui::TextEdit::singleline(tsa_url).hint_text("http://tsa.ejemplo/tsa"),
                 );
                 field.labelled_by(label.id);
             }
-            ui.weak(tr.adv_digest.clone());
+            ui.colored_label(palette(ui).note, tr.adv_digest.clone());
             ui.horizontal(|ui| {
                 for (label, alg) in [
                     ("SHA-256", openfirma_core::DigestAlg::Sha256),
@@ -1276,7 +1276,7 @@ impl App {
             });
             let formats = effective_formats(format, tsa_url);
             if formats.len() > 1 {
-                ui.weak(tr.formats_for.clone());
+                ui.colored_label(palette(ui).note, tr.formats_for.clone());
                 for (f, enabled) in formats {
                     let mut chosen = *chosen_format == f;
                     let re = ui.add_enabled_ui(enabled, |ui| {
@@ -1288,7 +1288,7 @@ impl App {
                 }
             }
             if format == Format::Pdf {
-                let label = ui.weak(tr.adv_reason.clone());
+                let label = ui.colored_label(palette(ui).note, tr.adv_reason.clone());
                 let field = ui.add_sized(
                     [(ui.available_width() - 60.0).min(460.0), 26.0],
                     egui::TextEdit::singleline(reason),
@@ -1324,9 +1324,9 @@ impl App {
                 sign_now = true;
             }
             if !can_sign && catalog.entries.is_empty() {
-                ui.weak(tr.no_certificates.clone());
+                ui.colored_label(palette(ui).note, tr.no_certificates.clone());
             } else if needs_password && selected.is_some() {
-                ui.weak(tr.password_missing.clone());
+                ui.colored_label(palette(ui).note, tr.password_missing.clone());
             }
         });
 
@@ -1404,7 +1404,7 @@ impl App {
         let mut open_it = false;
         let mut cancel = false;
         ui.group(|ui| {
-            ui.weak(tr.add_store_help.clone());
+            ui.colored_label(palette(ui).note, tr.add_store_help.clone());
             let mut d = std::mem::take(&mut self.descriptor_input);
             let mut p = String::new();
             App::mirror_secret(&self.pin_input, &mut p);
@@ -1620,16 +1620,17 @@ impl App {
         };
         let tr = &self.tr;
 
-        // The ✓ green is the theme's own success tone wherever one exists;
-        // egui has no success colour, so the strong foreground with the check
-        // mark carries "this is good" and the heading stays readable on both
-        // themes (the old arithmetic on Color32 did not compile against 0.37).
-        ui.label(RichText::new(format!("{} ✓", tr.signed_ok)).heading());
+        // M-7: the check mark is gone, not fixed: egui's fonts have no U+2713
+        // in either family (measured), so the window was painting an empty box
+        // beside the heading — and the harness said `allow_missing_glyphs()`
+        // rather than saying so. What carries "this is good" is the sentence
+        // itself, in the ordinary text colour, which reaches AA.
+        ui.label(RichText::new(tr.signed_ok.clone()).heading());
         // 06-N-11 (M-11): what the signature does NOT prove (an unchecked
         // time-stamp token) is said here, in the warning colour, not only on
         // the terminal this window was started from.
         if let Some(note) = self.pending_note.clone() {
-            ui.colored_label(ui.visuals().warn_fg_color, note);
+            ui.colored_label(palette(ui).warn, note);
         }
         ui.label(format!("{} · {}", display_name(path), format_label));
         ui.label(format!("{}: «{}»", tr.signer_line, signer_display));
@@ -1674,7 +1675,7 @@ impl App {
             // Folders only, never documents (ADR-0006 counts the viewer click
             // we deliberately do NOT spend): opening a signed PDF hands the
             // trust decision to whatever program answers, while this screen's
-            // ✓ already shows openfirma's own verdict.
+            // The verdict line already says what was checked.
             if let Err(e) = open_in_file_manager(&dir) {
                 folder_error = Some(format!("{} {e}", self.tr.fail_open_folder));
             }
@@ -1711,7 +1712,7 @@ impl App {
             }
         }
         if let Some(msg) = folder_error {
-            ui.colored_label(ui.visuals().error_fg_color, msg);
+            ui.colored_label(palette(ui).alert, msg);
         }
         if another {
             put_back!(Screen::Idle);
@@ -1780,7 +1781,7 @@ impl App {
         // "the issuer was not checked" and this is the sentence that explains
         // why and what to change.
         if let Some(note) = self.pending_note.clone() {
-            ui.colored_label(ui.visuals().warn_fg_color, note);
+            ui.colored_label(palette(ui).warn, note);
         }
         if verdicts.lines.is_empty() {
             ui.label(tr.verdict_unsigned.clone());
@@ -1793,11 +1794,7 @@ impl App {
         // success, over a document every conforming reader flags.
         if let Some(reason) = &verdicts.document {
             let sentence = format!("{} — {reason}", tr.verdict_document_invalid);
-            ui.label(
-                RichText::new(sentence)
-                    .color(ui.visuals().error_fg_color)
-                    .strong(),
-            );
+            ui.label(RichText::new(sentence).color(palette(ui).alert).strong());
             ui.add_space(6.0);
         }
         let mut go_idle = false;
@@ -1816,22 +1813,22 @@ impl App {
                     let open = details_open.get(i).copied().unwrap_or(false);
                     let tone = match line.status {
                         VerdictStatus::Valid => ui.visuals().text_color(),
-                        VerdictStatus::Invalid => ui.visuals().error_fg_color,
-                        VerdictStatus::Unknown => ui.visuals().warn_fg_color,
+                        VerdictStatus::Invalid => palette(ui).alert,
+                        VerdictStatus::Unknown => palette(ui).warn,
                     };
                     // A-5's screen form: one coloured line per signature that
                     // reads as a sentence ("Firma válida — NOMBRE" / "La firma
                     // NO es válida — el documento cambió…"), never DER.
                     let headline = verdict_sentence(line, &tr);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(line.status.glyph()).color(tone).size(16.0));
-                        ui.label(RichText::new(headline).color(tone).strong());
-                    });
+                    ui.label(RichText::new(headline).color(tone).strong());
                     if !line.when.is_empty() {
                         ui.label(format!("{}: {}", tr.signed_at_line, line.when));
                     }
                     if let Some(anchor) = &line.trust_anchor {
-                        ui.weak(format!("{}: {}", tr.chain_line, anchor));
+                        ui.colored_label(
+                            palette(ui).note,
+                            format!("{}: {}", tr.chain_line, anchor),
+                        );
                     }
                     // M-3: the toggle's state is the SCREEN'S, one bool per
                     // line — the old per-frame `let mut details = false` made
@@ -1856,7 +1853,7 @@ impl App {
                 }
                 for n in &verdicts.notes {
                     let n = n.clone();
-                    ui.weak(n);
+                    ui.colored_label(palette(ui).note, n);
                 }
                 if !verdicts.notes.is_empty() {
                     ui.add_space(6.0);
@@ -1898,7 +1895,7 @@ impl App {
         ui.label(
             RichText::new(tr.error_title.clone())
                 .heading()
-                .color(ui.visuals().error_fg_color),
+                .color(palette(ui).alert),
         );
         let plain = error.plain.clone();
         ui.label(plain);
@@ -2072,6 +2069,14 @@ impl App {
         }
         self.load_path_with_intent(path, false);
     }
+}
+
+/// The window's tones for the surface egui is painting on right now (review
+/// 06, M-7). egui's own weak text and its orange/red do not reach WCAG AA, and
+/// the weak colour is what carries this window's notes; `palette` holds the
+/// arithmetic and the surfaces.
+fn palette(ui: &Ui) -> crate::palette::Palette {
+    crate::palette::of(ui.visuals().dark_mode)
 }
 
 /// Whether dropping `path` leads to verdicts (a signed PDF, a CMS): the exact

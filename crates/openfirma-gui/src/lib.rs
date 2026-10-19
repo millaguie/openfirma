@@ -4,6 +4,7 @@
 pub mod app;
 pub mod errors;
 pub mod keystore_io;
+pub mod palette;
 pub mod signing;
 pub mod strings;
 pub mod tsa;

@@ -13,6 +13,7 @@ use egui::accesskit; // the role enum egui and kittest agree on
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT as _, Queryable};
 use openfirma_gui::app::{App, Dialogs};
+use openfirma_gui::strings::Tr;
 use openfirma_gui::wizard::{CertificateChoice, CloseDecision, KeySource, Screen, close_decision};
 
 /// The repo's test material (`tools/gen-testcert.sh` / `gen-testpdf.py`).
@@ -47,9 +48,13 @@ const WINDOW: egui::Vec2 = egui::Vec2::new(760.0, 560.0);
 /// An App under the harness, with fixture dialogs: exactly what `main` builds
 /// except where a path arrives from.
 fn harness_for(app: App) -> Harness<'static, App> {
+    // No `allow_missing_glyphs()` here any more (M-7): it was the switch that
+    // let the Done screen paint an empty box where a ✓ was meant to be, and no
+    // test said so. Every sentence in the table is checked character by
+    // character now (the test below), and any glyph the fonts are missing
+    // fails this suite instead of being allowed.
     Harness::builder()
         .with_size(WINDOW)
-        .allow_missing_glyphs() // the ✓ of the Done screen is not in the default font
         .build_eframe(move |cc| {
             let mut a = app;
             a.reinit_for_test(cc);
@@ -1474,4 +1479,37 @@ fn certified_then_signed_pdf() -> Option<Vec<u8>> {
         openfirma_pades::pades_sign(&doc, &signer.with_chain(chain), &opts)
             .expect("the fixture signs"),
     )
+}
+
+/// M-7: this suite used to call `allow_missing_glyphs()`, with a comment saying
+/// the ✓ of the Done screen was not in the default font — which is true, and
+/// which meant the window painted an empty box on the one screen that says the
+/// signature was written, while every test passed. The window draws no mark
+/// now and says it in words; this is the gate that keeps it that way: every
+/// character of every sentence, in both languages, is checked against the
+/// fonts a build actually carries.
+#[test]
+fn every_character_the_window_shows_has_a_glyph() {
+    let mut harness = harness_for(fixture_app(None));
+    harness.run();
+    let mut missing: Vec<(char, String)> = Vec::new();
+    for tr in [Tr::es(), Tr::en()] {
+        for sentence in tr.every_string() {
+            for c in sentence.chars() {
+                if c.is_whitespace() {
+                    continue;
+                }
+                harness.ctx.fonts_mut(|f| {
+                    if !f.has_glyph(&egui::FontId::proportional(14.0), c) {
+                        missing.push((c, sentence.clone()));
+                    }
+                });
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the fonts cannot draw these characters: {:?}",
+        &missing[..missing.len().min(8)]
+    );
 }

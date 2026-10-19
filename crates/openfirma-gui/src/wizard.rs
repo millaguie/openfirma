@@ -181,14 +181,19 @@ pub enum VerdictStatus {
 }
 
 impl VerdictStatus {
-    /// The line's leading mark: text glyphs, not icons (M-7 measured that
-    /// shipped icon fonts render emoji as tofu boxes; ✓/✗/? are in the one
-    /// font every build carries).
-    pub fn glyph(&self) -> &'static str {
+    /// The line's leading word, for `Debug` output and for nothing else
+    /// (M-7). This used to be a `glyph()` returning "✓"/"✗" and a claim that
+    /// they were "in the one font every build carries" — the opposite of what
+    /// the fonts have: egui's proportional and monospace families carry no
+    /// U+2713/U+2717, so the window painted an empty box and the test harness
+    /// hid it with `allow_missing_glyphs()`. A mark a reader sees as a box, and
+    /// a screen reader announces as nothing, is worse than a word; the screen
+    /// itself no longer draws a mark at all (its sentence says it).
+    pub fn mark(&self) -> &'static str {
         match self {
-            VerdictStatus::Valid => "✓",
-            VerdictStatus::Invalid => "✗",
-            VerdictStatus::Unknown => "?",
+            VerdictStatus::Valid => "válida",
+            VerdictStatus::Invalid => "NO válida",
+            VerdictStatus::Unknown => "sin confirmar",
         }
     }
 }
@@ -221,15 +226,15 @@ impl VerdictLine {
 }
 
 // Manual, sentence-shaped `Debug`s (not derives): a failed assert on a verdict
-// must read as "✗ firma 2 — el documento cambió", not as the technical DER
-// dump riding behind every line. The full text stays available through the
+// must read as "NO válida firma 2 — el documento cambió", not as the technical
+// DER dump riding behind every line. The full text stays available through the
 // fields themselves.
 impl core::fmt::Debug for VerdictLine {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "{} {}{}{}",
-            self.status.glyph(),
+            self.status.mark(),
             if self.signer.is_empty() {
                 "?"
             } else {
