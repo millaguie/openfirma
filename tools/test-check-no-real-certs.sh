@@ -288,6 +288,29 @@ else
   echo "ok, blocked: a .p12 deleted from the tree, found in --history by its path"
 fi
 
+# Round two's N-8: the guard's own exit line. A path named on the command line
+# is a promise it exists, so "ok" about a file that was never there certifies
+# bytes nobody saw — and every other corner of this script fails closed on
+# exactly that argument ("the guard cannot certify what it cannot see"). A path
+# git itself lists is different: the index can hold something the worktree lost,
+# and that case stays a pass.
+missing="$WORK/never-written.xml"
+rm -f "$missing"
+# must_block scores probes that exist (its own rule), so the judgement is taken
+# directly here: exit status and message, no probe file.
+miss_status=0
+out="$( cd "$ROOT" && ./tools/check-no-real-certs.sh "$missing" 2>&1 )" || miss_status=$?
+if [ "$miss_status" = 0 ]; then
+  echo "FAIL: guard certified a file that does not exist ($missing): it printed ok about nothing" >&2
+  fails=$((fails + 1))
+else
+  case "$out" in
+    *"does not exist"*) echo "ok, blocked: a path named and absent (round two's N-8)" ;;
+    *) echo "FAIL: guard exited $miss_status on the absent path but did not say why: $out" >&2
+       fails=$((fails + 1)) ;;
+  esac
+fi
+
 if [ "$fails" -gt 0 ]; then
   echo "$fails guard self-test failure(s)" >&2
   exit 1

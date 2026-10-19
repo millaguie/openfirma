@@ -845,6 +845,7 @@ check_history() {
 }
 
 mode="${1:-index}"
+explicit_paths=0
 case "$mode" in
   --history)
     check_history
@@ -856,7 +857,12 @@ case "$mode" in
   --*)
     echo "unknown mode $mode" >&2; exit 2 ;;
   *)
-    if [ "$#" -gt 0 ]; then files=("$@"); else mapfile -t files < <(list_files index); fi
+    # Paths named on the command line are a promise that they exist; paths git
+    # lists (the index, the tree) may legitimately be gone by the time we look.
+    # Round 2's N-8: naming a file that was never there used to print "ok",
+    # which is the one answer this guard has no right to give about bytes it
+    # never saw.
+    if [ "$#" -gt 0 ]; then files=("$@"); explicit_paths=1; else mapfile -t files < <(list_files index); fi
     ;;
 esac
 
@@ -867,7 +873,12 @@ PDFCMS_TMP="$(mktemp)"
 trap 'rm -f "$PDFCMS_TMP"' EXIT
 
 for f in "${files[@]:-}"; do
-  [ -n "$f" ] && check_file "$f" || true
+  [ -n "$f" ] || continue
+  if [ ! -e "$f" ] && [ "$explicit_paths" = 1 ]; then
+    block "$f was named on the command line and does not exist; the guard cannot certify what it cannot see"
+    continue
+  fi
+  check_file "$f" || true
 done
 
 if [ "$violations" -gt 0 ]; then
