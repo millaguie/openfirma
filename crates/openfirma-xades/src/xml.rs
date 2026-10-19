@@ -186,66 +186,135 @@ fn encoding_is(declared: &str, wanted: &[u8]) -> bool {
             .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
-/// The pseudo-attributes of an XML declaration, in order, each with its value
-/// when it follows production [24]'s `Name Eq AttValue` (`Eq ::= S? '=' S?`,
-/// so whitespace is allowed on both sides of the `=`) and `None` when it does
-/// not.
+/// Whether `uri` carries an RFC 3986 scheme (`scheme ":"`), which is what
+/// makes a namespace name absolute for Canonical XML 1.0's purposes. The
+/// scheme is checked without building a parser: ASCII ALPHA, then ASCII
+/// alphanumerics or `+`/`-`/`.`, then a colon. Anything else — `rel/ns`,
+/// `../ns`, `/ns`, a URI whose first colon comes after a `/` — is relative.
+fn has_a_scheme(uri: &str) -> bool {
+    let Some(colon) = uri.find(':') else {
+        return false;
+    };
+    let scheme = &uri.as_bytes()[..colon];
+    match scheme.split_first() {
+        Some((first, rest)) if first.is_ascii_alphabetic() => rest
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')),
+        _ => false,
+    }
+}
+
+/// The XML declaration's pseudo-attributes, in production [24]'s order:
+/// `version`, optional `encoding`, optional `standalone`. `Err` carries the
+/// first reason the text is not an XMLDecl.
 ///
-/// A name whose value cannot be read is kept rather than dropped: round 2's
-/// N-3 showed why. The old scan demanded the `=` immediately after the name,
-/// so `encoding ="ISO-8859-1"` — a spelling production [25] allows — looked
-/// like a declaration with no encoding at all, and the document was signed as
-/// UTF-8 while every parser that obeys the declaration reads Latin-1. Callers
-/// see the difference between "absent" and "present but unreadable" and can
-/// fail closed on the second.
-fn declaration_attributes(content: &str) -> Vec<(&str, Option<&str>)> {
-    let bytes = content.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
+/// This parses the production instead of looking for tokens, because both
+/// halves of that mistake were measured. Round two's N-3: the old scan
+/// demanded `=` immediately after a name, so `encoding ="ISO-8859-1"` — which
+/// production [25]'s `Eq ::= S? '=' S?` allows — looked like a declaration
+/// with no encoding at all, and the bytes were signed as UTF-8 while every
+/// parser that obeys the declaration reads Latin-1. Round two's N-4:
+/// `<?xml version="1.0" encodi:ng="ISO-8859-1"?>` is not XML to libxml2
+/// ("'?>' expected") and it was signed anyway. Names are compared
+/// case-sensitively, like every XML name.
+fn declaration_pseudo_attributes(content: &str) -> std::result::Result<[Option<&str>; 3], String> {
+    /// `Eq AttValue` after a name, with the S production [25] allows around
+    /// the `=`. Leaves `i` past the closing quote.
+    fn quoted<'a>(
+        content: &'a str,
+        i: &mut usize,
+        name: &str,
+    ) -> std::result::Result<&'a str, String> {
+        let bytes = content.as_bytes();
+        while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
         }
-        // production [5]: NameStartChar then NameChar. The names a declaration
-        // may carry are ASCII, so the ASCII subset of that production is what
-        // this scan understands.
-        let starts_name = bytes
-            .get(i)
-            .is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b':'));
-        if !starts_name {
+        if bytes.get(*i) != Some(&b'=') {
+            return Err(format!("{name} is not followed by '='"));
+        }
+        *i += 1;
+        while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+        let quote = match bytes.get(*i) {
+            Some(&q @ (b'"' | b'\'')) => q,
+            Some(_) => return Err(format!("{name}'s value is not quoted")),
+            None => return Err(format!("{name} carries no value")),
+        };
+        *i += 1;
+        let start = *i;
+        while *i < bytes.len() && bytes[*i] != quote {
+            *i += 1;
+        }
+        if *i == bytes.len() {
+            return Err(format!("{name}'s quoted value is never closed"));
+        }
+        let value = &content[start..*i];
+        *i += 1;
+        Ok(value)
+    }
+
+    const ORDER: [&str; 3] = ["version", "encoding", "standalone"];
+    let bytes = content.as_bytes();
+    let mut i = 0usize;
+    let mut out: [Option<&str>; 3] = [None; 3];
+    for (slot, expected) in ORDER.iter().enumerate() {
+        if slot > 0 {
+            // production [24] separates the pseudo-attributes with S; two of
+            // them side by side (`version="1.0"encoding=…`) are what libxml2
+            // calls "Blank needed here"
+            let before = i;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i == bytes.len() {
+                break;
+            }
+            if i == before {
+                return Err(format!(
+                    "{expected} is not separated from the preceding pseudo-attribute by \
+                     whitespace"
+                ));
+            }
+        }
+        if i >= bytes.len() {
             break;
         }
         let start = i;
+        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            return Err(format!(
+                "nothing after the {} pseudo-attribute starts a name (production [5])",
+                ORDER[slot.saturating_sub(1)]
+            ));
+        }
         while i < bytes.len()
-            && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b':' | b'.' | b'-'))
+            && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.' | b'-'))
         {
             i += 1;
         }
         let name = &content[start..i];
-        // Name Eq AttValue, with the optional spaces [25] allows around the '='
-        let rest = &content[i..];
-        let after_ws = rest.trim_start_matches([' ', '\t', '\r', '\n']);
-        let mut consumed = i + (rest.len() - after_ws.len());
-        let value = after_ws.strip_prefix('=').and_then(|after_eq| {
-            let after_ws2 = after_eq.trim_start_matches([' ', '\t', '\r', '\n']);
-            let quote = *after_ws2.as_bytes().first()?;
-            if quote != b'"' && quote != b'\'' {
-                // production [24] requires a quoted AttValue; an unquoted one is
-                // not this pseudo-attribute (and is reported as unreadable)
-                return None;
-            }
-            let end = after_ws2[1..].find(quote as char)?;
-            consumed = consumed + 1 + (after_eq.len() - after_ws2.len()) + 1 + end + 1;
-            Some(&after_ws2[1..end + 1])
-        });
-        out.push((name, value));
-        if value.is_none() {
-            // whatever follows is not a declaration this reader understands
-            break;
+        if name != *expected {
+            return Err(format!(
+                "the declaration has {name:?} where production [24] allows {expected}"
+            ));
         }
-        i = consumed;
+        out[slot] = Some(quoted(content, &mut i, expected)?);
     }
-    out
+    if bytes[i..].iter().any(|b| !b.is_ascii_whitespace()) {
+        return Err("the declaration carries something after its last pseudo-attribute".into());
+    }
+    if out[0].is_none() {
+        return Err("the declaration carries no version, which production [24] requires".into());
+    }
+    if let Some(standalone) = out[2] {
+        // SDDecl's value is exactly `yes` or `no` (production [32])
+        if standalone != "yes" && standalone != "no" {
+            return Err(format!(
+                "standalone is {standalone:?}; production [32] accepts only \"yes\" or \"no\""
+            ));
+        }
+    }
+    Ok(out)
 }
 
 impl<'a> Parser<'a> {
@@ -363,21 +432,11 @@ impl<'a> Parser<'a> {
         self.expect(b"<?xml")?;
         let content_start = self.pos;
         self.skip_until_pi_end()?;
-        // `<? ... ?>` closing the declaration is well-formedness, checked here
-        // because production [23] demands the question marks even when the
-        // attributes are refused for other reasons
-        if !self.src[content_start..self.pos].starts_with(b" ") {
-            return Err(self.err(
-                "the XML declaration must be followed by whitespace or '?>', and its \
-                 attributes separated from the target",
-            ));
-        }
-        // `version` and `encoding` are the two pseudo-attributes that decide
-        // how the bytes below mean something, so they are checked here (the
-        // rest of the declaration is data no consumer of ours reads). The
-        // whitespace check above makes content_start..pos start at the first
-        // character after the `<?xml` target itself; trimming it lands on the
-        // first pseudo-attribute.
+        // Everything between `<?xml` and `?>` must be the XMLDecl production
+        // ([24]); there is no separate "must start with a space" rule to
+        // enforce, because the production's VersionInfo carries its own S and
+        // a tab is S exactly as a space is (libxml2 accepts
+        // `<?xml\tversion="1.0"?>`, and the old check here refused it).
         let content = self.text[content_start..self.pos - 2].trim();
         self.check_declaration(content)?;
         Ok(Some((start, self.pos)))
@@ -395,19 +454,21 @@ impl<'a> Parser<'a> {
     /// certainty (UTF-8 itself, or US-ASCII, whose bytes are all single-char
     /// in both readings) or the document is refused with the name it declares.
     fn check_declaration(&self, content: &str) -> Result<()> {
-        // production [24] puts version first; real-world producers always do,
-        // and a declaration that puts something else there is not this
-        // document's version at all (review 03, M-3: libxml2 refuses those).
-        let attrs = declaration_attributes(content);
-        let version = match attrs.first() {
-            Some((name, Some(value))) if name.eq_ignore_ascii_case("version") => *value,
-            _ => {
-                return Err(self.err(
-                    "the XML declaration does not begin with a quoted version \
-                     pseudo-attribute, which XML 1.0 production [24] requires",
-                ));
-            }
-        };
+        // Production [24], parsed rather than searched for tokens (round two,
+        // N-3 and N-4): `<?xml` S version Eq AttValue (S encoding Eq AttValue)?
+        // (S standalone Eq AttValue)? S? `?>`, and nothing else. A declaration
+        // no other parser can read is not a document whose bytes this reader
+        // may interpret — libxml2 refuses every shape this rejects — so it is
+        // refused with the reason instead of being rewritten.
+        let attrs = declaration_pseudo_attributes(content).map_err(|reason| {
+            self.err(&format!(
+                "the XML declaration is not the XMLDecl production [24] \
+                 ('<?xml' S version=… S? encoding=…? S? standalone=…? S? '?>'): \
+                 {reason}. openfirma signs the document the declaration describes, so a \
+                 declaration it cannot read is refused"
+            ))
+        })?;
+        let version = attrs[0].unwrap_or_default();
         if !encoding_is(version, b"1.0") {
             return Err(self.err(&format!(
                 "the XML declaration declares version=\"{version}\"; openfirma signs \
@@ -415,22 +476,7 @@ impl<'a> Parser<'a> {
                  your content)"
             )));
         }
-        if let Some((_, value)) = attrs
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("encoding"))
-        {
-            // A name we cannot read is not a name we may ignore: `encoding
-            // ="ISO-8859-1"` (spaces around the `=`, which production [25]
-            // allows) used to read as "declares no encoding" and be signed as
-            // UTF-8 over text every other parser reads as Latin-1 (round 2,
-            // N-3). Fail closed instead.
-            let Some(encoding) = *value else {
-                return Err(self.err(
-                    "the XML declaration names an encoding it does not spell as a quoted \
-                     name (XML 1.0 production [24]: Name Eq AttValue), so openfirma cannot \
-                     tell which text your bytes mean and refuses the document",
-                ));
-            };
+        if let Some(encoding) = attrs[1] {
             // A declared UTF-8 encoding over bytes that are not valid UTF-8
             // is refused by the whole-file UTF-8 check in `parse` before this
             // method ever runs, so it cannot reach here.
@@ -482,13 +528,29 @@ impl<'a> Parser<'a> {
         // collected first and pushed onto the scope before anything is checked
         let mut pending_attrs: Vec<(QName, String)> = Vec::new();
         loop {
+            // STag (production [40]) separates the attributes from the element
+            // name and from one another with S. `<doc a="1"b="2">` is not XML
+            // to any reader, and signing it wrote a file libxml2 refuses with
+            // "attributes construct error" — a signature over something no
+            // validator can open (round two, N-4). So whitespace is required
+            // before every attribute name, not merely skipped.
+            let before = self.pos;
             self.skip_space();
+            let separated = self.pos > before;
             if self.pos >= self.src.len() {
                 return Err(self.err("the start tag is never closed"));
             }
             let c = self.src[self.pos];
             if c == b'/' || c == b'>' {
                 break;
+            }
+            if !separated {
+                let next: String = self.text[self.pos..].chars().take(8).collect();
+                return Err(self.err(&format!(
+                    "the attribute starting at {next:?} is not separated from what precedes \
+                     it by whitespace: XML's STag production requires S between attributes, \
+                     and a document without it is not XML to any other reader"
+                )));
             }
             let attr_name = self.parse_qname()?;
             self.skip_space();
@@ -565,6 +627,24 @@ impl<'a> Parser<'a> {
                 if uri.is_empty() {
                     return Err(self.err(&format!("xmlns:{p} cannot name an empty namespace")));
                 }
+            }
+            // Canonical XML 1.0 §2 makes canonicalization FAIL for a relative
+            // namespace name (by decision of the W3C Plenary), libxml2 warns
+            // "URI rel/ns is not absolute", xmlsec1 errors out of it, and
+            // AutoFirma's canonicalizer throws — so a document carrying one
+            // can be signed into something that verifies nowhere, our own
+            // reader included (round two, N-7). An absolute URI is one that
+            // carries an RFC 3986 scheme. Refused here, where the person can
+            // still fix the document. `xmlns=""` is the one non-empty-value
+            // exception and is handled above: it declares the absence of a
+            // default namespace, which C14N prints as nothing.
+            if !uri.is_empty() && !has_a_scheme(uri) {
+                return Err(self.err(&format!(
+                    "the namespace declared as {uri:?} is not an absolute URI (it has no \
+                     scheme). Canonical XML 1.0 makes canonicalization fail for a relative \
+                     namespace name, so a signature over this document would verify nowhere \
+                     — give the declaration an absolute URI (urn:…, https:…) first"
+                )));
             }
         }
 
@@ -799,6 +879,22 @@ impl<'a> Parser<'a> {
         let target = name.to_string_with_prefix();
         if target.eq_ignore_ascii_case("xml") {
             return Err(self.err("a processing instruction cannot be named xml"));
+        }
+        // Production [16]: `'<?' PITarget (S (Char* - …))? '?>'`. After the
+        // target comes whitespace or the closing `?`, nothing else. This used
+        // to take whatever followed as the data and re-emit it with a space
+        // inserted — so `<doc><?pi!x?></doc>`, which libxml2 refuses with
+        // "PI pi space expected", was signed into xmlsec1's "PI pi space
+        // expected" over our own output, and the PI's data no longer matched
+        // the file (round two, N-4).
+        match self.src.get(self.pos) {
+            Some(b' ' | b'\t' | b'\r' | b'\n' | b'?') | None => {}
+            Some(_) => {
+                return Err(self.err(
+                    "a processing instruction's target is followed by neither whitespace \
+                     nor '?>', which XML's PI production requires",
+                ));
+            }
         }
         let start = self.pos;
         self.skip_until_pi_end()?;
@@ -1164,6 +1260,74 @@ mod tests {
         };
         assert_eq!(second.namespace.as_deref(), Some("urn:d"));
         assert_eq!(doc.root.namespace.as_deref(), Some("urn:d"));
+    }
+
+    /// Round two, N-4: three XML shapes that used to be accepted and signed
+    /// into files no reader opens. Each was measured against libxml2 first:
+    /// `<doc a="1"b="2">` and `<doc xmlns="urn:d"xmlns:p="urn:p">` give
+    /// "attributes construct error", and `<?pi!x?>` gives "PI pi space
+    /// expected". The accepting half is pinned just as hard, because a reader
+    /// that refuses legal spelling loses documents: S is any of the four
+    /// whitespace characters, `<?pi?>` is a legal empty instruction, and a tab
+    /// after `<?xml` is S too (libxml2 reads it; the old check demanded a
+    /// literal space).
+    #[test]
+    fn stags_and_pis_are_separated_the_way_the_grammar_requires() {
+        let refused: &[&str] = &[
+            r#"<doc a="1"b="2"><x/></doc>"#,
+            r#"<doc xmlns="urn:d"xmlns:p="urn:p"><a>x</a></doc>"#,
+            r#"<doc><?pi!x?></doc>"#,
+            r#"<doc><?pi"x"?></doc>"#,
+            r#"<doc><?pi/x?></doc>"#,
+        ];
+        for input in refused {
+            assert!(
+                parse(input.as_bytes()).is_err(),
+                "{input:?} is not XML to any other reader"
+            );
+        }
+        let accepted: &[&str] = &[
+            r#"<doc a="1" b="2"><x/></doc>"#,
+            "<doc\n\ta=\"1\"\n\tb=\"2\"/>",
+            r#"<doc><?pi?></doc>"#,
+            r#"<doc><?pi data?></doc>"#,
+            "<doc><?pi\tdata?></doc>",
+        ];
+        for input in accepted {
+            assert!(parse(input.as_bytes()).is_ok(), "{input:?} must parse");
+        }
+    }
+
+    /// Round two, N-7: Canonical XML 1.0 §2 makes canonicalization FAIL for a
+    /// relative namespace name, so a signature over such a document verifies
+    /// nowhere — xmlsec1 errors out of it and AutoFirma's own canonicalizer
+    /// throws. It is refused here, where the person can still fix the
+    /// document. An absolute URI is one with an RFC 3986 scheme, and
+    /// `xmlns=""` is not a relative name: it declares that there is no default
+    /// namespace, which is what C14N prints.
+    #[test]
+    fn a_relative_namespace_name_is_refused() {
+        for input in [
+            r#"<doc xmlns="rel/ns"><a>x</a></doc>"#,
+            r#"<doc xmlns:p="../ns"><p:a>x</p:a></doc>"#,
+            r#"<doc xmlns:p="/ns"><p:a>x</p:a></doc>"#,
+            r#"<doc xmlns="x"><a/></doc>"#,
+        ] {
+            let err = parse(input.as_bytes()).expect_err("a relative namespace name is refused");
+            let text = err.to_string();
+            assert!(text.contains("absolute URI"), "{input:?}: {text}");
+        }
+        for input in [
+            r#"<doc xmlns="urn:d"><a>x</a></doc>"#,
+            r#"<doc xmlns="http://x.example/ns"><a>x</a></doc>"#,
+            r#"<doc xmlns=""><a>x</a></doc>"#,
+            r#"<doc xmlns="urn:x+1.2-3:a"><a>x</a></doc>"#,
+        ] {
+            assert!(
+                parse(input.as_bytes()).is_ok(),
+                "{input:?} carries an absolute namespace name"
+            );
+        }
     }
 
     /// Reviewer finding A-3: a declaration that says something other than

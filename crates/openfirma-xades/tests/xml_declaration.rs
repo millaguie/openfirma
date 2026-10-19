@@ -78,12 +78,57 @@ fn spacing_around_the_equals_stays_well_formed() {
         b"<?xml version = \"1.0\" ?><doc/>",
         b"<?xml version = '1.0' encoding ='utf8'?><doc>caf\xc3\xa9</doc>",
         b"<?xml version='1.0'\tencoding\t=\t'UTF-8' ?><doc/>",
-        b"<?xml version=\"1.0\" standalone = \"yes\" encoding=\"us-ascii\"?><doc/>",
+        // …in production [24]'s own order: `standalone` before `encoding` is
+        // not a declaration libxml2 reads (round two, N-4 — this case used to
+        // sit here in the wrong order because the reader did not look at it).
+        b"<?xml version=\"1.0\" encoding = 'us-ascii' standalone = \"yes\"?><doc/>",
     ];
     for input in good {
         assert!(
             parse(input).is_ok(),
             "{:?} must stay readable",
+            String::from_utf8_lossy(input)
+        );
+    }
+}
+
+/// Round 2, N-4: the declaration must BE production [24], not merely contain a
+/// version and an encoding somewhere. `<?xml version="1.0"
+/// encodi:ng="ISO-8859-1"?>` was accepted and signed — libxml2 answers
+/// "parsing XML declaration: '?>' expected" — and the same token scan swallowed
+/// an unknown pseudo-attribute, a repeated one and the two in the wrong order.
+/// The accepting side matters as much: a tab after `<?xml` is S, libxml2 reads
+/// it, and the old literal-space check refused a legal document.
+#[test]
+fn the_declaration_is_the_production() {
+    let refused: &[&[u8]] = &[
+        b"<?xml version=\"1.0\" encodi:ng=\"ISO-8859-1\"?><doc/>",
+        b"<?xml version=\"1.0\" foo=\"1\"?><doc/>",
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\" encoding=\"UTF-8\"?><doc/>",
+        b"<?xml version=\"1.0\" standalone=\"yes\" encoding=\"us-ascii\"?><doc/>",
+        b"<?xml version=\"1.0\" standalone=\"maybe\"?><doc/>",
+        b"<?xml VERSION=\"1.0\"?><doc/>",
+        b"<?xml version=\"1.0\"encoding=\"UTF-8\"?><doc/>",
+        b"<?xml?><doc/>",
+        b"<?xml version=\"1.0\"?><doc/>junk<?xml version=\"1.0\"?><d/>",
+    ];
+    for input in refused {
+        assert!(
+            parse(input).is_err(),
+            "{:?} is not an XML declaration any other parser reads",
+            String::from_utf8_lossy(input)
+        );
+    }
+    let accepted: &[&[u8]] = &[
+        b"<?xml\tversion=\"1.0\"?><doc/>",
+        b"<?xml\nversion=\"1.0\"?><doc/>",
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\" ?><doc/>",
+        b"<?xml version='1.0'?><doc/>",
+    ];
+    for input in accepted {
+        assert!(
+            parse(input).is_ok(),
+            "{:?} is XML libxml2 reads",
             String::from_utf8_lossy(input)
         );
     }
