@@ -437,11 +437,13 @@ cryptoki_packed! {
     }
 }
 
-/// `CK_TOKEN_INFO`. Note the total size is 192 bytes on a 64-bit target, not
-/// the 188 the field list seems to add up to: after `utc_time` no field needs
-/// 8-byte alignment, but the trailing row still rounds the struct up past
-/// every member's natural placement — the offsets below pin down exactly
-/// where C reads each one. Do not "fix" them from the field widths alone.
+/// `CK_TOKEN_INFO`. Note the total size is not what the field list seems to
+/// add up to: the text plus eleven ulongs end at 204 bytes on LP64, and the
+/// struct's own 8-byte alignment rounds it to 208 there — while under the
+/// packed Windows headers (4-byte ulongs, alignment 1) it is 160. Both are
+/// asserted in `tests/pkcs11_abi.rs`; the ADR used to quote 192, which is
+/// neither (round 2, N7). The offsets below pin down exactly where C reads
+/// each one. Do not "fix" them from the field widths alone.
 /// Its *fields* land at the same addresses under both packing rules on every
 /// target we ship (every ulong starts after 96 bytes of fixed text or after
 /// another ulong at natural width), which is why this struct keeps plain

@@ -498,9 +498,13 @@ item is what a person with that hardware runs once; findings go to
 `docs/validation-log.md`.
 
 - [ ] Windows, own login: `openfirma keystores list --store windows` shows the
-      store's signing certificates with their key specs (the enumeration asks
-      CNG then legacy CAPI per certificate, and refuses to call a
-      non-exportable key signable when neither provider can be opened for it).
+      store's signing certificates — one row per certificate whose private key
+      both exists and can be acquired (a single
+      `CryptAcquireCertificatePrivateKey` with ALLOW_NCRYPT + SILENT per
+      certificate; a certificate whose key cannot be acquired is left out
+      rather than listed as signable, and the listing shows no key specs —
+      round 2, N7: this item used to promise them, and to describe a
+      CNG-then-CAPI walk that the code does not make).
 - [ ] Windows, sign: `openfirma sign -i doc.txt -o doc.csig --store windows`
       with a cert whose key is non-exportable (its "Microsoft Enhanced
       Cryptographic Provider v1.0" style CSP or a CNG key marked
@@ -508,13 +512,16 @@ item is what a person with that hardware runs once; findings go to
       certificate context: AutoFirma's Java path needs it too — a context
       rebuilt from DER has no `CERT_KEY_PROV_INFO` and `CryptAcquireCertificatePrivateKey`
       fails on it (its javap evidence is in this repo's ADR-0004 discussion).
-      If the store crypto ever produced "No CAPI provider for this
-      certificate's private key" for a cert that AutoFirma signs fine, that is
-      exactly this bug.
+      If the store crypto ever answered "this certificate's private key lives
+      in the CNG store, and openfirma's Windows signer drives legacy CSP
+      providers only" for a certificate AutoFirma signs fine, that is exactly
+      this bug. (Round 2, N7: the wording quoted here before — "No CAPI
+      provider for this certificate's private key" — is in no version of the
+      code.)
 - [ ] Windows, DNIe: same through the card's CSP; with a PIN, expect the card
       dialog or the prompt to be suppressible by `SILENT` only when a PIN was
       already supplied — check the interactive and the pre-authenticated case.
-- [ ] macOS keychain (14+, 26): `--store macos-keychain:` listing; until it is
+- [ ] macOS keychain (14+, 26): `--store macos` listing; until it is
       tested the code refuses rather than guessing, so this box checks that the
       refusal wording is actionable, nothing else.
 - [ ] DNIe card, PIN twice: a token whose keys carry
@@ -534,9 +541,14 @@ item is what a person with that hardware runs once; findings go to
       list it by descriptor (`nss:<path>`); quoting is unit-tested against real
       libsoftokn3 on Linux, this box confirms the vendor's own error wording.
 - [ ] PKCS#12 out of Java: take one `.p12` each from a RealVNC export, a
-      Google-wide-character-set keystore, and any 40-bit RC2 legacy keystore;
-      `openfirma keystores list --p12 <f>` must open all three where the old
-      DER walker refused. These are the exact shapes AutoFirma's Sun provider
+      Google-wide-character-set keystore, and any 40-bit RC2 legacy keystore,
+      and sign a small text file with each:
+      `openfirma sign -i doc.txt -o doc.csig --p12 <f> --password-file <pw>`
+      must open all three where the old DER walker refused (there is no
+      `keystores list --p12`: a `.p12` is a file, and the two places openfirma
+      opens one are `sign --p12` and the window's "Open a certificate file
+      (.p12)". Round 2, N7: this item named the command that does not exist.)
+      These are the exact shapes AutoFirma's Sun provider
       reads (its ASN1Parser integer/length limits were measured by javap, see
       ADR-0003); the synthetic versions of them are in CI (`pkcs12_interop`).
 

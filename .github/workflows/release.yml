@@ -197,6 +197,12 @@ jobs:
             echo "NSS modules load with \`dlopen\`, which a static musl binary"
             echo "cannot do - that artifact signs with PKCS#12 files; for"
             echo "\`--store pkcs11:\`/\`nss\` use the glibc build."
+            echo ""
+            echo "PKCS#11 and NSS are tested on Linux (SoftHSM and libsoftokn3)."
+            echo "On Windows the same code compiles and is linted, but no module"
+            echo "has ever been loaded there: CI provisions no SoftHSM for the"
+            echo "Windows runners. The Windows certificate store has never run"
+            echo "against a real card either."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: softprops/action-gh-release@62c96d0c4e8a889135c1f3a25910db8dbe0e85f7 # v2.3.4

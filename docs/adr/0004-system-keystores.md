@@ -64,19 +64,27 @@ pub trait SystemStore {
   names a path and the library is whatever lives there.
 - **The ABI facts were measured, not trusted.** Every layout below was
   confirmed against live SoftHSM 2.6 and libsoftokn3 before being relied on;
-  `types.rs` asserts them at compile time and tests/pkcs11.rs re-proves the
-  function-list slots (`spec function k sits at byte 8k`) against a loaded
-  module:
-  - slot 0 is `{major, minor}` followed by six bytes of C alignment padding,
-    so every entry point is at byte `8·k` for LP64/LLP64;
+  `types.rs` asserts them at compile time and tests/pkcs11_abi.rs re-derives
+  the function-list slots from the packing rules of each target — `8·k` where
+  pointers are naturally aligned, and `2 + (k−1)·p` under the packed Windows
+  headers, which is where the round-1 C1 defect lived — against a loaded
+  module where one exists:
+  - slot 0 is `{major, minor}`; on unix six bytes of C alignment padding
+    follow it, so entry point `k` is at byte `8·k`, while the cryptoki
+    headers pack the table on Windows and put it at `2 + (k−1)·p` (review 04,
+    N7: this said `8·k` for "LP64/LLP64", which is exactly the C1 mistake);
   - v2.40's table has no mutex/reserved slots between the two; a 3.x module
     returns a `CK_FUNCTION_LIST_3_x`, whose identical prefix makes it safe to
     read through our layout (spec 4.12) — modules reporting < 2.0 are refused
     before any call;
   - `C_GetSlotList` takes the count pointer **last**, and `CK_ATTRIBUTE` is
     natural-order `{type, p_value, ul_value_len}`;
-  - `CK_TOKEN_INFO` must be sized 192 bytes (padding after the second UTC
-    string) or NSS rejects the buffer.
+  - `CK_TOKEN_INFO` must be sized for the module to fill: 208 bytes on LP64
+    (the text and eleven ulongs reach 204, and the struct's 8-byte alignment
+    rounds the tail) and 160 under the packed Windows headers (4-byte ulongs,
+    no padding). NSS rejects a buffer shorter than it wants; the ADR used to
+    say 192, which is neither layout (review 04, N7).
+
 - **NSS specifics** (each observed live, each in `nss.rs`/`nss_args.rs`):
   softokn3 redefines the spec's reserved initialize-args field as
   `LibraryParameters` and requires the full `configDir='sql:/path'` syntax —
@@ -130,8 +138,11 @@ pub trait SystemStore {
     no way to test a keychain prompt, and an untested keychain write is worse
     than an honest error. Windows compiles but has never run: same honesty
     applies at the feature-table level, not in code comments only.
-  - musl static binaries cannot `dlopen` later than glibc-style anyway; the
-    runtime load needs a dynamic loader, which every target we ship has.
+  - musl static binaries cannot `dlopen`: the published
+    `x86_64-unknown-linux-musl` artifact carries the CLI and signs with
+    PKCS#12 files only, which its release notes and `docs/platforms.md` say;
+    the runtime module load needs a dynamic loader, which every other target
+    we ship has. (Review 04, N7: this used to claim "every target we ship".)
   - The version-refusal branch is unreachable naturally (no pre-2.0 module
     exists), so it has a test hook env var and an `#[ignore]`d single-threaded
     test rather than being dead code without evidence.

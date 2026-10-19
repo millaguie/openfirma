@@ -197,10 +197,9 @@ fn ck_info_follows_the_headers_field_order() {
     // the 32-byte array no ABI pads, right behind the version pair
     assert_eq!(offset_of!(CkInfo, manufacturer_id), 2);
     if cfg!(windows) {
-        // pack(1): no padding anywhere. (MSVC's own headers keep `unsigned
-        // long` an 8-aligned *type* even at /Zp1, which would put `flags` six
-        // bytes later; this struct is never read and the field order is what
-        // the finding was about, so the packed-1 numbers are what is pinned.)
+        // pack(1): no padding anywhere, the same concatenation the
+        // `CkAttribute` offsets above measure against the MSVC ABIs (a
+        // 4-byte `unsigned long` does not hold an 8-byte alignment there).
         assert_eq!(offset_of!(CkInfo, flags), 34);
         assert_eq!(offset_of!(CkInfo, library_description), 38);
         assert_eq!(offset_of!(CkInfo, library_version), 70);
@@ -217,6 +216,28 @@ fn ck_info_follows_the_headers_field_order() {
             (flags + ulong + 32 + 2).next_multiple_of(ulong)
         );
     }
+}
+
+#[test]
+fn ck_token_info_is_the_size_the_module_will_write_into_it() {
+    // The buffer openfirma passes to `C_GetTokenInfo` is this struct, and the
+    // module fills it as C lays it out: a short one is rejected (NSS says so)
+    // and a long one silently reads whatever the module left. Round 2, N7
+    // found the ADR claiming 192 here and the type's own comment claiming 188;
+    // neither is a layout this target (or any other) produces.
+    let ulong = size_of::<CkUlong>();
+    // 32+32+16+16 bytes of text, eleven CK_ULONGs, then the two version pairs
+    // and the 16-byte UTC string.
+    let end = 96 + 11 * ulong + 2 + 2 + 16;
+    let laid_out = if cfg!(windows) {
+        // pack(1): alignment 1, so nothing rounds the tail
+        end
+    } else {
+        // the ulongs' own alignment rounds the tail up (LP64: 204 -> 208)
+        end.next_multiple_of(ulong)
+    };
+    assert_eq!(size_of::<CkTokenInfo>(), laid_out);
+    assert_eq!(size_of::<CkTokenInfo>(), if ulong == 8 { 208 } else { 160 });
 }
 
 #[test]
