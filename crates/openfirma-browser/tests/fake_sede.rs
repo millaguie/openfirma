@@ -803,6 +803,39 @@ fn request_chunked(
     parse_response(&raw)
 }
 
+/// Finding B-4's head-parser cases, written as the raw bytes they are about:
+/// every helper in this file builds a well-formed HTTP/1.1 head, and the point
+/// of these cases is that no well-formed head produces them. The read follows
+/// [`request_on`]'s rules (judge against the response's own boundary, never
+/// race the endpoint's close), and a refused answer discarded unread in the
+/// socket layer is asked again — the paths used here are probes, so no
+/// credential can be burned by a retry.
+fn raw_head(addr: SocketAddr, request: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    for _ in 0..3 {
+        let mut stream = common::connect(addr);
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        let _ = stream.write_all(request.as_bytes());
+        let _ = stream.flush();
+        let mut raw = Vec::new();
+        match stream.read_to_end(&mut raw) {
+            Ok(_) => {}
+            // A refusal that closes while unwritten bytes are still in flight
+            // resets the connection; the answer may still be in the buffer.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("reading the answer to {request:?} failed: {e}"),
+        }
+        if complete_response(&raw) {
+            return parse_response(&raw);
+        }
+        // Windows discards the answer of a connection it resets with data
+        // unread; a probe is free to ask again.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("the endpoint never answered this head: {request:?}");
+}
+
 fn request_no_length(
     addr: SocketAddr,
     path: &str,
@@ -857,6 +890,79 @@ fn localhost_is_the_alias_of_127001_it_claims_to_be() {
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
 }
 
+/// Finding B-4 (round two re-checked it and found the parser still lenient):
+/// what a head this endpoint cannot honour gets, and what a legal-but-odd one
+/// now gets instead of a refusal. Raw bytes, because a well-formed head never
+/// produces these: two Content-Length fields (RFC 9112 lets a recipient reject
+/// that, and a request smuggling pair is built out of exactly that ambiguity),
+/// and a version this parser does not implement (`HTTP/1.9` used to pass a
+/// `starts_with("HTTP/1.")` test and be answered as if it did). The other way
+/// round, `Host: LOCALHOST:<port>` is legal — host names are case-insensitive —
+/// and used to be refused for its spelling.
+#[test]
+fn the_head_parser_refuses_what_it_cannot_honour() {
+    let Some(key) = p12() else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let server = server_on(&key);
+    let addr = server.addr();
+    let port = addr.port();
+
+    // Two lengths, and they disagree: whichever one this parser believed, some
+    // other reader of the same bytes would believe the other. The body sent is
+    // exactly what the FIRST declares — that matters, because the older rule
+    // further down (a body longer than the declared length) would otherwise be
+    // the one refusing this and the duplicate rule would never be reached.
+    let (status, headers, _) = raw_head(
+        addr,
+        &format!(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 4\r\n\
+             Content-Length: 9\r\n\r\nAAAA"
+        ),
+    );
+    assert_eq!(status, 400);
+    assert_eq!(
+        header(&headers, "x-openfirma-reason"),
+        Some("duplicate-content-length")
+    );
+
+    // A version the parser does not implement is 505, not an answer.
+    let (status, headers, _) = raw_head(
+        addr,
+        &format!("POST /echo HTTP/1.9\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\n\r\n"),
+    );
+    assert_eq!(status, 505);
+    assert_eq!(
+        header(&headers, "x-openfirma-reason"),
+        Some("unsupported-http-version")
+    );
+
+    // And 1.0 is still spoken: the narrowing above is not a new refusal of
+    // anything legal.
+    let (status, _, _) = raw_head(
+        addr,
+        &format!("POST /echo HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\n\r\n"),
+    );
+    assert_eq!(status, 200);
+
+    // The legal-but-odd Host spelling, through the ordinary helper.
+    let (status, _, body) = request(
+        addr,
+        "POST",
+        "/echo",
+        &format!("LOCALHOST:{port}"),
+        None,
+        b"",
+    );
+    assert_eq!(
+        status,
+        200,
+        "a host name is case-insensitive (RFC 9110 7.2): {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
 /// The endpoint binds loopback or refuses to start: a non-loopback bind would
 /// hand the same token-only trust model to the whole network, which is not a
 /// configuration this build may reach by argument.
@@ -873,6 +979,27 @@ fn binding_a_non_loopback_address_is_refused_before_the_bind() {
     assert!(err.to_string().contains("loopback"), "{err}");
 }
 
+/// Finding B-4, one of its four points: `[::1]` IS loopback, so it passed the
+/// check above, bound a real port, and then refused every request that could
+/// reach it — the Host rule knows 127.0.0.1 and localhost and nothing else. A
+/// socket nobody can talk to is refused by name now, at the bind, where the
+/// operator can still change the argument (and where no port is spent).
+#[test]
+fn binding_ipv6_loopback_is_refused_by_name() {
+    let err = LoopbackServer::start(
+        "[::1]:0".parse().unwrap(),
+        OwnedKeySource::P12 {
+            path: PathBuf::from("/does/not/matter"),
+            password: Zeroizing::new(String::new()),
+        },
+    )
+    .expect_err("[::1] is loopback but no request could ever pass the Host rule");
+    let text = err.to_string();
+    assert!(
+        text.contains("[::1]") && text.contains("127.0.0.1"),
+        "{text}"
+    );
+}
 /// A JSON body naming the URI under `"message"` signs exactly like the bare
 /// URI form; a JSON object without one is refused with the reason that names
 /// what is missing. The wrapper exists for hand-written sede clients; AutoFirma's

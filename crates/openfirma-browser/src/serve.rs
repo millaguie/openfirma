@@ -228,6 +228,18 @@ impl LoopbackServer {
                  endpoint on 127.0.0.1/localhost, so it can answer its own machine at all"
             )));
         }
+        // B-4: `[::1]` is loopback, so it passed the check above — and then the
+        // Host/Origin rules, which name `127.0.0.1` and `localhost`, refused
+        // every request that could arrive on it. A socket nobody can talk to is
+        // not a configuration worth accepting: it is refused here, by name,
+        // instead of binding a port that only answers 403.
+        if addr.is_ipv6() {
+            return Err(ServeError(format!(
+                "{addr} is an IPv6 loopback address, and the Host/Origin rules that keep a \
+                 rebound name out of this port only know 127.0.0.1 and localhost: a socket \
+                 bound to [::1] could never be talked to. Bind 127.0.0.1 (finding B-4)"
+            )));
+        }
         // Fail early on material problems: reading the p12 now means the first
         // real request cannot be the one that discovers a typo in a path.
         match &key {
@@ -406,12 +418,29 @@ fn handle_connection(
     // runs inside whatever is left of `absolute` (below), never beyond it.
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() != 3 || !parts[2].starts_with("HTTP/1.") {
+    if parts.len() != 3 || !parts[2].starts_with("HTTP/") {
         return write_refusal(
             &mut stream,
             400,
             "the request line is not a well formed HTTP/1.x request",
             "malformed-request-line",
+        );
+    }
+    // B-4: the check used to be `starts_with("HTTP/1.")`, so `HTTP/1.9` was
+    // answered as if this parser implemented it — one request per connection
+    // with `Connection: close`, which is a framing rule, and guessing at a
+    // version's framing is how a parser and a proxy come to disagree about
+    // where a request ends. Only 1.0 and 1.1 are spoken here; anything else
+    // gets 505, the status whose whole meaning is "version not supported".
+    if parts[2] != "HTTP/1.0" && parts[2] != "HTTP/1.1" {
+        return write_refusal(
+            &mut stream,
+            505,
+            &format!(
+                "the endpoint speaks HTTP/1.0 and HTTP/1.1 and this request declares {}",
+                parts[2]
+            ),
+            "unsupported-http-version",
         );
     }
     let method = parts[0];
@@ -435,12 +464,16 @@ fn handle_connection(
         );
     }
 
-    // 2. Host must name *us*: the loopback alias and exactly our port.
+    // 2. Host must name *us*: the loopback alias and exactly our port. Host is
+    // a case-insensitive name (RFC 9110 §7.2), so the comparison is done on the
+    // lowercased value — B-4 found `Host: LOCALHOST:<port>` refused while the
+    // lowercase spelling was accepted, which refused something legal instead of
+    // something hostile.
     let host_ok = headers
         .iter()
         .find(|(k, _)| k == "host")
         .map(|(_, v)| {
-            let v = v.trim();
+            let v = v.trim().to_ascii_lowercase();
             v == format!("127.0.0.1:{bound_port}") || v == format!("localhost:{bound_port}")
         })
         .unwrap_or(false);
@@ -461,7 +494,9 @@ fn handle_connection(
     let origin_ok = match headers.iter().find(|(k, _)| k == "origin") {
         None => true,
         Some((_, o)) => {
-            let o = o.trim();
+            // Same case-insensitivity as Host, and for the same reason: the
+            // scheme and the host name are both case-insensitive.
+            let o = o.trim().to_ascii_lowercase();
             o == format!("http://127.0.0.1:{bound_port}")
                 || o == format!("http://localhost:{bound_port}")
         }
@@ -507,8 +542,27 @@ fn handle_connection(
             "no-chunked-bodies",
         );
     }
-    let length: Option<u64> = match headers.iter().find(|(k, _)| k == "content-length") {
-        Some((_, v)) => match v.trim().parse::<u64>() {
+    // B-4: two Content-Length fields used to be accepted with the first one
+    // winning. RFC 9112 §6.3 lets a recipient either reject that or collapse
+    // identical duplicates, and this endpoint rejects it: a request carrying
+    // two lengths is exactly the shape a smuggling pair is built out of, and
+    // there is no client here whose requests would die of it.
+    let lengths: Vec<&str> = headers
+        .iter()
+        .filter(|(k, _)| k == "content-length")
+        .map(|(_, v)| v.trim())
+        .collect();
+    if lengths.len() > 1 {
+        return write_refusal(
+            &mut stream,
+            400,
+            "more than one Content-Length header arrived: a request with two lengths is \
+             how smuggling is built, so this endpoint refuses it instead of picking one",
+            "duplicate-content-length",
+        );
+    }
+    let length: Option<u64> = match lengths.first() {
+        Some(v) => match v.parse::<u64>() {
             Ok(n) => Some(n),
             Err(_) => {
                 return write_refusal(
@@ -883,6 +937,7 @@ fn write_bytes(
         405 => "Method Not Allowed",
         411 => "Length Required",
         413 => "Content Too Large",
+        505 => "HTTP Version Not Supported",
         // A stalled read answers before the request has a method to refuse,
         // so no verb is pending at that point: 599 is our own status for it.
         // (408 is not usable from this code path — with no method parsed yet,

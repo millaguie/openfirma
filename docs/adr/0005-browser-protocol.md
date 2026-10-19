@@ -1,6 +1,6 @@
 # ADR-0005 — The browser protocol (afirma://) and its loopback endpoint
 
-**Status:** accepted, amended 2026-10-17 by wave 4d's review findings (C-1, A-1..A-5, M-1..M-9, B-1..B-6 from `/tmp/review/05-browser.md`), and again 2026-10-19 by round two's browser findings (04-N1: `--register` asks the OS who holds the scheme now; 04-N3: the endpoint takes its standing consent from the config file; 04-N5: the config stores paths the handler can find; 04-N7: `--unregister` removes its own association line; 04-N9: `dat=` is refused; 04-N10: the desktop entry escapes for the file and for `Exec`; 04-N6: this file no longer promises a tty prompt an argv key never gets). Every rule below is recorded line-by-line against the AutoFirma 1.9.1 sources (`tools/fetch-autofirma.sh`, corpus location in `docs/validation.md`).
+**Status:** accepted, amended 2026-10-17 by wave 4d's review findings (C-1, A-1..A-5, M-1..M-9, B-1..B-6 from `/tmp/review/05-browser.md`), and again 2026-10-19 by round two's browser findings (04-N1: `--register` asks the OS who holds the scheme now; 04-N3: the endpoint takes its standing consent from the config file; 04-N5: the config stores paths the handler can find; 04-N7: `--unregister` removes its own association line; 04-N9: `dat=` is refused; 04-N10: the desktop entry escapes for the file and for `Exec`; 04-N6: this file no longer promises a tty prompt an argv key never gets; 04-N8: a refusal for want of consent travels as the cancellation pair, not as "operation not supported"; B-4, B-6 and M-7: the head parser refuses what it cannot honour, the token's entropy is written as what it is, and the wss transport's premise is the corrected one). Every rule below is recorded line-by-line against the AutoFirma 1.9.1 sources (`tools/fetch-autofirma.sh`, corpus location in `docs/validation.md`).
 
 ## Context
 
@@ -175,10 +175,24 @@ exactly the moment of signing. openfirma keeps that invariant headlessly:
 
 ### The loopback endpoint stays localhost-only and never posts
 
-serve.rs binds 127.0.0.1 (refuses non-loopback before binding), validates Host
-and Origin against rebinding, one-shot tokens from a CSPRNG, HTTP/1.1 keep-alive
-with absolute deadlines (stalled/dribbling/flooded peers age out with 408/503 —
-never a dead endpoint). **openfirma never POSTs to any server**: `stservlet`/
+serve.rs binds 127.0.0.1 (refuses non-loopback before binding, and refuses the
+IPv6 loopback `[::1]` by name — it is loopback, so the address check passed it,
+but the Host/Origin rules below only know 127.0.0.1 and localhost and every
+request that reached such a socket would have been a 403), validates Host and
+Origin against rebinding (case-insensitively: a host name is one), and issues
+one-shot tokens from a CSPRNG. The transport is HTTP/1.0 or HTTP/1.1 and nothing
+else — `HTTP/1.9` is answered 505 rather than parsed as if this endpoint
+implemented it — and it is deliberately WITHOUT keep-alive: one request per
+connection, `Connection: close` on every answer, so an idle socket is never a
+slowloris surface. Every handler still enforces an absolute deadline, and a peer
+that stalls or dribbles is answered `599 Request Timeout` with the reason
+`request-head-timeout` (599 rather than 408 because a head that never finished
+has no method to refuse yet, and every refusal on that path would lose the
+distinction); a port past `MAX_CONCURRENT_CONNECTIONS` answers `503` and keeps
+accepting — a refusal, never a dead endpoint. A request carrying two
+`Content-Length` fields is refused (400) instead of one of them being believed:
+a recipient may do either under RFC 9112, and two lengths are how a smuggling
+pair is built. **openfirma never POSTs to any server**: `stservlet`/
 `rtservlet` URIs that need the intermediate-server route are refused by name
 (M-5: signing without delivering is worse than not signing), and the answer
 travels only over the connection the page itself opened.
