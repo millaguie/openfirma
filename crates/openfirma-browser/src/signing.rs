@@ -708,35 +708,17 @@ mod tests {
 #[cfg(test)]
 mod clock_tests {
     use super::clock;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn the_shared_clock_is_one_whole_second_and_honest_utc() {
-        // Stable across reads (two signatures of one process timestamp with
-        // one tick) and inside what the raw clock says (a floor, never a
-        // jump): an invented constant would pass stability alone.
-        let before = SystemTime::now();
-        let t = clock::now();
-        let after = SystemTime::now();
-        assert_eq!(t, clock::now(), "one process, one second");
-        assert_eq!(
-            t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            "floored value is a whole second"
-        );
-        let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs();
-        assert_eq!(
-            secs,
-            before.duration_since(UNIX_EPOCH).unwrap().as_secs().max(
-                after
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    .saturating_sub(1)
-            ),
-            "the floored instant belongs to the second the raw clock showed"
-        );
-    }
+    // The honesty half of this clock — that the memoised instant is the SECOND
+    // the raw clock was showing when the process asked — cannot live here. It
+    // is only true of the FIRST caller in a process, and any other test in
+    // this binary that signs takes the clock first (and `a_second_boundary_
+    // crossing_changes_no_single_byte` below deliberately sleeps past a
+    // boundary before asking), so the assertion raced its own neighbours and CI
+    // measured exactly that: left 1792400029, right 1792400030. The property is
+    // pinned where it can hold, as the only caller of its own process, in
+    // `tests/clock_shared.rs`. Stability across reads (`t == clock::now()`)
+    // stays true wherever it runs and needs no such care.
 
     #[test]
     fn a_second_boundary_crossing_changes_no_single_byte() {
