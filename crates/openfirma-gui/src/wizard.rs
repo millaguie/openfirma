@@ -46,6 +46,18 @@ impl KeySource {
         }
     }
 
+    /// The store label or PKCS#12 alias this source carries, when it has one.
+    /// The shared naming rule prefers it, and without one the certificate's
+    /// own name is used (A-7: the result screen must name the HOLDER, not the
+    /// file the holder was read from — `display()` is the picker's row, which
+    /// for a `.p12` is its file name).
+    pub fn alias(&self) -> Option<&str> {
+        match self {
+            KeySource::P12 { alias, .. } => alias.as_deref(),
+            KeySource::Store { cert, .. } => cert.label.as_deref(),
+        }
+    }
+
     /// A second owned copy of the same source (A-3: when the output collides
     /// and the save dialog answers with a new name, the signing job is rebuilt
     /// for that destination — the key must survive the first job's move into

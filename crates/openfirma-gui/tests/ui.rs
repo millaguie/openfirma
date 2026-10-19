@@ -247,6 +247,16 @@ fn signing_the_same_document_again_with_a_p12_asks_and_writes_the_new_name() {
     drain_worker(&mut harness);
     harness.run();
     harness.get_by_label_contains("Firma guardada");
+    // A-7: the result names the HOLDER, through the one naming rule the
+    // terminal also prints signers with — never the file the holder was read
+    // from. The picker's row for a `.p12` is that file name, and it has to be
+    // (nothing has unlocked the container yet); the result screen is not a row.
+    harness.get_by_label_contains("PEREZ GARCIA, ANA");
+    let tree = format!("{:?}", harness.root());
+    assert!(
+        !tree.contains("signer-rsa.p12"),
+        "the result screen names the file, not the signer: {tree}"
+    );
     let first = dir.join("nota.txt.csig");
     assert!(
         first.is_file(),

@@ -2383,29 +2383,36 @@ fn run_sign_job(job: SignJob, tr: &Tr) -> SignOutcome {
         path,
         out,
     } = job;
-    let display = key.display().to_string();
     let _ = &path; // the Done screen reads its path from the parked back screen
     // 06-N-11 (M-11): whether a time-stamp token went in without its own
     // signature being checked. The callback sets it; the Done screen says it.
     let tsa_unchecked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let result: openfirma_core::Result<Vec<u8>> = (|| {
+    let result: openfirma_core::Result<(Vec<u8>, String)> = (|| {
         let timestamp = if tsa_url.trim().is_empty() {
             None
         } else {
             Some(crate::tsa::provider(tsa_url.trim(), &tsa_unchecked)?)
         };
         let signer = key.signer()?;
-        signing::execute(
+        // A-7: WHO SIGNED comes from the certificate, through the one naming
+        // rule both frontends print a signer with (`signer_display`, the same
+        // string `openfirma sign` prints on success — its doc comment has
+        // claimed both call it since it was written). The picker's row for a
+        // `.p12` is its FILE name, so the result screen used to answer "who
+        // signed?" with "signer-rsa.p12".
+        let who = openfirma_core::workflow::signer_display(key.alias(), signer.certificate());
+        let signature = signing::execute(
             &chosen_format,
             &content,
             signer.as_ref(),
             digest,
             timestamp,
             reason,
-        )
+        )?;
+        Ok((signature, who))
     })();
     match result {
-        Ok(signature) => {
+        Ok((signature, display)) => {
             // Write as the first act of the result (ADR-0006: the name is
             // decided by the library — one write, next to the original —
             // and it is durable before the word "guardada" appears). The
