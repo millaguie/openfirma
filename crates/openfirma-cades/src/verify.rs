@@ -1399,6 +1399,11 @@ fn build_chain_refs<'c, 'a>(
         let issuer_der = current.issuer().to_der()?;
         let mut name_matches = 0usize;
         let mut signature_failures = 0usize;
+        // The first reason a candidate was refused AFTER its key verified the
+        // signature. Kept because "nothing worked" is a worse answer than the
+        // reason the closest candidate failed, and because this search no longer
+        // stops at such a candidate (round two's N11, below).
+        let mut refused: Option<String> = None;
         // certificates below `current` that its pathLenConstraint bounds: RFC
         // 5280 6.1.4 (l)/(m) counts the INTERMEDIATE certificates between it
         // and the end entity — never the end entity itself, and never a
@@ -1416,8 +1421,23 @@ fn build_chain_refs<'c, 'a>(
             name_matches += 1;
             match check_cert_signature(current, anchor, policy) {
                 Ok(()) => {
-                    check_validity(anchor, at)?;
-                    check_certificate_rules(anchor, CertRole::Issuer { depth_below })?;
+                    // RFC 5280 6.1.4 (c): even a trust anchor has to be valid at
+                    // `at`, and 01-M10: it has to be able to stand as an issuer,
+                    // which the caller who supplied it cannot waive.
+                    //
+                    // Round two's N11 is why failing either no longer ends the
+                    // search. A renewed CA certificate keeps its predecessor's
+                    // subject and key, so a pool that carries both holds one that
+                    // verifies this signature and has expired. Refusing the
+                    // expired one is right; refusing the valid one waiting behind
+                    // it is a false refusal, and that is what happened whenever
+                    // the expired copy came first in the list.
+                    if let Err(e) = check_validity(anchor, at).and_then(|()| {
+                        check_certificate_rules(anchor, CertRole::Issuer { depth_below })
+                    }) {
+                        refused.get_or_insert_with(|| detail_of(&e));
+                        continue;
+                    }
                     return Ok((chain, anchor));
                 }
                 Err(_) => signature_failures += 1,
@@ -1436,10 +1456,18 @@ fn build_chain_refs<'c, 'a>(
             // an embedded certificate that equals a trust anchor is the
             // anchor: the user named it, no issuer rules to prove
             let stands_on_anchor = anchors.iter().any(|a| a.der() == candidate.der());
-            if !stands_on_anchor {
-                check_certificate_rules(candidate, CertRole::Issuer { depth_below })?;
+            // 01-N11, as above: a certificate that really issued this one but
+            // cannot act as an issuer is passed over, so the current copy of the
+            // same name and key behind it still gets its turn.
+            let rules = if stands_on_anchor {
+                Ok(())
+            } else {
+                check_certificate_rules(candidate, CertRole::Issuer { depth_below })
+            };
+            if let Err(e) = rules.and_then(|()| check_validity(candidate, at)) {
+                refused.get_or_insert_with(|| detail_of(&e));
+                continue;
             }
-            check_validity(candidate, at)?;
             if visited.contains(&candidate.der()) {
                 return Err(fail(
                     CHECK_CERTIFICATE_CHAIN,
@@ -1453,8 +1481,21 @@ fn build_chain_refs<'c, 'a>(
             let issuer_name = Name::from_der(&issuer_der)
                 .map(|n| n.to_string())
                 .unwrap_or_else(|_| hex::encode(&issuer_der));
-            return Err(if signature_failures > 0 {
-                fail(
+            return Err(match refused {
+                // The name matched and the key verified, so this is no longer the
+                // "who signed this" question: the candidate spoke and could not
+                // stand as an issuer. That is what the search knew, and it is the
+                // useful thing to say.
+                Some(why) => fail(
+                    CHECK_CERTIFICATE_CHAIN,
+                    format!(
+                        "\"{}\" names \"{issuer_name}\" as its issuer, and the certificates with \
+                         that subject whose key verifies the signature on it cannot stand as its \
+                         issuer: the first of them because {why}",
+                        subject(current)
+                    ),
+                ),
+                None if signature_failures > 0 => fail(
                     CHECK_CERTIFICATE_CHAIN,
                     format!(
                         "\"{}\" names \"{issuer_name}\" as its issuer and {signature_failures} \
@@ -1462,9 +1503,8 @@ fn build_chain_refs<'c, 'a>(
                          keys verifies the signature on it",
                         subject(current)
                     ),
-                )
-            } else {
-                fail(
+                ),
+                None => fail(
                     CHECK_CERTIFICATE_CHAIN,
                     format!(
                         "the chain stops at \"{}\": its issuer \"{issuer_name}\" is neither \
@@ -1473,7 +1513,7 @@ fn build_chain_refs<'c, 'a>(
                         subject(current),
                         anchors.len()
                     ),
-                )
+                ),
             });
         };
         chain.push(next);
