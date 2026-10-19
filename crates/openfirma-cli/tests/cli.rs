@@ -1138,3 +1138,164 @@ fn compat_list_aliases_prints_one_alias_per_line() {
         .unwrap();
     assert_eq!(out.status.code(), Some(255));
 }
+
+/// Finding 04-N5, end to end through the two processes that matter: the
+/// registration and the handler the desktop session launches afterwards.
+///
+/// `--register --p12 certificado.p12 --password-file pw.txt` is the README's
+/// own example, and it stored both paths verbatim. The handler is started by
+/// the desktop session from ITS working directory, so the registration only
+/// worked by accident — when the session happened to start where the user had
+/// typed the command. Here the register runs in one directory, the handler in a
+/// second one, and the handler ends up holding a real signature: before the
+/// fix it died reading `claves/pw.txt` relative to the wrong directory.
+#[test]
+fn register_stores_paths_the_handler_can_find_from_any_directory() {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace("::", "_");
+    let root = std::env::temp_dir().join(format!("openfirma-{}-{test}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let keys = root.join("claves");
+    std::fs::create_dir_all(&keys).unwrap();
+    let p12 = keys.join("clave.p12");
+    if !Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/certs/signer-rsa.p12"
+    ))
+    .is_file()
+    {
+        if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_some() {
+            panic!("OPENFIRMA_REQUIRE_TESTS is set and testdata/certs/signer-rsa.p12 is missing");
+        }
+        eprintln!("skipped: the test PKI is absent, run tools/gen-testcert.sh");
+        return;
+    }
+    std::fs::copy(
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/certs/signer-rsa.p12"
+        )),
+        &p12,
+    )
+    .unwrap();
+    let pw = keys.join("pw.txt");
+    std::fs::write(&pw, b"openfirma\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let cfg = root.join("browser.toml");
+
+    // The registration, from `root`, with the relative paths as written.
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .current_dir(&root)
+        .env("HOME", root.join("home"))
+        .env("XDG_DATA_HOME", root.join("home/.local/share"))
+        .env("XDG_CONFIG_HOME", root.join("home/.config"))
+        .env("OPENFIRMA_ASSUME_XDG_MIME", "1")
+        .args([
+            "afirma-uri",
+            "--register",
+            "--acknowledge-autofirma",
+            "--allow-unattended",
+            "--p12",
+            "claves/clave.p12",
+            "--password-file",
+            "claves/pw.txt",
+            "--config",
+            cfg.to_str().unwrap(),
+        ])
+        .output()
+        .expect("the binary must run");
+    assert!(
+        out.status.success(),
+        "register refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&cfg).expect("the config must exist");
+    assert!(
+        !text.contains("\"claves/clave.p12\"") && !text.contains("\"claves/pw.txt\""),
+        "the config must not store the relative paths it was given: {text}"
+    );
+    let canonical = std::fs::canonicalize(&p12).unwrap();
+    assert!(
+        text.contains(&canonical.display().to_string()),
+        "the config must name the key the handler will find: {text}"
+    );
+
+    // The handler the desktop starts: another working directory, no --p12 at
+    // all (argv carries the URI and nothing else), the config doing its job.
+    let elsewhere = root.join("otro-sitio");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let payload = root.join("firma.txt");
+    let doc = std::fs::read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/inputs/simple.pdf"
+    )))
+    .unwrap_or_else(|_| b"%PDF-1.4\n%%EOF\n".to_vec());
+    let dat = dat_param(&doc);
+    let uri = format!("afirma://sign?op=sign&format=CAdES&algorithm=SHA256withRSA&dat={dat}");
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .current_dir(&elsewhere)
+        .args([
+            "afirma-uri",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--output",
+            payload.to_str().unwrap(),
+            &uri,
+        ])
+        .output()
+        .expect("the handler must run");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !stderr.contains("No such file or directory"),
+        "the handler could not find what the config named: {stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "the handler started from another directory refused: {stderr}"
+    );
+    let produced = std::fs::read(&payload).expect("the handler must write its payload");
+    assert!(
+        produced.contains(&b'|'),
+        "a signature payload is cert|signature, got {:?}",
+        &produced[..produced.len().min(64)]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `dat` exactly as `autoscript.js` sends it: standard base64 with the three
+/// characters a query string cannot carry percent-encoded (`%2B`, `%2F`,
+/// `%3D`). Hand-rolled because a CLI test has no base64 dependency, and the
+/// recorded form is the whole point — a URL-safe `-`/`_` payload is refused by
+/// the URI parser, which is how the first draft of this test failed.
+fn dat_param(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        b64.push(A[(b[0] >> 2) as usize] as char);
+        b64.push(A[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            b64.push(A[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char);
+        } else {
+            b64.push('=');
+        }
+        if chunk.len() > 2 {
+            b64.push(A[(b[2] & 0x3f) as usize] as char);
+        } else {
+            b64.push('=');
+        }
+    }
+    b64.replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D")
+}

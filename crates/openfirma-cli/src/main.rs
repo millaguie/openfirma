@@ -1961,6 +1961,18 @@ struct PendingConfig {
     password_file: PathBuf,
 }
 
+/// The path the handler will be handed, made independent of this process's
+/// working directory (finding 04-N5). An absolute path already is; a relative
+/// one is resolved here, against the only directory it can have meant to the
+/// person who typed it.
+fn absolute_for_handler(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::fs::canonicalize(&path)
+        .with_context(|| format!("resolving {} against the current directory", path.display()))
+}
+
 fn prepare_browser_config(
     p12: Option<&Path>,
     password_file: Option<&Path>,
@@ -2000,6 +2012,16 @@ fn prepare_browser_config(
     // B-2: the config names (and the password file IS) signing-key material —
     // same private-mode rule on both, before anything reads them.
     openfirma_browser::scheme::check_private(&pw_file).map_err(anyhow::Error::msg)?;
+    // 04-N5: what goes into the config is a path the BROWSER's handler can
+    // find, and the handler is launched by the desktop session from whatever
+    // directory that session calls home — not from the one this command ran in.
+    // The README's own example (`--register --p12 certificado.p12`) stored the
+    // relative path verbatim, so the registration only worked when the desktop
+    // happened to start in the same directory; every other session died with
+    // "No such file or directory". Absolute paths are already CWD-independent
+    // and are kept exactly as given.
+    let container = absolute_for_handler(container)?;
+    let pw_file = absolute_for_handler(pw_file)?;
     let contents = openfirma_browser::scheme::BrowserConfig {
         p12: Some(container.clone()),
         password_file: Some(pw_file.clone()),
