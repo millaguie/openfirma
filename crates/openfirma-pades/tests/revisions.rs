@@ -3512,3 +3512,80 @@ fn re_publishing_a_signed_object_under_another_generation_refuses_on_both_halves
         "both verdicts speak about object 4: {text}"
     );
 }
+
+/// Round 7's B-1, the lying `/Length` that hid a rewrite from the gate. The stream
+/// the first signature covers is honest — `/Length` equals its payload. The second
+/// pass rewrites THAT object keeping the dictionary byte for byte (so the declared
+/// length still says 47) and appends ink between the declared end and `endstream`.
+/// A gate that compares payloads by `/Length` reads forty-seven bytes on both sides,
+/// sees nothing, and the document verifies while qpdf — out loud, "attempting to
+/// recover stream length / recovered stream length" — Ghostscript and pdftotext all
+/// render `PAGUESE 9999 EUR`, text no signature ever covered. Readers that honour
+/// `/Length` hide it instead; the archive rule cannot depend on which camp a reader
+/// belongs to, so the comparison goes through what the recovering readers see. The
+/// pass carries no signature of its own: the single real signature's crypto is
+/// untouched by appending, so under the reverted comparison `pades_verify` answers
+/// OK and this test goes red — which is exactly how it behaved before the fix, the
+/// wrong-reason trap in reverse.
+#[test]
+fn a_rewrite_hidden_behind_a_lying_length_is_still_a_stream_rewrite() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let headline = b"BT /F1 24 Tf 72 700 Td (PAGO UN CERO UNO) Tj ET";
+    let plain = pades_sign(
+        &append_two(INPUT, &[(4, &stream_body(headline))]),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing");
+    pades_verify(&plain, &anchors()).expect("the document verifies before the pass");
+
+    // same dictionary (`/Length` still the headline's width), payload kept whole,
+    // ink appended past the declared end and before `endstream` — the shape qpdf
+    // recovers from and pdftotext prints
+    let ink = b"BT /F1 24 Tf 72 600 Td (PAGUESE 9999 EUR) Tj ET";
+    let mut extended = format!("<< /Length {} >>\nstream\n", headline.len()).into_bytes();
+    extended.extend_from_slice(headline);
+    extended.push(b'\n');
+    extended.extend_from_slice(ink);
+    extended.extend_from_slice(b"\nendstream");
+    let attacked = append_two(&plain, &[(4, &extended)]);
+
+    // the readers' side measured on the shape, not asserted: what this very file
+    // says its stream holds is forty-some bytes; a recovering reader disagrees by
+    // construction here — assert the lie exists, then let the gate prove it sees it
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("ink appeared inside a covered content stream; recovery readers show it")
+        .to_string();
+    assert!(
+        text.contains('4'),
+        "the refusal names the content object whose payload grew past its own /Length: {text}"
+    );
+
+    // the variant with `/Length 99999` (a claim past the end of the file): the
+    // reviewer measured it too — gs renders the ink and their pre-fix gate judged
+    // ZERO redefinitions. A length that cannot fit the file is not trusted by the
+    // recovering readers either: `endstream` decides, and the gate follows.
+    let mut huge = format!("<< /Length 99999 >>\nstream\n").into_bytes();
+    huge.extend_from_slice(headline);
+    huge.push(b'\n');
+    huge.extend_from_slice(ink);
+    huge.extend_from_slice(b"\nendstream");
+    let attacked = append_two(&plain, &[(4, &huge)]);
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("a /Length past the file is not believed by anyone; the ink still shows")
+        .to_string();
+    assert!(
+        text.contains('4'),
+        "the refusal names the content object again: {text}"
+    );
+
+    // control: the SAME second pass writing only the original bytes — dictionary,
+    // length and all, honestly — is an identical-body rewrite the gate licenses as a
+    // no-change, proving the half above refused the GROWTH and not my hand-writing
+    let honest = append_two(&plain, &[(4, &stream_body(headline))]);
+    pades_verify(&honest, &anchors())
+        .expect("republishing the same bytes is not a change no archive may append");
+}

@@ -1151,6 +1151,21 @@ pub fn stream_raw(data: &[u8], offset: usize) -> Result<Vec<u8>> {
         return Ok(data[i..i + n].to_vec());
     }
 
+    // unchanged from before the recovery function existed: /Length was already
+    // tried above (that is how we got here), so the marker is all that is left
+    match find_endstream(data, i) {
+        Some(end) => Ok(data[i..end].to_vec()),
+        None => Err(Error::Pdf(format!(
+            "the stream at {offset} has an indirect /Length and no endstream to fall back on"
+        ))),
+    }
+}
+
+/// Where this stream's payload really ends: the byte before an `endstream` that
+/// is really the end (an `endobj` follows it, which compressed data does not
+/// contain by accident often enough to matter), with the single run of end-of-line
+/// bytes before the keyword stripped. `None` when no such marker exists at all.
+fn find_endstream(data: &[u8], i: usize) -> Option<usize> {
     let mut from = i;
     while let Some(p) = data[from..].windows(9).position(|w| w == b"endstream") {
         let candidate = from + p;
@@ -1161,13 +1176,72 @@ pub fn stream_raw(data: &[u8], offset: usize) -> Result<Vec<u8>> {
             while end > i && (data[end - 1] == b'\n' || data[end - 1] == b'\r') {
                 end -= 1;
             }
-            return Ok(data[i..end].to_vec());
+            return Some(end);
         }
         from = candidate + 9;
     }
-    Err(Error::Pdf(format!(
-        "the stream at {offset} has an indirect /Length and no endstream to fall back on"
-    )))
+    None
+}
+
+/// The payload of a stream as the RECOVERING readers see it: what `/Length`
+/// declares, or as far as the real `endstream` reaches when that is longer; and
+/// when `/Length` cannot be believed at all — unparseable, or past the end of the
+/// file — exactly where the marker says.
+///
+/// `/Length` is the specification's word and [`stream_raw`] rightly trusts it —
+/// but qpdf, Ghostscript and poppler do not stop trusting a lying length: when
+/// the bytes after the declared end are not an `endstream`, they scan to the real
+/// one and re-render from there (measured on round 7's PoC, where qpdf says so out
+/// loud: "attempting to recover stream length" / "recovered stream length: 97",
+/// while pdftotext prints text no signature covered). A later pass that keeps a
+/// lying stream's dictionary byte-identical and LENGTHENS the payload is therefore
+/// not invisible: the extra bytes are exactly what those readers show. The
+/// revision gate compares bodies through this function so such a rewrite is seen
+/// as the stream rewrite it is; readers that honour `/Length` still hide the ink —
+/// no verdict may depend on which side of that disagreement a reader sits on.
+pub fn stream_payload_as_readers(data: &[u8], offset: usize) -> Result<Vec<u8>> {
+    let dict_span = object_body(data, offset)?;
+    let dict = &data[dict_span.clone()];
+    let mut i = skip_ws(data, dict_span.end);
+    if !data[i..].starts_with(b"stream") {
+        return Err(Error::Pdf(format!(
+            "the object at {offset} is not a stream"
+        )));
+    }
+    // the same step past `stream` and its end-of-line that stream_raw takes
+    i += 6;
+    if data[i..].starts_with(b"\r\n") {
+        i += 2;
+    } else if at(data, i) == b'\n' || at(data, i) == b'\r' {
+        i += 1;
+    }
+    // a length that runs past the end of the file is not trusted even by the
+    // recovering readers (their scan stops at `endstream` anyway); everything
+    // else stands until the marker reaches farther than it does
+    let declared = get(dict, "/Length")
+        .and_then(parse_uint)
+        .map(|n| n as usize)
+        .filter(|n| *n <= data.len() - i);
+    let end = find_endstream(data, i);
+    let stop = match (declared, end) {
+        (Some(n), Some(e)) => (i + n).max(e),
+        (Some(n), None) => i + n,
+        (None, Some(e)) => e,
+        (None, None) => {
+            return Err(Error::Pdf(format!(
+                "the stream at {offset} has no readable /Length and no endstream to fall back on"
+            )));
+        }
+    };
+    let span = stop - i;
+    let cap = crate::stream::MAX_DECODED_STREAM;
+    if span > cap {
+        return Err(Error::Pdf(format!(
+            "the stream declares a {span}-byte read, more than the {cap} openfirma copies \
+             from one stream: a structural stream this large is not a document"
+        )));
+    }
+    Ok(data[i..stop].to_vec())
 }
 
 thread_local! {
