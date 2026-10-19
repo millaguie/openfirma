@@ -102,9 +102,14 @@ fn a_truncated_container_is_a_keystore_error_never_a_panic() {
     let exact = Pkcs12::load(&[0x30, 0x84], "openfirma").expect_err("two bytes are not a PKCS#12");
     let text = exact.to_string();
     assert!(text.contains("runs past the input"), "{text}");
+    // Round 2, N8: the way out must be a command that writes a container.
+    // `openssl pkcs12 -in old.p12 -out new.p12` — what this assertion used to
+    // pin, and what the refusal used to say — writes PEM files, so the reader
+    // who followed it got a .p12-named file openfirma then refused again.
     assert!(
-        text.contains("openssl pkcs12 -in old.p12 -out new.p12"),
-        "{text}"
+        text.contains("openssl pkcs12 -legacy -in old.p12 -nodes")
+            && text.contains("-export -out new.p12"),
+        "the re-export recipe must produce a PKCS#12: {text}"
     );
 
     // every prefix of a real container, plus the long-form markers written

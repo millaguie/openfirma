@@ -606,7 +606,8 @@ fn non_utf8_secret_error() -> String {
      encoding openfirma cannot represent. PKCS#12 encodes passwords as UTF-16 \
      BMPStrings and openfirma re-encodes them from UTF-8; supply the password as \
      UTF-8, or re-export the container with an ASCII password: \
-     `openssl pkcs12 -in old.p12 -out new.p12`"
+     `openssl pkcs12 -legacy -in old.p12 -nodes | openssl pkcs12 -export -out new.p12` \
+     (the key crosses the pipe in the clear)"
         .to_string()
 }
 

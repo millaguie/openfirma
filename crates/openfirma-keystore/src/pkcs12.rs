@@ -75,6 +75,18 @@ const OID_HMAC_SHA1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.11
 const OID_HMAC_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.9");
 const OID_HMAC_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.10");
 const OID_HMAC_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.2.11");
+
+/// The re-export recipe every "this container is one openfirma cannot open"
+/// refusal ends with. It produces an actual PKCS#12: `-legacy` is what lets
+/// OpenSSL 3 even READ the cipher and MAC families this crate turns away by
+/// name, and the pipe re-exports as a modern PBES2/SHA-256 container in one
+/// step. (`openssl pkcs12 -in old.p12 -out new.p12` — what these sentences
+/// said before — writes PEM files, not a container: round 1, A2, raised again
+/// by round 2, N8.) The private key crosses the pipe in the clear, which the
+/// sentence says rather than leaving it to be discovered.
+const REEXPORT: &str = "`openssl pkcs12 -legacy -in old.p12 -nodes | openssl pkcs12 \
+     -export -out new.p12` (the key crosses the pipe in the clear)";
+
 const OID_AES128_CBC: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.2");
 const OID_AES192_CBC: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.22");
 const OID_AES256_CBC: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.42");
@@ -298,8 +310,7 @@ impl Level {
         let mut inner = base.resume_at(self.i);
         let v = inner.value().map_err(|e| {
             Error::Keystore(format!(
-                "{e}. Re-export the file with `openssl pkcs12 -in old.p12 \
-                 -out new.p12` if it came from elsewhere"
+                "{e}. Re-export the file with {REEXPORT} if it came from elsewhere"
             ))
         })?;
         self.i = inner.position();
@@ -342,8 +353,7 @@ impl Level {
         if tag != 0x04 {
             return Err(Error::Keystore(format!(
                 "expected an OCTET STRING in the PKCS#12, found tag {tag:#04x}. \
-                 Re-export the file with `openssl pkcs12 -in old.p12 -pw new.p12` \
-                 if it came from elsewhere"
+                 Re-export the file with {REEXPORT} if it came from elsewhere"
             )));
         }
         // A nested OCTET STRING means BER put one element in the wrapper
@@ -566,7 +576,7 @@ fn join_octet_elements(mut level: Level) -> Result<Zeroizing<Vec<u8>>> {
 fn sequence_error(tag: u8) -> Error {
     Error::Keystore(format!(
         "expected a SEQUENCE in the PKCS#12, found tag {tag:#04x}. Re-export the \
-         file with `openssl pkcs12 -in old.p12 -out new.p12` if it came from elsewhere"
+         file with {REEXPORT} if it came from elsewhere"
     ))
 }
 
@@ -595,8 +605,8 @@ fn check_iterations(iterations: usize, what: &str) -> Result<()> {
         return Err(Error::Keystore(format!(
             "the PKCS#12 asks for {iterations} {what} iterations, more than the \
              {MAX_ITERATIONS} openfirma accepts: the file is hostile or so old that \
-             nothing wrote it that a current tool reads. Re-export it with \
-             `openssl pkcs12 -in old.p12 -out new.p12`, which uses a sane count"
+             nothing wrote it that a current tool reads. Re-export it with {REEXPORT}, \
+             which uses a sane count"
         )));
     }
     Ok(())
@@ -768,6 +778,12 @@ fn read_macs(cur: &mut Level) -> Result<Vec<MacData>> {
 /// The MAC is the password check. Doing it first means a wrong password is
 /// reported as a wrong password, not as padding garbage three layers down.
 /// Several MacData entries verify independently; one match is integrity.
+///
+/// Round 2, N8: a MAC whose algorithm this reader does not implement is NOT a
+/// wrong password, and the two have to be told apart — the digest lives in the
+/// file, not in the password. The named refusal is kept and returned only when
+/// nothing matched, so a container that mixes an unsupported MAC with a
+/// supported one still opens on the supported one.
 fn verify_mac(macs: &[MacData], auth_safe: &[u8], password: &str) -> Result<()> {
     // The MAC keeps the strict PKCS#12 rule — BMPString, `00 00` for the empty
     // password on OpenSSL/NSS, no bytes at all on Java (review 04, A3). Both
@@ -776,12 +792,18 @@ fn verify_mac(macs: &[MacData], auth_safe: &[u8], password: &str) -> Result<()> 
     // PBES2's PBKDF2 over raw UTF-8 while the MAC stays BMP (see
     // `password_candidates`), which is exactly why verify_mac succeeding and a
     // bag refusing to decrypt were both true for an openssl-exported file.
+    let mut unsupported: Option<Error> = None;
     for pw in &mac_password_candidates(password) {
         for mac in macs {
-            if check_one_mac(mac, auth_safe, pw) {
-                return Ok(());
+            match check_one_mac(mac, auth_safe, pw) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => unsupported = Some(e),
             }
         }
+    }
+    if let Some(e) = unsupported {
+        return Err(e);
     }
     Err(Error::Keystore(
         "the PKCS#12 integrity check failed: wrong password, or the file was \
@@ -875,7 +897,7 @@ fn pbes2_password_candidates(password: &str) -> Vec<Zeroizing<Vec<u8>>> {
     out
 }
 
-fn check_one_mac(mac: &MacData, auth_safe: &[u8], pw: &[u8]) -> bool {
+fn check_one_mac(mac: &MacData, auth_safe: &[u8], pw: &[u8]) -> Result<bool> {
     // instantiated per hash rather than generic over it: Hmac's bounds in this
     // digest generation are a thicket, and there are exactly five hashes a
     // PKCS#12 MAC can use (MD5 the legacy one)
@@ -891,14 +913,14 @@ fn check_one_mac(mac: &MacData, auth_safe: &[u8], pw: &[u8]) -> bool {
             );
             let mut m = match <Hmac<$d> as KeyInit>::new_from_slice(&key) {
                 Ok(m) => m,
-                Err(_) => return false,
+                Err(_) => return Ok(false),
             };
             m.update(auth_safe);
             // constant time: the MAC is compared before the password is known
             // to be right, so an early exit here would leak it digest byte by
             // digest byte to anyone who can hand us files and watch the time
             let computed = m.finalize().into_bytes();
-            bool::from(mac.digest.as_slice().ct_eq(computed.as_slice()))
+            Ok(bool::from(mac.digest.as_slice().ct_eq(computed.as_slice())))
         }};
     }
     match mac.digest_oid {
@@ -911,12 +933,21 @@ fn check_one_mac(mac: &MacData, auth_safe: &[u8], pw: &[u8]) -> bool {
         OID_SHA256 => check!(sha2::Sha256, 64),
         OID_SHA384 => check!(sha2::Sha384, 128),
         OID_SHA512 => check!(sha2::Sha512, 128),
-        // PBMAC1 (RFC 9579) integrity keeps the *bag* MACs inside a different
-        // scheme; rare in the wild. Named refusal beats a wrong-password lie.
-        other => {
-            tracing::debug!("unsupported PKCS#12 MAC digest {other}");
-            false
-        }
+        // Round 2, N8: an unknown MAC algorithm is not a wrong password, and
+        // saying so costs a user their afternoon. PBMAC1 (RFC 9579) is the one
+        // that exists in the field — it puts its KDF and HMAC in the
+        // parameters, so the digest slot only ever held its own OID — and it
+        // gets named; any other OID gets its number.
+        OID_PBMAC1 => Err(Error::Keystore(format!(
+            "this PKCS#12 is protected with PBMAC1 (RFC 9579), which openfirma does not \
+             implement. Re-export it with {REEXPORT}, which produces a container whose \
+             MAC this reader can check"
+        ))),
+        other => Err(Error::Keystore(format!(
+            "this PKCS#12's integrity is protected with a MAC algorithm openfirma does \
+             not implement ({other}). Re-export it with {REEXPORT}, which produces a \
+             container whose MAC this reader can check"
+        ))),
     }
 }
 
@@ -1146,7 +1177,7 @@ fn bmp_string(bytes: &[u8]) -> Result<String> {
             "the PKCS#12 carries a BMPString that is not valid UTF-16 (an unpaired \
              surrogate): the alias, or the password on the tool that wrote the file, \
              contains non-ASCII characters this reader cannot represent. Re-export the \
-             container with an ASCII alias: `openssl pkcs12 -in old.p12 -out new.p12`"
+             container with an ASCII alias: {REEXPORT}"
                 .into(),
         )
     })
@@ -1264,12 +1295,11 @@ pub(crate) fn decrypt_pbe(
                 cbc_decrypt::<des::TdesEde3>(&key, &iv, encrypted)
             }
         }
-        OID_PBMAC1 => Err(Error::Keystore(
-            "this PKCS#12 is protected with PBMAC1 (RFC 9579), which openfirma does not \
-             implement yet; re-export it with `openssl pkcs12 -in old.p12 -out new.p12` \
-             (without -pbmac1_* options)"
-                .into(),
-        )),
+        // (PBMAC1 is not here: it is a MAC scheme, so it is named where MACs
+        // are decided — `check_one_mac`. This matcher only ever sees
+        // encryption algorithms, and the branch that used to sit here was
+        // unreachable dead code carrying a re-export recipe that wrote PEM.
+        // Round 2, N8.)
         other => Err(Error::Keystore(format!(
             "unsupported PKCS#12 encryption scheme {other}"
         ))),
@@ -1475,7 +1505,7 @@ fn decrypt_pbes2(params: &[u8], encrypted: &[u8], pw: &[u8]) -> Result<Zeroizing
             return Err(Error::Keystore(format!(
                 "the PKCS#12 declares a PBKDF2 keyLength of {declared} for a cipher \
                  with a {key_len} byte key: its parameters disagree with themselves. \
-                 Re-export it with `openssl pkcs12 -in old.p12 -out new.p12`"
+                 Re-export it with {REEXPORT}"
             )));
         }
     }
@@ -1528,7 +1558,7 @@ fn decrypt_pbes2(params: &[u8], encrypted: &[u8], pw: &[u8]) -> Result<Zeroizing
         return Err(Error::Keystore(format!(
             "RC2-CBC declares an effective key length of {declared_bits} bits over \
              a PBKDF2 key of {} bytes: its parameters name two different ciphers. \
-             Re-export the file with `openssl pkcs12 -in old.p12 -out new.p12`",
+             Re-export the file with {REEXPORT}",
             key_len
         )));
     }
@@ -1711,24 +1741,87 @@ mod tests {
     }
 
     /// The smallest shape that is still a PFX: version 3, an empty plain
-    /// authenticated safe, and a MAC whose iteration count is the point of
-    /// the test. No certificate material anywhere, so it can live here.
-    fn pfx_with_mac_iterations(iterations: usize) -> Vec<u8> {
-        let digest_info = tlv::sequence(&[
-            tlv::sequence(&[tlv::oid(&OID_SHA1).unwrap(), tlv::null()]),
-            tlv::octet_string(&[0u8; 20]).unwrap(),
-        ]);
-        let mac_data = tlv::sequence(&[
-            digest_info,
-            tlv::octet_string(b"saltsalt").unwrap(),
-            der_integer(iterations),
-        ]);
+    /// authenticated safe, and the MAC entries given as
+    /// `(digest algorithm, digest bytes, salt, iterations)`. No certificate
+    /// material anywhere, so it can live here.
+    fn pfx_with_macs(macs: &[(ObjectIdentifier, Vec<u8>, &[u8], usize)]) -> Vec<u8> {
         let safe_contents = tlv::sequence(&[]);
         let auth_safe = tlv::sequence(&[
             tlv::oid(&OID_DATA).unwrap(),
             tlv::explicit(0, &tlv::octet_string(&safe_contents).unwrap()),
         ]);
-        tlv::sequence(&[tlv::integer_small(3), auth_safe, mac_data])
+        let mut elements = vec![tlv::integer_small(3), auth_safe];
+        for (oid, digest, salt, iterations) in macs {
+            let digest_info = tlv::sequence(&[
+                tlv::sequence(&[tlv::oid(oid).unwrap(), tlv::null()]),
+                tlv::octet_string(digest).unwrap(),
+            ]);
+            elements.push(tlv::sequence(&[
+                digest_info,
+                tlv::octet_string(salt).unwrap(),
+                der_integer(*iterations),
+            ]));
+        }
+        tlv::sequence(&elements)
+    }
+
+    /// The one shape the iteration tests care about: a SHA-1 MAC over the empty
+    /// authenticated safe, with whatever digest bytes the test wants.
+    fn pfx_with_mac_iterations(iterations: usize) -> Vec<u8> {
+        pfx_with_macs(&[(OID_SHA1, vec![0u8; 20], b"saltsalt", iterations)])
+    }
+
+    /// Round 2, N8: a MAC algorithm this reader does not implement was reported
+    /// as a wrong password — the comment above it said "named refusal beats a
+    /// wrong-password lie" while the code returned the lie. PBMAC1 and a future
+    /// hash both land in the same slot (the digest algorithm of MacData), and
+    /// the answer has to say which: a user whose password is fine must not be
+    /// sent looking for a bad one.
+    #[test]
+    fn an_unimplemented_mac_algorithm_is_named_not_called_a_wrong_password() {
+        for (oid, named) in [
+            (OID_PBMAC1, "PBMAC1"),
+            (
+                ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"),
+                "2.16.840.1.101.3.4.2.8",
+            ),
+        ] {
+            let pfx = pfx_with_macs(&[(oid, vec![0u8; 32], b"saltsalt", 2048)]);
+            let err = load(&pfx, "whatever").unwrap_err().to_string();
+            assert!(
+                err.contains(named),
+                "the refusal must name the algorithm: {err}"
+            );
+            assert!(
+                !err.contains("wrong password"),
+                "an algorithm openfirma does not implement is not a wrong password: {err}"
+            );
+            assert!(
+                err.contains("openssl pkcs12 -legacy"),
+                "the way out must be one that writes a container: {err}"
+            );
+        }
+    }
+
+    /// And a container that carries an unimplemented MAC next to a working one
+    /// still opens: PKCS#12 allows several MacData entries, one spelling per
+    /// password/algorithm pairing, and one match is integrity. Aborting at the
+    /// unimplemented entry instead of collecting it would turn a readable file
+    /// into a refusal.
+    #[test]
+    fn an_unimplemented_mac_beside_a_good_one_still_opens() {
+        let salt: &[u8] = b"saltsalt";
+        let auth_safe_bytes = tlv::sequence(&[]);
+        let key =
+            pkcs12_kdf::<sha1::Sha1>(3, &mac_password_candidates("pw")[0], salt, 2048, 20, 64);
+        let mut m = <Hmac<sha1::Sha1> as KeyInit>::new_from_slice(&key).unwrap();
+        m.update(&auth_safe_bytes);
+        let digest = m.finalize().into_bytes().to_vec();
+        let pfx = pfx_with_macs(&[
+            (OID_PBMAC1, vec![0u8; 32], salt, 2048),
+            (OID_SHA1, digest, salt, 2048),
+        ]);
+        load(&pfx, "pw").expect("the working MAC is what integrity is");
     }
 
     /// The MAC runs before anything is decrypted, so its iteration count is

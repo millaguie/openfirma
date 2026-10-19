@@ -109,7 +109,9 @@ mod tests {
         // rewriting it would be strictly worse for the reader.
         let e = Error::Keystore(
             "this PKCS#12 uses RC2, a cipher from 1995 that this reader will not \
-             implement. Re-export it with `openssl pkcs12 -in old.p12 -out new.p12`"
+             implement. Re-export it with `openssl pkcs12 -legacy -in old.p12 -nodes \
+             | openssl pkcs12 -export -out new.p12` (the key crosses the pipe in the \
+             clear)"
                 .into(),
         );
         let r = report(&e, &Tr::es());
