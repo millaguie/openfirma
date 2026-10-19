@@ -350,6 +350,10 @@ fn declaration_pseudo_attributes(content: &str) -> std::result::Result<[Option<&
     let mut i = 0usize;
     let mut out: [Option<&str>; 3] = [None; 3];
     for (slot, expected) in ORDER.iter().enumerate() {
+        // Where this slot left off if it turns out not to exist: an absent
+        // optional slot has to hand the same bytes back to the next one, and the
+        // separator skipped below is part of them.
+        let resume = i;
         if slot > 0 {
             // production [24] separates the pseudo-attributes with S; two of
             // them side by side (`version="1.0"encoding=…`) are what libxml2
@@ -385,6 +389,19 @@ fn declaration_pseudo_attributes(content: &str) -> std::result::Result<[Option<&
         }
         let name = &content[start..i];
         if name != *expected {
+            // Only `version` is mandatory: production [24] makes EqEncoding and
+            // EqStandalone optional, so `version="1.0" standalone="yes"` is a
+            // declaration libxml2, AutoFirma and every other parser reads. What
+            // is not a declaration is a *later* name appearing where an *earlier*
+            // one would have to be, so the test is whether the name found belongs
+            // to a slot still ahead: if it does, this slot is simply absent and
+            // the bytes go back unread to the next one. Round two's N-4 closure
+            // read the three slots positionally and refused that legal shape,
+            // which is the same false-refusal mistake in the other direction.
+            if slot > 0 && ORDER[slot + 1..].contains(&name) {
+                i = resume;
+                continue;
+            }
             return Err(format!(
                 "the declaration has {name:?} where production [24] allows {expected}"
             ));
@@ -549,8 +566,12 @@ impl<'a> Parser<'a> {
         // N-3 and N-4): `<?xml` S version Eq AttValue (S encoding Eq AttValue)?
         // (S standalone Eq AttValue)? S? `?>`, and nothing else. A declaration
         // no other parser can read is not a document whose bytes this reader
-        // may interpret — libxml2 refuses every shape this rejects — so it is
-        // refused with the reason instead of being rewritten.
+        // may interpret, and on that shape rule libxml2 agrees: it refuses every
+        // declaration this one rejects for being outside [24]. The two rules
+        // layered on top — only version 1.0, and only encodings whose bytes can
+        // be read with certainty — are ours, and they refuse more than libxml2
+        // does on purpose (it accepts version=\"1.1\"; see `check_declaration`).
+        // A refusal is issued with its reason instead of rewriting the file.
         let attrs = declaration_pseudo_attributes(content).map_err(|reason| {
             self.err(&format!(
                 "the XML declaration is not the XMLDecl production [24] \

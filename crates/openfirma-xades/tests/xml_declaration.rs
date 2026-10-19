@@ -103,6 +103,12 @@ fn the_declaration_is_the_production() {
         b"<?xml version=\"1.0\" encoding=\"UTF-8\" encoding=\"UTF-8\"?><doc/>",
         b"<?xml version=\"1.0\" standalone=\"yes\" encoding=\"us-ascii\"?><doc/>",
         b"<?xml version=\"1.0\" standalone=\"maybe\"?><doc/>",
+        // Skipping an absent optional slot must not turn into a licence to
+        // reorder or repeat: `version` is production [24]'s first and only
+        // mandatory name, and a name twice is not the production.
+        b"<?xml encoding=\"UTF-8\" version=\"1.0\"?><doc/>",
+        b"<?xml version=\"1.0\" version=\"1.1\"?><doc/>",
+        b"<?xml version=\"1.0\" standalone=\"yes\" standalone=\"no\"?><doc/>",
         b"<?xml VERSION=\"1.0\"?><doc/>",
         b"<?xml version=\"1.0\"encoding=\"UTF-8\"?><doc/>",
         b"<?xml?><doc/>",
@@ -120,6 +126,13 @@ fn the_declaration_is_the_production() {
         b"<?xml\nversion=\"1.0\"?><doc/>",
         b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\" ?><doc/>",
         b"<?xml version='1.0'?><doc/>",
+        // The two optional slots are optional *independently*. Production [24]
+        // has EqEncoding? and EqStandalone?, so a declaration may carry the
+        // standalone without the encoding — libxml2 and AutoFirma both read this,
+        // and the positional reader added with N-4 refused it (which is a false
+        // refusal about a legal document, the more expensive direction).
+        b"<?xml version=\"1.0\" standalone=\"yes\"?><doc/>",
+        b"<?xml version=\"1.0\" standalone = 'no'?><doc/>",
     ];
     for input in accepted {
         assert!(
