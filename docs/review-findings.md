@@ -203,7 +203,7 @@ and the ones that are not closed say what is still open.
   sane; no copied AutoFirma code; no personal data; pure-Rust where it
   matters; edition 2024 consistent).
 
-## Adversarial rounds on the fixes itself (`R1`, `R2`, `R3`)
+## Adversarial rounds on the fixes itself (`R1` … `R7`)
 
 The seven reviews above judge the code; these rounds judge the *fixes*. A
 frozen tree was handed to a model that had not written them, with the findings
@@ -323,6 +323,7 @@ round of *fixes* review above.
 | 05-N11 | The README's `afirma-serve` command exits 1: the documented first step of the browser path was a refusal | fixed (`c340d81`): the line carries `--allow-unattended`, and a test reads that command out of `README.md` (following its shell continuation) and runs the same shape both ways — with the flag the endpoint starts and prints its token, without it the refusal names the flag |
 
 
+| R7-H1 | **An appearance was licensed by who wrote it, not by whose slot it is.** `appearances` is a set of object numbers, and `appearance_chain` asks one question about each: was it written by the pass of the signature that owns the widget the walk started from. That is provenance of the WRITER, and the set was answering a different question — is this a place a new signature may write. A second signer's own legitimate chain (widget, `/AP /N`, that appearance's `/Resources /XObject`, every one written and covered by that signer) reaches the number the FIRST signer's covered widget had named and that did not exist when it signed; the second pass writes ink there, it is drawn inside the first signature's rectangle, both signatures verify, and `pdftotext` returns the ink — measured end to end with a real CMS (`e2e.pdf` in the round's report), with a deep variant (`e2e-I.pdf`) reaching the same number through the covered form's own `/Resources`, one hop from bytes the signature did attest | fixed (`44e09ce`: the licensing branch also asks that the covered bytes had not already named the object — nobody the pass left alone points at it, and no rewritten object's EARLIER body did either; that second half is what a writer that respells the `/Resources` it touches makes necessary, because respelling moves the namer to the changed side). Five tests, five reverts: with the guard gone the end-to-end one goes back to verifying OK (that is the attack working), and each half alone goes red on exactly the shapes that half exists for. The walk's bound keeps failing closed and now says so in the refusal rather than describing bytes it never read — its own test, bitten by lifting the bound and by reverting the message — and 64 stays because the reference tool's deepest appearance chain measures three objects, read off AutoFirma 1.9.1's own twice-signed two-field output with its object streams flattened) |
 ## What remains unverifiable from this repository
 
 1. **Windows runtime paths**: PKCS#11 against a real card DLL, and the CAPI
