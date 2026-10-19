@@ -651,9 +651,20 @@ fn a_signed_pdf_dropped_becomes_verdicts_not_a_new_signing_task() {
     let mut app = fixture_app(None);
     app.set_anchors_for_test(vec![testdata().join("certs/chain.crt")]);
     app.load_path_for_test(out.clone());
+    // A-1's second half, asserted before a frame is drawn: a verification
+    // parks the screen and says what it is doing, instead of leaving the drop
+    // zone painted while the whole archive is read. Same park shape the
+    // signing job and the keystore open have had since `c58831a`/`141cdd2`.
+    assert!(
+        matches!(app.screen_ref_for_test(), Screen::Verifying { .. }),
+        "a verification parks the screen with its spinner"
+    );
     // The verify starts a worker (A-1); kittest has no frame loop to drain it,
     // so the test answers through the app's own transition.
     let mut harness = harness_for(app);
+    // A spinner never settles: one frame, not `run()`.
+    harness.step();
+    harness.get_by_label_contains("Comprobando la firma");
     harness
         .state_mut()
         .deliver_verify_answer_for_test(Ok(answer));

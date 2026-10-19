@@ -72,6 +72,10 @@ pub struct Tr {
     /// 06-N-10: opening a keystore (module load + login) runs on the worker,
     /// so the window says what it is waiting for instead of freezing.
     pub opening_store: String,
+    /// A-1's second half: a verification also runs on the worker, and the
+    /// window says so instead of leaving the drop zone painted while the
+    /// verdict is being built.
+    pub verifying: String,
     // --- verify -----------------------------------------------------------
     pub verdict_valid: String,
     pub verdict_invalid: String,
@@ -272,6 +276,9 @@ impl Tr {
             save_as: "Guardar en otra parte…".into(),
             copy_path: "Copiar ruta".into(),
             sign_another: "Firmar otro documento".into(),
+            verifying: "Comprobando la firma. En documentos grandes puede tardar unos \
+                        segundos…"
+                .into(),
             signing_in_progress: "Firmando. Si usas una tarjeta, tenla a mano…".into(),
             opening_store: "Abriendo el almacén de certificados. Si usas una tarjeta, tenla a \
                             mano…"
@@ -458,6 +465,7 @@ impl Tr {
             save_as: "Save as…".into(),
             copy_path: "Copy path".into(),
             sign_another: "Sign another document".into(),
+            verifying: "Checking the signature. A large document can take a few seconds…".into(),
             signing_in_progress: "Signing. If you use a card, have it ready…".into(),
             opening_store: "Opening the certificate store. If you use a card, have it ready…"
                 .into(),
@@ -652,6 +660,7 @@ impl Tr {
             &self.sign_another,
             &self.signing_in_progress,
             &self.opening_store,
+            &self.verifying,
             &self.verdict_valid,
             &self.verdict_invalid,
             &self.verdict_unknown,

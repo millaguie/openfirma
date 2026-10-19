@@ -446,11 +446,18 @@ impl App {
         }
         let tr = self.tr.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        // A-1's second half: a verification also runs with the screen saying
+        // so. Building a verdict reads the whole archive, the embedded
+        // validation data and every signature in it; the drop zone used to
+        // stay painted through all of it, and a citizen who saw nothing
+        // happen dropped the same file again (refused, out loud, but refused).
+        let back = Box::new(std::mem::replace(&mut self.screen, Screen::Idle));
         std::thread::spawn(move || {
             let answer = run_verify_job(job, &tr);
             let _ = tx.send(WorkerReply::Verify(answer));
         });
         self.worker_rx = Some(rx);
+        self.screen = Screen::Verifying { back };
     }
 
     /// 06-N-10: opening a keystore is loading a module and logging in — the
@@ -504,7 +511,9 @@ impl App {
                 // is not a job that is still running).
                 self.worker_rx = None;
                 let back = match std::mem::replace(&mut self.screen, Screen::Idle) {
-                    Screen::Signing { back } | Screen::OpeningStore { back } => *back,
+                    Screen::Signing { back }
+                    | Screen::OpeningStore { back }
+                    | Screen::Verifying { back } => *back,
                     other => other,
                 };
                 self.pending_note = Some(self.tr.fail_worker_died.clone());
@@ -1459,6 +1468,19 @@ impl App {
         ui.label(self.tr.opening_store.clone());
     }
 
+    /// A-1: the one job whose screen the citizen used to watch do nothing.
+    /// Same shape as the signing spinner and the keystore one; the note is
+    /// rendered here too, because the drop that arrives during a verification
+    /// is refused out loud (`load_dropped`) and this is the screen that has to
+    /// carry the sentence.
+    fn render_verifying(&mut self, ui: &mut Ui) {
+        if let Some(note) = self.pending_note.clone() {
+            ui.colored_label(palette(ui).warn, note);
+        }
+        ui.spinner();
+        ui.label(self.tr.verifying.clone());
+    }
+
     /// Ask "this name already exists" once per attempt: save dialog answers,
     /// overwrite confirms, decline returns to the picker untouched (A-3).
     /// The key the chosen row signs with, or `None` when there is no row to
@@ -2202,6 +2224,7 @@ impl eframe::App for App {
             Screen::Picked { .. } => self.render_picked(ui),
             Screen::Signing { .. } => self.render_signing(ui),
             Screen::OpeningStore { .. } => self.render_opening_store(ui),
+            Screen::Verifying { .. } => self.render_verifying(ui),
             Screen::Done { .. } => self.render_done(ui),
             Screen::Verified { .. } => self.render_verified(ui),
             Screen::NeedsContent { .. } => self.render_needs_content(ui),

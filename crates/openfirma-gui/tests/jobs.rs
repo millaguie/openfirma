@@ -30,6 +30,7 @@ fn which(screen: &openfirma_gui::wizard::Screen) -> &'static str {
         S::Picked { .. } => "Picked",
         S::Signing { .. } => "Signing",
         S::OpeningStore { .. } => "OpeningStore",
+        S::Verifying { .. } => "Verifying",
         S::Done { .. } => "Done",
         S::Verified { .. } => "Verified",
         S::NeedsContent { .. } => "NeedsContent",

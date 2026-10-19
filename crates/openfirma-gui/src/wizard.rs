@@ -434,6 +434,16 @@ pub enum Screen {
         /// The Picked screen parked while the store opens.
         back: Box<Screen>,
     },
+    /// A verification is running on the worker thread (A-1's second half: the
+    /// drop zone used to sit there as if nothing were happening, for as long
+    /// as the archive took, with the file's own name already flashing in the
+    /// window's title bar). Same park shape again — what was on screen comes
+    /// back if the worker dies — but a verification's own answer replaces the
+    /// screen anyway, so `back` is only ever read on that failure.
+    Verifying {
+        /// The screen parked while the verdict is being built.
+        back: Box<Screen>,
+    },
     /// A signature is finished and held. This state cannot be left through
     /// the window's close button without an explicit decision; the bytes live
     /// here until they are saved for real or discarded on purpose.
@@ -483,6 +493,7 @@ impl Screen {
         match self {
             Screen::Signing { back } => Some(back),
             Screen::OpeningStore { back } => Some(back),
+            Screen::Verifying { back } => Some(back),
             _ => None,
         }
     }
@@ -498,7 +509,10 @@ impl Screen {
     /// had no password yet is dropped.
     pub fn restore(&self) -> Screen {
         match self {
-            Screen::Idle | Screen::Signing { .. } | Screen::OpeningStore { .. } => Screen::Idle,
+            Screen::Idle
+            | Screen::Signing { .. }
+            | Screen::OpeningStore { .. }
+            | Screen::Verifying { .. } => Screen::Idle,
             Screen::Picked {
                 path,
                 content,
