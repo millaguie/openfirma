@@ -48,6 +48,12 @@ use x509_cert::name::Name;
 pub const OID_EKU_TIME_STAMPING: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
 
+/// `anyExtendedKeyUsage` (RFC 5280 4.2.1.12): "this key may be used for any
+/// purpose". Named here because it is the one EKU entry that undoes a
+/// membership test — a certificate carrying it beside `id-kp-timeStamping`
+/// both passes the test and means the key is not a time-stamp authority's key.
+const OID_EKU_ANY_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37.0");
+
 /// `basicConstraints` (RFC 5280 4.2.1.9). The same OID as
 /// `const_oid::db::rfc5280::ID_CE_BASIC_CONSTRAINTS`, spelled out here in the
 /// dotted form every other OID in this file uses.
@@ -1221,6 +1227,22 @@ pub fn check_certificate_rules(cert: &CertificateHandle, role: CertRole) -> Resu
                 }
             }
             OID_EXTENDED_KEY_USAGE if role == CertRole::TimeStamping => {
+                // RFC 3161 2.3, in so many words: a time-stamp authority's
+                // extendedKeyUsage "MUST be present, MUST contain the extended
+                // key usage purpose id-kp-timeStamping, and MUST be marked as
+                // critical". The criticality is checked here because it is what
+                // makes the extension binding: a non-critical one is a note a
+                // verifier may ignore, and RFC 5280 forbids nothing about it,
+                // so only RFC 3161's own words make it a rule (round two, N8).
+                if !ext.critical {
+                    return Err(fail(
+                        CHECK_CERTIFICATE_CHAIN,
+                        format!(
+                            "the TSA certificate \"{}\" carries its extendedKeyUsage                              non-critical; RFC 3161 2.3 requires a time-stamp authority's to                              be marked critical, and a non-critical one is a statement                              verifiers are allowed to ignore",
+                            subject(cert)
+                        ),
+                    ));
+                }
                 let eku = ExtendedKeyUsage::from_der(ext.extn_value.as_bytes()).map_err(|e| {
                     fail(
                         CHECK_CERTIFICATE_CHAIN,
@@ -1230,6 +1252,19 @@ pub fn check_certificate_rules(cert: &CertificateHandle, role: CertRole) -> Resu
                         ),
                     )
                 })?;
+                // anyExtendedKeyUsage (2.5.29.37.0) alongside timeStamping says
+                // "this key is good for any purpose", which is exactly the
+                // reading the check below exists to prevent; it is refused by
+                // name rather than folded into the membership test.
+                if eku.0.contains(&OID_EKU_ANY_KEY_USAGE) {
+                    return Err(fail(
+                        CHECK_CERTIFICATE_CHAIN,
+                        format!(
+                            "the TSA certificate \"{}\" names anyExtendedKeyUsage                              ({OID_EKU_ANY_KEY_USAGE}) next to id-kp-timeStamping: a key that                              may sign for any purpose is not a time-stamp authority's key",
+                            subject(cert)
+                        ),
+                    ));
+                }
                 if !eku.0.contains(&OID_EKU_TIME_STAMPING) {
                     return Err(fail(
                         CHECK_CERTIFICATE_CHAIN,
@@ -1659,7 +1694,7 @@ pub(crate) fn subject(cert: &CertificateHandle) -> String {
     cert.subject().to_string()
 }
 
-fn fmt_time(t: SystemTime) -> String {
+pub(crate) fn fmt_time(t: SystemTime) -> String {
     match UtcTime::from_system_time(t) {
         Ok(u) => u.to_date_time().to_string(),
         // outside UTCTime's 1970..2049 window; the debug form still says when

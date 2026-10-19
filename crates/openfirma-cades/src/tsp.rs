@@ -470,6 +470,27 @@ pub fn verify_token_signature(
     })?;
     crate::verify::check_certificate_rules(tsa_cert, crate::verify::CertRole::TimeStamping)?;
 
+    // (6b) the instant the token asserts has to fall inside the validity of the
+    // certificate that signed it. A TSA keeps its key across certificate
+    // renewals, so a token can be perfectly signed by the right key and still
+    // claim a moment when that key was not under this certificate: round two's
+    // N8 measured a token with genTime 2010, signed by the current TSA key,
+    // verifying — a stamp back-dated into a period its own certificate does not
+    // cover is no evidence of when anything existed.
+    let validity = tsa_cert.parsed().tbs_certificate().validity();
+    let not_before = std::time::SystemTime::from(validity.not_before);
+    let not_after = std::time::SystemTime::from(validity.not_after);
+    if tst.gen_time < not_before || tst.gen_time > not_after {
+        return Err(Error::Other(format!(
+            "the token says it was stamped at {}, outside the validity of the TSA \
+             certificate that signed it ({} to {}): a stamp dated beyond its own \
+             certificate attests nothing",
+            crate::verify::fmt_time(tst.gen_time),
+            crate::verify::fmt_time(not_before),
+            crate::verify::fmt_time(not_after)
+        )));
+    }
+
     // (7) the messageImprint must hash under an algorithm this code can
     // compute. It is deliberately NOT required to be the algorithm the
     // SignerInfo digests under: RFC 3161 never asks for that, and the two
