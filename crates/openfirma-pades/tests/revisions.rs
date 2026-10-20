@@ -3568,7 +3568,7 @@ fn a_rewrite_hidden_behind_a_lying_length_is_still_a_stream_rewrite() {
     // reviewer measured it too — gs renders the ink and their pre-fix gate judged
     // ZERO redefinitions. A length that cannot fit the file is not trusted by the
     // recovering readers either: `endstream` decides, and the gate follows.
-    let mut huge = format!("<< /Length 99999 >>\nstream\n").into_bytes();
+    let mut huge = b"<< /Length 99999 >>\nstream\n".to_vec();
     huge.extend_from_slice(headline);
     huge.push(b'\n');
     huge.extend_from_slice(ink);
