@@ -1071,7 +1071,7 @@ fn int_array(value: &[u8]) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-fn parse_uint(bytes: &[u8]) -> Option<u32> {
+pub(crate) fn parse_uint(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(trim_ws(bytes))
         .ok()?
         .trim()
@@ -1183,6 +1183,19 @@ fn find_endstream(data: &[u8], i: usize) -> Option<usize> {
     None
 }
 
+/// Whether these bytes are a stream object: a dictionary followed by the
+/// `stream` keyword. The gate asks so that "I cannot read the payload" is never
+/// mistaken for "this object is a bare dictionary" (round 7's C-1).
+pub fn is_stream_object(data: &[u8], offset: usize) -> bool {
+    match object_body(data, offset) {
+        Ok(span) => {
+            let i = skip_ws(data, span.end);
+            data[i..].starts_with(b"stream")
+        }
+        Err(_) => false,
+    }
+}
+
 /// The payload of a stream as the RECOVERING readers see it: what `/Length`
 /// declares, or as far as the real `endstream` reaches when that is longer; and
 /// when `/Length` cannot be believed at all — unparseable, or past the end of the
@@ -1201,7 +1214,24 @@ fn find_endstream(data: &[u8], i: usize) -> Option<usize> {
 /// no verdict may depend on which side of that disagreement a reader sits on.
 pub fn stream_payload_as_readers(data: &[u8], offset: usize) -> Result<Vec<u8>> {
     let dict_span = object_body(data, offset)?;
-    let dict = &data[dict_span.clone()];
+    let declared = get(&data[dict_span], "/Length").and_then(parse_uint);
+    stream_payload_with_declared(data, offset, declared.map(|n| n as usize))
+}
+
+/// [`stream_payload_as_readers`] with the declared length already resolved — the
+/// gate holds the cross-reference and can follow an INDIRECT `/Length`, which is
+/// legal (ISO 32000-1 Table 4) and which [`stream_raw`] documents it cannot do
+/// while the xref is itself being built. Round 7's C-1 is the shape: a covered
+/// stream with an indirect `/Length` and no marker the reader can tie to an
+/// `endobj`; resolving the length is the difference between "I cannot read this
+/// stream" (which the gate must not mistake for a bare dictionary) and the payload
+/// the recovering readers actually decode.
+pub fn stream_payload_with_declared(
+    data: &[u8],
+    offset: usize,
+    declared: Option<usize>,
+) -> Result<Vec<u8>> {
+    let dict_span = object_body(data, offset)?;
     let mut i = skip_ws(data, dict_span.end);
     if !data[i..].starts_with(b"stream") {
         return Err(Error::Pdf(format!(
@@ -1218,10 +1248,7 @@ pub fn stream_payload_as_readers(data: &[u8], offset: usize) -> Result<Vec<u8>> 
     // a length that runs past the end of the file is not trusted even by the
     // recovering readers (their scan stops at `endstream` anyway); everything
     // else stands until the marker reaches farther than it does
-    let declared = get(dict, "/Length")
-        .and_then(parse_uint)
-        .map(|n| n as usize)
-        .filter(|n| *n <= data.len() - i);
+    let declared = declared.filter(|n| *n <= data.len() - i);
     let end = find_endstream(data, i);
     let stop = match (declared, end) {
         (Some(n), Some(e)) => (i + n).max(e),

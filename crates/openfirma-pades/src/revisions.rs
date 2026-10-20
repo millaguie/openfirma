@@ -407,7 +407,20 @@ fn rendered_body(
     // (No let-chain: the workspace floor is 1.85, where they are still an
     // unstable feature; the GUI, which is allowed them, runs at 1.95.)
     let payload = match locations.get(&object) {
-        Some(Location::Direct(at)) => pdf::stream_payload_as_readers(pdf, *at).ok(),
+        Some(Location::Direct(at)) => {
+            // Round 7's C-1: an indirect /Length is legal, and the gate holds the
+            // cross-reference, so it follows it instead of reading "no length" out
+            // of a stream that has one. When even that cannot produce a payload,
+            // an object whose bytes declare a stream is UNREADABLE, not a bare
+            // dictionary — the `/ITXT` rule asks `is_bare_dictionary` of bodies and
+            // must not be handed the head of a stream with its data lopped off.
+            let declared = declared_length(pdf, locations, cache, *at);
+            match pdf::stream_payload_with_declared(pdf, *at, declared) {
+                Ok(payload) => Some(payload),
+                Err(_) if pdf::is_stream_object(pdf, *at) => return None,
+                Err(_) => None,
+            }
+        }
         _ => None,
     };
     if let Some(payload) = payload {
@@ -418,6 +431,25 @@ fn rendered_body(
         out.extend_from_slice(&payload);
     }
     Some(out)
+}
+
+/// The `/Length` an object declares, following an indirect reference through
+/// `locations` — the one reading [`pdf::stream_raw`] documents it cannot do while
+/// the cross-reference is being built, and the gate can.
+fn declared_length(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    cache: &mut pdf::ObjectStreamCache,
+    at: usize,
+) -> Option<usize> {
+    let span = pdf::object_body(pdf, at).ok()?;
+    let value = pdf::get(&pdf[span], "/Length")?;
+    if let Some(n) = pdf::parse_uint(value) {
+        return Some(n as usize);
+    }
+    let target = pdf::parse_ref(value)?;
+    let resolved = pdf::resolve(pdf, locations, Some(cache), target).ok()?;
+    pdf::parse_uint(&resolved).map(|n| n as usize)
 }
 
 /// The redefinitions that happened strictly after the revision ending at

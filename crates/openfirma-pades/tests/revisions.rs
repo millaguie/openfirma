@@ -3589,3 +3589,102 @@ fn a_rewrite_hidden_behind_a_lying_length_is_still_a_stream_rewrite() {
     pades_verify(&honest, &anchors())
         .expect("republishing the same bytes is not a change no archive may append");
 }
+
+/// A hand-forged one-revision PDF: the bodies are objects 1..=n, written exactly
+/// as given (so a stream can lack `endstream`, as a recovery-shaped producer's
+/// does), behind a classic cross-reference table.
+fn hand_pdf(objects: &[&str], trailer: &str) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref_at = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for off in offsets {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< {trailer} >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+/// Round 7's C-1: the `/ITXT` guard asks `is_bare_dictionary` of bodies that
+/// `rendered_body` produced, and when a stream's payload could not be read the
+/// body was its dictionary alone — so a pass could rewrite the payload of a
+/// covered stream and add the producer's mark, and the gate called it
+/// `Bookkeeping` while Ghostscript drew the new text. The trigger is legal: an
+/// INDIRECT `/Length` (ISO 32000-1 Table 4 allows it) on a stream with no
+/// `endstream` any reader can tie to an `endobj` — the defect qpdf already warns
+/// about in the base, which is exactly why the gate may not inherit it. The gate
+/// holds the cross-reference, so it follows the reference; when even that yields
+/// nothing, a body whose bytes declare a stream is UNREADABLE, never a bare
+/// dictionary.
+///
+/// The base is signed with a HAND-WRITTEN invisible signature (`sign_the_pass`),
+/// not this crate's writer: the writer's empty appearance XObject puts an
+/// `endstream` late in the file, and then the old `stream_raw` fallback would
+/// "recover" a payload for the covering state by accident and refuse the pass for
+/// an unrelated reason. The reviewer's PoC measured the same difference; here the
+/// signed file carries no `endstream` at all, so the pre-fix reading of BOTH
+/// states is the dictionary alone — equal — and the attack verifies.
+#[test]
+fn a_stream_the_gate_cannot_read_is_never_a_bare_dictionary() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let headline = b"BT /F1 24 Tf 72 700 Td (PAGO UN CERO UNO) Tj ET";
+    let declared = format!("{}", headline.len());
+    let content = format!(
+        "<< /Length 5 0 R >>\nstream\n{}",
+        String::from_utf8_lossy(headline)
+    );
+    let base = hand_pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+             /Resources << /Font << /F1 6 0 R >> >> /Contents 4 0 R >>",
+            &content,
+            &declared,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ],
+        "/Size 7 /Root 1 0 R",
+    );
+    // invisible signature, hand-written: no appearance stream, so nothing after
+    // object 4 gives the old fallback an `endstream` to tie to an `endobj`
+    let signature_dict = real_signature_body(RESERVED);
+    let mut plain = append_two(&base, &[(7, &signature_dict)]);
+    sign_the_pass(&mut plain, &signer, RESERVED);
+    pades_verify(&plain, &anchors()).expect("the hand-signed base verifies");
+
+    let swapped = b"BT /F1 24 Tf 72 700 Td (PAGUESE 9999 EURS) Tj ET";
+    let same_dict = format!(
+        "<< /Length 5 0 R >>\nstream\n{}",
+        String::from_utf8_lossy(swapped)
+    );
+    let attacked = append_two(&plain, &[(4, same_dict.as_bytes())]);
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err(
+            "a payload nobody could read still changed; the gate follows the indirect length",
+        )
+        .to_string();
+    assert!(text.contains('4'), "the refusal names the stream: {text}");
+
+    let marked = format!(
+        "<< /Length 5 0 R /ITXT(2.1.7) >>\nstream\n{}",
+        String::from_utf8_lossy(swapped)
+    );
+    let attacked = append_two(&plain, &[(4, marked.as_bytes())]);
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("the producer's mark licenses bookkeeping, not a stream whose data moved")
+        .to_string();
+    assert!(
+        text.contains('4'),
+        "the refusal names the stream the mark tried to cover: {text}"
+    );
+}
