@@ -400,6 +400,14 @@ fn not_a_module_is_reported_clearly() {
         missing.contains("cannot load PKCS#11 module"),
         "a missing file must say so: {missing}"
     );
+    // round two's N-3: on the static musl artifact dlopen cannot work at all, so
+    // "pass the full path" alone sent a user with an already-absolute path in a
+    // circle. The message names that artifact and the two ways out.
+    assert!(
+        missing.contains("static musl") && missing.contains("PKCS#12"),
+        "the load failure names the artifact that cannot load anything and the way \
+         out: {missing}"
+    );
 }
 
 #[test]

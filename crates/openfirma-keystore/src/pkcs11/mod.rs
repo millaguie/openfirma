@@ -663,7 +663,9 @@ fn load_and_init(path: &Path, init: InitShape, library_parameters: Option<&str>)
         Error::Keystore(format!(
             "cannot load PKCS#11 module {}: {e}. Pass the full path to the \
              vendor's module file (libsoftokn3.so, opensc-pkcs11.so, \
-             aetap11.dll, ...)",
+             aetap11.dll, ...); if this is the static musl artifact it cannot \
+             load modules at all (no dlopen) — sign with a PKCS#12 file or use \
+             the glibc build for tokens",
             path.display()
         ))
     })?;
