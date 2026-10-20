@@ -1870,57 +1870,58 @@ pub(crate) mod tests {
             "an object taken from inside an object stream has no obj/endobj wrapper"
         );
     }
-}
 
-// ---- what the recovery readers see in a stream payload (round 7, B-1) ----
+    // ---- what the recovery readers see in a stream payload (round 7, B-1) ----
 
-/// One direct object whose body is exactly `body`, at its real offset.
-fn one_stream(body: &str) -> (Vec<u8>, usize) {
-    let mut pdf = b"%PDF-1.4\n".to_vec();
-    let at = pdf.len();
-    pdf.extend_from_slice(format!("1 0 obj\n{body}\nendobj\n").as_bytes());
-    (pdf, at)
-}
+    /// One direct object whose body is exactly `body`, at its real offset.
+    fn one_stream(body: &str) -> (Vec<u8>, usize) {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let at = pdf.len();
+        pdf.extend_from_slice(format!("1 0 obj\n{body}\nendobj\n").as_bytes());
+        (pdf, at)
+    }
 
-/// Every shape a lying or honest `/Length` takes, judged by what qpdf and
-/// Ghostscript end up reading. The gate compares through this function, so
-/// these are the boundaries of the B-1 fix: an exact length with the EOL a
-/// producer writes before `endstream` must read as exactly the payload (no
-/// false rewrite), and a length that stops short must read through to the
-/// marker (the ink those readers draw).
-#[test]
-fn the_payload_the_recovering_readers_see() {
-    // exact /Length, producer's own EOL before the keyword: the EOL is not data
-    let (pdf, at) = one_stream("<< /Length 5 >>\nstream\nHELLO\nendstream");
-    assert_eq!(stream_payload_as_readers(&pdf, at).unwrap(), b"HELLO");
+    /// Every shape a lying or honest `/Length` takes, judged by what qpdf and
+    /// Ghostscript end up reading. The gate compares through this function, so
+    /// these are the boundaries of the B-1 fix: an exact length with the EOL a
+    /// producer writes before `endstream` must read as exactly the payload (no
+    /// false rewrite), and a length that stops short must read through to the
+    /// marker (the ink those readers draw).
+    #[test]
+    fn the_payload_the_recovering_readers_see() {
+        // exact /Length, producer's own EOL before the keyword: the EOL is not data
+        let (pdf, at) = one_stream("<< /Length 5 >>\nstream\nHELLO\nendstream");
+        assert_eq!(stream_payload_as_readers(&pdf, at).unwrap(), b"HELLO");
 
-    // /Length stops at HELLO; readers recover through the space to `endstream`
-    let (pdf, at) = one_stream("<< /Length 5 >>\nstream\nHELLO world\nendstream");
-    assert_eq!(
-        stream_payload_as_readers(&pdf, at).unwrap(),
-        b"HELLO world",
-        "a short /Length does not hide what the marker exposes"
-    );
+        // /Length stops at HELLO; readers recover through the space to `endstream`
+        let (pdf, at) = one_stream("<< /Length 5 >>\nstream\nHELLO world\nendstream");
+        assert_eq!(
+            stream_payload_as_readers(&pdf, at).unwrap(),
+            b"HELLO world",
+            "a short /Length does not hide what the marker exposes"
+        );
 
-    // a fake `endstream`+`endobj` INSIDE the declared payload must not shrink
-    // the read: the declared span is longer, and the max is what the gate uses
-    let (pdf, at) = one_stream("<< /Length 26 >>\nstream\nHELLOendstreamendobjHELLO\nendstream");
-    let seen = stream_payload_as_readers(&pdf, at).unwrap();
-    assert!(
-        seen.len() >= 26,
-        "the declared span wins over an early marker, got {} bytes",
-        seen.len()
-    );
+        // a fake `endstream`+`endobj` INSIDE the declared payload must not shrink
+        // the read: the declared span is longer, and the max is what the gate uses
+        let (pdf, at) =
+            one_stream("<< /Length 26 >>\nstream\nHELLOendstreamendobjHELLO\nendstream");
+        let seen = stream_payload_as_readers(&pdf, at).unwrap();
+        assert!(
+            seen.len() >= 26,
+            "the declared span wins over an early marker, got {} bytes",
+            seen.len()
+        );
 
-    // /Length past the end of the file: believed by nobody; the marker decides
-    let (pdf, at) = one_stream("<< /Length 99999 >>\nstream\nHELLO world\nendstream");
-    assert_eq!(stream_payload_as_readers(&pdf, at).unwrap(), b"HELLO world");
+        // /Length past the end of the file: believed by nobody; the marker decides
+        let (pdf, at) = one_stream("<< /Length 99999 >>\nstream\nHELLO world\nendstream");
+        assert_eq!(stream_payload_as_readers(&pdf, at).unwrap(), b"HELLO world");
 
-    // no /Length at all: the marker decides, exactly like stream_raw's fallback
-    let (pdf, at) = one_stream("<< /Type /XObject >>\nstream\nHELLO world\nendstream");
-    assert_eq!(stream_payload_as_readers(&pdf, at).unwrap(), b"HELLO world");
+        // no /Length at all: the marker decides, exactly like stream_raw's fallback
+        let (pdf, at) = one_stream("<< /Type /XObject >>\nstream\nHELLO world\nendstream");
+        assert_eq!(stream_payload_as_readers(&pdf, at).unwrap(), b"HELLO world");
 
-    // neither a trustworthy length nor a marker: not a payload anybody can read
-    let (pdf, at) = one_stream("<< /Type /XObject >>\nstream\nHELLO");
-    assert!(stream_payload_as_readers(&pdf, at).is_err());
+        // neither a trustworthy length nor a marker: not a payload anybody can read
+        let (pdf, at) = one_stream("<< /Type /XObject >>\nstream\nHELLO");
+        assert!(stream_payload_as_readers(&pdf, at).is_err());
+    }
 }
