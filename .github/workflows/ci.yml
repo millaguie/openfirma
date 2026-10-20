@@ -51,6 +51,13 @@ jobs:
       # tags are mutable references; a workflow that trusts a tag trusts
       # whatever it happened to point at on the day someone bumped it).
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # A workflow with a repeated YAML key is refused by Actions as a run that
+      # ends in zero seconds — which reads like infrastructure, not a syntax
+      # error — while PyYAML's default loader accepts it last-key-wins. Round
+      # two's N-5 repair (90d1854) was exactly that shape; this step names the
+      # file and the key on every push, before Actions has to.
+      - name: workflow YAML has no duplicate keys
+        run: python3 tools/check-workflows.py
       # dtolnay/rust-toolchain pinned to master's tip as of 2026-10-17 — the
       # commit SHA, which is the only stable reference the repo offers (it has
       # no release tags). The `stable` toolchain it installs stays fresh by
