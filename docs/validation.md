@@ -377,9 +377,14 @@ not enough either — a pass could keep the dictionary byte for byte and append
 ink between the declared end and `endstream`, which qpdf recovers
 ("attempting to recover stream length"), Ghostscript draws and pdftotext prints.
 The comparison now takes the declared span or the real marker, whichever reaches
-farther, and an unbelievable `/Length` leaves the marker to decide; the
-specification-faithful readers keep their own read for the structural uses
-(xref streams, validation-data payloads). And an object the new section declares that nothing can read is
+farther, an unbelievable `/Length` leaves the marker to decide, and an INDIRECT
+`/Length` — legal, and unreadable by `stream_raw` while the cross-reference is
+being built — is followed through the cross-reference the gate already holds.
+An object whose bytes declare a stream and whose payload still cannot be read is
+UNREADABLE, refused by contract; it is never treated as a bare dictionary, which
+would hand the `/ITXT` rule the head of a stream with its data lopped off (round
+7's C1). The specification-faithful readers keep their own read for the
+structural uses (xref streams, validation-data payloads). And an object the new section declares that nothing can read is
 refused rather than skipped: the covering state decides whether silence is
 defensible, and bytes that could be read before and cannot be read now are the
 change. Attribution is closed the same way: a revision whose own
