@@ -313,7 +313,11 @@ per hop: a hop is reached only when the pass that wrote it is the pass of the
 signature that owns the widget, and the licensing branch still asks that it be
 brand new, so a hop that rewrote a covered object is refused however it was
 reached. Reaching it is only half the question, and round 7's H1 and H2 are the
-other half: the set answers who WROTE an object and says nothing about who was
+other half (and B2 the arithmetic of the same half: a promise is an object
+NUMBER, not a `(number, generation)` pair — a covered `/AP /N 904 0 R` is not
+unnamed by writing `904 1 obj`, because Ghostscript resolves by number and
+draws what it finds, so the licensing branch asks the number whatever
+generation the new entry carries): the set answers who WROTE an object and says nothing about who was
 PROMISED it, so a second signer's own legitimate chain (widget, appearance, the
 `/Resources /XObject` of that appearance, every one written and covered by that
 signer) reached the `/AP /N` slot the FIRST signer's covered widget had named and
@@ -365,10 +369,17 @@ because those are the only bytes it has: the container is where its bytes and th
 entry that maps them live, and a container a signature covers is one that existed
 when it was made. Two things that gate compares are worth stating, because
 reading did not catch either of them going wrong. What an object HOLDS is its
-dictionary and — when the object is a stream — the data that dictionary declares:
-comparing dictionaries alone called a rewritten page-content payload unchanged,
-because `/Length` stays the same number while the bytes a reader draws are
-replaced. And an object the new section declares that nothing can read is
+dictionary and — when the object is a stream — the payload AS THE RECOVERING
+READERS SEE IT: comparing dictionaries alone called a rewritten page-content
+payload unchanged, because `/Length` stays the same number while the bytes a
+reader draws are replaced, and round 7's B1 showed that trusting `/Length` was
+not enough either — a pass could keep the dictionary byte for byte and append
+ink between the declared end and `endstream`, which qpdf recovers
+("attempting to recover stream length"), Ghostscript draws and pdftotext prints.
+The comparison now takes the declared span or the real marker, whichever reaches
+farther, and an unbelievable `/Length` leaves the marker to decide; the
+specification-faithful readers keep their own read for the structural uses
+(xref streams, validation-data payloads). And an object the new section declares that nothing can read is
 refused rather than skipped: the covering state decides whether silence is
 defensible, and bytes that could be read before and cannot be read now are the
 change. Attribution is closed the same way: a revision whose own
