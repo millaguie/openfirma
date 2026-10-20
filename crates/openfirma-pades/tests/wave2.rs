@@ -35,6 +35,12 @@ fn opts() -> PadesOptions {
 fn signing_an_encrypted_pdf_is_refused_with_the_way_out() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     // The /Encrypt dictionary is object 4; the trailer names it exactly as
@@ -75,6 +81,12 @@ fn signing_an_encrypted_pdf_is_refused_with_the_way_out() {
 fn an_older_revision_holding_encrypt_is_refused_too() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     // revision 1: a full one-page document whose trailer names /Encrypt
@@ -115,6 +127,12 @@ fn an_older_revision_holding_encrypt_is_refused_too() {
 fn the_appended_trailer_carries_the_previous_id_and_extra_keys() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     // A document whose trailer holds /ID and a vendor key: exactly the shape
@@ -156,6 +174,12 @@ fn the_appended_trailer_carries_the_previous_id_and_extra_keys() {
 fn the_info_object_the_signature_writes_is_the_one_the_trailer_names() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     // no /Info anywhere (mini_pdf): the fixture simple.pdf is this shape, and
@@ -225,6 +249,12 @@ fn the_info_object_the_signature_writes_is_the_one_the_trailer_names() {
 fn a_pdf_a_identity_declaration_stops_the_moddate_rewrite() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     for (packet, compress) in [
@@ -394,6 +424,12 @@ fn deflate(data: &[u8]) -> Vec<u8> {
 fn a_p1_certification_refuses_signing_unless_told_otherwise() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     let certified = mini_pdf(
@@ -458,6 +494,12 @@ fn a_p1_certification_refuses_signing_unless_told_otherwise() {
 fn verify_flags_revisions_after_a_p1_certification() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     // First: an ordinary signed document (its own revision chain is honest).
@@ -610,6 +652,12 @@ fn verify_flags_revisions_after_a_p1_certification() {
 fn a_revision_after_a_certification_is_counted_from_the_reader_numbering() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     // The certification names object 7, and object 7 is what the signing
@@ -679,6 +727,12 @@ fn a_revision_after_a_certification_is_counted_from_the_reader_numbering() {
 fn signing_withdraws_usage_rights_and_keeps_the_rest_of_perms() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     let doc = mini_pdf(
@@ -729,6 +783,12 @@ fn signing_withdraws_usage_rights_and_keeps_the_rest_of_perms() {
 fn a_trailer_without_size_refuses_and_a_lying_size_never_overwrites() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     // no /Size at all
@@ -789,6 +849,12 @@ fn unsafe_str_rfind(hay: &[u8], needle: &[u8]) -> usize {
 fn a_page_tree_that_repeats_a_child_is_refused_not_explored() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     // object 2 is the root: /Kids [4 0 R 4 0 R], and 4 itself repeats the leaf
@@ -831,6 +897,12 @@ fn a_page_tree_that_repeats_a_child_is_refused_not_explored() {
 fn offsets_past_the_end_of_the_file_are_errors_never_panics() {
     let Some(signer) = test_signer() else {
         eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        // round two's N-7: CI sets OPENFIRMA_REQUIRE_TESTS, so a missing PKI is a
+        // failure there instead of a green run of nothing
+        assert!(
+            std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none(),
+            "OPENFIRMA_REQUIRE_TESTS is set and the test PKI is missing"
+        );
         return;
     };
     // startxref names an offset far past the end of the file.
