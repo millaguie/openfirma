@@ -3768,3 +3768,80 @@ fn a_stream_too_large_to_copy_is_still_compared_by_fingerprint() {
         "the refusal names the attachment: {text}"
     );
 }
+
+/// Round 7's C-3: the fill clause asked the REWRITTEN OBJECT whether the field was
+/// empty (`pdf::get(older, "/V").is_none()`), and a widget may carry only
+/// `/Parent` while the value lives on the field — the shape Acrobat, Word and the
+/// legacy iText/PDFbox servers write. A widget under a field that already held a
+/// value could therefore be re-pointed at a new `/AP`, handed a foreign `/V` and
+/// licensed as plumbing: `verify` answered OK with two signatures while the ink
+/// inside the first signer's rectangle changed from `FIRMADO Y PAGADO` to
+/// `PAGUESE 9999 EURS`. The clause now asks the FIELD (`/Parent` chain) too; a
+/// field that already has a value is not a place a later pass may fill.
+#[test]
+fn a_widget_under_a_filled_field_cannot_be_repainted_as_a_fill() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let headline = b"BT /F1 24 Tf 72 700 Td (PAGO UN CERO UNO) Tj ET";
+    let content = format!(
+        "<< /Length {} >>\nstream\n{}\nendstream",
+        headline.len(),
+        String::from_utf8_lossy(headline)
+    );
+    let drawn = b"BT /F1 18 Tf 2 2 Td (FIRMADO Y PAGADO) Tj ET";
+    let appearance = format!(
+        "<< /Type /XObject /Subtype /Form /FormType 1 /BBox [ 0 0 300 100 ] \
+         /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+        drawn.len(),
+        String::from_utf8_lossy(drawn)
+    );
+    let base = hand_pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [ 7 0 R ] >> >>",
+            "<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 595 842 ] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R /Annots [ 8 0 R ] >>",
+            &content,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &appearance,
+            "<< /FT /Sig /T (Firma1) /V 20 0 R /Kids [ 8 0 R ] >>",
+            "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma1) /Parent 7 0 R \
+             /Rect [ 50 500 350 700 ] /P 3 0 R /AP << /N 6 0 R >> >>",
+        ],
+        "/Size 11 /Root 1 0 R",
+    );
+    // first signature: hand-written, real CMS, the field's /V names it
+    let first = real_signature_body(RESERVED);
+    let mut signed = append_two(&base, &[(20, &first)]);
+    sign_the_pass(&mut signed, &signer, RESERVED);
+    pades_verify(&signed, &anchors()).expect("the hand-built form verifies");
+
+    // the pass: the SAME widget gains /V and a new /AP, its field still holding the
+    // first signature. Every other key is byte-identical, which is the clause's shape
+    let repainted = b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Firma1) /Parent 7 0 R \
+                       /Rect [ 50 500 350 700 ] /P 3 0 R /V 301 0 R /AP << /N 300 0 R >> >>"
+        .to_vec();
+    let ink = b"BT /F1 18 Tf 2 2 Td (PAGUESE 9999 EURS) Tj ET";
+    let repaint = format!(
+        "<< /Type /XObject /Subtype /Form /FormType 1 /BBox [ 0 0 300 100 ] \
+         /Resources << /Font << /F1 5 0 R >> >> /Length {} >>\nstream\n{}\nendstream",
+        ink.len(),
+        String::from_utf8_lossy(ink)
+    );
+    let second = real_signature_body(RESERVED);
+    let mut attacked = append_pieces(
+        &signed,
+        &[(8, repainted), (300, repaint.into_bytes()), (301, second)],
+    );
+    sign_the_pass(&mut attacked, &signer, RESERVED);
+
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("the field already held a value; this is replacing another signer's ink")
+        .to_string();
+    assert!(
+        text.contains("10") || text.contains("form field value"),
+        "the refusal names the widget or the rule: {text}"
+    );
+}

@@ -794,6 +794,30 @@ struct Gate<'a> {
     transport: &'a BTreeSet<ObjRef>,
 }
 
+/// Whether the FIELD a widget belongs to already carries a value, walking
+/// `/Parent` through the final state (ISO 32000-1 12.7.4.3 keeps `/V` on the
+/// field; Acrobat, Word and the legacy iText/PDFbox servers write widgets that
+/// carry only `/Parent`). Round 7's C-3: the fill clause asked the REWRITTEN
+/// OBJECT whether it was empty, so a widget under a field already holding a value
+/// could be re-pointed at a new `/AP` and given a foreign `/V` — plumbing, two
+/// signatures OK, ink inside the first signer's rectangle replaced.
+fn parent_carries_a_value(gate: &Gate, body: &[u8]) -> bool {
+    let mut current = body.to_vec();
+    for _ in 0..8 {
+        let Some(parent) = pdf::get(&current, "/Parent").and_then(pdf::parse_ref) else {
+            return false;
+        };
+        let Some(parent_body) = gate.final_state.get(&parent) else {
+            return false;
+        };
+        if pdf::get(parent_body, "/V").is_some() {
+            return true;
+        }
+        current = parent_body.clone();
+    }
+    false
+}
+
 fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Change {
     let pdf = gate.pdf;
     let locations = gate.locations;
@@ -1046,6 +1070,12 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
         if brand_new
             || other_keys_equal(older, newer, b"/V")
             || (pdf::get(older, "/V").is_none()
+                // C-3: the clause asks the OBJECT whether the field was empty, and
+                // a widget may carry only `/Parent` while the value lives on the
+                // field — the shape Acrobat, Word and the legacy iText/PDFbox
+                // servers write. A widget whose FIELD already holds a value is not
+                // filling an empty field; it is repainting someone else's ink.
+                && !parent_carries_a_value(gate, newer)
                 && keys_equal_except(older, newer, &[b"/V", b"/AP"]))
         {
             return Change::SignaturePlumbing(*object);
