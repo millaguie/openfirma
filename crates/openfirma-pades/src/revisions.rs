@@ -417,7 +417,15 @@ fn rendered_body(
             let declared = declared_length(pdf, locations, cache, *at);
             match pdf::stream_payload_with_declared(pdf, *at, declared) {
                 Ok(payload) => Some(payload),
-                Err(_) if pdf::is_stream_object(pdf, *at) => return None,
+                Err(_) if pdf::is_stream_object(pdf, *at) => {
+                    // C-2: the cap refuses the copy, not the judgement. A stream a
+                    // few hundred megabytes long (a scanned invoice, a plan) is
+                    // legal and common; comparing it as absence let a pass rewrite
+                    // it whole behind an `/ITXT`. A length+digest fingerprint of the
+                    // extent the readers take costs what the refused copy would and
+                    // allocates nothing.
+                    Some(pdf::stream_payload_fingerprint(pdf, *at, declared)?)
+                }
                 Err(_) => None,
             }
         }

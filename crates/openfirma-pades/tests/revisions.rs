@@ -3688,3 +3688,83 @@ fn a_stream_the_gate_cannot_read_is_never_a_bare_dictionary() {
         "the refusal names the stream the mark tried to cover: {text}"
     );
 }
+
+/// Round 7's C-2: the cap that stops the gate copying a stream also stopped it
+/// SEEING one. A legal, qpdf-clean attachment of a few hundred megabytes — an
+/// invoice's scan, a plan — read as ABSENCE on both sides, so a pass could rewrite
+/// it whole behind the producer's `/ITXT` and be licensed as bookkeeping while the
+/// citizen downloads a file no signature covers. The cap is about allocation, not
+/// judgement: the gate now compares a length+SHA-256 fingerprint of the extent the
+/// readers take, which allocates nothing and changes on any byte.
+///
+/// Heavy by design (the cap is 256 MiB and the document doubles when the pass
+/// appends its own copy), so it runs where `OPENFIRMA_REQUIRE_TESTS` is set — the
+/// same opt-in the object-stream budget test uses.
+#[test]
+fn a_stream_too_large_to_copy_is_still_compared_by_fingerprint() {
+    if std::env::var_os("OPENFIRMA_REQUIRE_TESTS").is_none() {
+        return;
+    }
+    let Some(_signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let size = openfirma_pades::stream::MAX_DECODED_STREAM + 1;
+    let mut payload = vec![b'A'; size];
+    payload[..17].copy_from_slice(b"ATTACHMENT-AAAAAA");
+    let attachment = format!("<< /Type /EmbeddedFile /Length {size} >>\nstream\n").into_bytes();
+    let mut attachment = attachment;
+    attachment.extend_from_slice(&payload);
+    attachment.extend_from_slice(b"\nendstream");
+
+    let content = b"<< /Length 0 >>\nstream\n\nendstream".to_vec();
+    let mut base = Vec::new();
+    let mut offsets = Vec::new();
+    let bodies: Vec<&[u8]> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>",
+        &content,
+        &attachment,
+    ];
+    base.extend_from_slice(b"%PDF-1.4\n");
+    for body in &bodies {
+        offsets.push(base.len());
+        base.extend_from_slice(format!("{} 0 obj\n", offsets.len()).as_bytes());
+        base.extend_from_slice(body);
+        base.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_at = base.len();
+    base.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    base.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+        base.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    base.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
+    );
+
+    let signature_dict = real_signature_body(RESERVED);
+    let mut signed = append_two(&base, &[(6, &signature_dict)]);
+    sign_the_pass(&mut signed, &_signer, RESERVED);
+    // without a signature this test would measure nothing; the sign call above
+    // signs the base, and the document is what a citizen would hold
+    drop(base);
+
+    let mut swapped = vec![b'B'; size];
+    swapped[..17].copy_from_slice(b"ATTACHMENT-BBBBBB");
+    let mut rewritten =
+        format!("<< /Type /EmbeddedFile /Length {size} /ITXT(2.1.7) >>\nstream\n").into_bytes();
+    rewritten.extend_from_slice(&swapped);
+    rewritten.extend_from_slice(b"\nendstream");
+    drop(swapped);
+
+    let attacked = append_two(&signed, &[(5, &rewritten)]);
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("an attachment that large is still an attachment; its bytes moved")
+        .to_string();
+    assert!(
+        text.contains('5') || text.contains("stream"),
+        "the refusal names the attachment: {text}"
+    );
+}

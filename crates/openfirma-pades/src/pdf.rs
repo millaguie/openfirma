@@ -1226,6 +1226,53 @@ pub fn stream_payload_as_readers(data: &[u8], offset: usize) -> Result<Vec<u8>> 
 /// `endobj`; resolving the length is the difference between "I cannot read this
 /// stream" (which the gate must not mistake for a bare dictionary) and the payload
 /// the recovering readers actually decode.
+/// A deterministic fingerprint of the payload a recovering reader would take —
+/// length and SHA-256 of the bytes — for a stream whose payload is too large for
+/// [`stream_payload_with_declared`] to copy.
+///
+/// The cap exists so one structural stream cannot make the gate allocate past
+/// `MAX_DECODED_STREAM`; it does not exist to make big streams disappear. Round
+/// 7's C-2 measured exactly that: a legal attachment of a few hundred megabytes
+/// (an invoice's scan, a plan) was compared as ABSENCE, so a pass could rewrite it
+/// wholesale behind an `/ITXT` mark and the gate called it bookkeeping. Hashing
+/// costs the same order as the copy the cap refuses and allocates nothing, so a
+/// rewrite of ANY byte changes the fingerprint; the same-length/same-bytes case
+/// still compares equal, which is what every unchanged stream must do.
+pub fn stream_payload_fingerprint(
+    data: &[u8],
+    offset: usize,
+    declared: Option<usize>,
+) -> Option<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+
+    let dict_span = object_body(data, offset).ok()?;
+    let mut i = skip_ws(data, dict_span.end);
+    if !data[i..].starts_with(b"stream") {
+        return None;
+    }
+    i += 6;
+    if data[i..].starts_with(b"\r\n") {
+        i += 2;
+    } else if at(data, i) == b'\n' || at(data, i) == b'\r' {
+        i += 1;
+    }
+    let declared = declared.filter(|n| *n <= data.len() - i);
+    let end = find_endstream(data, i);
+    let stop = match (declared, end) {
+        (Some(n), Some(e)) => (i + n).max(e),
+        (Some(n), None) => i + n,
+        (None, Some(e)) => e,
+        (None, None) => return None,
+    };
+    let span = stop - i;
+    if span <= crate::stream::MAX_DECODED_STREAM {
+        // the copy path can judge this one; only the refused sizes need a digest
+        return None;
+    }
+    let digest = hex::encode(Sha256::digest(&data[i..stop]));
+    Some(format!("\x00openfirma stream fingerprint: {span} bytes {digest}").into_bytes())
+}
+
 pub fn stream_payload_with_declared(
     data: &[u8],
     offset: usize,
