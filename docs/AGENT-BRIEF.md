@@ -48,6 +48,10 @@ For any format or behaviour, never implement from a specification alone.
   `cargo clippy --all-targets -- -D warnings`,
   `OPENFIRMA_REQUIRE_TESTS=1 cargo test`, and the golden diff where one exists.
   All clean, no exceptions, no `#[allow]` to silence clippy.
+- Long or memory-hungry test runs go under a scope, not bare on the host (round
+  two, N-11: the recipe lived only in the /tmp briefs):
+  `systemd-run --user --scope -q -p MemoryMax=6G -p MemorySwapMax=1G \
+   -p CPUQuota=350% -- bash -c 'cargo test --workspace 2>&1 | tail -30'`.
 - Certificate material policy: no certificate, key, keystore or signature made
   with a real certificate ever enters the repository. `tools/check-no-real-certs.sh`
   runs as the pre-commit hook (core.hooksPath tools/hooks) and in CI over the
@@ -57,9 +61,11 @@ For any format or behaviour, never implement from a specification alone.
   (IDNIE-), legal person / sello de entidad (CIF in serialNumber plus
   organizationIdentifier VATES- per ETSI EN 319 412-1), representative of a
   legal person, and a TSA. Never assume a signer is a natural person.
-- Every commit message ends with exactly this trailer and mentions no AI
-  product or session:
-  `Co-authored-by: Qwen 3.8 <qwen3.8@millaguie.net>`
+- Commit messages mention no AI product or session (round two, N-11: this line
+  used to demand the `Co-authored-by: Qwen 3.8 <qwen3.8@millaguie.net>` trailer
+  on every commit, which the owner's global rule since retired — the trailer
+  goes in only when the owner asks for it, and 53 consecutive commits predate
+  the retirement; history is not rewritten over it).
 - Git: work on branch main, one agent at a time. Commit as one well-described
   commit per coherent change and `git push origin main`. Never rewrite
   history, never force push, never touch .github/workflows unless the task is
@@ -76,7 +82,9 @@ For any format or behaviour, never implement from a specification alone.
 - golden diff empty against AutoFirma where a golden is possible,
 - an independent verifier in `cargo test`,
 - fmt/clippy/test clean with OPENFIRMA_REQUIRE_TESTS=1,
-- CI green on all 8 jobs after push,
+- CI green after push — every job in `.github/workflows/ci.yml`, including each
+  leg of the test matrix (round two, N-11: this said "all 8 jobs" when the
+  matrix had grown; the file is the count, not this sentence),
 - README status table and docs/validation.md updated to reality,
 - a new ADR when the decision is expensive to reverse.
 
