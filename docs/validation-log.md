@@ -18,7 +18,7 @@ platforms that provision them; the golden diff is a pre-release local gate.
 | Check | Where | Result | Since |
 |---|---|---|---|
 | `cargo fmt --all --check`, `cargo clippy -D warnings` (Linux) | lint job | pass | 2026-10-15 |
-| clippy `-D warnings` on Windows and macOS targets too | test jobs, per-platform step | pass | 2026-10-17 |
+| No workflow YAML repeats a mapping key (Actions refuses such a file as a zero-second run; PyYAML's default loader takes the last key and calls it valid) | `tools/check-workflows.py` in the lint job, every push | pass | 2026-10-21 (round two's N-5 repair `90d1854` shipped exactly that shape; the step names the file and the column) || clippy `-D warnings` on Windows and macOS targets too | test jobs, per-platform step | pass | 2026-10-17 |
 | OpenSSL verifies CAdES (RSA SHA-256/512, ECDSA P-256, encapsulated and detached) | test jobs, linux/macos (openssl on PATH) | pass | 2026-10-15 |
 | OpenSSL verifies PAdES over the `/ByteRange` bytes | same | pass | 2026-10-15 |
 | poppler `pdfsig`: signature valid, total document signed | test jobs on linux (poppler-utils installed; a missing pdfsig now FAILS instead of skipping) | pass | probe fixed 2026-10-17 — the check had never run before that date despite this row claiming it since 10-15 |
