@@ -407,7 +407,7 @@ fn rendered_body(
     // (No let-chain: the workspace floor is 1.85, where they are still an
     // unstable feature; the GUI, which is allowed them, runs at 1.95.)
     let payload = match locations.get(&object) {
-        Some(Location::Direct(at)) => pdf::stream_raw(pdf, *at).ok(),
+        Some(Location::Direct(at)) => pdf::stream_payload_as_readers(pdf, *at).ok(),
         _ => None,
     };
     if let Some(payload) = payload {
