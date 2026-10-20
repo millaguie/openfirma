@@ -972,7 +972,15 @@ fn classify_one(gate: &Gate, object: &ObjRef, newer: &[u8], older: &[u8]) -> Cha
     // pointer, an author with meaning to a reader, anything) fails the test on
     // either side and lands on the refusal floor. `brand_new` copies keep their
     // own rule above; this one is only for bytes that already existed covered.
-    if !brand_new && only_date_keys(newer) && older_keys_are_dates(older) {
+    if !brand_new
+        && only_date_keys(newer)
+        && older_keys_are_dates(older)
+        // C-4a: keys were the only question, and our own writer's `/Info` is pure
+        // (`<< /ModDate (D:…) >>`), so a later pass could put a sentence, a
+        // reference or an empty dictionary under the same key and be licensed as
+        // plumbing — `pdfinfo` then shows the sentence as the document's ModDate.
+        && date_values_are_dates(newer)
+    {
         return Change::SignaturePlumbing(*object);
     }
     // The shape real writers actually produce: a REWRITE of `/Info`, or of the XMP
@@ -1214,6 +1222,19 @@ const PDF_DATE_KEYS: &[&[u8]] = &[b"/ModDate", b"/CreationDate"];
 /// not list stays refused, which is the direction this gate refuses in.
 const XMP_DATE_ELEMENTS: &[&[u8]] = &[b"xmp:CreateDate", b"xmp:ModifyDate", b"xmp:MetadataDate"];
 
+/// Whether every VALUE of a pure timestamp dictionary is a date. C-4a: the keys
+/// were the only question, so `<< /ModDate (PAGUESE UN MILLON DE EUROS) >>` — and
+/// an empty `<<>>` — were plumbing over our own writer's pure `/Info`.
+fn date_values_are_dates(body: &[u8]) -> bool {
+    let Ok(items) = pdf::items(body) else {
+        return false;
+    };
+    !items.is_empty()
+        && items
+            .iter()
+            .all(|(_, value)| is_pdf_date(&body[value.clone()]))
+}
+
 /// Whether `newer` is `older` with every key kept and only the values of
 /// [`PDF_DATE_KEYS`] moved, the new values still dates.
 ///
@@ -1260,13 +1281,53 @@ fn dates_only_moved(older: &[u8], newer: &[u8]) -> bool {
 /// escape inside them, so the escaping means something else is in there.
 fn is_pdf_date(value: &[u8]) -> bool {
     let text = pdf::trim_ws(value);
-    let inner = match (text.first(), text.last()) {
-        (Some(b'('), Some(b')')) | (Some(b'<'), Some(b'>')) => &text[1..text.len() - 1],
-        _ => return false,
-    };
+    match (text.first(), text.last()) {
+        (Some(b'('), Some(b')')) => is_pdf_date_text(&text[1..text.len() - 1]),
+        (Some(b'<'), Some(b'>')) => {
+            // C-4b: a HEX string is legal in any edition (ISO 32000-1 7.9.2.2) and
+            // readers print it as a date — including the UTF-16BE-with-BOM spelling
+            // producers with an ICU-ish stack emit. Decode before judging the shape;
+            // the rule's other half (every other entry identical) is untouched, so a
+            // hex string carrying a sentence still fails on the shape below.
+            let Some(bytes) = hex_bytes(&text[1..text.len() - 1]) else {
+                return false;
+            };
+            let units: Option<Vec<u16>> = if bytes.starts_with(&[0xFE, 0xFF]) {
+                bytes[2..]
+                    .chunks(2)
+                    .map(|pair| (pair.len() == 2).then(|| u16::from_be_bytes([pair[0], pair[1]])))
+                    .collect()
+            } else if bytes.starts_with(&[0xFF, 0xFE]) {
+                bytes[2..]
+                    .chunks(2)
+                    .map(|pair| (pair.len() == 2).then(|| u16::from_le_bytes([pair[0], pair[1]])))
+                    .collect()
+            } else {
+                // plain ASCII carried as hex: the old reading, now explicit
+                return is_pdf_date_text(&bytes);
+            };
+            let Some(units) = units else {
+                return false;
+            };
+            let Ok(decoded) = String::from_utf16(&units) else {
+                return false;
+            };
+            is_pdf_date_text(decoded.as_bytes())
+        }
+        _ => false,
+    }
+}
+
+/// The literal- or decoded-string half of [`is_pdf_date`]. A `:` is allowed in the
+/// tail only when the value carries the `D:` prefix with four leading digits — that
+/// is the PDF 2.0 (ISO 32000-2) spelling `D:YYYY-MM-DDTHH:mm:ss+HH:mm`, which qpdf
+/// and pdfinfo read, and which this rule refused as tampering over clean files
+/// (round 7's C-4b).
+fn is_pdf_date_text(inner: &[u8]) -> bool {
     if inner.contains(&b'\\') {
         return false;
     }
+    let prefixed = inner.starts_with(b"D:");
     let body = inner.strip_prefix(b"D:".as_slice()).unwrap_or(inner);
     body.len() >= 4
         && body[..4].iter().all(|b| b.is_ascii_digit())
@@ -1274,8 +1335,21 @@ fn is_pdf_date(value: &[u8]) -> bool {
             matches!(
                 b,
                 b'0'..=b'9' | b'.' | b'+' | b'-' | b'\'' | b'T' | b't' | b'Z' | b'z' | b' '
-            )
+            ) || (prefixed && *b == b':')
         })
+}
+
+fn hex_bytes(hex: &[u8]) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
 }
 
 /// The dictionary and the payload of a body [`rendered_body`] built for a stream:

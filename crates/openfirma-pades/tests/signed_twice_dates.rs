@@ -421,3 +421,89 @@ fn one_signature_with_two_unclassified_changes_is_one_sentence() {
         "the content stream is described as the stream it is: {text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 7 part C, C-4a and C-4b: the date rules read on the two shapes the
+// earlier tests did not cover — a PURE `/Info` (the one this crate's writer
+// produces) and legal date spellings the rule used to refuse.
+
+const INPUT: &[u8] = include_bytes!("../../../testdata/inputs/simple.pdf");
+
+fn signed_input() -> Option<Vec<u8>> {
+    let signer = signer()?;
+    pades_sign(INPUT, &signer, &PadesOptions::default()).ok()
+}
+
+/// C-4a, hiding direction: our writer's `/Info` holds only date keys, and the
+/// pure branch asked the KEYS and never the VALUES — so a later pass could put a
+/// sentence (visible as the document's ModDate in `pdfinfo`), a reference, or an
+/// empty dictionary there and be licensed as plumbing over bytes a signature
+/// attested.
+#[test]
+fn a_pure_info_that_stops_carrying_dates_is_refused() {
+    let Some(signed) = signed_input() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let xref = openfirma_pades::pdf::last_startxref(&signed).expect("startxref");
+    let info = openfirma_pades::pdf::trailer(&signed, xref)
+        .expect("the signed trailer parses")
+        .info
+        .expect("the writer stamps an /Info");
+
+    let sentence = "<</ModDate(PAGUESE UN MILLON DE EUROS)>>";
+    let attacked = append_pass(&signed, &[(info.num, sentence.as_bytes().to_vec())]);
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("a date key is not a licence to put a sentence in the properties")
+        .to_string();
+    assert!(
+        text.contains("/Info"),
+        "the refusal names the properties dictionary: {text}"
+    );
+
+    // the same key removed: the attested date disappears from every reader
+    let attacked = append_pass(&signed, &[(info.num, b"<</>>".to_vec())]);
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("an empty dictionary is nobody's bookkeeping")
+        .to_string();
+    assert!(
+        text.contains(&info.to_string()),
+        "and the object it emptied is named here: {text}"
+    );
+}
+
+/// C-4b, refusing direction: two spellings every reader prints as a date and the
+/// rule used to call tampering — PDF 2.0's `D:YYYY-MM-DDTHH:mm:ss+HH:mm` and a
+/// HEX string carrying UTF-16BE with a BOM (legal in any edition, ISO 32000-1
+/// 7.9.2.2). Both here rewrite ONLY `/ModDate` on a mixed `/Info`, so the
+/// acceptance is the dates-only shape working, not a loophole.
+#[test]
+fn legal_date_spellings_move_as_dates() {
+    let Some(signed) = signed_once() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let iso = INFO_BODY_LATER.replace(
+        "/ModDate(D:20261019101108+02'00')",
+        "/ModDate(D:2026-10-19T10:12:00+02:00)",
+    );
+    let attacked = append_pass(&signed, &[(INFO, iso.into_bytes())]);
+    pades_verify(&attacked, &anchors())
+        .expect("a PDF 2.0 date is a date; refusing it called a clean file tampered");
+
+    let utf16: String = {
+        let text = "D:20261019101200+02'00'";
+        let mut hex = String::from("FEFF");
+        for unit in text.encode_utf16() {
+            hex.push_str(&format!("{unit:04X}"));
+        }
+        hex
+    };
+    let hex_body = INFO_BODY_LATER.replace(
+        "/ModDate(D:20261019101108+02'00')",
+        &format!("/ModDate<{utf16}>"),
+    );
+    let attacked = append_pass(&signed, &[(INFO, hex_body.into_bytes())]);
+    pades_verify(&attacked, &anchors())
+        .expect("a UTF-16 hex string is a date spelling, not an escape");
+}
