@@ -461,6 +461,13 @@ fn read_and_check(
     let pool: Vec<CertificateHandle> = embedded.iter().chain(issuers.iter()).cloned().collect();
     let mut signature_verified = false;
     let mut chains_to_issuer = false;
+    // The one CA this responder proved authority over. Round 4's N4-1: the
+    // response may carry several SingleResponses, each naming a different CA, and
+    // authority over ANY of them used to launder every CertID it carried — one
+    // "good" about a CA of the attacker's own made a second, real-CA CertID about
+    // a revoked signer count as that CA's word. Only the CertIDs of the CA the
+    // responder is authorized for survive.
+    let mut authorized_ca: Option<CertificateHandle> = None;
     for candidate in &pool {
         if verify_prehash(candidate, digest, &digest.digest(rd.whole), sig_bytes).is_err() {
             continue;
@@ -490,6 +497,7 @@ fn read_and_check(
             };
             if authority {
                 chains_to_issuer = true;
+                authorized_ca = Some((*ca).clone());
                 break;
             }
         }
@@ -541,6 +549,24 @@ fn read_and_check(
         })
     } else {
         None
+    };
+
+    // Keep only the answers about the CA the signer was authorized for. A
+    // CertID whose hashes name another CA is not this response's statement about
+    // that CA, whatever it says.
+    let cert_ids: Vec<OcspCertId> = match &authorized_ca {
+        Some(ca) => cert_ids
+            .into_iter()
+            .filter(|id| {
+                DigestAlg::from_oid(&id.hash_algorithm)
+                    .ok()
+                    .and_then(|alg| ocsp_issuer_hashes(ca, alg).ok())
+                    .is_some_and(|(name, key)| {
+                        name == id.issuer_name_hash && key == id.issuer_key_hash
+                    })
+            })
+            .collect(),
+        None => cert_ids,
     };
 
     Ok(OcspStatus {

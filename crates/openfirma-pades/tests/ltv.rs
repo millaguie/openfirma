@@ -2058,3 +2058,235 @@ fn an_ocsp_response_from_a_name_impostor_is_not_a_datum() {
         "the refusal names the link with no datum from its real CA: {text}"
     );
 }
+
+/// Round 4's N4-1: a response carrying TWO SingleResponses — one about a CA of
+/// the attacker's own (which gives the responder authority over *a* named CA) and
+/// one with the REAL CA's CertID and the revoked signer's serial — used to launder
+/// the second entry through the first. The responder must now be authorized for
+/// the CA each answer names; only the answers about that CA survive, so the
+/// signer's link has no datum from its real CA.
+///
+/// The response is minted with openssl against a file holding both CAs, exactly
+/// the recipe the reviewer used for `A7-two-singleresponses`.
+#[test]
+fn an_ocsp_response_cannot_launder_a_real_ca_entry_with_its_own() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    let Some(signer) = rsa_signer() else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let (Ok(ca_crl), Ok(int_pem)) = (
+        std::fs::read(certs_dir().join("ca.crl.der")),
+        std::fs::read_to_string(certs_dir().join("intermediate.crt")),
+    ) else {
+        require_or_skip("test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let _intermediate = CertificateHandle::from_pem(&int_pem).expect("intermediate.crt");
+
+    // the attacker's CA: self-signed, its own key, in the archive's /Certs
+    let evil_key = tmp_path("evil.key");
+    let evil_crt = tmp_path("evil.crt");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            evil_key.to_str().unwrap(),
+            "-out",
+            evil_crt.to_str().unwrap(),
+            "-days",
+            "300",
+            "-subj",
+            "/C=ES/O=atk/CN=evil",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ],
+    );
+    assert!(ok, "openssl could not mint the attacker CA:\n{text}");
+    let evil_pem = std::fs::read_to_string(&evil_crt).expect("evil certificate");
+    let evil_handle = CertificateHandle::from_pem(&evil_pem).expect("the evil CA parses");
+
+    // one request naming the evil CA about its own certificate, one naming the
+    // REAL intermediate about the signer; merged into a single OCSPRequest
+    let r_evil = tmp_path("evil.req");
+    let r_real = tmp_path("real.req");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-issuer",
+            evil_crt.to_str().unwrap(),
+            "-cert",
+            evil_crt.to_str().unwrap(),
+            "-reqout",
+            r_evil.to_str().unwrap(),
+            "-no_nonce",
+        ],
+    );
+    assert!(ok, "openssl could not build the evil request:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-issuer",
+            certs_dir().join("intermediate.crt").to_str().unwrap(),
+            "-cert",
+            certs_dir().join("signer-rsa.crt").to_str().unwrap(),
+            "-reqout",
+            r_real.to_str().unwrap(),
+            "-no_nonce",
+        ],
+    );
+    assert!(ok, "openssl could not build the real request:\n{text}");
+    // Merge the two requests into ONE OCSPRequest: the Request entries live in
+    // tbsRequest.requestList (SEQUENCE OF Request), so the lists are joined and
+    // the tbsRequest rebuilt with the default version and no requestorName.
+    fn tlvs(der: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 2 <= der.len() {
+            let tag = der[i];
+            let (len, mut at) = if der[i + 1] & 0x80 == 0 {
+                (der[i + 1] as usize, i + 2)
+            } else {
+                let n = (der[i + 1] & 0x7f) as usize;
+                let mut len = 0usize;
+                for b in &der[i + 2..i + 2 + n] {
+                    len = (len << 8) | *b as usize;
+                }
+                (len, i + 2 + n)
+            };
+            out.push((tag, der[at..at + len].to_vec()));
+            at += len;
+            i = at;
+        }
+        out
+    }
+    let requests_of = |path: &std::path::Path| -> Vec<Vec<u8>> {
+        let der = std::fs::read(path).expect("request");
+        let outer = tlvs(&der).remove(0).1; // OCSPRequest content
+        // tbsRequest is the first SEQUENCE; inside it, the requestList is the
+        // first SEQUENCE (a [0] version or [1] requestorName may precede it)
+        let tbs = tlvs(&outer)
+            .into_iter()
+            .find(|(tag, _)| *tag == 0x30)
+            .expect("tbsRequest")
+            .1;
+        let list = tlvs(&tbs)
+            .into_iter()
+            .find(|(tag, _)| *tag == 0x30)
+            .expect("requestList")
+            .1;
+        let entries: Vec<Vec<u8>> = tlvs(&list).into_iter().map(|(_, body)| body).collect();
+        entries
+            .into_iter()
+            .map(|body| openfirma_core::tlv::sequence(&[body]))
+            .collect()
+    };
+    let mut requests = requests_of(&r_evil);
+    requests.extend(requests_of(&r_real));
+    let request_list = openfirma_core::tlv::sequence(&requests);
+    let tbs = openfirma_core::tlv::sequence(&[request_list]);
+    let combined = openfirma_core::tlv::sequence(&[tbs]);
+    let combined_path = tmp_path("two.req");
+    std::fs::write(&combined_path, &combined).expect("write combined request");
+
+    // the responder: both CAs as its own, signing with the evil key
+    let mut two_cas = std::fs::read(&evil_crt).expect("evil");
+    two_cas.extend_from_slice(&std::fs::read(certs_dir().join("intermediate.crt")).expect("int"));
+    let two_ca_path = tmp_path("two-ca.pem");
+    std::fs::write(&two_ca_path, &two_cas).expect("write two CAs");
+    let evil_serial = String::from_utf8_lossy(
+        &run(
+            "openssl",
+            &[
+                "x509",
+                "-in",
+                evil_crt.to_str().unwrap(),
+                "-noout",
+                "-serial",
+            ],
+        )
+        .1
+        .into_bytes(),
+    )
+    .trim()
+    .trim_start_matches("serial=")
+    .to_string();
+    let signer_serial = hex::encode_upper(signer.certificate().serial_number().as_bytes());
+    let index = write_tmp(
+        "two.index",
+        format!(
+            "V\t301231000000Z\t\t{evil_serial}\tunknown\t/CN=evil\nV\t301231000000Z\t\t{signer_serial}\tunknown\t/CN=signer\n"
+        )
+        .as_bytes(),
+    );
+    let response = tmp_path("two.ocsp.der");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-index",
+            index.to_str().unwrap(),
+            "-CA",
+            two_ca_path.to_str().unwrap(),
+            "-rsigner",
+            evil_crt.to_str().unwrap(),
+            "-rkey",
+            evil_key.to_str().unwrap(),
+            "-reqin",
+            combined_path.to_str().unwrap(),
+            "-respout",
+            response.to_str().unwrap(),
+            "-ndays",
+            "30",
+        ],
+    );
+    assert!(
+        ok,
+        "openssl could not sign the two-answer response:\n{text}"
+    );
+    let forged = std::fs::read(&response).expect("openssl wrote the response");
+    let ids = openfirma_cades::revocation::parse_ocsp_response(&forged)
+        .expect("the two-answer response parses");
+    assert_eq!(ids.len(), 2, "the fixture carries both answers");
+
+    // the archive: that response as the signer link's only datum, the evil CA in
+    // the certificate pool so the responder may be judged, the root CRL for the
+    // root link
+    let opts = PadesOptions {
+        validation_certs: vec![evil_handle],
+        revocation: vec![RevocationBytes::Ocsp(forged), RevocationBytes::Crl(ca_crl)],
+        ..PadesOptions::default()
+    };
+    let signed = match pades_sign(INPUT, &signer, &opts) {
+        Ok(signed) => signed,
+        Err(e) => {
+            // refusing to archive it is also this fix working; the verify-side
+            // judgement is measured on the reviewer's A7 artifact
+            assert!(
+                e.to_string().contains("not usable") || e.to_string().contains("revocation"),
+                "signing refused it for another reason: {e}"
+            );
+            return;
+        }
+    };
+    let text = pades_verify(&signed, &anchors())
+        .expect_err("the real CA never authorized this responder")
+        .to_string();
+    assert!(
+        text.contains("carries no revocation datum issued by")
+            && text.contains("Test Intermediate CA"),
+        "the refusal names the link with no datum from its real CA: {text}"
+    );
+}

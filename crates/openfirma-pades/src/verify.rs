@@ -906,19 +906,13 @@ fn verify_dss(
                 status.problem.unwrap_or_else(|| "unverifiable".into())
             )));
         }
-        match revocation::parse_ocsp_response(der) {
-            Ok(ids) => {
-                verified_ocsps += 1;
-                ocsp_ids.extend(ids);
-            }
-            Err(e) => {
-                return Err(fail_dss(&format!(
-                    "OCSP response {} archived under /OCSPs is not a revocation datum: {}",
-                    i + 1,
-                    unwrap(&e)
-                )));
-            }
-        }
+        // The CertIDs the checker accepted — not a fresh parse of the raw
+        // response. `read_ocsp_response` drops the answers about CAs the signer
+        // was not authorized for (round 4's N4-1); re-parsing here put every
+        // SingleResponse back, so one "good" about the attacker's own CA laundered
+        // a real-CA CertID about a revoked signer.
+        verified_ocsps += 1;
+        ocsp_ids.extend(status.cert_ids);
     }
 
     let vri_keys = dss
