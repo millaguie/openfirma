@@ -1197,26 +1197,71 @@ pub fn stream_raw(data: &[u8], offset: usize) -> Result<Vec<u8>> {
     }
 }
 
+/// Every payload-end marker in one document — an `endstream` really followed by an
+/// `endobj`, with the end-of-line before the keyword already stripped — found in
+/// ONE pass and searched by position.
+///
+/// Round 3's N3-4 measured why this exists: `find_endstream` scanned from each
+/// stream's start to the first marker that happened to follow, so a document
+/// whose streams are missing their `endobj` (all readers tolerate it) cost a scan
+/// to the signature's own appearance — near the end of the file — for every
+/// stream, twice. A 723 KB file with 4000 such streams took 38 s and 1.2 GB; the
+/// work was quadratic in the file and the copies quadratic in streams × document.
+/// Building the positions once makes every lookup a binary search, and the copy
+/// that follows is only as far as the stream's own marker, or its /Length.
+pub struct EndstreamIndex {
+    /// Every `endstream` in the document, payload end already stripped of the
+    /// end-of-line before the keyword. This is what a recovering reader takes
+    /// first — qpdf prints "attempting to recover stream length" and scans for the
+    /// keyword, not for the `endobj` after it — and using it when `/Length` exists
+    /// is what keeps a stream without its `endobj` from swallowing every later
+    /// object (round 3's N3-4: 4000 such streams copied the rest of the file each,
+    /// 1.2 GB of resident memory after the time fix).
+    ends: Vec<usize>,
+    /// The `endstream`s that ARE followed by an `endobj`: the strict reading used
+    /// only when `/Length` cannot be trusted at all, where any marker might be
+    /// compressed data that happens to spell the keyword.
+    strict: Vec<usize>,
+}
+
+impl EndstreamIndex {
+    pub fn build(data: &[u8]) -> Self {
+        let mut ends = Vec::new();
+        let mut strict = Vec::new();
+        let mut from = 0usize;
+        while let Some(p) = data[from..].windows(9).position(|w| w == b"endstream") {
+            let candidate = from + p;
+            let after = skip_ws(data, candidate + 9);
+            let mut end = candidate;
+            while end > 0 && (data[end - 1] == b'\n' || data[end - 1] == b'\r') {
+                end -= 1;
+            }
+            ends.push(end);
+            if data[after..].starts_with(b"endobj") {
+                strict.push(end);
+            }
+            from = candidate + 9;
+        }
+        Self { ends, strict }
+    }
+
+    fn at_or_after(&self, i: usize) -> Option<usize> {
+        let k = self.ends.partition_point(|end| *end < i);
+        self.ends.get(k).copied()
+    }
+
+    fn strict_at_or_after(&self, i: usize) -> Option<usize> {
+        let k = self.strict.partition_point(|end| *end < i);
+        self.strict.get(k).copied()
+    }
+}
+
 /// Where this stream's payload really ends: the byte before an `endstream` that
 /// is really the end (an `endobj` follows it, which compressed data does not
 /// contain by accident often enough to matter), with the single run of end-of-line
 /// bytes before the keyword stripped. `None` when no such marker exists at all.
 fn find_endstream(data: &[u8], i: usize) -> Option<usize> {
-    let mut from = i;
-    while let Some(p) = data[from..].windows(9).position(|w| w == b"endstream") {
-        let candidate = from + p;
-        let after = skip_ws(data, candidate + 9);
-        if data[after..].starts_with(b"endobj") {
-            let mut end = candidate;
-            // the end of line before the keyword is not part of the data either
-            while end > i && (data[end - 1] == b'\n' || data[end - 1] == b'\r') {
-                end -= 1;
-            }
-            return Some(end);
-        }
-        from = candidate + 9;
-    }
-    None
+    EndstreamIndex::build(data).strict_at_or_after(i)
 }
 
 /// Whether these bytes are a stream object: a dictionary followed by the
@@ -1262,57 +1307,22 @@ pub fn stream_payload_as_readers(data: &[u8], offset: usize) -> Result<Vec<u8>> 
 /// `endobj`; resolving the length is the difference between "I cannot read this
 /// stream" (which the gate must not mistake for a bare dictionary) and the payload
 /// the recovering readers actually decode.
-/// A deterministic fingerprint of the payload a recovering reader would take —
-/// length and SHA-256 of the bytes — for a stream whose payload is too large for
-/// [`stream_payload_with_declared`] to copy.
-///
-/// The cap exists so one structural stream cannot make the gate allocate past
-/// `MAX_DECODED_STREAM`; it does not exist to make big streams disappear. Round
-/// 7's C-2 measured exactly that: a legal attachment of a few hundred megabytes
-/// (an invoice's scan, a plan) was compared as ABSENCE, so a pass could rewrite it
-/// wholesale behind an `/ITXT` mark and the gate called it bookkeeping. Hashing
-/// costs the same order as the copy the cap refuses and allocates nothing, so a
-/// rewrite of ANY byte changes the fingerprint; the same-length/same-bytes case
-/// still compares equal, which is what every unchanged stream must do.
-pub fn stream_payload_fingerprint(
-    data: &[u8],
-    offset: usize,
-    declared: Option<usize>,
-) -> Option<Vec<u8>> {
-    use sha2::{Digest, Sha256};
-
-    let dict_span = object_body(data, offset).ok()?;
-    let mut i = skip_ws(data, dict_span.end);
-    if !data[i..].starts_with(b"stream") {
-        return None;
-    }
-    i += 6;
-    if data[i..].starts_with(b"\r\n") {
-        i += 2;
-    } else if at(data, i) == b'\n' || at(data, i) == b'\r' {
-        i += 1;
-    }
-    let declared = declared.filter(|n| *n <= data.len() - i);
-    let end = find_endstream(data, i);
-    let stop = match (declared, end) {
-        (Some(n), Some(e)) => (i + n).max(e),
-        (Some(n), None) => i + n,
-        (None, Some(e)) => e,
-        (None, None) => return None,
-    };
-    let span = stop - i;
-    if span <= crate::stream::MAX_DECODED_STREAM {
-        // the copy path can judge this one; only the refused sizes need a digest
-        return None;
-    }
-    let digest = hex::encode(Sha256::digest(&data[i..stop]));
-    Some(format!("\x00openfirma stream fingerprint: {span} bytes {digest}").into_bytes())
-}
-
 pub fn stream_payload_with_declared(
     data: &[u8],
     offset: usize,
     declared: Option<usize>,
+) -> Result<Vec<u8>> {
+    let index = EndstreamIndex::build(data);
+    stream_payload_with_declared_indexed(data, offset, declared, &index)
+}
+
+/// [`stream_payload_with_declared`] with the document's marker index already
+/// built — the gate reads every stream of both states, and builds one.
+pub fn stream_payload_with_declared_indexed(
+    data: &[u8],
+    offset: usize,
+    declared: Option<usize>,
+    index: &EndstreamIndex,
 ) -> Result<Vec<u8>> {
     let dict_span = object_body(data, offset)?;
     let mut i = skip_ws(data, dict_span.end);
@@ -1332,7 +1342,12 @@ pub fn stream_payload_with_declared(
     // recovering readers (their scan stops at `endstream` anyway); everything
     // else stands until the marker reaches farther than it does
     let declared = declared.filter(|n| *n <= data.len() - i);
-    let end = find_endstream(data, i);
+    // with a trusted length the FIRST marker is the one readers recover to; only
+    // a stream whose length is unknowable leans on the strict reading
+    let end = match declared {
+        Some(_) => index.at_or_after(i),
+        None => index.strict_at_or_after(i),
+    };
     let stop = match (declared, end) {
         (Some(n), Some(e)) => (i + n).max(e),
         (Some(n), None) => i + n,
@@ -1352,6 +1367,67 @@ pub fn stream_payload_with_declared(
         )));
     }
     Ok(data[i..stop].to_vec())
+}
+
+/// A deterministic fingerprint of the payload a recovering reader would take —
+/// length and SHA-256 of the bytes — for a stream whose payload is too large for
+/// [`stream_payload_with_declared`] to copy.
+///
+/// The cap exists so one structural stream cannot make the gate allocate past
+/// `MAX_DECODED_STREAM`; it does not exist to make big streams disappear. Round
+/// 7's C-2 measured exactly that: a legal attachment of a few hundred megabytes
+/// (an invoice's scan, a plan) was compared as ABSENCE, so a pass could rewrite it
+/// wholesale behind an `/ITXT` mark and the gate called it bookkeeping. Hashing
+/// costs the same order as the copy the cap refuses and allocates nothing, so a
+/// rewrite of ANY byte changes the fingerprint; the same-length/same-bytes case
+/// still compares equal, which is what every unchanged stream must do.
+pub fn stream_payload_fingerprint(
+    data: &[u8],
+    offset: usize,
+    declared: Option<usize>,
+) -> Option<Vec<u8>> {
+    let index = EndstreamIndex::build(data);
+    stream_payload_fingerprint_indexed(data, offset, declared, &index)
+}
+
+/// [`stream_payload_fingerprint`] with the marker index already built.
+pub fn stream_payload_fingerprint_indexed(
+    data: &[u8],
+    offset: usize,
+    declared: Option<usize>,
+    index: &EndstreamIndex,
+) -> Option<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+
+    let dict_span = object_body(data, offset).ok()?;
+    let mut i = skip_ws(data, dict_span.end);
+    if !data[i..].starts_with(b"stream") {
+        return None;
+    }
+    i += 6;
+    if data[i..].starts_with(b"\r\n") {
+        i += 2;
+    } else if at(data, i) == b'\n' || at(data, i) == b'\r' {
+        i += 1;
+    }
+    let declared = declared.filter(|n| *n <= data.len() - i);
+    let end = match declared {
+        Some(_) => index.at_or_after(i),
+        None => index.strict_at_or_after(i),
+    };
+    let stop = match (declared, end) {
+        (Some(n), Some(e)) => (i + n).max(e),
+        (Some(n), None) => i + n,
+        (None, Some(e)) => e,
+        (None, None) => return None,
+    };
+    let span = stop - i;
+    if span <= crate::stream::MAX_DECODED_STREAM {
+        // the copy path can judge this one; only the refused sizes need a digest
+        return None;
+    }
+    let digest = hex::encode(Sha256::digest(&data[i..stop]));
+    Some(format!("\x00openfirma stream fingerprint: {span} bytes {digest}").into_bytes())
 }
 
 thread_local! {
@@ -2146,5 +2222,31 @@ pub(crate) mod tests {
             "an unknown row type is a null reference; the number must not resolve"
         );
         let _ = pairs_at;
+    }
+
+    /// Round 3's N3-4, the memory half: a stream whose `endstream` is not followed
+    /// by `endobj` (readers tolerate it; qpdf warns) and which carries a `/Length`
+    /// is recovered to ITS OWN marker — readers scan for the FIRST `endstream`, not
+    /// for the one with an `endobj` after it. Taking the strict marker made every
+    /// such stream swallow the rest of the document up to the signature's
+    /// appearance: 4000 streams, 1.2 GB, and a rewrite of any of them invisible.
+    #[test]
+    fn a_stream_with_a_length_stops_at_its_own_marker_not_a_later_one() {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let a = pdf.len();
+        // object 1 has no endobj after its endstream: readers tolerate it, and the
+        // strict marker would be object 2's, far past this stream's own data
+        pdf.extend_from_slice(b"1 0 obj\n<< /Length 5 >>\nstream\nHELLO\nendstream\n2 0 obj\n");
+        pdf.extend_from_slice(b"<< /Length 3 >>\nstream\nXYZ\nendstream\nendobj\n");
+        assert_eq!(
+            stream_payload_with_declared(&pdf, a, Some(5)).unwrap(),
+            b"HELLO",
+            "the next object is not this stream's payload"
+        );
+        assert_eq!(
+            stream_payload_as_readers(&pdf, a).unwrap(),
+            b"HELLO",
+            "and the direct path agrees"
+        );
     }
 }

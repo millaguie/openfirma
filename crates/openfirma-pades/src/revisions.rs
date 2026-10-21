@@ -398,6 +398,7 @@ fn rendered_body(
     pdf: &[u8],
     locations: &BTreeMap<ObjRef, Location>,
     cache: &mut pdf::ObjectStreamCache,
+    index: &pdf::EndstreamIndex,
     object: ObjRef,
 ) -> Option<Vec<u8>> {
     let body = pdf::resolve(pdf, locations, Some(cache), object).ok()?;
@@ -415,7 +416,7 @@ fn rendered_body(
             // dictionary — the `/ITXT` rule asks `is_bare_dictionary` of bodies and
             // must not be handed the head of a stream with its data lopped off.
             let declared = declared_length(pdf, locations, cache, *at);
-            match pdf::stream_payload_with_declared(pdf, *at, declared) {
+            match pdf::stream_payload_with_declared_indexed(pdf, *at, declared, index) {
                 Ok(payload) => Some(payload),
                 Err(_) if pdf::is_stream_object(pdf, *at) => {
                     // C-2: the cap refuses the copy, not the judgement. A stream a
@@ -424,7 +425,9 @@ fn rendered_body(
                     // it whole behind an `/ITXT`. A length+digest fingerprint of the
                     // extent the readers take costs what the refused copy would and
                     // allocates nothing.
-                    Some(pdf::stream_payload_fingerprint(pdf, *at, declared)?)
+                    Some(pdf::stream_payload_fingerprint_indexed(
+                        pdf, *at, declared, index,
+                    )?)
                 }
                 Err(_) => None,
             }
@@ -483,11 +486,17 @@ pub fn redefinitions_after(
     // its /Prev chain — i.e. exactly what a reader showed at signing time), and
     // each newer section's own entries
     let covering_locs = pdf::object_locations(pdf, revs[covering].startxref)?;
+    // one pass over the document for every payload-end marker: the gate reads
+    // each stream of both states, and scanning to the file's end per stream was
+    // quadratic (round 3's N3-4)
+    let endstream_index = pdf::EndstreamIndex::build(pdf);
     let mut covering_bodies: BTreeMap<ObjRef, Vec<u8>> = BTreeMap::new();
     {
         let mut cache = pdf::ObjectStreamCache::new();
         for object in covering_locs.keys() {
-            if let Some(body) = rendered_body(pdf, &covering_locs, &mut cache, *object) {
+            if let Some(body) =
+                rendered_body(pdf, &covering_locs, &mut cache, &endstream_index, *object)
+            {
                 covering_bodies.insert(*object, body);
             }
         }
@@ -522,7 +531,7 @@ pub fn redefinitions_after(
         // only objects a newer revision touched can differ from the covering
         // state; but an object that lives inside an OLDER section keeps resolving
         // to old bytes and matches. This is exactly the wanted test.
-        let current = match rendered_body(pdf, &merged, &mut cache, *object) {
+        let current = match rendered_body(pdf, &merged, &mut cache, &endstream_index, *object) {
             Some(body) => body,
             // The final state declares this object and nothing can read it. If
             // the covering state could, that IS the change: the bytes a reader
