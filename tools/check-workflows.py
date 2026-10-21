@@ -12,6 +12,7 @@ Run from the repository root; exits 1 naming every file and key repetition.
 """
 
 import glob
+import re
 import sys
 
 import yaml
@@ -39,15 +40,54 @@ def construct_mapping(loader, node, deep=False):
 UniqueKeyLoader.construct_mapping = construct_mapping
 
 failed = 0
+workflows = {}
 for path in sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")):
     try:
         with open(path, encoding="utf-8") as handle:
-            yaml.load(handle, Loader=UniqueKeyLoader)
+            loaded = yaml.load(handle, Loader=UniqueKeyLoader)
     except yaml.YAMLError as error:
         print(f"{path}: {error}", file=sys.stderr)
         failed += 1
     else:
+        workflows[path] = loaded
         print(f"ok, {path}")
+
+
+def release_notes_match_the_matrix(release):
+    """The release body's GUI list is derived from the one place that decides it.
+
+    Round 3's N3-1: the publish step said aarch64 Windows shipped the window while
+    its matrix entry carried no `gui: true`, and the notes had just started reaching
+    the release page. Comparing the two texts turns that sentence into something the
+    lint job checks on every push instead of something a reviewer has to catch.
+    """
+    matrix = release["jobs"]["build"]["strategy"]["matrix"]["include"]
+    gui = sorted(entry["target"] for entry in matrix if entry.get("gui"))
+    runs = [
+        step.get("run", "")
+        for step in release["jobs"]["publish"]["steps"]
+        if "Ships inside the artifacts for" in step.get("run", "")
+    ]
+    if len(runs) != 1:
+        return "the publish job must state the GUI list once"
+    text = runs[0]
+    start = text.index("Ships inside the artifacts for")
+    end = text.index('echo ""', start)
+    named = sorted(set(re.findall(r"[a-z0-9_]+(?:-[a-z0-9_]+)+", text[start:end])))
+    named = [name for name in named if name in {e["target"] for e in matrix}]
+    if sorted(set(named)) != gui:
+        return f"notes name {sorted(set(named))}, matrix gui:true is {gui}"
+    return None
+
+
+release_path = ".github/workflows/release.yml"
+if release_path in workflows:
+    problem = release_notes_match_the_matrix(workflows[release_path])
+    if problem:
+        print(f"{release_path}: {problem}", file=sys.stderr)
+        failed += 1
+    else:
+        print(f"ok, {release_path}: release notes list matches matrix gui:true")
 
 if failed:
     sys.exit(1)

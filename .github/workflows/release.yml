@@ -92,13 +92,17 @@ jobs:
       - name: build CLI
         run: cargo build --release --locked --target ${{ matrix.target }} --bin openfirma
 
-      # The window ships where its toolkit builds (gui: true above): the
-      # runner's native targets. The cross compilations — x86_64 binaries
-      # built from an arm64 macOS image, and any target whose matrix entry
-      # omits `gui` — carry no openfirma-gui: a cross sysroot has no
-      # windowing system to link against, and shipping a CLI-only binary
-      # beats shipping nothing. The release notes say exactly which
-      # artifacts hold the GUI.
+      # The window ships exactly where the matrix says `gui: true`, and nowhere
+      # else. Those are the targets whose toolkit the leg can link: all four
+      # Apple/Windows x64 and Linux glibc entries build it, including the Intel
+      # macOS one that is cross-built from the arm64 runner (the SDK is
+      # universal). A target without the flag — the two ARM Windows entries, the
+      # musl static build, aarch64 Linux — carries no openfirma-gui: a cross
+      # sysroot there has no windowing system to link against, and shipping a
+      # CLI-only binary beats shipping nothing. Round 3's N3-1 caught this
+      # comment promising GUI for aarch64 Windows while the matrix did not; the
+      # release notes and `tools/check-workflows.py` now derive from the matrix
+      # itself so the sentence cannot drift again.
       - name: build GUI
         if: matrix.gui
         run: cargo build --release --locked --target ${{ matrix.target }} -p openfirma-gui --bin openfirma-gui
@@ -228,11 +232,12 @@ jobs:
             echo "### openfirma-gui (the window)"
             echo ""
             echo "Ships inside the artifacts for \`x86_64-unknown-linux-gnu\`,"
-            echo "\`x86_64-pc-windows-msvc\`, \`aarch64-pc-windows-msvc\`,"
-            echo "\`x86_64-apple-darwin\` and \`aarch64-apple-darwin\`."
-            echo "The other artifacts (i686 Windows, x86_64 musl, aarch64 Linux)"
-            echo "carry the CLI only: their build has no windowing system to link"
-            echo "(the GUI needs its target's native OpenGL/X11 client libraries)."
+            echo "\`x86_64-pc-windows-msvc\`, \`x86_64-apple-darwin\` and"
+            echo "\`aarch64-apple-darwin\`."
+            echo "The other artifacts (i686 and aarch64 Windows, x86_64 musl,"
+            echo "aarch64 Linux) carry the CLI only: their build has no windowing"
+            echo "system to link (the GUI needs its target's native OpenGL/X11"
+            echo "client libraries)."
             echo ""
             echo "\`x86_64-unknown-linux-musl\` is a static binary: PKCS#11 and"
             echo "NSS modules load with \`dlopen\`, which a static musl binary"
