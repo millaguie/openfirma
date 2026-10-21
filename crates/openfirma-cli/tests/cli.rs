@@ -1907,6 +1907,14 @@ fn verify_says_when_a_signature_does_not_cover_the_whole_file() {
 /// invalidated by the next one — openfirma signs it and the user delivers a file
 /// whose first signature both xmlsec1 and AutoFirma call broken. A warning names
 /// it; a prior signature that isolates itself (our own, AutoFirma's) does not warn.
+/// The XML fixture used by the XAdES warning tests.
+fn input_for(_pki: &std::path::Path) -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/inputs/simple.xml"
+    )
+}
+
 #[test]
 fn signing_over_a_prior_enveloped_only_xml_signature_warns() {
     let Some(pki) = test_certs() else {
@@ -1915,7 +1923,10 @@ fn signing_over_a_prior_enveloped_only_xml_signature_warns() {
     };
     let with_prior = write_tmp(
         "prior-enveloped.xml",
-        b"<r xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:Signature><ds:SignedInfo/></ds:Signature><a>1</a></r>",
+        b"<r xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:Signature><ds:SignedInfo>\
+          <ds:Reference URI=\"\"><ds:Transforms><ds:Transform \
+          Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>\
+          </ds:Transforms></ds:Reference></ds:SignedInfo></ds:Signature><a>1</a></r>",
     );
     let out_path = write_tmp("prior-enveloped.signed.xml", b"");
     let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
@@ -1946,6 +1957,76 @@ fn signing_over_a_prior_enveloped_only_xml_signature_warns() {
     assert!(
         stderr.contains("does not exclude other signatures") && stderr.contains("NO_MATCH_DATA"),
         "the warning names the breakage and its verifiers: {stderr}"
+    );
+
+    // the mixed document round 4 measured: our isolated signature plus an
+    // enveloped-only one from xmlsec1 — one isolation string must not silence the
+    // warning for the second signature
+    let our_sig = write_tmp("mixed-our.xml", b"");
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "sign",
+            "-i",
+            input_for(&pki),
+            "-o",
+            our_sig.to_str().unwrap(),
+            "--format",
+            "xades-b-b",
+            "--cert",
+            pki.join("signer-rsa.crt").to_str().unwrap(),
+            "--key",
+            pki.join("signer-rsa.key").to_str().unwrap(),
+            "--chain",
+            pki.join("intermediate.crt").to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("signing");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut mixed = std::fs::read_to_string(&our_sig).expect("our signature");
+    // inside the root element: appending after it would make a second root
+    let closing = mixed.rfind("</").expect("the root's closing tag");
+    mixed.insert_str(
+        closing,
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
+         <ds:SignedInfo><ds:Reference URI=\"\"><ds:Transforms><ds:Transform \
+         Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>\
+         </ds:Transforms></ds:Reference></ds:SignedInfo></ds:Signature>",
+    );
+    let mixed_path = write_tmp("mixed-enveloped.xml", mixed.as_bytes());
+    let out_path = write_tmp("mixed-enveloped.signed.xml", b"");
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "sign",
+            "-i",
+            mixed_path.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+            "--format",
+            "xades-b-b",
+            "--cert",
+            pki.join("signer-rsa.crt").to_str().unwrap(),
+            "--key",
+            pki.join("signer-rsa.key").to_str().unwrap(),
+            "--chain",
+            pki.join("intermediate.crt").to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("signing the mixed document");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("does not exclude other signatures"),
+        "one isolated signature does not license ignoring the enveloped-only one: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     // control: our own signature isolates itself, so co-signing it stays silent

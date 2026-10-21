@@ -39,7 +39,10 @@ enum Command {
         #[command(subcommand)]
         command: KeystoreCommand,
     },
-    /// Answer one browser invocation URI (`afirma://…`), headless. This is
+    /// Answer one browser invocation URI (`afirma://…`), headless.
+    /// EXPERIMENTAL: not part of what 0.1.0 supports (no live sede reaches it,
+    /// there is no wss transport yet, and `--register` takes the afirma://
+    /// scheme away from AutoFirma after asking). This is
     /// what the OS scheme handler runs when a sede electronica's page hands
     /// the browser an afirma:// URL; the result goes to --output (AutoFirma's
     /// wire form, `base64(cert)|base64(signature)` — in the real flow the
@@ -116,7 +119,8 @@ enum Command {
         config: Option<PathBuf>,
     },
     /// Serve the loopback endpoint a sede page calls, and run every URI that
-    /// arrives through it. The ephemeral port is printed at startup — like
+    /// arrives through it. EXPERIMENTAL: not part of what 0.1.0 supports (see
+    /// `afirma-uri`). The ephemeral port is printed at startup — like
     /// AutoFirma's pages learn theirs, out of band — and each session token
     /// is consumed by its first request. Ctrl-C stops it. See
     /// docs/adr/0005-browser-protocol.md for the transport decision and its
@@ -206,9 +210,12 @@ enum KeystoreCommand {
         #[arg(long = "store", short = 's')]
         stores: Vec<String>,
 
-        /// Environment variable holding the PIN of every listed keystore.
-        /// Without it, tokens that hide their objects until login report how
-        /// to give one instead of pretending to be empty.
+        /// Environment variable holding the PIN of the ONE keystore being
+        /// listed, or of the one `sign` opens. A listing that would open more
+        /// than one PIN-capable store with it is refused before any opens (one
+        /// wrong guess costs a lockout try on real cards). Without it, tokens
+        /// that hide their objects until login report how to give one instead
+        /// of pretending to be empty.
         #[arg(long)]
         pin_env: Option<String>,
     },
@@ -659,16 +666,34 @@ fn parse_store_spec(text: &str) -> Result<StoreSpec> {
 /// (URI="" or the root's Id) covers every other signature in the document, so a
 /// second one invalidates it. The isolated shape — what this crate and AutoFirma
 /// write — carries `not(ancestor-or-self::ds:Signature)` in a transform, and then
-/// the prior signature keeps verifying. A byte search is enough for a warning, and
-/// the warning is the point: refusing here would refuse the co-signature of half
-/// the FacturaE files in the field.
+/// the prior signature keeps verifying.
+///
+/// Counted per ELEMENT, not by substring: round 4 measured both directions of the
+/// naive search — a document with our isolated signature AND an enveloped-only one
+/// from xmlsec1 slipped through (one isolation string was enough to silence the
+/// warning), while `<xades:SignatureDate>` was taken for a signature. A signature
+/// only breaks when the document has a root-reaching reference for it.
 fn a_prior_signature_would_break(xml: &[u8]) -> bool {
     let text = String::from_utf8_lossy(xml);
-    let has_signature = text.contains(":Signature") || text.contains("<Signature");
-    // the filter can appear under any prefix, and its text is what matters
-    let isolated = text.contains("ancestor-or-self::ds:Signature")
-        || text.contains("ancestor-or-self::Signature");
-    has_signature && !isolated
+    let mut signatures = 0usize;
+    for (at, _) in text.match_indices("Signature") {
+        let before = text[..at].chars().next_back();
+        let after = text[at + "Signature".len()..].chars().next();
+        let element = matches!(before, Some('<') | Some(':'))
+            && matches!(
+                after,
+                Some(' ') | Some('\t') | Some('\r') | Some('\n') | Some('>') | Some('/')
+            );
+        if element {
+            signatures += 1;
+        }
+    }
+    let isolated = text.matches("ancestor-or-self::ds:Signature").count()
+        + text.matches("ancestor-or-self::Signature").count();
+    // only a reference that reaches the whole document can be invalidated by
+    // adding another signature; a detached one signs bytes outside it
+    let reaches_the_document = text.contains("URI=\"\"") || text.contains("URI=\"#");
+    reaches_the_document && signatures > isolated
 }
 
 fn store_pin(pin_env: Option<&String>) -> Result<Option<Zeroizing<String>>> {
