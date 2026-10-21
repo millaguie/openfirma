@@ -1409,6 +1409,33 @@ fn main() -> Result<()> {
                 }
             }
             let pin = store_pin(pin_env.as_ref())?;
+            // Round 3's N3-1: one --pin-env is one secret, and a token reports a
+            // wrong PIN by spending a lockout try — the DNIe locks at the third and
+            // needs a police station to reopen. Listing two tokens with one PIN
+            // therefore tried the first token's secret on the second; the README's
+            // own "what can sign" example (DNIe and an FNMT card together) is
+            // exactly that shape. Refused before any store opens.
+            if pin.is_some() {
+                let pin_capable = specs
+                    .iter()
+                    .filter(|spec| {
+                        matches!(
+                            spec,
+                            StoreSpec::Pkcs11 { .. }
+                                | StoreSpec::Nss { .. }
+                                | StoreSpec::NssFirefox { .. }
+                        )
+                    })
+                    .count();
+                if pin_capable > 1 {
+                    anyhow::bail!(
+                        "--pin-env names ONE PIN and this listing opens {pin_capable} stores that \
+                         take one: a wrong guess costs a lockout try on real cards (the DNIe locks \
+                         at the third), so list them one at a time or drop --pin-env if the \
+                         stores need none"
+                    );
+                }
+            }
             // One failure must not hide the other keystores' listings: every
             // descriptor is attempted, and a nonzero exit at the end says the
             // run was not fully successful.

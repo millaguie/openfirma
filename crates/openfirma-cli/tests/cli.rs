@@ -1745,3 +1745,40 @@ fn unregister_removes_our_association_line_and_leaves_the_rest() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Round 3's N3-1: one `--pin-env` is one secret, and `keystores list` with two
+/// tokens used to try it on each of them — a spent lockout try per extra token,
+/// on the shape the README's own "what can sign" example prints (a DNIe and an
+/// FNMT card listed together). The refusal has to come BEFORE any store opens,
+/// so this test points at modules that do not exist: reaching the loader at all
+/// is the failure.
+#[test]
+fn one_pin_env_for_several_tokens_is_refused_before_any_store_opens() {
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "keystores",
+            "list",
+            "-s",
+            "pkcs11:/nonexistent/a.so:token-a",
+            "-s",
+            "pkcs11:/nonexistent/b.so:token-b",
+            "--pin-env",
+            "OPENFIRMA_TEST_PIN",
+        ])
+        .env("OPENFIRMA_TEST_PIN", "1234")
+        .output()
+        .expect("the binary must run");
+    assert!(
+        !out.status.success(),
+        "two PINs' worth of stores cannot share one"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("lockout") && stderr.contains("one at a time"),
+        "the refusal names the cost and the way out: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot load PKCS#11 module"),
+        "nothing may be opened before the refusal: {stderr}"
+    );
+}
