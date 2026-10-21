@@ -125,7 +125,7 @@ died in the licence step, see review 07 H-12 in `docs/review-findings.md`.
 | `x86_64-unknown-linux-musl` artifact: sha256 matches, binary is `static-pie`, runs, and carries the CLI only — exactly what the release note promises | same | pass | 2026-10-18 |
 | `openfirma-gui` from the Linux artifact starts on a real X server and stays alive | `xvfb-run` (1280x1024x24), 15 s watch | pass on a **virtual** display; a real desktop is still the manual checklist item below | 2026-10-18 |
 | `i686-pc-windows-msvc` artifact: sha256 matches, `openfirma.exe` present, CLI only (no GUI), as the note says | same | inspected only — a Windows PE **cannot be executed on this machine** | 2026-10-18 |
-| Windows x64/arm64 and both macOS artifacts run on their own platforms | — | **not verifiable here**: cross-built, no such host | |
+| Windows x64/arm64 and both macOS artifacts run on their own platforms | — | **not verifiable here**: built on the project's own runners (Windows and macOS are native hosts, not cross), but this machine has no such host to run them | |
 | The `publish` job (release page, checksums attached, generated notes) | needs a tag | **never run** — creating `v0.1.0` is the owner's call | |
 
 ## Manual

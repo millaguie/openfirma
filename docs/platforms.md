@@ -16,15 +16,15 @@ in format code, ever.
 | Capability | Windows | macOS | Linux | Rust approach |
 |---|---|---|---|---|
 | System certificate store | CAPI/CNG via hand-written FFI (`windows.rs`) | refused until testable (`macos.rs`, see ADR-0004) | none canonical, use PKCS#11 + NSS | one `SystemStore` trait per `cfg(target_os)` backend |
-| Non exportable keys, sign with OS key | CAPI CSP (`CryptSignHash`, PKCS#1 v1.5); a CNG-only key is refused by name — no NCrypt signer yet | `SecKeyCreateSignature` | PKCS#11 | platform bindings |
+| Non exportable keys, sign with OS key | CAPI CSP (`CryptSignHash`, PKCS#1 v1.5); a CNG-only key is refused by name — no NCrypt signer yet | refused until it can be tested, like every macOS store door (ADR-0004) | PKCS#11 | platform bindings |
 | PKCS#11 tokens | vendor DLL | vendor dylib | `pkcs11-module` via p11-kit | openfirma-keystore loads the module at runtime with `libloading` (hand-written Cryptoki types, no bindings crate). The musl static release binary cannot `dlopen`, so that artifact is PKCS#12-only; use the glibc build for `--store pkcs11:`/`nss`. **Windows: compiled and linted, never run against a real module** — CI provisions no SoftHSM there, so the tested module path is Linux. **macOS: never executed at runtime either** (round 3's N3-4; neither a PKCS#11 module nor an NSS database has been loaded) |
-| Smartcards, DNIe | WinSCard | WinSCard equivalent (PCSC.framework) | pcsclite | `pcsc` crate, one API on all three |
+| Smartcards, DNIe | a vendor PKCS#11 module | a vendor PKCS#11 module | a vendor PKCS#11 module | no PC/SC layer at all: the card is reached through its Cryptoki module, the same path on every OS (README says so too) |
 | Firefox / NSS store | cert9.db | cert9.db | cert9.db | open softokn3 through PKCS#11 (loaded with `libloading`), no sqlite needed |
 | Local endpoint for the browser protocol | plain HTTP on loopback (docs/adr/0005) + an `afirma://` launcher that dials it | same | same | identical code; a wss service would need a TLS client, and the pure-Rust rule keeps rustls/openssl out until that decision is made |
-| `afirma://` URL scheme | registry `HKCU\Software\Classes` | Info.plist `CFBundleURLTypes` | `.desktop` + `gio`/`xdg-mime`, D-Bus on KDE | per OS installer step |
+| `afirma://` URL scheme | registry `HKCU\Software\Classes` | Info.plist `CFBundleURLTypes` | `.desktop` + `gio`/`xdg-mime`, D-Bus on KDE | **not in the 0.1.0 release**: no installer ships, nothing is registered, and `afirma-uri --register` is experimental (README, release notes). The per-OS entries above are 0.2 work |
 | Trust store install of local CA | `certutil` / `CertAddCertificateContextToStore` | `SecTrustSettingsSetTrustSettings` + admin auth | `update-ca-trust`, `update-ca-certificates`, NSS `certutil` | per OS, needs elevation |
 | Elevation | UAC manifest / runas | `AuthorizationExecuteWithPrivileges` replaced by SMAppService or `security` with prompt | pkexec / sudo | installer only |
-| Installer | NSIS or WiX | `.pkg` + `.dmg` | `.deb`, `.rpm`, AppImage | `cargo-dist` or `tauri` bundler |
+| Installer | none in 0.1.0 (tarball/zip) | none in 0.1.0 (tarball/zip) | none in 0.1.0 (tarball/zip) | planned: NSIS or WiX, `.pkg`/`.dmg`, `.deb`/`.rpm`/AppImage; no bundler exists yet |
 | GUI | egui/eframe | same | same | one codebase, plus `tray-icon`. **Executed only on Linux**: the window has run on a virtual display (`xvfb-run`) and in the manual checklist; the Windows and macOS builds are compiled and published, never launched (round 3's N3-4) |
 
 ## Notes that will bite

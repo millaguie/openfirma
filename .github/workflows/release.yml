@@ -80,11 +80,11 @@ jobs:
         if: matrix.setup_gui
         run: ${{ matrix.setup_gui }}
 
-      # Any target that could not link a windowing system still builds with
-      # `--no-default-features`, which drops the `gui` feature (eframe, egui,
-      # rfd) — this is what makes the GUI an opt-out workspace member rather
-      # than a hard dependency of the CLI: no bin other than openfirma-gui
-      # ever needs it, and openfirma-gui's own bin has required-features.
+      # Targets without `gui: true` leave the GUI member out of the workspace
+      # build (`--exclude openfirma-gui`): no binary other than openfirma-gui
+      # depends on eframe/egui/rfd, and the member's own bin declares
+      # required-features. (The old comment described a --no-default-features
+      # flag that no longer exists.)
       - name: build every member without the GUI (non-GUI targets)
         if: ${{ !matrix.gui }}
         run: cargo build --release --locked --workspace --exclude openfirma-gui --target ${{ matrix.target }}
