@@ -1815,3 +1815,90 @@ fn an_empty_pin_variable_is_refused_as_the_missing_secret_it_is() {
         "nothing may be opened before the refusal: {stderr}"
     );
 }
+
+/// Round 3's disagreement 3, condition 2: `verify` says out loud what pdfsig says
+/// — that a signature does not cover the whole file and how many revisions follow
+/// it — without changing the verdict or the exit code. The later pass is the gate's
+/// business; the coverage is the reader's.
+#[test]
+fn verify_says_when_a_signature_does_not_cover_the_whole_file() {
+    let Some(pki) = test_certs() else {
+        eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let first = write_tmp("coverage-1.pdf", b"");
+    let second = write_tmp("coverage-2.pdf", b"");
+    let input =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/inputs/simple.pdf");
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "sign",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            first.to_str().unwrap(),
+            "--format",
+            "pades-b-b",
+            "--cert",
+            pki.join("signer-rsa.crt").to_str().unwrap(),
+            "--key",
+            pki.join("signer-rsa.key").to_str().unwrap(),
+            "--chain",
+            pki.join("intermediate.crt").to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("signing the first signature");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "sign",
+            "-i",
+            first.to_str().unwrap(),
+            "-o",
+            second.to_str().unwrap(),
+            "--format",
+            "pades-b-b",
+            "--cert",
+            pki.join("signer-ec.crt").to_str().unwrap(),
+            "--key",
+            pki.join("signer-ec.key").to_str().unwrap(),
+            "--chain",
+            pki.join("intermediate.crt").to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("signing the second signature");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "verify",
+            "-i",
+            second.to_str().unwrap(),
+            "--trust",
+            pki.join("ca.crt").to_str().unwrap(),
+            "--trust",
+            pki.join("intermediate.crt").to_str().unwrap(),
+        ])
+        .output()
+        .expect("verify runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("covers bytes 0..") && stdout.contains("revision(s) follow it"),
+        "the first signature does not cover the second's bytes and the output says so: {stdout}"
+    );
+}

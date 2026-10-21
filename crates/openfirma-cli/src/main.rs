@@ -1251,6 +1251,9 @@ fn main() -> Result<()> {
                     );
                 }
                 let document = openfirma_pades::pades_verify(&bytes, &opts)?;
+                let revision_ends = openfirma_pades::revisions::revisions(&bytes)
+                    .map(|revs| revs.iter().map(|r| r.end).collect::<Vec<_>>())
+                    .unwrap_or_default();
                 for (i, sig) in document.signatures.iter().enumerate() {
                     let [a, b, c, d] = sig.byte_range;
                     println!(
@@ -1261,6 +1264,19 @@ fn main() -> Result<()> {
                     );
                     for report in &sig.reports {
                         print_report(report);
+                    }
+                    // Round 3's disagreement 3, condition 2: pdfsig says out loud
+                    // when a signature does not cover the whole file. This one can
+                    // too, from data it already has, without changing the verdict or
+                    // the exit code — a later pass is what the gate judged above.
+                    let covered = c.saturating_add(d);
+                    if covered < bytes.len() {
+                        let after = revision_ends.iter().filter(|end| **end > covered).count();
+                        println!(
+                            "  covers bytes 0..{covered} of {}; {after} revision(s) follow it, \
+                             judged by the revisions gate",
+                            bytes.len()
+                        );
                     }
                 }
                 for (i, t) in document.document_timestamps.iter().enumerate() {
