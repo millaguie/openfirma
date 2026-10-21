@@ -644,12 +644,19 @@ fn chain_walk(signer: &CertificateHandle, pool: &[CertificateHandle]) -> Vec<Cer
 /// Whether an OCSP `CertID` speaks about certificates issued by `ca`, by the
 /// RFC 6960 hashes. An unsupported hash algorithm answers `false`, not an
 /// error: the response is still archived, it just cannot be associated.
+///
+/// BOTH hashes, never either one: RFC 6960 4.1.1 identifies the issuer by the
+/// name hash AND the key hash. An `||` here let a self-signed impostor that copied
+/// the CA's subject name sign its own "good" answer — the key hash differed, the
+/// name matched, and a revoked signer sailed through B-LT (round 3's N3-1, the
+/// sumptuous name-impostor of round 2 coming back through the OCSP door). The
+/// key hash is the half an impostor cannot mint without the CA's private key.
 pub(crate) fn ocsp_id_names_ca(id: &OcspCertId, ca: &CertificateHandle) -> Result<bool> {
     let Ok(hash) = DigestAlg::from_oid(&id.hash_algorithm) else {
         return Ok(false);
     };
     let (name_hash, key_hash) = revocation::ocsp_issuer_hashes(ca, hash)?;
-    Ok(id.issuer_name_hash == name_hash || id.issuer_key_hash == key_hash)
+    Ok(id.issuer_name_hash == name_hash && id.issuer_key_hash == key_hash)
 }
 
 fn refs(list: &[ObjRef]) -> String {

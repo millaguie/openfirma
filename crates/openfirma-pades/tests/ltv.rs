@@ -1841,3 +1841,220 @@ fn qpdf_reads_the_b_lt_document() {
         "qpdf warned about the B-LT document:\n{text}"
     );
 }
+
+/// Round 3, N3-1. Round 2's name-impostor came back through the OCSP door:
+/// `ocsp_id_names_ca` compared the `CertID` with the parent using `||` where RFC
+/// 6960 4.1.1 says BOTH hashes name the issuer. The fixture is the reviewer's own
+/// recipe: a synthetic root, a leaf it signs, and a self-signed impostor wearing
+/// the root's exact subject with a key of its own, whose "good" answer about the
+/// leaf names the root by NAME only. Before the fix the archive counted that as the
+/// root's word and `verify` answered OK; with both hashes demanded it has no datum
+/// from the real CA and is refused.
+#[test]
+fn an_ocsp_response_from_a_name_impostor_is_not_a_datum() {
+    if !openssl_available() {
+        require_or_skip("openssl not found");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("openfirma-n31-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let p = |name: &str| dir.join(name);
+
+    // the root and the leaf it signs (synthetic, the reviewer's shape)
+    let leaf_ext = write_tmp(
+        "n31-leaf.ext",
+        b"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,nonRepudiation\n",
+    );
+    let root_key = p("n31-root.key");
+    let root_crt = p("n31-root.crt");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            root_key.to_str().unwrap(),
+            "-out",
+            root_crt.to_str().unwrap(),
+            "-days",
+            "300",
+            "-subj",
+            "/C=ES/O=atk/CN=root",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ],
+    );
+    assert!(ok, "openssl could not mint the root:\n{text}");
+    let leaf_key = p("n31-leaf.key");
+    let leaf_csr = p("n31-leaf.csr");
+    let leaf_crt = p("n31-leaf.crt");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            leaf_key.to_str().unwrap(),
+            "-out",
+            leaf_csr.to_str().unwrap(),
+            "-subj",
+            "/C=ES/O=atk/CN=rleaf",
+        ],
+    );
+    assert!(ok, "openssl could not mint the leaf key:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "x509",
+            "-req",
+            "-in",
+            leaf_csr.to_str().unwrap(),
+            "-CA",
+            p("n31-root.crt").to_str().unwrap(),
+            "-CAkey",
+            p("n31-root.key").to_str().unwrap(),
+            "-CAcreateserial",
+            "-days",
+            "300",
+            "-extfile",
+            leaf_ext.to_str().unwrap(),
+            "-out",
+            leaf_crt.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "openssl could not sign the leaf:\n{text}");
+
+    // the impostor: self-signed, the root's exact subject, its own key
+    let imp_key = p("n31-imp.key");
+    let imp_crt = p("n31-imp.crt");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            imp_key.to_str().unwrap(),
+            "-out",
+            imp_crt.to_str().unwrap(),
+            "-days",
+            "300",
+            "-set_serial",
+            "777",
+            "-subj",
+            "/C=ES/O=atk/CN=root",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ],
+    );
+    assert!(ok, "openssl could not mint the impostor:\n{text}");
+    let imp_pem = std::fs::read_to_string(&imp_crt).expect("impostor certificate");
+    let imp_handle = CertificateHandle::from_pem(&imp_pem).expect("the impostor parses");
+    let root_pem = std::fs::read_to_string(p("n31-root.crt")).expect("root certificate");
+    let root_handle = CertificateHandle::from_pem(&root_pem).expect("the root parses");
+    assert_eq!(
+        imp_handle.subject_der().unwrap(),
+        root_handle.subject_der().unwrap(),
+        "the impostor wears the root's name: that is the attack"
+    );
+
+    // a genuine "good" answer about the leaf, computed with the IMPOSTOR as its
+    // issuer: name hash = the root's name, key hash = the impostor's key
+    let (ok, serial_text) = run(
+        "openssl",
+        &[
+            "x509",
+            "-in",
+            leaf_crt.to_str().unwrap(),
+            "-noout",
+            "-serial",
+        ],
+    );
+    assert!(ok, "openssl could not read the leaf serial:\n{serial_text}");
+    let serial = serial_text
+        .trim()
+        .strip_prefix("serial=")
+        .expect("openssl prints serial=")
+        .to_string();
+    let index = write_tmp(
+        "n31.index",
+        format!("V\t301231000000Z\t\t{serial}\tunknown\t/CN=rleaf\n").as_bytes(),
+    );
+    let request = p("n31.req");
+    let response = p("n31.ocsp.der");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-issuer",
+            imp_crt.to_str().unwrap(),
+            "-cert",
+            leaf_crt.to_str().unwrap(),
+            "-reqout",
+            request.to_str().unwrap(),
+            "-no_nonce",
+        ],
+    );
+    assert!(ok, "openssl could not build the request:\n{text}");
+    let (ok, text) = run(
+        "openssl",
+        &[
+            "ocsp",
+            "-index",
+            index.to_str().unwrap(),
+            "-rsigner",
+            imp_crt.to_str().unwrap(),
+            "-rkey",
+            imp_key.to_str().unwrap(),
+            "-CA",
+            imp_crt.to_str().unwrap(),
+            "-reqin",
+            request.to_str().unwrap(),
+            "-respout",
+            response.to_str().unwrap(),
+            "-ndays",
+            "30",
+        ],
+    );
+    assert!(ok, "openssl could not sign the impostor response:\n{text}");
+    let forged = std::fs::read(&response).expect("openssl wrote the response");
+    let ids = openfirma_cades::revocation::parse_ocsp_response(&forged)
+        .expect("the impostor response parses");
+    assert_eq!(ids.len(), 1);
+    assert!(!ids[0].revoked, "the impostor says the leaf is good");
+
+    let leaf_cert_pem = std::fs::read_to_string(&leaf_crt).expect("leaf certificate");
+    let leaf_key_pem = std::fs::read_to_string(&leaf_key).expect("leaf key");
+    let signer = SoftwareSigner::from_pkcs8_pem(&leaf_cert_pem, &leaf_key_pem)
+        .expect("the minted leaf loads")
+        .with_chain(vec![root_handle.clone()]);
+
+    // the archive: the impostor response as the signer link's only datum
+    let opts = PadesOptions {
+        validation_certs: vec![imp_handle],
+        revocation: vec![RevocationBytes::Ocsp(forged)],
+        ..PadesOptions::default()
+    };
+    let signed = pades_sign(INPUT, &signer, &opts)
+        .expect("signing must accept the material; verify is where the binding is judged");
+    let text = pades_verify(&signed, &VerifyOptions::new(vec![root_handle]))
+        .expect_err("a name-only impostor signed this answer; the real root did not")
+        .to_string();
+    assert!(
+        text.contains("carries no revocation datum issued by") && text.contains("CN=root"),
+        "the refusal names the link with no datum from its real CA: {text}"
+    );
+}
