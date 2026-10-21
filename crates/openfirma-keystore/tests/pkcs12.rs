@@ -313,3 +313,39 @@ fn which(program: &str) -> Option<std::path::PathBuf> {
         })
     })
 }
+
+/// Round 3's N3-2, end to end: two valid PKCS#12 files whose IV (one) and PBKDF2
+/// salt (the other) begin with the two bytes `04 0e`, so the reader that unwrapped
+/// opaque fields as if they were nested TLVs took a 14-byte IV ("bad key or IV
+/// length") or derived a different key ("wrong password" with the right one).
+/// openssl opens both. About one file in 11 000 from OpenSSL 3 falls in this shape,
+/// which is what the single macOS CI failure was.
+///
+/// The two files are hunted artifacts kept OUTSIDE the repository (they are
+/// `testdata/certs/pkcs12-flake/` when present, or the directory named by
+/// `OPENFIRMA_PKCS12_FLAKE_DIR`); like the AutoFirma jar tests, they skip with a
+/// message where they are absent, and the shape itself is pinned by the unit test
+/// on the two readers.
+#[test]
+fn a_pkcs12_whose_iv_or_salt_begins_like_a_tlv_opens() {
+    let dir = std::env::var_os("OPENFIRMA_PKCS12_FLAKE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| certs_dir().join("pkcs12-flake"));
+    let mut seen = 0usize;
+    for name in ["iv-hit.p12", "salt-hit.p12"] {
+        let Ok(bytes) = std::fs::read(dir.join(name)) else {
+            continue;
+        };
+        seen += 1;
+        Pkcs12::load(&bytes, "clave").unwrap_or_else(|e| {
+            panic!("{name} is a valid PKCS#12 (openssl opens it with the same password): {e}")
+        });
+    }
+    if seen == 0 {
+        eprintln!(
+            "skipped, no hunted PKCS#12 flake fixtures under {}: set \
+             OPENFIRMA_PKCS12_FLAKE_DIR to run this one",
+            dir.display()
+        );
+    }
+}

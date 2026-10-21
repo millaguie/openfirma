@@ -377,6 +377,30 @@ impl Level {
         })
     }
 
+    /// The bytes of an OCTET STRING, with NO unwrapping.
+    ///
+    /// Round 3's N3-2: `octets` unwraps a level whose whole content happens to be
+    /// one more OCTET STRING, which is right where BER really nests a wrapper —
+    /// and wrong for the fields that are just bytes. An AES IV of 16 bytes whose
+    /// first two happen to be `04 0e` was read as a 14-byte IV ("bad key or IV
+    /// length: Invalid Length"), and a PBKDF2 salt of that shape derived a
+    /// different key ("wrong password" on the right one). The fields that are
+    /// opaque — IV, salts, the MAC digest, `localKeyID` — are read with this; the
+    /// ones BER wraps (the authSafe content, the encrypted content) keep `octets`.
+    /// About one file in 11 000 from OpenSSL 3 hits this, which is what the single
+    /// macOS CI failure was (measured by round 3, and reproduced with a hunted
+    /// fixture before this existed).
+    fn primitive_octets(&mut self) -> Result<Level> {
+        let (tag, level) = self.any()?;
+        if tag != 0x04 {
+            return Err(Error::Keystore(format!(
+                "expected an OCTET STRING in the PKCS#12, found tag {tag:#04x}. \
+                 Re-export the file with {REEXPORT} if it came from elsewhere"
+            )));
+        }
+        Ok(level)
+    }
+
     /// `[n] EXPLICIT`, the wrapper PKCS#12 puts around nested content. BER's
     /// constructed form of a context tag is the same bit pattern (`0xA0|n`
     /// already carries the constructed bit), so nothing extra is needed here.
@@ -755,8 +779,8 @@ fn read_macs(cur: &mut Level) -> Result<Vec<MacData>> {
         if !alg.is_done() {
             let _ = alg.take_bytes()?;
         }
-        let digest = digest_info.octets()?.into_level_bytes().to_vec();
-        let salt = mac.octets()?.into_level_bytes().to_vec();
+        let digest = digest_info.primitive_octets()?.into_level_bytes().to_vec();
+        let salt = mac.primitive_octets()?.into_level_bytes().to_vec();
         // iterations defaults to 1 when absent, per the specification
         let iterations = if mac.is_done() { 1 } else { mac.number()? };
         check_iterations(iterations, "MAC")?;
@@ -1148,7 +1172,9 @@ fn read_attributes(cur: &mut Level) -> Result<(Option<String>, Option<Vec<u8>>)>
                 }
                 alias = Some(bmp_string(&raw)?);
             }
-            OID_LOCAL_KEY_ID => local_key_id = Some(values.octets()?.into_level_bytes().to_vec()),
+            OID_LOCAL_KEY_ID => {
+                local_key_id = Some(values.primitive_octets()?.into_level_bytes().to_vec())
+            }
             _ => {}
         }
     }
@@ -1282,7 +1308,7 @@ pub(crate) fn decrypt_pbe(
             // iterations, and a key/IV derived with ids 1 and 2 of the same
             // KDF. RC2 uses a 5-byte (40-bit) key; 3DES its full 24.
             let mut p = Level::new(params);
-            let salt = p.octets()?.into_level_bytes().to_vec();
+            let salt = p.primitive_octets()?.into_level_bytes().to_vec();
             let iterations = p.number()?;
             check_iterations(iterations, "key derivation")?;
             if alg == OID_PBE_SHA1_RC2_40 {
@@ -1444,7 +1470,7 @@ fn decrypt_pbes2(params: &[u8], encrypted: &[u8], pw: &[u8]) -> Result<Zeroizing
         match iv_level.peek_tag() {
             // 0xa0 is OpenSSL's `[0]` around the INTEGER — a tag the IV can
             // never carry, so dispatching on it cannot misread anything else.
-            Some(0x04) => iv = Some(iv_level.octets()?.into_level_bytes().to_vec()),
+            Some(0x04) => iv = Some(iv_level.primitive_octets()?.into_level_bytes().to_vec()),
             Some(0x82) | Some(0xa2) | Some(0xa0) | Some(0x02) => {
                 declared_bits = read_efcl(&mut iv_level)?;
             }
@@ -1461,7 +1487,7 @@ fn decrypt_pbes2(params: &[u8], encrypted: &[u8], pw: &[u8]) -> Result<Zeroizing
     let kdf_params = Level::new(&kdf_params);
 
     let mut kp = kdf_params;
-    let salt = kp.octets()?.into_level_bytes().to_vec();
+    let salt = kp.primitive_octets()?.into_level_bytes().to_vec();
     let iterations = kp.number()?;
     // `keyLength` is the optional INTEGER Java 11+ writes after the iteration
     // count (finding A1). It is not ignored blindly: when present it must name
@@ -1728,6 +1754,31 @@ fn pkcs8_spki(key_pkcs8: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use openfirma_core::tlv;
+
+    /// Round 3's N3-2: the two readers differ exactly on the shape that broke —
+    /// an OCTET STRING whose content is 16 opaque bytes beginning `04 0e`. The
+    /// unwrapping one (correct where BER nests) reads it as a 14-byte value; the
+    /// primitive one (correct for IV, salts, MAC digest, localKeyID) keeps all 16.
+    #[test]
+    fn a_primitive_octet_string_is_never_unwrapped() {
+        let content: Vec<u8> = [&[0x04u8, 0x0e][..], &[0xAA; 14]].concat();
+        let mut tlv = vec![0x04, 0x10];
+        tlv.extend_from_slice(&content);
+
+        let mut primitive = Level::new(&tlv);
+        assert_eq!(
+            *primitive.primitive_octets().unwrap().into_level_bytes(),
+            content,
+            "an IV of 16 bytes is 16 bytes even when it starts like a TLV"
+        );
+
+        let mut wrapped = Level::new(&tlv);
+        assert_eq!(
+            wrapped.octets().unwrap().into_level_bytes().len(),
+            14,
+            "the wrapper reader still unwraps; that is why opaque fields use the other"
+        );
+    }
 
     /// A DER INTEGER in minimal form, for the iteration counts below.
     fn der_integer(v: usize) -> Vec<u8> {
