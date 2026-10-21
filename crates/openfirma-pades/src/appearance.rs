@@ -73,12 +73,15 @@ pub fn form_xobject(
 /// The empty appearance, which is what an invisible signature carries.
 ///
 /// Viewers still expect the entry to exist, so this is not the same as leaving
-/// `/AP` out.
+/// `/AP` out. The empty payload still ends with an end-of-line before `endstream`:
+/// PDF/A-2 6.1.7.1 requires it, and veraPDF called the one-byte-shorter spelling a
+/// violation of the whole point of signing a PDF/A (round 3's N3-3, measured on
+/// the artifact Ghostscript produces and AutoFirma preserves).
 pub fn blank() -> Vec<u8> {
     Vec::from(
         &b"<< /BBox [0 0 0 0] /FormType 1 /Length 0 /Matrix [1 0 0 1 0 0] \
            /Resources << /ProcSet [/PDF /Text /ImageB /ImageC /ImageI] >> \
-           /Subtype /Form /Type /XObject >>\nstream\nendstream"[..],
+           /Subtype /Form /Type /XObject >>\nstream\n\nendstream"[..],
     )
 }
 
@@ -285,5 +288,12 @@ mod tests {
         let body = String::from_utf8(blank()).unwrap();
         assert!(body.contains("/Length 0"), "{body}");
         assert!(body.contains("/BBox [0 0 0 0]"), "{body}");
+        // the end-of-line before `endstream` is not payload, and PDF/A-2 6.1.7.1
+        // requires it: veraPDF flags its absence on the invisible signature of an
+        // otherwise conforming PDF/A (round 3's N3-3)
+        assert!(
+            body.contains("stream\n\nendstream"),
+            "the empty stream still ends its EOL before endstream: {body}"
+        );
     }
 }
