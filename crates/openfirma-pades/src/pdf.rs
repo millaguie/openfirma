@@ -1245,7 +1245,7 @@ impl EndstreamIndex {
         Self { ends, strict }
     }
 
-    fn at_or_after(&self, i: usize) -> Option<usize> {
+    pub(crate) fn at_or_after(&self, i: usize) -> Option<usize> {
         let k = self.ends.partition_point(|end| *end < i);
         self.ends.get(k).copied()
     }

@@ -444,6 +444,60 @@ fn rendered_body(
     Some(out)
 }
 
+/// Whether a redefined stream's declared length is AMBIGUOUS: there is a marker
+/// for this object somewhere, but the `/Length` end does not land at
+/// `EOL? endstream`. Round 4's B-2: with a trusted length the gate stops at the
+/// first marker, and a marker that is not the one the length points at leaves the
+/// choice between "declared wins" and "marker wins" to whichever reader one
+/// happens to ask. A stream that a pass rewrote with that disagreement is refused
+/// instead of guessed; an UNCHANGED defective stream never reaches this (it emits
+/// no redefinition), so documents that always carried a bad length keep verifying
+/// exactly as before.
+fn ambiguous_stream_length(
+    pdf: &[u8],
+    locations: &BTreeMap<ObjRef, Location>,
+    cache: &mut pdf::ObjectStreamCache,
+    object: ObjRef,
+) -> bool {
+    let Some(Location::Direct(at)) = locations.get(&object).copied() else {
+        return false;
+    };
+    let Some(n) = declared_length(pdf, locations, cache, at) else {
+        return false;
+    };
+    let Ok(dict_span) = pdf::object_body(pdf, at) else {
+        return false;
+    };
+    let mut i = dict_span.end;
+    while i < pdf.len() && matches!(pdf[i], b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\0') {
+        i += 1;
+    }
+    if !pdf[i..].starts_with(b"stream") {
+        return false;
+    }
+    i += 6;
+    if pdf[i..].starts_with(b"\r\n") {
+        i += 2;
+    } else if pdf[i..].starts_with(b"\n") || pdf[i..].starts_with(b"\r") {
+        i += 1;
+    }
+    let index = pdf::EndstreamIndex::build(pdf);
+    if index.at_or_after(i).is_none() {
+        // no marker at all: readers fall back to the declared length, no choice
+        return false;
+    }
+    if i.saturating_add(n) > pdf.len() {
+        return true; // a claim past the file, with a marker somewhere: ambiguous
+    }
+    let mut end = i + n;
+    if pdf[end..].starts_with(b"\r\n") {
+        end += 2;
+    } else if pdf[end..].starts_with(b"\n") || pdf[end..].starts_with(b"\r") {
+        end += 1;
+    }
+    !pdf[end..].starts_with(b"endstream")
+}
+
 /// The `/Length` an object declares, following an indirect reference through
 /// `locations` — the one reading [`pdf::stream_raw`] documents it cannot do while
 /// the cross-reference is being built, and the gate can.
@@ -560,11 +614,20 @@ pub fn redefinitions_after(
             // that did not exist below is `None` — a pure addition, classified as
             // such by the whitelist below (new signature objects land here).
             Some(previous) if previous != &current => {
-                out.push(Redefinition {
-                    object: *object,
-                    after: current,
-                    before: previous.clone(),
-                });
+                if ambiguous_stream_length(pdf, &merged, &mut cache, *object) {
+                    // B-2: refuse the disagreement rather than pick a reader.
+                    out.push(Redefinition {
+                        object: *object,
+                        after: UNREADABLE.to_vec(),
+                        before: previous.clone(),
+                    });
+                } else {
+                    out.push(Redefinition {
+                        object: *object,
+                        after: current,
+                        before: previous.clone(),
+                    });
+                }
             }
             None => {
                 out.push(Redefinition {

@@ -3845,3 +3845,50 @@ fn a_widget_under_a_filled_field_cannot_be_repainted_as_a_fill() {
         "the refusal names the widget or the rule: {text}"
     );
 }
+
+/// Round 4's B-2: with a trusted `/Length` the gate picks the first `endstream`,
+/// and a rewrite whose declared end does not land at that keyword leaves the
+/// choice to the reader one happens to ask. The gate now refuses the
+/// disagreement for a stream a pass REWROTE, and the refusal says the new bytes
+/// cannot be read instead of describing a rewrite it cannot vouch for. An
+/// unchanged defective stream emits no redefinition and is not touched.
+///
+/// The shape: the signed content stream is honest; the pass keeps the declared
+/// width and changes the data, but the keyword no longer sits at the declared
+/// end (a space stands between). The verdict was already a refusal; what this
+/// test pins is that the gate no longer PRETENDS to have read the stream.
+#[test]
+fn a_redefined_stream_whose_length_disagrees_with_its_marker_is_unreadable() {
+    let Some(signer) = signer() else {
+        require_or_skip("test PKI missing, rerun tools/gen-testcert.sh");
+        return;
+    };
+    let headline = b"BT /F1 24 Tf 72 700 Td (PAGO UN CERO UNO) Tj ET";
+    let plain = pades_sign(
+        &append_two(INPUT, &[(4, &stream_body(headline))]),
+        &signer,
+        &PadesOptions::default(),
+    )
+    .expect("signing");
+    pades_verify(&plain, &anchors()).expect("the base verifies");
+
+    // same declared width, different data, and the keyword one byte off the end
+    let mut swapped = b"BT /F1 24 Tf 72 700 Td (PAGUESE 9999 EURS) Tj E".to_vec();
+    swapped.truncate(headline.len());
+    while swapped.len() < headline.len() {
+        swapped.push(b' ');
+    }
+    let mut body = format!("<< /Length {} >>\nstream\n", headline.len()).into_bytes();
+    body.extend_from_slice(&swapped);
+    body.extend_from_slice(b" endstream");
+    let attacked = append_two(&plain, &[(4, &body)]);
+
+    let text = pades_verify(&attacked, &anchors())
+        .expect_err("the gate refuses a length and marker that disagree")
+        .to_string();
+    assert!(
+        text.contains("cannot be read"),
+        "the refusal says the new bytes could not be judged, not that a stream was \
+         rewritten: {text}"
+    );
+}
