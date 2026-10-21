@@ -1134,7 +1134,9 @@ fn read_bag(
         OID_SHROUDED_KEY_BAG => {
             let mut eki = value.sequence()?;
             let (alg_oid, params) = read_algorithm(&mut eki)?;
-            let encrypted = eki.octets()?.into_level_bytes();
+            // ciphertext is bytes, not a nested TLV: a payload that begins `04 LL`
+            // was read as a shorter one here too (round 4's note on N4-3)
+            let encrypted = eki.primitive_octets()?.into_level_bytes();
             let pkcs8 = decrypt_pbe_all(alg_oid, &params, &encrypted, password)?;
             keys.push((local_key_id, alias, pkcs8));
         }
