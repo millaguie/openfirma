@@ -1782,3 +1782,36 @@ fn one_pin_env_for_several_tokens_is_refused_before_any_store_opens() {
         "nothing may be opened before the refusal: {stderr}"
     );
 }
+
+/// Round 3's N3-3: a variable that exists but holds nothing is not a PIN. Sending
+/// it spends a lockout try and answers "the PIN is wrong"; the `::` marker is how
+/// a passwordless token is spelled. This runs before the module would load.
+#[test]
+fn an_empty_pin_variable_is_refused_as_the_missing_secret_it_is() {
+    let doc = write_tmp("empty-pin.pdf", b"%PDF-1.4\nnever read\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "sign",
+            "-i",
+            doc.to_str().unwrap(),
+            "-o",
+            "/tmp/opencode/empty-pin.csig",
+            "--store",
+            "pkcs11:/nonexistent/module.so:token",
+            "--pin-env",
+            "OPENFIRMA_EMPTY_PIN",
+        ])
+        .env("OPENFIRMA_EMPTY_PIN", "")
+        .output()
+        .expect("the binary must run");
+    assert!(!out.status.success(), "an empty PIN is refused, not sent");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("empty") && stderr.contains("::"),
+        "the refusal says the value is empty and names the way out: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot load PKCS#11 module"),
+        "nothing may be opened before the refusal: {stderr}"
+    );
+}

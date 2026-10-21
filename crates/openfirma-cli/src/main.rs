@@ -656,6 +656,13 @@ fn parse_store_spec(text: &str) -> Result<StoreSpec> {
 fn store_pin(pin_env: Option<&String>) -> Result<Option<Zeroizing<String>>> {
     match pin_env {
         Some(var) => match std::env::var(var) {
+            Ok(value) if value.is_empty() => anyhow::bail!(
+                "{var} is set but empty, and an empty value is not a PIN: sending one spends a \
+                 lockout try on real cards (the DNIe locks at the third). A keystore that \
+                 genuinely needs no PIN is spelled with the :: marker (e.g. \
+                 --store pkcs11:/path/to/module.so::), and a PIN that came from a file or a \
+                 prompt reached {var} empty — fix the source, not the flag"
+            ),
             Ok(value) => Ok(Some(Zeroizing::new(value))),
             Err(std::env::VarError::NotPresent) => anyhow::bail!(
                 "--pin-env names {var}, and {var} is not set; refusing to try the token \
