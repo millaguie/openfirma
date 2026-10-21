@@ -1989,3 +1989,52 @@ fn signing_over_a_prior_enveloped_only_xml_signature_warns() {
         "an isolated prior signature is not a warning"
     );
 }
+
+/// Round 4's B-4: AutoFirma's `-password ""` is not "no password". The native
+/// CLI already refused an empty PIN variable (one C_Login, one lockout try), and
+/// the compat layer — the one a sede script drives — used to send it anyway. The
+/// refusal must arrive before the module is ever loaded, and it names the `::`
+/// spelling for a store that really needs no PIN.
+#[test]
+fn compat_refuses_an_empty_password_before_it_reaches_a_token() {
+    let input = write_tmp(
+        "compat-empty-password.txt",
+        b"a plain document, never signed",
+    );
+    // compat's pkcs11 store takes a bare library path and checks only that the
+    // file exists before the PIN question; a file that is not a module is enough
+    // because the refusal must precede loading it
+    let module = write_tmp("compat-not-a-module.so", b"not a Cryptoki module");
+    let store = format!("pkcs11:{}", module.display());
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "autofirma",
+            "sign",
+            "-i",
+            input.to_str().unwrap(),
+            "-o",
+            "/tmp/opencode/compat-empty.csig",
+            "-alias",
+            "any",
+            "-store",
+            &store,
+            "-password",
+            "",
+        ])
+        .output()
+        .expect("the compat layer runs");
+    assert_eq!(
+        out.status.code(),
+        Some(255),
+        "compat errors are 255: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("empty") && stderr.contains("::") && stderr.contains("lockout"),
+        "the refusal names the empty PIN, the cost and the way out: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot load PKCS#11 module"),
+        "nothing may be opened before the refusal: {stderr}"
+    );
+}

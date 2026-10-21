@@ -3370,7 +3370,21 @@ fn autofirma_sign(p: CompatParams) {
             // here (CachePasswordCallback), so accepting it as the PIN is
             // the one honest mapping for mozilla/pkcs11 stores; absent, the
             // store's own no-PIN or OPENFIRMA_PIN paths stay open to try.
-            let pin = p.password.clone().map(Zeroizing::new);
+            //
+            // Round 4's B-4: `-password ""` is not "no password". The native
+            // CLI refuses an empty variable because sending it spends a lockout
+            // try (a DNIe locks at the third); this layer used to send it. The
+            // passwordless shape is the descriptor's `::`, exactly as native.
+            let pin = match p.password.as_deref() {
+                Some("") => compat_fail(
+                    "-password was given but empty: an empty PIN is not a PIN, and sending \
+                     one spends a lockout try on real cards (the DNIe locks at the third). \
+                     A store that genuinely needs no PIN is spelled with the :: marker \
+                     (pkcs11:/path/to/module.so::)",
+                ),
+                Some(password) => Some(Zeroizing::new(password.to_string())),
+                None => None,
+            };
             let store = match open_store(&spec, pin) {
                 Ok(s) => s,
                 Err(e) => compat_fail(&format!("{e:#}")),
