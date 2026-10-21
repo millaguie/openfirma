@@ -105,6 +105,26 @@ pub fn discover() -> Vec<openfirma_core::workflow::StoreSpec> {
     // a picker must show every database once.
     specs.sort_by_key(|s| s.descriptor());
     specs.dedup_by(|a, b| a.descriptor() == b.descriptor());
+    // …and the profile Firefox ITSELF would open comes first (round 4's B-3:
+    // only one NSS database can be open per process, so the first descriptor is
+    // the one a listing reaches; alphabetically `.pki/nssdb` or an old profile
+    // used to win over the profile Firefox opens, which is the one a citizen
+    // expects the window to show). The rule is the same one `nss:firefox` uses.
+    // The root, not the config string: descriptors spell an NSS database
+    // "nss:sql:<absolute path>", and comparing paths avoids depending on how
+    // config_string quotes a location with spaces.
+    let preferred_root = firefox_parents().iter().find_map(|parent| {
+        profiles_ini(&parent.join("profiles.ini"), None)
+            .ok()
+            .flatten()
+    });
+    if let Some(root) = preferred_root {
+        let preferred = format!("nss:sql:{}", root.display());
+        specs.sort_by_key(|s| {
+            let d = s.descriptor();
+            (d != preferred, d)
+        });
+    }
     specs
 }
 
@@ -911,6 +931,60 @@ mod tests {
         assert!(err.to_string().contains("quote"), "{err}");
         let err = config_string("   ").expect_err("empty must fail too");
         assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    /// Round 4's B-3: with several databases, discovery must put the profile
+    /// Firefox itself opens FIRST — one NSS database per process means the first
+    /// descriptor is the one a listing can reach, and alphabetical order used to
+    /// hand that place to an old profile or to Chrome's `~/.pki/nssdb`.
+    #[test]
+    fn discovery_offers_the_profile_firefox_opens_before_the_others() {
+        let dir = tmp("discovery-order");
+        // Firefox's own layout: a.old sorts before b.default-release, and the
+        // [Install…] section says the latter is the one Firefox opens.
+        let ff = dir.join(".mozilla/firefox");
+        std::fs::create_dir_all(&ff).unwrap();
+        std::fs::write(
+            ff.join("profiles.ini"),
+            "[Install4F96D1932A9F858E]\nDefault=b.default-release\nLocked=1\n\n\
+             [Profile0]\nName=default-release\nIsRelative=1\nPath=b.default-release\nDefault=1\n\n\
+             [Profile1]\nName=old\nIsRelative=1\nPath=a.old\n",
+        )
+        .unwrap();
+        for name in ["a.old", "b.default-release"] {
+            let p = ff.join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("cert9.db"), b"").unwrap();
+        }
+        // Chrome's shared database, alphabetically first under HOME
+        std::fs::create_dir_all(dir.join(".pki/nssdb")).unwrap();
+
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let anchored = std::env::var_os("OPENFIRMA_FIREFOX_PARENTS");
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("OPENFIRMA_FIREFOX_PARENTS");
+        }
+        let specs = discover();
+        unsafe {
+            match home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            if let Some(list) = anchored {
+                std::env::set_var("OPENFIRMA_FIREFOX_PARENTS", list);
+            }
+        }
+        if !cfg!(unix) || cfg!(any(target_os = "macos", target_os = "ios")) {
+            return; // the walk is unix-only
+        }
+        let first = specs.first().expect("at least one database");
+        assert_eq!(
+            first.descriptor(),
+            format!("nss:sql:{}", ff.join("b.default-release").display()),
+            "the profile Firefox opens is the one offered first: {specs:?}"
+        );
     }
 
     #[test]
