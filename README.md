@@ -309,12 +309,15 @@ Its measured limits, named so that nobody reads the guard as more than it is: a
 certificate whose base64 is re-wrapped across lines — the shape `xmlsec1`
 writes, or a certificate body with its PEM markers stripped — is not decoded
 and passes; a PKCS#12 container renamed to a free extension (`secret.dat`) is
-not parsed and passes; a certificate inside a *compressed* container is not
-recursed into and passes (an uncompressed one is read as text and blocked). The
-guard reads one file at a time and stops where its decoders stop. What it
-exists for it does: a certificate in a PEM file, a signature made here or by
-AutoFirma, a `.p12` or keystore under a name it recognises, and a certificate
-pasted into markdown are all blocked.
+not parsed and passes; a DER or PEM certificate inside a ZIP is not recursed
+into (compressed or stored) and passes; a certificate spelled as long hex runs —
+lower case, upper case, split, with `:`, inside `hex!("…")` or a C array from
+`xxd -i` — is not decoded and passes; and a PEM block escaped inside a string
+literal (`\n` between its lines) is not seen. The guard reads one file at a
+time and stops where its decoders stop. What it exists for it does: a
+certificate in a PEM file, a signature made here or by AutoFirma, a `.p12` or
+keystore under a name it recognises, a certificate pasted into markdown, and a
+DER file under any of the extensions it reads are all blocked.
 
 Acceptance runs against VALIDe that need a trusted certificate are done by hand
 by whoever holds one, outside the repository, and only the verdict is written
