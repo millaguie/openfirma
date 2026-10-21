@@ -10,8 +10,11 @@ must validate in VALIDe, in the ETSI reference validators and in the government
 portals exactly like files signed with AutoFirma.
 
 Written in Rust with no C dependencies in the crypto or the signature formats.
-Platform native APIs (Windows CNG, macOS Security.framework, PC/SC, PKCS#11)
-are reached through Rust binding crates, see `docs/platforms.md`.
+Platform native APIs are reached through hand-written FFI — the PKCS#11 function
+table, the Windows certificate store (CAPI; CNG signing is refused, not guessed)
+and the NSS command line for the two databases the profiles name — see
+`docs/platforms.md`. PC/SC is not used: a card is reached through its PKCS#11
+module.
 
 ## Status
 
@@ -73,13 +76,19 @@ Very early, phase 1. What works today:
   signatures, document time-stamps, validation data, the plumbing a signature field needs, and
   the dates a signing pass refreshes (`/ModDate` in the document properties, `xmp:ModifyDate`
   and `xmp:MetadataDate` in the XMP packet). Anything else the later revision changed is
-  refused, and the message names the object and the change instead of accusing anyone. One
-  everyday shape is still refused today: AutoFirma signing a document openfirma signed with an
-  *invisible* signature. AutoFirma rewrites the page it puts its box on, this verifier compares
-  bytes, and so it cannot see that nothing a reader is told has changed — the declared residual
-  in `docs/validation.md`, pinned in its own test. What does verify, measured against
-  AutoFirma 1.9.1's own output: the tool signing a document twice, filling a form box over our
-  signature, and its documents carrying XMP and document properties.
+  refused, and the message names the object and the change instead of accusing anyone.
+
+  **AutoFirma co-signing an openfirma signature is refused today, in every measured
+  case.** Round 3 repeated it on four bases (a plain document, Ghostscript's, an
+  object-stream one, a PDF/A): AutoFirma's iText rewrites the page it puts its box on
+  with the same meaning and different bytes, and with Ghostscript/PDF-A bases it also
+  rewrites the XMP packet. This verifier compares bytes on purpose — that is what
+  stops a re-pointed `/Contents` hiding a shadow — so it refuses the result and names
+  the object. pdfsig calls both signatures valid, and so does AutoFirma. The direction
+  that DOES verify, measured: AutoFirma signing first and openfirma co-signing it (all
+  four bases), AutoFirma signing twice, and AutoFirma filling a form box over our
+  signature. This is the declared residual R4-C2 in `docs/validation.md`; the 0.2
+  work is comparing nested objects by tokens rather than bytes.
 - CLI: `openfirma sign`, `openfirma verify`, `openfirma inspect` (dumping any
   DER signature as a normalized tree for diffing), and `openfirma keystores
   list`, which lists what a PKCS#11 token or NSS database holds.
@@ -107,12 +116,12 @@ see docs/adr/0005-browser-protocol.md and the table row below.
 | PAdES B-LTA (document time-stamp over the archive) | works, crosschecked with openssl ts, qpdf and pdfsig |
 | CAdES ES-LT / ES-LTA (validation data inside the CMS) | out of scope: the long-term path is PAdES B-LT/B-LTA, see docs/pades.md |
 | Keystores: PKCS#12 | works, pure Rust: BER parser (RealVNC/Google-style indefinite-length files open), keyLength 128-bit keys and legacy RC2-40 certificates decrypt via PBES1, absent-password spellings match Java KeyStore, see docs/adr/0003-pkcs12-container.md |
-| Keystores: PKCS#11 tokens (OpenSC/DNIe shape), NSS shared DB | works, FFI into the vendor module at runtime, tested against SoftHSM and libsoftokn3 with signatures double-verified by openfirma and openssl; keys whose token advertises CKA_ALWAYS_AUTHENTICATE get their per-signature context login; `keystores list` with no --store discovers Firefox/Thunderbird profile databases through profiles.ini (snap and flatpak included). **Windows: compiles and is linted on CI, and no PKCS#11 module has ever been loaded there** — SoftHSM is not provisioned for the Windows runners, so the module path is tested on Linux only |
+| Keystores: PKCS#11 tokens (OpenSC/DNIe shape), NSS shared DB | works, FFI into the vendor module at runtime, tested against SoftHSM and libsoftokn3 with signatures double-verified by openfirma and openssl; keys whose token advertises CKA_ALWAYS_AUTHENTICATE get their per-signature context login; `keystores list` with no --store discovers Firefox/Thunderbird profile databases through profiles.ini (snap and flatpak included). **Windows: compiles and is linted on CI, and no PKCS#11 module has ever been loaded there** — SoftHSM is not provisioned for the Windows runners, so the module path is tested on Linux only. **macOS: never executed at runtime either** (no PKCS#11 module or NSS database has been loaded there). One NSS database per process: discovery opens the profile Firefox opens and reports the others as not opened instead of guessing (round 3's N3-4) |
 | Keystores: Windows cert store, macOS keychain | Windows compiles on CI and is untested at runtime: it lists the certificates whose private key CAPI can acquire, signs through the store's own context with a legacy CSP (PKCS#1 v1.5), and **refuses by name** a key that lives only in the CNG store (the NCrypt signer does not exist yet) and one whose provider is CNG-only; a legacy CSP that cannot produce SHA-256 (a `PROV_RSA_FULL` provider — the usual destination of a double-clicked `.pfx`) fails with its Win32 error instead of being re-opened through `PROV_RSA_AES`, see the note in `crates/openfirma-keystore/src/windows.rs`. macOS refuses both listing and signing until it can be tested, see docs/adr/0004-system-keystores.md |
-| XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |
+| XAdES-B-B (XML-DSig + ETSI EN 319 132-1, enveloped) | works, crosschecked with xmlsec1 and AutoFirma's own validator |. **Declared limit**: a document where an ancestor and a descendant carry DIFFERENT `xml:` attributes (`xml:lang`/`xml:space`) is canonicalized as the specification and xmlsec1 say; Apache Santuario (AutoFirma's library) builds a different digest and rejects it, and no signature shape satisfies both — measured in round 3 (XAdES N3-1)
 | XAdES B-T and above, FacturaE, enveloping/detached shapes | not started |
 | Browser integration (`afirma://` parsing, dispatch, loopback endpoint) | works end to end against a fake sede (openssl crosschecks the signature it produces); wire forms — the URL-safe base64 payload, the `:=` error envelope with AutoFirma's Spanish catalogue and SAF pairings — pinned against recorded autoscript.js predicates (tests/autoscript_wire.rs); precalculatedHashAlgorithm signs the sede's imprint verbatim, proven against openssl (tests/prehash_golden.rs). **A browser cannot reach it yet**: the transport is plain HTTP on loopback and the one-shot token goes to whoever started the endpoint, while a real sede's page opens `wss://127.0.0.1:<port>` on a port IT chose with an `idsession` it minted, and the flows need `afirma://websocket`/`afirma://service` and the `echo=`/`getresult` messages — none of that is implemented, and it is refused by name rather than faked, see docs/adr/0005-browser-protocol.md |
-| GUI (`openfirma-gui`, egui/eframe): sign, verify, keystores, .p12 | works: the same library calls as the CLI (docs/adr/0006-gui-toolkit.md); windowless kittest tests drive the real App, including an end-to-end sign-then-verify; real-display checks live in docs/validation.md's manual checklist |
+| GUI (`openfirma-gui`, egui/eframe): sign, verify, keystores, .p12 | works: the same library calls as the CLI (docs/adr/0006-gui-toolkit.md); windowless kittest tests drive the real App, including an end-to-end sign-then-verify; real-display checks live in docs/validation.md's manual checklist. **Windows and macOS: built, never executed** — the window has only ever run on Linux (a virtual display in CI and a desktop in the manual checklist) |
 
 ## Quick start
 
@@ -185,11 +194,15 @@ a bare name up in the system library paths, and accepting one would sign with
 some other library than the one named. `nss:<path>` passes the path to NSS
 quoted when it contains spaces, read-only.
 
-A sede's browser call answers through the same signing code. The scheme and
-the loopback endpoint's rules are docs/adr/0005-browser-protocol.md; at install
-time you register the scheme once, naming the key the handler signs with (it
-writes only your own files — the `.desktop` entry plus a browser config under
-`$XDG_CONFIG_HOME/openfirma/browser.toml` that stores paths, never a password):
+A sede's browser call answers through the same signing code. **This part is
+experimental and is NOT part of what 0.1.0 supports**: no live sede has been
+reached (there is no `wss` transport yet), `afirma-uri`/`afirma-serve` ship in the
+binary but nothing in this release runs them, and `afirma-uri --register` takes
+the `afirma://` scheme away from AutoFirma after asking. The scheme and the
+loopback endpoint's rules are docs/adr/0005-browser-protocol.md; registering
+names the key the handler signs with (it writes only your own files — the
+`.desktop` entry plus a browser config under `$XDG_CONFIG_HOME/openfirma/browser.toml`
+that stores paths, never a password):
 
 ```
 cargo run -- afirma-uri --register \

@@ -356,7 +356,9 @@ inside a rewritten object — iText re-serializing a page's `/Resources` as well
 growing its `/Annots` when it appends an annotation of its own — is still the
 incremental saving attack, and closing it means deciding an appended revision by
 what a reader RESOLVES rather than by object bytes. That residual is what refuses
-the reference tool co-signing one of our INVISIBLE signatures today: its widget is
+the reference tool co-signing an openfirma signature today — measured in round 3 on
+four bases with invisible signatures and on two with visible ones, while the reverse
+direction (AutoFirma first, we co-sign) verifies on all four: its widget is
 attested and the rule agrees, the respelled page around it is what the gate cannot
 read, and the refusal says exactly that rather than blaming the widget (pinned as
 that shape in `crates/openfirma-pades/tests/autofirma_cosign.rs`). A second declared
