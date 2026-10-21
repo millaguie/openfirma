@@ -25,7 +25,7 @@ in format code, ever.
 | Trust store install of local CA | `certutil` / `CertAddCertificateContextToStore` | `SecTrustSettingsSetTrustSettings` + admin auth | `update-ca-trust`, `update-ca-certificates`, NSS `certutil` | per OS, needs elevation |
 | Elevation | UAC manifest / runas | `AuthorizationExecuteWithPrivileges` replaced by SMAppService or `security` with prompt | pkexec / sudo | installer only |
 | Installer | none in 0.1.0 (tarball/zip) | none in 0.1.0 (tarball/zip) | none in 0.1.0 (tarball/zip) | planned: NSIS or WiX, `.pkg`/`.dmg`, `.deb`/`.rpm`/AppImage; no bundler exists yet |
-| GUI | egui/eframe | same | same | one codebase, plus `tray-icon`. **Executed only on Linux**: the window has run on a virtual display (`xvfb-run`) and in the manual checklist; the Windows and macOS builds are compiled and published, never launched (round 3's N3-4) |
+| GUI | egui/eframe | same | same | one codebase. **Executed only on Linux**: the window has run on a virtual display (`xvfb-run`) and in the manual checklist; the Windows and macOS builds are compiled and published, never launched (round 3's N3-4) |
 
 ## Notes that will bite
 

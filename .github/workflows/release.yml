@@ -97,9 +97,10 @@ jobs:
       # Apple/Windows x64 and Linux glibc entries build it, including the Intel
       # macOS one that is cross-built from the arm64 runner (the SDK is
       # universal). A target without the flag — the two ARM Windows entries, the
-      # musl static build, aarch64 Linux — carries no openfirma-gui: a cross
-      # sysroot there has no windowing system to link against, and shipping a
-      # CLI-only binary beats shipping nothing. Round 3's N3-1 caught this
+      # musl static build, aarch64 Linux — carries no openfirma-gui: the GUI is
+      # built only where the leg provisions its target's native windowing
+      # libraries, and shipping a CLI-only binary beats shipping nothing. Round
+      # 3's N3-1 caught this
       # comment promising GUI for aarch64 Windows while the matrix did not; the
       # release notes and `tools/check-workflows.py` now derive from the matrix
       # itself so the sentence cannot drift again.
@@ -235,9 +236,9 @@ jobs:
             echo "\`x86_64-pc-windows-msvc\`, \`x86_64-apple-darwin\` and"
             echo "\`aarch64-apple-darwin\`."
             echo "The other artifacts (i686 and aarch64 Windows, x86_64 musl,"
-            echo "aarch64 Linux) carry the CLI only: their build has no windowing"
-            echo "system to link (the GUI needs its target's native OpenGL/X11"
-            echo "client libraries)."
+            echo "aarch64 Linux) carry the CLI only: the window is built on the"
+            echo "targets whose runner provisions its native OpenGL/X11 client"
+            echo "libraries, and those are the four listed above."
             echo ""
             echo "\`x86_64-unknown-linux-musl\` is a static binary: PKCS#11 and"
             echo "NSS modules load with \`dlopen\`, which a static musl binary"
