@@ -777,11 +777,14 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
             // let a hybrid file hide a deletion with a row type the old reader
             // rejected (round 3's N3-2). /XRefStm is the file's claim, so the
             // offset is bounds-checked the same way as /Prev.
-            if (stm as usize) <= data.len() {
-                if let Ok((extra, extra_frees, _)) = read_xref_stream(data, stm as usize) {
-                    stream = Some((extra, extra_frees));
-                }
+            if (stm as usize) > data.len() {
+                return Err(Error::Pdf(format!(
+                    "the /XRefStm offset {stm} is past the end of a {} byte file",
+                    data.len()
+                )));
             }
+            let (extra, extra_frees, _) = read_xref_stream(data, stm as usize)?;
+            stream = Some((extra, extra_frees));
         }
         if let Some((sentries, sfrees)) = stream {
             record_section(&mut map, &mut decided, sentries, sfrees)?;
@@ -1074,11 +1077,7 @@ fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, XrefFree
                 // a "free" row past the gate by adding a third row of type 3
                 // (round 3's N3-2). Null is a decision for the gate: it hides the
                 // older definition, which is exactly what a deletion is.
-                other => {
-                    return Err(Error::Pdf(format!(
-                        "cross-reference entry type {other} does not exist, only 0, 1 and 2 do"
-                    )));
-                }
+                _ => frees.push(num),
             }
         }
     }
@@ -2091,5 +2090,61 @@ pub(crate) mod tests {
             .expect_err("a stream that repeats a number has the same order problem")
             .to_string();
         assert!(err.contains("more than once"), "says why: {err}");
+    }
+
+    /// Round 3's N3-2: a hybrid file's `/XRefStm` is a section of the revision,
+    /// not a hint. One the reader cannot open is an error (it used to be skipped
+    /// silently), and a row type the specification does not define is a null
+    /// reference — a deletion the gate must see, not an error the caller can dodge.
+    #[test]
+    fn a_hybrid_xref_stm_is_never_silently_skipped() {
+        // unreadable: the offset points at a plain stream with no /Type /XRef
+        let mut out = b"%PDF-1.5\n".to_vec();
+        let not_xref = out.len();
+        out.extend_from_slice(b"3 0 obj\n<< /Length 1 >>\nstream\nX\nendstream\nendobj\n");
+        let xref_at = out.len();
+        out.extend_from_slice(
+            format!(
+                "xref\n1 1\n0000000009 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R /XRefStm {not_xref} >>\nstartxref\n{xref_at}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let err = object_locations(&out, xref_at)
+            .expect_err("an unreadable XRefStm is a section the gate did not read")
+            .to_string();
+        assert!(
+            err.contains("XRefStm") || err.contains("not a cross-reference stream"),
+            "{err}"
+        );
+
+        // type 3 is a null reference: object 6 becomes a deletion, not a skip
+        let mut out = b"%PDF-1.5\n".to_vec();
+        let pairs_at = out.len();
+        out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let stream_at = out.len();
+        // one row of /W [1 4 2] for number 6, type 3
+        let rows: Vec<u8> = vec![3, 0, 0, 0, 0, 0, 0];
+        out.extend_from_slice(
+            format!(
+                "7 0 obj\n<< /Type /XRef /Size 8 /Root 1 0 R /W [1 4 2] /Index [6 1] /Length {} >>\nstream\n",
+                rows.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&rows);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_at = out.len();
+        out.extend_from_slice(
+            format!(
+                "xref\n1 1\n0000000009 00000 n \ntrailer\n<< /Size 8 /Root 1 0 R /XRefStm {stream_at} >>\nstartxref\n{xref_at}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let locs = object_locations(&out, xref_at).expect("a type-3 row is readable");
+        assert!(
+            !locs.contains_key(&ObjRef::new(6, 0)),
+            "an unknown row type is a null reference; the number must not resolve"
+        );
+        let _ = pairs_at;
     }
 }
