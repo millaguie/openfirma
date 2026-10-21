@@ -68,8 +68,14 @@ def release_notes_match_the_matrix(release):
         for step in release["jobs"]["publish"]["steps"]
         if "Ships inside the artifacts for" in step.get("run", "")
     ]
+    # Option B publishes no window at all: an empty matrix list needs no notes
+    # sentence, and a notes sentence naming nobody is equally consistent.
+    if not gui and not runs:
+        return None
     if len(runs) != 1:
         return "the publish job must state the GUI list once"
+    if not gui:
+        return "the matrix builds no GUI but the notes still list one"
     text = runs[0]
     start = text.index("Ships inside the artifacts for")
     end = text.index('echo ""', start)
