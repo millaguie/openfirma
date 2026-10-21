@@ -653,6 +653,24 @@ fn parse_store_spec(text: &str) -> Result<StoreSpec> {
 /// does come back arrives already zeroizing: from this line on, every buffer
 /// that held it zeroes on drop (finding B-2: the p12 password had this
 /// posture and the token PIN did not).
+/// Whether an XML document carries a signature that the next one would break.
+///
+/// A prior `ds:Signature` whose data reference is the plain enveloped transform
+/// (URI="" or the root's Id) covers every other signature in the document, so a
+/// second one invalidates it. The isolated shape — what this crate and AutoFirma
+/// write — carries `not(ancestor-or-self::ds:Signature)` in a transform, and then
+/// the prior signature keeps verifying. A byte search is enough for a warning, and
+/// the warning is the point: refusing here would refuse the co-signature of half
+/// the FacturaE files in the field.
+fn a_prior_signature_would_break(xml: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(xml);
+    let has_signature = text.contains(":Signature") || text.contains("<Signature");
+    // the filter can appear under any prefix, and its text is what matters
+    let isolated = text.contains("ancestor-or-self::ds:Signature")
+        || text.contains("ancestor-or-self::Signature");
+    has_signature && !isolated
+}
+
 fn store_pin(pin_env: Option<&String>) -> Result<Option<Zeroizing<String>>> {
     match pin_env {
         Some(var) => match std::env::var(var) {
@@ -1178,6 +1196,20 @@ fn main() -> Result<()> {
             } else {
                 None
             };
+            // Round 3's XAdES N3-4: a document that already carries a signature
+            // whose data reference does not exclude other signatures (the plain
+            // enveloped transform xmlsec1 and many ERP writers produce) stops
+            // verifying the moment another signature is added — openfirma signs it
+            // happily and the user delivers a file whose first signature is broken.
+            // A warning, not a refusal: co-signing is the reason the command exists.
+            if matches!(format, Format::Xades) && a_prior_signature_would_break(&content) {
+                eprintln!(
+                    "warning: this document already carries a signature whose data reference \
+                     does not exclude other signatures (enveloped-only). Adding this one makes \
+                     xmlsec1 and AutoFirma report the earlier signature as NO_MATCH_DATA / \
+                     digest failure: sign the original instead if that signature must stay valid"
+                );
+            }
             let signature = openfirma_browser::signing::execute_with_detection(
                 &mut request,
                 &content,

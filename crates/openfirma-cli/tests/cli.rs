@@ -1902,3 +1902,90 @@ fn verify_says_when_a_signature_does_not_cover_the_whole_file() {
         "the first signature does not cover the second's bytes and the output says so: {stdout}"
     );
 }
+
+/// Round 3's XAdES N3-4: a prior signature with the plain enveloped transform is
+/// invalidated by the next one — openfirma signs it and the user delivers a file
+/// whose first signature both xmlsec1 and AutoFirma call broken. A warning names
+/// it; a prior signature that isolates itself (our own, AutoFirma's) does not warn.
+#[test]
+fn signing_over_a_prior_enveloped_only_xml_signature_warns() {
+    let Some(pki) = test_certs() else {
+        eprintln!("skipped, test PKI missing, run tools/gen-testcert.sh");
+        return;
+    };
+    let with_prior = write_tmp(
+        "prior-enveloped.xml",
+        b"<r xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:Signature><ds:SignedInfo/></ds:Signature><a>1</a></r>",
+    );
+    let out_path = write_tmp("prior-enveloped.signed.xml", b"");
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "sign",
+            "-i",
+            with_prior.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+            "--format",
+            "xades-b-b",
+            "--cert",
+            pki.join("signer-rsa.crt").to_str().unwrap(),
+            "--key",
+            pki.join("signer-rsa.key").to_str().unwrap(),
+            "--chain",
+            pki.join("intermediate.crt").to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("signing runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not exclude other signatures") && stderr.contains("NO_MATCH_DATA"),
+        "the warning names the breakage and its verifiers: {stderr}"
+    );
+
+    // control: our own signature isolates itself, so co-signing it stays silent
+    let isolated = write_tmp(
+        "isolated.xml",
+        format!(
+            "<r xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:Signature>\
+             <ds:Transforms><ds:Transform><ds:XPath>{}</ds:XPath></ds:Transform></ds:Transforms>\
+             </ds:Signature><a>1</a></r>",
+            "not(ancestor-or-self::ds:Signature)"
+        )
+        .as_bytes(),
+    );
+    let out_path = write_tmp("isolated.signed.xml", b"");
+    let out = Command::new(env!("CARGO_BIN_EXE_openfirma"))
+        .args([
+            "sign",
+            "-i",
+            isolated.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+            "--format",
+            "xades-b-b",
+            "--cert",
+            pki.join("signer-rsa.crt").to_str().unwrap(),
+            "--key",
+            pki.join("signer-rsa.key").to_str().unwrap(),
+            "--chain",
+            pki.join("intermediate.crt").to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("signing runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("NO_MATCH_DATA"),
+        "an isolated prior signature is not a warning"
+    );
+}
