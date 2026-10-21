@@ -772,9 +772,11 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
         // file marks those same numbers free on purpose.
         let mut stream: Option<(XrefEntries, XrefFrees)> = None;
         if let Some(stm) = get(&dict, "/XRefStm").and_then(parse_uint) {
-            // same bounds rule as above: /XRefStm is the file's claim. The
-            // nesting keeps this under the 1.85 floor: `let ... && ...` in an
-            // if head is a let-chain, stable only from 1.88 (review 07 H-8).
+            // A /XRefStm the reader cannot read is not "absent": it is a section
+            // of this revision that says which objects are free, and skipping it
+            // let a hybrid file hide a deletion with a row type the old reader
+            // rejected (round 3's N3-2). /XRefStm is the file's claim, so the
+            // offset is bounds-checked the same way as /Prev.
             if (stm as usize) <= data.len() {
                 if let Ok((extra, extra_frees, _)) = read_xref_stream(data, stm as usize) {
                     stream = Some((extra, extra_frees));
@@ -782,9 +784,9 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
             }
         }
         if let Some((sentries, sfrees)) = stream {
-            record_section(&mut map, &mut decided, sentries, sfrees);
+            record_section(&mut map, &mut decided, sentries, sfrees)?;
         }
-        record_section(&mut map, &mut decided, entries, frees);
+        record_section(&mut map, &mut decided, entries, frees)?;
         cur = get(&dict, "/Prev").and_then(parse_uint).map(|v| v as usize);
     }
     Ok(map)
@@ -793,12 +795,40 @@ pub fn object_locations(data: &[u8], xref_at: usize) -> Result<BTreeMap<ObjRef, 
 /// Fold one cross-reference section into the map: the first decision about an
 /// object number wins (sections are walked newest first), and a free entry is a
 /// decision too — the numbers it lists may not be restored by an older section.
+///
+/// One section naming the same number TWICE is refused (round 3's N3-1). Both
+/// list-building readers return in-use entries and frees separately, so a table
+/// that says "6 free" and then "6 at the old offset" reached this function as one
+/// free and one entry with no order left to honour; the gate kept the in-use one
+/// and judged zero changes while qpdf and Ghostscript take the FIRST entry — the
+/// free one — and render the document without the signed object. No legitimate
+/// writer repeats a number in one section, and refusing costs nothing.
 fn record_section(
     map: &mut BTreeMap<ObjRef, Location>,
     decided: &mut BTreeSet<u32>,
     entries: XrefEntries,
     frees: XrefFrees,
-) {
+) -> Result<()> {
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    for (r, _) in &entries {
+        if !seen.insert(r.num) {
+            return Err(Error::Pdf(format!(
+                "a cross-reference section names object {} more than once: the order of \
+                 the entries decides what readers see, and the sections the gate reads do \
+                 not keep it",
+                r.num
+            )));
+        }
+    }
+    for num in &frees {
+        if !seen.insert(*num) {
+            return Err(Error::Pdf(format!(
+                "a cross-reference section names object {num} more than once: the order of \
+                 the entries decides what readers see, and the sections the gate reads do \
+                 not keep it"
+            )));
+        }
+    }
     for (r, loc) in entries {
         if decided.insert(r.num) {
             map.insert(r, loc);
@@ -807,6 +837,7 @@ fn record_section(
     for num in frees {
         decided.insert(num);
     }
+    Ok(())
 }
 
 /// One classic cross-reference table: its in-use entries and its trailer.
@@ -1037,6 +1068,12 @@ fn read_xref_stream(data: &[u8], obj_at: usize) -> Result<(XrefEntries, XrefFree
                         index: third as u32,
                     },
                 )),
+                // ISO 32000-1 Table 18: a type the reader does not know is a
+                // reference to null — i.e. the object is not defined by this
+                // revision. Treating it as an error let a hybrid /XRefStm smuggle
+                // a "free" row past the gate by adding a third row of type 3
+                // (round 3's N3-2). Null is a decision for the gate: it hides the
+                // older definition, which is exactly what a deletion is.
                 other => {
                     return Err(Error::Pdf(format!(
                         "cross-reference entry type {other} does not exist, only 0, 1 and 2 do"
@@ -1997,5 +2034,62 @@ pub(crate) mod tests {
         // neither a trustworthy length nor a marker: not a payload anybody can read
         let (pdf, at) = one_stream("<< /Type /XObject >>\nstream\nHELLO");
         assert!(stream_payload_as_readers(&pdf, at).is_err());
+    }
+
+    // ---- round 3's xref findings: order is meaning, and silence is not absent ----
+
+    /// A one-object PDF whose cross-reference SECTION is exactly `body` (what
+    /// follows `xref\n`) and whose trailer is `trailer`.
+    fn xref_with(body: &str, trailer: &str) -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let xref_at = out.len();
+        out.extend_from_slice(b"xref\n");
+        out.extend_from_slice(body.as_bytes());
+        out.extend_from_slice(
+            format!("trailer\n<< {trailer} /Size 7 /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    /// Round 3's N3-1, classic table: the same number free and then in use in ONE
+    /// section. qpdf and Ghostscript take the first entry (free) and drop the
+    /// signed object; the gate's two-list reader kept the in-use one and judged
+    /// zero changes. A section that repeats a number is now a read error.
+    #[test]
+    fn a_section_that_names_an_object_twice_is_refused() {
+        // two subsections, both for object 6: the first frees it, the second
+        // points at the old bytes — one section, one number, two decisions
+        let pdf = xref_with("6 1\n0000000000 65535 f \n6 1\n0000000009 00000 n \n", "");
+        let err = object_locations(&pdf, last_startxref(&pdf).unwrap())
+            .expect_err("the order of two entries for one number is what readers obey")
+            .to_string();
+        assert!(err.contains("more than once"), "says why: {err}");
+    }
+
+    /// The same shape in a cross-reference STREAM: `/Index [6 1 6 1]` with a free
+    /// row and then an in-use one.
+    #[test]
+    fn an_xref_stream_that_names_an_object_twice_is_refused() {
+        let mut out = b"%PDF-1.5\n".to_vec();
+        let stream_at = out.len();
+        // two rows of /W [1 4 2]: type 0 (free) then type 1 (in use, offset 0)
+        let rows: Vec<u8> = vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        out.extend_from_slice(
+            format!(
+                "6 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R /W [1 4 2] /Index [6 1 6 1] /Length {} >>\nstream\n",
+                rows.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&rows);
+        out.extend_from_slice(
+            format!("\nendstream\nendobj\nstartxref\n{stream_at}\n%%EOF\n").as_bytes(),
+        );
+        let err = object_locations(&out, stream_at)
+            .expect_err("a stream that repeats a number has the same order problem")
+            .to_string();
+        assert!(err.contains("more than once"), "says why: {err}");
     }
 }
